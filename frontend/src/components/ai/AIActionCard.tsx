@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle } from "lucide-react";
 import type { AgentResponse } from "@/lib/types/api";
 import { formatCurrency } from "@/lib/utils/currency";
@@ -36,6 +37,61 @@ function natureLabel(nature: unknown): string {
   return key ? key.replace(/_/g, " ").toLowerCase() : String(nature);
 }
 
+/* ---- View Details target -------------------------------------------------
+   Maps the action/intent that produced this card to the page where the
+   recorded transaction actually lives. Only /sales/invoices/[id] has a
+   DETAIL route today, so that one deep-links to the exact record via the
+   affected entity's id; every other action links to its module page.
+---------------------------------------------------------------------------*/
+const ENTITY_DETAIL_ROUTES: Record<string, string> = {
+  invoice: "/sales/invoices",
+  quotation: "/sales/quotations",
+};
+
+const ACTION_ROUTES: Record<string, string> = {
+  create_invoice: "/sales/invoices",
+  record_cash_sale: "/sales/invoices",
+  record_credit_sale: "/sales/invoices",
+  create_quotation: "/sales/quotations",
+  create_credit_note: "/sales/credit-notes",
+  record_credit_purchase: "/purchases/bills",
+  record_cash_purchase: "/purchases/bills",
+  create_purchase_return: "/purchases/returns",
+  record_expense: "/expenses",
+  record_payment: "/payments",
+  record_receipt: "/receipts",
+  record_bank_transfer: "/banking",
+  register_fixed_asset: "/accounting/journal",
+  dispose_fixed_asset: "/accounting/journal",
+  record_asset_depreciation: "/accounting/journal",
+  generate_trial_balance: "/accounting/trial-balance",
+  generate_profit_loss: "/reports/profit-loss",
+  generate_balance_sheet: "/reports/balance-sheet",
+  generate_cash_flow: "/reports/cash-flow",
+  customer_balance: "/customers",
+  supplier_balance: "/suppliers",
+};
+
+function detailsTarget(response: AgentResponse): string | null {
+  // Deep-link to the exact record when the affected entity carries an id
+  // AND a detail page exists for its type (e.g. invoice -> /sales/invoices/<id>).
+  const entity = response.affected_entities?.find(
+    (e) => {
+      const base = e.type ? ENTITY_DETAIL_ROUTES[e.type.toLowerCase()] : undefined;
+      return base && e.id;
+    }
+  );
+  if (entity) {
+    return `${ENTITY_DETAIL_ROUTES[entity.type.toLowerCase()]}/${entity.id}`;
+  }
+  // Otherwise the module page for the recorded action...
+  if (response.action && ACTION_ROUTES[response.action]) {
+    return ACTION_ROUTES[response.action];
+  }
+  // ...or the AI Activity trail for unmapped actions.
+  return response.execution_id ? "/ai-activity" : null;
+}
+
 export default function AIActionCard({ response }: Props) {
   // VERIFIED means the ERP operation actually executed and its resulting
   // DB state was verified.  A text-only AI answer (no tools executed) is
@@ -43,6 +99,7 @@ export default function AIActionCard({ response }: Props) {
   const verification = response.verification_status;
   const isVerified = verification === "VERIFIED";
   const isUnverified = verification === "UNVERIFIED";
+  const target = detailsTarget(response);
 
   return (
     <div className="bg-bg-surface rounded-2xl border border-border-subtle shadow-sm overflow-hidden">
@@ -187,10 +244,13 @@ export default function AIActionCard({ response }: Props) {
 
         {/* Action Links */}
         <div className="flex gap-2 pt-1">
-          {response.data && (
-            <button className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-bg-muted text-xs font-medium text-text-secondary hover:text-text-primary transition-colors">
+          {target && (
+            <Link
+              href={target}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-bg-muted text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
+            >
               <ExternalLink className="w-3 h-3" /> View Details
-            </button>
+            </Link>
           )}
         </div>
       </div>
