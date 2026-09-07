@@ -23,7 +23,9 @@ export default function HeroCanvas() {
     const mouse = { x: -9999, y: -9999, tx: -9999, ty: -9999 };
     const PULL_RADIUS = 190;
 
-    type Star = { x: number; y: number; vx: number; vy: number; r: number; tw: number; ts: number };
+    type Star = { x: number; y: number; vx: number; vy: number; r: number; tw: number; ts: number; c: string };
+    // Multi-colour palette tuned for a LIGHT stage (surreal glass-clay).
+    const PALETTE = ["13,148,136", "79,70,229", "217,119,6", "219,39,119", "2,132,199"];
     let width = 0;
     let height = 0;
     let raf = 0;
@@ -39,6 +41,7 @@ export default function HeroCanvas() {
         r: 0.5 + Math.random() * 1.3,
         tw: Math.random() * Math.PI * 2,
         ts: 0.006 + Math.random() * 0.02,
+        c: PALETTE[Math.floor(Math.random() * PALETTE.length)],
       }));
     };
 
@@ -92,7 +95,7 @@ export default function HeroCanvas() {
           const d2 = dx * dx + dy * dy;
           if (d2 < LINK * LINK) {
             const t = 1 - Math.sqrt(d2) / LINK;
-            ctx.strokeStyle = `rgba(94, 234, 212, ${(t * 0.14).toFixed(3)})`;
+            ctx.strokeStyle = `rgba(79, 70, 229, ${(t * 0.12).toFixed(3)})`;
             ctx.lineWidth = 0.6;
             ctx.beginPath();
             ctx.moveTo(a.x, a.y);
@@ -102,15 +105,15 @@ export default function HeroCanvas() {
         }
       }
 
-      // Stars with a soft teal-white twinkle.
+      // Multi-colour stars with a soft halo twinkle.
       for (const s of stars) {
         const tw = 0.5 + 0.5 * Math.sin(s.tw);
-        ctx.fillStyle = `rgba(224, 247, 250, ${(0.25 + tw * 0.55).toFixed(3)})`;
+        ctx.fillStyle = `rgba(${s.c}, ${(0.35 + tw * 0.45).toFixed(3)})`;
         ctx.beginPath();
         ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
         ctx.fill();
         if (s.r > 1.2) {
-          ctx.fillStyle = `rgba(94, 234, 212, ${(tw * 0.35).toFixed(3)})`;
+          ctx.fillStyle = `rgba(${s.c}, ${(tw * 0.22).toFixed(3)})`;
           ctx.beginPath();
           ctx.arc(s.x, s.y, s.r * 2.4, 0, Math.PI * 2);
           ctx.fill();

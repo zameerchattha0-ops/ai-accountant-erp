@@ -82,16 +82,18 @@ function Counter({ target, suffix = "" }: { target: number; suffix?: string }) {
   return <span ref={ref}>{count.toLocaleString()}{suffix}</span>;
 }
 
-/* ---- Feature card ---- */
+/* ---- Feature card — glass pane in a gradient hairline ring ---- */
 function FeatureCard({
   icon: Icon,
   title,
   description,
+  tone,
   delay,
 }: {
   icon: React.ElementType;
   title: string;
   description: string;
+  tone: { chip: string; icon: string; from: string; to: string };
   delay: string;
 }) {
   const { ref, inView } = useInView();
@@ -99,32 +101,44 @@ function FeatureCard({
     <div
       ref={ref}
       className={cn(
-        "opacity-0 rounded-2xl bg-bg-surface border border-border-subtle p-6 transition-shadow hover:shadow-lg",
+        "opacity-0 group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5",
         inView && "animate-scale-in",
       )}
-      style={{ animationDelay: delay }}
+      style={{
+        animationDelay: delay,
+        background: `linear-gradient(135deg, ${tone.from}, ${tone.to})`,
+      }}
     >
-      <div className="w-11 h-11 rounded-xl bg-ai-50 flex items-center justify-center mb-4">
-        <Icon className="w-5 h-5 text-ai-600" />
+      <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-6 h-full">
+        <div
+          className={cn(
+            "w-12 h-12 rounded-2xl flex items-center justify-center mb-4 clay-chip transition-transform duration-300 group-hover:scale-110 group-hover:rotate-3",
+            tone.chip,
+          )}
+        >
+          <Icon className={cn("w-5 h-5", tone.icon)} />
+        </div>
+        <h3 className="text-sm font-semibold text-text-primary mb-1.5">{title}</h3>
+        <p className="text-sm text-text-secondary leading-relaxed">{description}</p>
       </div>
-      <h3 className="text-sm font-semibold text-text-primary mb-1.5">{title}</h3>
-      <p className="text-sm text-text-secondary leading-relaxed">{description}</p>
     </div>
   );
 }
 
-/* ---- Step card for How It Works ---- */
+/* ---- Step card for How It Works — claymorphic disc ---- */
 function StepCard({
   step,
   icon: Icon,
   title,
   description,
+  tone,
   delay,
 }: {
   step: number;
   icon: React.ElementType;
   title: string;
   description: string;
+  tone: { disc: string; stepText: string; badge: string };
   delay: string;
 }) {
   const { ref, inView } = useInView();
@@ -137,12 +151,22 @@ function StepCard({
       )}
       style={{ animationDelay: delay }}
     >
-      <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-brand-teal to-brand-navy flex items-center justify-center mb-4 shadow-lg shadow-brand-teal/20">
-        <Icon className="w-7 h-7 text-white" />
+      <div
+        className={cn(
+          "relative w-16 h-16 rounded-3xl flex items-center justify-center mb-4 clay-chip transition-transform duration-300 hover:scale-110",
+          tone.disc,
+        )}
+      >
+        <Icon className={cn("w-7 h-7", tone.stepText)} />
+        <span
+          className={cn(
+            "absolute -top-2 -right-2 w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center shadow-md",
+            tone.badge,
+          )}
+        >
+          {step}
+        </span>
       </div>
-      <span className="text-xs font-bold text-ai-600 uppercase tracking-widest mb-1">
-        Step {step}
-      </span>
       <h3 className="text-base font-semibold text-text-primary mb-2">{title}</h3>
       <p className="text-sm text-text-secondary leading-relaxed max-w-64">{description}</p>
     </div>
@@ -185,77 +209,109 @@ export default function WelcomePage() {
       title: "AI Accounting Agent",
       description:
         "Tell the AI what happened in plain language. It handles the journal entries, posting, and reconciliation automatically.",
+      tone: {
+        chip: "bg-gradient-to-br from-teal-100 to-teal-50",
+        icon: "text-teal-600",
+        from: "#2dd4bf",
+        to: "#0ea5e9",
+      },
     },
     {
       icon: BarChart3,
       title: "Real-time Financial Reports",
       description:
         "Profit and Loss, Balance Sheet, Cash Flow, Trial Balance. All reports update the moment entries are posted.",
+      tone: {
+        chip: "bg-gradient-to-br from-indigo-100 to-indigo-50",
+        icon: "text-indigo-600",
+        from: "#818cf8",
+        to: "#6366f1",
+      },
     },
     {
       icon: Building2,
       title: "Multi-tenant Architecture",
       description:
         "Each organization gets isolated data with row-level security. Your books stay private and compliant.",
+      tone: {
+        chip: "bg-gradient-to-br from-rose-100 to-rose-50",
+        icon: "text-rose-600",
+        from: "#fb7185",
+        to: "#e11d48",
+      },
     },
     {
       icon: BookOpen,
       title: "Automated Journal Engine",
       description:
         "Documents like invoices and purchase bills automatically generate balanced journal entries. No manual debits and credits.",
+      tone: {
+        chip: "bg-gradient-to-br from-amber-100 to-amber-50",
+        icon: "text-amber-600",
+        from: "#fbbf24",
+        to: "#f59e0b",
+      },
     },
     {
       icon: Search,
       title: "Smart Entity Search",
       description:
         "Find customers, suppliers, accounts, and transactions instantly with fuzzy search across your entire ledger.",
+      tone: {
+        chip: "bg-gradient-to-br from-sky-100 to-sky-50",
+        icon: "text-sky-600",
+        from: "#38bdf8",
+        to: "#0284c7",
+      },
     },
     {
       icon: ShieldCheck,
       title: "Enterprise Compliance",
       description:
         "Role-based permissions, audit trails, confirmation gates for high-risk operations, and full accounting period management.",
+      tone: {
+        chip: "bg-gradient-to-br from-violet-100 to-violet-50",
+        icon: "text-violet-600",
+        from: "#a78bfa",
+        to: "#7c3aed",
+      },
     },
   ];
 
   return (
     <div className={cn(cinzel.variable, cormorant.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
-      {/* NAVBAR — high contrast against the dark stage                */}
+      {/* NAVBAR — light floating glass                                 */}
       {/* ============================================================ */}
       <nav
         className={cn(
           "fixed top-0 left-0 right-0 z-50 transition-all duration-500",
           scrolled
-            ? "bg-[#04070d]/85 backdrop-blur-xl border-b border-white/10 py-2.5"
-            : "bg-gradient-to-b from-[#04070d]/85 via-[#04070d]/40 to-transparent py-4",
+            ? "bg-white/70 backdrop-blur-2xl border-b border-white/80 shadow-[0_10px_40px_-18px_rgba(27,42,74,0.25)] py-2.5"
+            : "bg-transparent py-4",
         )}
       >
         <div className="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between">
           <Link href="/" className="flex items-center">
-            {/* The logo artwork is dark navy — seat it on a light chip so it
-                always reads against the dark stage. */}
-            <span className="inline-flex items-center rounded-lg bg-white px-3 py-1.5 shadow-lg shadow-black/50">
-              <Image
-                src="/ai-accountant.png"
-                alt="AI Accountant"
-                width={132}
-                height={36}
-                className="h-6 w-auto object-contain"
-                priority
-              />
-            </span>
+            <Image
+              src="/ai-accountant.png"
+              alt="AI Accountant"
+              width={140}
+              height={38}
+              className="h-8 w-auto object-contain"
+              priority
+            />
           </Link>
           <div className="flex items-center gap-3">
             <Link
               href="/login"
-              className="px-4 py-2 rounded-xl text-sm font-medium text-white/85 hover:text-white border border-white/15 hover:border-white/35 hover:bg-white/5 backdrop-blur-sm transition-all"
+              className="px-4 py-2 rounded-xl text-sm font-semibold text-brand-navy hover:text-ai-700 border border-transparent hover:border-border-default hover:bg-white/70 transition-all"
             >
               Login
             </Link>
             <Link
               href="/signup"
-              className="px-5 py-2 rounded-xl bg-brand-teal hover:bg-teal-400 text-[#03150f] text-sm font-semibold transition-all shadow-lg shadow-brand-teal/25 hover:shadow-brand-teal/45 hover:-translate-y-px"
+              className="lp-btn-primary px-5 py-2 rounded-xl bg-gradient-to-r from-teal-500 to-indigo-500 text-white text-sm font-semibold transition-all shadow-lg shadow-indigo-500/25 hover:shadow-indigo-500/45 hover:-translate-y-px"
             >
               Get Started
             </Link>
@@ -264,36 +320,46 @@ export default function WelcomePage() {
       </nav>
 
       {/* ============================================================ */}
-      {/* HERO — the elite universe                                    */}
+      {/* HERO — surrealist glass-clay light stage                      */}
       {/* ============================================================ */}
       <section
         ref={heroRef}
         onPointerMove={handlePointerMove}
         onPointerLeave={handlePointerLeave}
-        className="hero-stage relative min-h-screen flex items-center"
+        className="lp-stage relative min-h-screen flex items-center"
       >
-        {/* Interactive constellation layer */}
+        {/* Interactive multi-colour constellation */}
         <HeroCanvas />
 
-        {/* Ambient scene layers */}
-        <div className="hero-aurora hero-aurora-a" />
-        <div className="hero-aurora hero-aurora-b" />
-        <div className="hero-grid" />
-        <div className="hero-grain" />
-        <div className="hero-vignette" />
+        {/* Surrealist colour clouds */}
+        <div className="lp-blob lp-blob-a" />
+        <div className="lp-blob lp-blob-b" />
+        <div className="lp-blob lp-blob-c" />
 
-        <div className="hero-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
+        {/* Floating glass geometry */}
+        <div className="lp-shape lp-shape-square" />
+        <div className="lp-shape lp-shape-square-2" />
+        <div className="lp-shape lp-shape-ring" />
+
+        {/* Whisper of grain */}
+        <div className="lp-grain" />
+
+        <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
           <div className="max-w-3xl">
             <p
-              className="hero-eyebrow inline-flex items-center gap-3 text-[11px] font-medium uppercase text-teal-200/90 mb-7"
+              className="hero-eyebrow inline-flex items-center gap-3 text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
               style={{ animationDelay: "80ms" }}
             >
-              <span className="w-1.5 h-1.5 rounded-full bg-teal-300 animate-pulse" />
+              <span className="flex gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse" />
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse [animation-delay:200ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse [animation-delay:400ms]" />
+              </span>
               AI-native accounting for modern businesses
             </p>
 
             <h1
-              className="text-white text-5xl sm:text-6xl lg:text-7xl leading-[1.08] font-semibold"
+              className="text-brand-navy text-5xl sm:text-6xl lg:text-7xl leading-[1.08] font-semibold"
               style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
             >
               <span className="reveal-line">
@@ -302,7 +368,7 @@ export default function WelcomePage() {
               <span className="reveal-line">
                 <span style={{ "--d": "420ms" } as React.CSSProperties}>
                   <span
-                    className="hero-gradient-word font-medium italic"
+                    className="text-aurora font-medium italic"
                     style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
                   >
                     balanced
@@ -313,7 +379,7 @@ export default function WelcomePage() {
             </h1>
 
             <p
-              className="mt-7 text-lg sm:text-xl text-white/85 leading-relaxed max-w-xl font-light"
+              className="mt-7 text-lg sm:text-xl text-[#3d4b66] leading-relaxed max-w-xl font-light"
               style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 650ms both" }}
             >
               Record transactions in plain English. Get instant financial
@@ -327,13 +393,13 @@ export default function WelcomePage() {
             >
               <Link
                 href="/signup"
-                className="hero-btn-primary inline-flex items-center gap-2 px-8 py-4 rounded-xl bg-gradient-to-b from-teal-300 to-teal-500 text-[#03150f] font-semibold text-base transition-all shadow-xl shadow-teal-500/25 hover:shadow-teal-400/45 hover:-translate-y-0.5"
+                className="lp-btn-primary inline-flex items-center gap-2 px-8 py-4 rounded-2xl bg-gradient-to-r from-teal-500 to-indigo-500 text-white font-semibold text-base transition-all shadow-xl shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5"
               >
                 Start Free <ArrowRight className="w-4 h-4" />
               </Link>
               <Link
                 href="/login"
-                className="inline-flex items-center px-8 py-4 rounded-xl text-white font-medium text-base border border-white/20 bg-white/5 hover:bg-white/10 hover:border-white/40 backdrop-blur-sm transition-all"
+                className="inline-flex items-center px-8 py-4 rounded-2xl glass-panel text-brand-navy font-semibold text-base transition-all hover:-translate-y-0.5"
               >
                 Sign In
               </Link>
@@ -342,18 +408,15 @@ export default function WelcomePage() {
         </div>
 
         {/* Scroll cue */}
-        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-2 text-white/60">
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-2 text-brand-navy/50">
           <span
             className="text-[10px] uppercase tracking-[0.3em]"
             style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
           >
             Scroll
           </span>
-          <span className="hero-scrollcue block w-px h-9 bg-gradient-to-b from-teal-300/80 to-transparent" />
+          <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-indigo-500/70 to-transparent" />
         </div>
-
-        {/* Bottom gradient fade into the page */}
-        <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-bg-primary to-transparent z-[5]" />
       </section>
 
       {/* ============================================================ */}
@@ -362,19 +425,19 @@ export default function WelcomePage() {
       <section className="py-24 sm:py-32">
         <div className="max-w-6xl mx-auto px-4 sm:px-6">
           <Section className="text-center mb-16">
-            <span className="text-xs font-bold text-ai-600 uppercase tracking-widest mb-3 block">
+            <span className="text-xs font-bold text-ai-700 uppercase tracking-widest mb-3 block">
               Features
             </span>
-            <h2 className="text-3xl sm:text-4xl font-bold text-text-primary mb-4">
-              Everything your accountant needs
+            <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
+              Everything your <span className="text-aurora">accountant</span> needs
             </h2>
-            <p className="text-text-secondary text-lg max-w-2xl mx-auto">
+            <p className="text-[#3d4b66] text-lg max-w-2xl mx-auto">
               A complete ERP built for small businesses that want accurate
               books without the complexity.
             </p>
           </Section>
 
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
             {features.map((f, i) => (
               <FeatureCard
                 key={f.title}
@@ -389,16 +452,18 @@ export default function WelcomePage() {
       {/* ============================================================ */}
       {/* HOW IT WORKS                                                   */}
       {/* ============================================================ */}
-      <section className="py-24 sm:py-32 bg-brand-aqua-soft/60">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6">
+      <section className="relative py-24 sm:py-32">
+        {/* Surreal colour wash behind the steps */}
+        <div className="absolute inset-0 bg-gradient-to-b from-transparent via-brand-aqua-soft/70 to-transparent pointer-events-none" />
+        <div className="relative max-w-6xl mx-auto px-4 sm:px-6">
           <Section className="text-center mb-16">
-            <span className="text-xs font-bold text-ai-600 uppercase tracking-widest mb-3 block">
+            <span className="text-xs font-bold text-indigo-600 uppercase tracking-widest mb-3 block">
               How It Works
             </span>
-            <h2 className="text-3xl sm:text-4xl font-bold text-text-primary mb-4">
-              Up and running in minutes
+            <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
+              Up and running in <span className="text-aurora">minutes</span>
             </h2>
-            <p className="text-text-secondary text-lg max-w-xl mx-auto">
+            <p className="text-[#3d4b66] text-lg max-w-xl mx-auto">
               Three simple steps to transform how you manage your finances.
             </p>
           </Section>
@@ -409,6 +474,7 @@ export default function WelcomePage() {
               icon={UserPlus}
               title="Create Your Account"
               description="Sign up with your email. Verify your identity and you are ready to go."
+              tone={{ disc: "bg-teal-50", stepText: "text-teal-600", badge: "bg-teal-500" }}
               delay="0ms"
             />
             <StepCard
@@ -416,6 +482,7 @@ export default function WelcomePage() {
               icon={Settings2}
               title="Set Up Your Organization"
               description="Enter your business details. Your chart of accounts, financial year, and document numbering are created automatically."
+              tone={{ disc: "bg-indigo-50", stepText: "text-indigo-600", badge: "bg-indigo-500" }}
               delay="150ms"
             />
             <StepCard
@@ -423,6 +490,7 @@ export default function WelcomePage() {
               icon={TrendingUp}
               title="Start Accounting"
               description="Tell the AI about your transactions. Invoices, purchases, expenses, and reports are handled end to end."
+              tone={{ disc: "bg-amber-50", stepText: "text-amber-600", badge: "bg-amber-500" }}
               delay="300ms"
             />
           </div>
@@ -434,24 +502,39 @@ export default function WelcomePage() {
       {/* ============================================================ */}
       <section className="py-24 sm:py-32">
         <div className="max-w-6xl mx-auto px-4 sm:px-6">
-          <div className="grid sm:grid-cols-3 gap-8 text-center">
+          <div className="grid sm:grid-cols-3 gap-6">
             <Section animation="animate-scale-in" delay="0ms">
-              <div className="text-4xl sm:text-5xl font-bold text-brand-navy mb-2">
-                <Counter target={36} />
+              <div className="glass-panel rounded-3xl p-8 text-center transition-transform duration-300 hover:-translate-y-1">
+                <div
+                  className="text-4xl sm:text-5xl font-bold mb-2 text-aurora"
+                  style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+                >
+                  <Counter target={36} />
+                </div>
+                <p className="text-[#3d4b66] text-sm font-medium">AI-powered tools</p>
               </div>
-              <p className="text-text-secondary text-sm">AI-powered tools</p>
             </Section>
             <Section animation="animate-scale-in" delay="120ms">
-              <div className="text-4xl sm:text-5xl font-bold text-brand-navy mb-2">
-                <Counter target={12} />
+              <div className="glass-panel rounded-3xl p-8 text-center transition-transform duration-300 hover:-translate-y-1">
+                <div
+                  className="text-4xl sm:text-5xl font-bold mb-2 text-brand-navy"
+                  style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+                >
+                  <Counter target={12} />
+                </div>
+                <p className="text-[#3d4b66] text-sm font-medium">Financial report types</p>
               </div>
-              <p className="text-text-secondary text-sm">Financial report types</p>
             </Section>
             <Section animation="animate-scale-in" delay="240ms">
-              <div className="text-4xl sm:text-5xl font-bold text-brand-navy mb-2">
-                <Counter target={78} />
+              <div className="glass-panel rounded-3xl p-8 text-center transition-transform duration-300 hover:-translate-y-1">
+                <div
+                  className="text-4xl sm:text-5xl font-bold mb-2 text-brand-navy"
+                  style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+                >
+                  <Counter target={78} />
+                </div>
+                <p className="text-[#3d4b66] text-sm font-medium">Validated parameters</p>
               </div>
-              <p className="text-text-secondary text-sm">Validated parameters</p>
             </Section>
           </div>
         </div>
@@ -463,25 +546,28 @@ export default function WelcomePage() {
       <section className="py-24 sm:py-32">
         <div className="max-w-6xl mx-auto px-4 sm:px-6">
           <Section>
-            <div className="rounded-3xl bg-gradient-to-br from-brand-navy via-[#1f3560] to-brand-navy p-10 sm:p-16 text-center relative overflow-hidden">
-              {/* Subtle teal glow */}
-              <div className="absolute top-0 right-0 w-72 h-72 bg-brand-teal/10 rounded-full blur-3xl" />
-              <div className="absolute bottom-0 left-0 w-56 h-56 bg-brand-teal/5 rounded-full blur-3xl" />
+            <div className="relative rounded-[2rem] p-[1.5px]" style={{ background: "linear-gradient(135deg, #2dd4bf, #6366f1 45%, #f59e0b 80%, #ec4899)" }}>
+              <div className="glass-panel rounded-[calc(2rem-1.5px)] p-10 sm:p-16 text-center relative overflow-hidden">
+                {/* Surreal floating accents inside the panel */}
+                <div className="absolute -top-16 -right-16 w-56 h-56 rounded-full bg-gradient-to-br from-teal-200/50 to-transparent blur-3xl pointer-events-none" />
+                <div className="absolute -bottom-20 -left-16 w-64 h-64 rounded-full bg-gradient-to-tr from-indigo-200/50 to-transparent blur-3xl pointer-events-none" />
+                <div className="lp-shape lp-shape-square !w-16 !h-16 !top-8 !left-10 opacity-70" />
 
-              <div className="relative z-10">
-                <h2 className="text-3xl sm:text-4xl font-bold text-white mb-4">
-                  Ready to automate your accounting?
-                </h2>
-                <p className="text-white/60 text-lg max-w-xl mx-auto mb-8">
-                  Join businesses that trust AI Accountant to keep their
-                  books balanced, accurate, and audit-ready.
-                </p>
-                <Link
-                  href="/signup"
-                  className="inline-flex items-center gap-2 px-8 py-4 rounded-xl bg-brand-teal hover:bg-teal-400 text-white font-semibold text-base transition-all shadow-lg shadow-brand-teal/30"
-                >
-                  Get Started Free <ArrowRight className="w-4 h-4" />
-                </Link>
+                <div className="relative z-10">
+                  <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
+                    Ready to <span className="text-aurora">automate</span> your accounting?
+                  </h2>
+                  <p className="text-[#3d4b66] text-lg max-w-xl mx-auto mb-8">
+                    Join businesses that trust AI Accountant to keep their
+                    books balanced, accurate, and audit-ready.
+                  </p>
+                  <Link
+                    href="/signup"
+                    className="lp-btn-primary inline-flex items-center gap-2 px-8 py-4 rounded-2xl bg-gradient-to-r from-teal-500 to-indigo-500 text-white font-semibold text-base transition-all shadow-xl shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5"
+                  >
+                    Get Started Free <ArrowRight className="w-4 h-4" />
+                  </Link>
+                </div>
               </div>
             </div>
           </Section>
