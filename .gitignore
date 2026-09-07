@@ -7,6 +7,9 @@
 .env.*
 !.env.example
 
+# ---- Vercel ----
+.vercel/
+
 # ---- Python virtual environments ----
 venv/
 env/

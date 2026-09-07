@@ -81,11 +81,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — added at module level before any requests are served
-_settings = get_settings()
+# CORS — added at module level before any requests are served.
+# Guarded: on serverless platforms (e.g. Vercel) the function cold-starts
+# by importing this module for EVERY request. If required environment
+# variables are missing there, Settings() would raise and crash the
+# function (FUNCTION_INVOCATION_FAILED) — hiding even /api/health from
+# diagnostics. Degrade to empty CORS origins instead; endpoints that
+# need config will still fail loudly at request time with a clear error.
+try:
+    _cors_origins: List[str] = get_settings().cors_origin_list
+    _config_ok: bool = True
+except Exception as exc:  # pragma: no cover — misconfigured deployment
+    log.error("config.settings_invalid", error=str(exc))
+    _cors_origins = []
+    _config_ok = False
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_settings.cors_origin_list,
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -114,8 +126,8 @@ async def get_current_user(
 
 @app.get("/api/health")
 async def health_check():
-    """Simple health check."""
-    return {"status": "ok", "version": "1.0.0"}
+    """Liveness probe — safe to call even when the environment is misconfigured."""
+    return {"status": "ok", "version": "1.0.0", "config_ok": _config_ok}
 
 
 @app.get("/api/ai/providers")

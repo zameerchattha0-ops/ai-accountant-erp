@@ -1,6 +1,9 @@
 import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, SessionSummary, AgentProgress } from "@/lib/types/api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Same-origin by default: on Vercel the FastAPI backend is served under
+// /api/* of the same domain (see vercel.json "services"). For local dev set
+// NEXT_PUBLIC_API_URL=http://localhost:8000 in frontend/.env.local.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 class ApiError extends Error {
   constructor(public status: number, message: string) {
