@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-const PUBLIC_ROUTES = ["/login", "/signup", "/verify-email"];
+const PUBLIC_ROUTES = ["/login", "/signup", "/verify-email", "/welcome"];
 
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
@@ -13,6 +13,13 @@ export async function middleware(request: NextRequest) {
 
   if (!hasAuthCookie && !isPublic) {
     const url = request.nextUrl.clone();
+    // Site root: signed-out visitors get the marketing landing page (served
+    // via rewrite so the URL stays "/") instead of being bounced to the
+    // login form. Signed-in users keep seeing the dashboard at "/".
+    if (pathname === "/") {
+      url.pathname = "/welcome";
+      return NextResponse.rewrite(url);
+    }
     url.pathname = "/login";
     return NextResponse.redirect(url);
   }
