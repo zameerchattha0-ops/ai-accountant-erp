@@ -1,0 +1,607 @@
+@import "tailwindcss";
+
+/* ============================================================
+   ERP AI Agent — Design System: "Intelligent Soft Enterprise"
+   70% Clean Enterprise | 20% Soft Clay | 10% Glassmorphism
+   ============================================================ */
+
+@theme inline {
+  /* ---- Primary backgrounds ---- */
+  --color-bg-primary: #f8f9fb;
+  --color-bg-surface: #ffffff;
+  --color-bg-elevated: #ffffff;
+  --color-bg-muted: #f1f3f7;
+
+  /* ---- Text ---- */
+  --color-text-primary: #1a1d26;
+  --color-text-secondary: #5f6880;
+  --color-text-muted: #9198a8;
+  --color-text-inverse: #ffffff;
+
+  /* ---- Borders ---- */
+  --color-border-subtle: #e8eaef;
+  --color-border-default: #d4d8e1;
+  --color-border-strong: #b0b7c8;
+
+  /* ---- Semantic: Success / Paid ---- */
+  --color-success-50: #ecfdf5;
+  --color-success-100: #d1fae5;
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+  --color-success-700: #047857;
+
+  /* ---- Semantic: Warning / Pending ---- */
+  --color-warning-50: #fffbeb;
+  --color-warning-100: #fef3c7;
+  --color-warning-500: #f59e0b;
+  --color-warning-600: #d97706;
+
+  /* ---- Semantic: Error / Overdue ---- */
+  --color-error-50: #fef2f2;
+  --color-error-100: #fee2e2;
+  --color-error-500: #ef4444;
+  --color-error-600: #dc2626;
+
+  /* ---- Semantic: Info ---- */
+  --color-info-50: #eff6ff;
+  --color-info-100: #dbeafe;
+  --color-info-500: #3b82f6;
+  --color-info-600: #2563eb;
+
+  /* ---- Semantic: AI / Teal (brand-derived) ---- */
+  --color-ai-50: #f0fdfa;
+  --color-ai-100: #ccfbf1;
+  --color-ai-200: #99f6e4;
+  --color-ai-500: #14b8a6;
+  --color-ai-600: #0d9488;
+  --color-ai-700: #0f766e;
+
+  /* ---- Brand tokens (from Ai Accountant logo) ---- */
+  --color-brand-navy: #1B2A4A;
+  --color-brand-teal: #14b8a6;
+  --color-brand-aqua: #e8f4f8;
+  --color-brand-aqua-soft: #f0f7fa;
+
+  /* ---- Sidebar (light aqua gradient) ---- */
+  --color-sidebar-bg: #eef4f7;
+  --color-sidebar-bg-end: #f6fafb;
+  --color-sidebar-text: #1B2A4A;
+  --color-sidebar-nav: #3d5170;
+  --color-sidebar-active-bg: #d4edf3;
+  --color-sidebar-active-text: #1B2A4A;
+  --color-sidebar-hover: #dce8ee;
+  --color-sidebar-border: #d4e2ea;
+
+  /* ---- Typography ---- */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+
+  /* ---- Spacing tokens ---- */
+  --spacing-page: 1.5rem;
+
+  /* ---- Border radius ---- */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+
+  /* ---- Shadows ---- */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.06), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.06), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
+  --shadow-clay: 6px 6px 14px rgba(0, 0, 0, 0.05), -6px -6px 14px rgba(255, 255, 255, 0.85);
+  --shadow-clay-sm: 3px 3px 8px rgba(0, 0, 0, 0.04), -3px -3px 8px rgba(255, 255, 255, 0.75);
+  --shadow-glass: 0 8px 32px rgba(0, 0, 0, 0.06);
+}
+
+/* ---- Base ---- */
+body {
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---- Utility classes ---- */
+@utility glass {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+@utility clay {
+  box-shadow: var(--shadow-clay);
+  border-radius: var(--radius-xl);
+}
+
+@utility clay-sm {
+  box-shadow: var(--shadow-clay-sm);
+  border-radius: var(--radius-lg);
+}
+
+@utility tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Scrollbar ---- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-default);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}
+
+/* ---- Logo entrance animations ---- */
+@keyframes logo-zoom {
+  from {
+    opacity: 0;
+    transform: scale(0.88);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes logo-zoom-subtle {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@utility logo-enter {
+  animation: logo-zoom 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@utility logo-enter-subtle {
+  animation: logo-zoom-subtle 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ---- Landing page animations ---- */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-48px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(48px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@utility animate-fade-in-up {
+  animation: fade-in-up 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@utility animate-slide-in-left {
+  animation: slide-in-left 0.65s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@utility animate-slide-in-right {
+  animation: slide-in-right 0.65s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@utility animate-float {
+  animation: float 3.5s ease-in-out infinite;
+}
+
+@utility animate-fade-in {
+  animation: fade-in 0.6s ease forwards;
+}
+
+@utility animate-scale-in {
+  animation: scale-in 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ============================================================
+   PREMIUM 3D BUTTONS — raised surfaces, tactile press physics.
+   Add `btn-3d` next to any button's colour classes.
+   ============================================================ */
+@utility btn-3d {
+  position: relative;
+  transform: translateY(0);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.35) inset,
+    0 -2px 0 rgba(0, 0, 0, 0.12) inset,
+    0 3px 0 0 rgba(0, 0, 0, 0.14),
+    0 6px 12px -2px rgba(0, 0, 0, 0.18);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+
+  &:hover {
+    transform: translateY(-2px);
+    filter: brightness(1.06) saturate(1.05);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.4) inset,
+      0 -2px 0 rgba(0, 0, 0, 0.12) inset,
+      0 5px 0 0 rgba(0, 0, 0, 0.14),
+      0 10px 20px -4px rgba(0, 0, 0, 0.22);
+  }
+
+  &:active {
+    transform: translateY(1px);
+    filter: brightness(0.97);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.25) inset,
+      0 1px 0 0 rgba(0, 0, 0, 0.12),
+      0 2px 4px -1px rgba(0, 0, 0, 0.18);
+  }
+
+  &:disabled {
+    transform: none;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+}
+
+/* Softer variant for neutral buttons (Print, filters, secondary actions) */
+@utility btn-3d-soft {
+  position: relative;
+  transform: translateY(0);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 2px 0 0 var(--color-border-subtle),
+    0 4px 8px -2px rgba(27, 42, 74, 0.08);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+
+  &:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.7) inset,
+      0 3px 0 0 var(--color-border-subtle),
+      0 8px 16px -4px rgba(27, 42, 74, 0.14);
+  }
+
+  &:active {
+    transform: translateY(1px);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.5) inset,
+      0 1px 3px -1px rgba(27, 42, 74, 0.12);
+  }
+}
+
+/* ============================================================
+   AGENT THINKING ANIMATIONS
+   ============================================================ */
+@keyframes think-breathe {
+  0%, 100% { transform: scale(0.85); opacity: 0.75; }
+  50% { transform: scale(1.15); opacity: 1; }
+}
+
+@utility animate-think {
+  animation: think-breathe 1.15s ease-in-out infinite;
+}
+
+@keyframes fade-swap {
+  0% { opacity: 0; transform: translateY(4px); filter: blur(2px); }
+  100% { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+
+@utility animate-fade-swap {
+  animation: fade-swap 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes pulse-slow {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.35); opacity: 0.6; }
+}
+
+@utility animate-pulse-slow {
+  animation: pulse-slow 1.4s ease-in-out infinite;
+}
+
+/* ============================================================
+   CURSOR-APPROACH PREMIUM EFFECTS
+   ============================================================ */
+
+/* Lift + deepen shadow as the cursor approaches — for cards/tabs */
+@utility hover-lift {
+  transition:
+    transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+
+  &:hover {
+    transform: translateY(-3px) scale(1.015);
+    box-shadow:
+      0 12px 24px -8px rgba(27, 42, 74, 0.22),
+      0 4px 10px -4px rgba(27, 42, 74, 0.12);
+  }
+
+  &:active {
+    transform: translateY(-1px) scale(1.005);
+  }
+}
+
+/* Brand-teal glow ring on approach — elite accent for nav/tabs */
+@utility hover-glow {
+  transition:
+    box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.2s,
+    background-color 0.2s;
+
+  &:hover {
+    border-color: rgba(20, 184, 166, 0.45);
+    box-shadow:
+      0 0 0 1px rgba(20, 184, 166, 0.25),
+      0 4px 14px -4px rgba(20, 184, 166, 0.4);
+  }
+}
+
+/* Light-sweep that flashes across the surface as the cursor arrives */
+@utility btn-shine {
+  overflow: hidden;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      105deg,
+      transparent 35%,
+      rgba(255, 255, 255, 0.5) 50%,
+      transparent 65%
+    );
+    transform: translateX(-130%);
+    transition: transform 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+    pointer-events: none;
+    border-radius: inherit;
+  }
+
+  &:hover::after {
+    transform: translateX(130%);
+  }
+}
+
+/* Icon micro-interaction: pop + tilt when the parent is approached */
+@utility icon-pop {
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), filter 0.2s;
+
+  .group:hover & {
+    transform: scale(1.14) rotate(-5deg);
+    filter: drop-shadow(0 3px 6px rgba(20, 184, 166, 0.35));
+  }
+}
+
+/* ============================================================
+   AMBIENT AURA (dashboard only) - a perpetually moving,
+   color-shifting light shade BEHIND the content.
+   Light cool colors, faded (opacity 0.10-0.16), transform-only
+   keyframes (GPU friendly), never interactive, never scrolls.
+   ============================================================ */
+
+.ambient-aura {
+  /* Fixed to the VIEWPORT: the aura is the app's background - it covers
+     the whole screen (sidebar, topbar, content, auth screens) rather than
+     one container. Paints behind everything (z-index -10) and can never
+     influence layout or hit-targets. */
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: -10;
+  /* Layout containment: the decoration can NEVER influence the page's
+     layout or hit-targets, whatever it renders. */
+  contain: layout paint;
+}
+
+.ambient-aura-blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  will-change: transform, opacity;
+  pointer-events: none;
+}
+
+.ambient-aura-blob-1 {
+  top: -16%;
+  left: -12%;
+  width: 72%;
+  height: 72%;
+  animation: aura-drift-a 22s ease-in-out infinite;
+}
+
+.ambient-aura-blob-2 {
+  top: 12%;
+  right: -14%;
+  width: 62%;
+  height: 62%;
+  animation: aura-drift-b 30s ease-in-out infinite;
+}
+
+.ambient-aura-blob-3 {
+  bottom: -22%;
+  left: 18%;
+  width: 66%;
+  height: 66%;
+  animation: aura-drift-c 38s ease-in-out infinite;
+}
+
+@keyframes aura-drift-a {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(9%, 7%, 0) scale(1.12);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes aura-drift-b {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1.08);
+  }
+  50% {
+    transform: translate3d(-8%, 9%, 0) scale(0.96);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.08);
+  }
+}
+
+@keyframes aura-drift-c {
+  0% {
+    transform: translate3d(0, 0, 0) scale(0.98);
+  }
+  50% {
+    transform: translate3d(7%, -8%, 0) scale(1.14);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(0.98);
+  }
+}
+
+/* Accessibility: pause the drift, keep a static faint tint. */
+@media (prefers-reduced-motion: reduce) {
+  .ambient-aura-blob {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+   PRINT — clean document output in the app's palette.
+   Anything interactive is marked .no-print; chrome (sidebar,
+   topbar, filters, action buttons) disappears on paper.
+   ============================================================ */
+@media print {
+  @page {
+    margin: 14mm;
+  }
+
+  /* The ambient aura is screen-only decoration. */
+  .ambient-aura {
+    display: none !important;
+  }
+
+  aside,
+  nav,
+  header,
+  .no-print {
+    display: none !important;
+  }
+
+  body {
+    background: #ffffff !important;
+    color: #1a1d26;
+    font-size: 12px;
+  }
+
+  /* Neutralise decorative surfaces — keep badges' semantic colour */
+  .glass,
+  .clay,
+  .clay-sm {
+    background: #ffffff !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    border: 1px solid #e8eaef !important;
+  }
+
+  .bg-bg-primary,
+  .bg-bg-surface,
+  .bg-bg-muted,
+  .hover\:bg-bg-muted\/50:hover {
+    background: #ffffff !important;
+  }
+
+  table {
+    border-collapse: collapse !important;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid #e8eaef !important;
+  }
+
+  thead th {
+    color: #5f6880 !important;
+  }
+
+  /* Keep the brand + status colours readable on paper */
+  .text-ai-600,
+  .text-ai-700 {
+    color: #0d9488 !important;
+  }
+
+  .text-success-600,
+  .text-success-700 {
+    color: #047857 !important;
+  }
+
+  .text-warning-600 {
+    color: #d97706 !important;
+  }
+
+  .text-error-600 {
+    color: #dc2626 !important;
+  }
+
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

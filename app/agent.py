@@ -1,0 +1,2644 @@
+"""
+ERP AI Agent — Central Orchestrator
+=====================================
+Owns the complete lifecycle of an AI request.
+
+10-phase reasoning protocol (from Constitution v1.2.0):
+  Understand → Determine Requirements → Acquire Context →
+  Re-evaluate → Plan → Validate → Confirm → Execute → Verify → Respond
+
+13-state execution state machine:
+  RECEIVED → INTERPRETING → PLANNING → CONTEXT_LOADING →
+  AWAITING_CLARIFICATION → VALIDATING → AWAITING_CONFIRMATION →
+  EXECUTING → VERIFYING → COMPLETED (+FAILED/CANCELLED/REJECTED)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import uuid
+from collections import deque
+from datetime import date
+from typing import Any, Dict, List, Optional
+
+import structlog
+import time
+
+from app.auth import AuthContext
+from app.context_manager import build_context
+from app.database import (
+    create_clarification,
+    create_confirmation,
+    create_execution_result,
+    create_execution_session,
+    create_execution_step,
+    create_tool_call as log_tool_call,
+    fetch_one,
+    get_clarification_history,
+    resolve_clarification,
+    resolve_confirmation,
+    seed_clarification_history,
+    set_session_phase,
+    update_one,
+)
+from app.ai_orchestrator import get_client
+from app.error_normalizer import build_missing_field_question
+from app.reasoning import options_for_question, purpose_label, purpose_option, strip_markdown
+
+
+# ---------------------------------------------------------------------------
+# Work Stream R2 - DETERMINISTIC MUTATION FAST PATH (instant mode)
+# ---------------------------------------------------------------------------
+# Provider evidence (live): ONE Qwen tool-planning round-trip costs 30-85s.
+# When the planner + classifier have already resolved EVERYTHING (intent,
+# nature, account hint, party, amount, date), re-deriving those parameters
+# through the LLM adds pure latency.  For whitelisted intents the tool call
+# is built DETERMINISTICALLY here and the LLM is bypassed entirely.  The
+# confirmation gate (Phase 5), the tool router/validator and the date
+# protocol are unchanged - this only removes the model round-trip.
+
+# Work Stream R3.5/R4.5: the DETERMINISTIC fast path family — when the
+# reasoning ladder has fully resolved a transaction (nature/purpose,
+# settlement channel, party, amount, date), the tool call is built here
+# and the LLM is bypassed entirely.  Ambiguous or unconfirmed plans are
+# NEVER fast-pathed — they complete the question ladder first.
+_FAST_PATH_INTENTS = {
+    "record_credit_purchase",   # R2: credit purchase bill path
+    "record_expense",           # R3.5: generic expense (unambiguous)
+    "record_receipt",           # R4.5: customer receipt
+    "record_payment",           # R4.5: supplier payment
+    "record_cash_sale",         # R4.5: cash sale (goods/service)
+    "record_bank_transfer",     # R4.5: named bank-to-bank transfer
+    "create_invoice",           # R4.7: resolved single-line invoice
+    "record_credit_sale",       # R4.7: resolved credit sale -> invoice
+}
+
+
+# R4.8: sale-side intents whose deterministic fast path gates on a CUSTOMER
+# ledger (everything else keeps the original supplier gate).
+_CUSTOMER_PARTY_INTENTS = {
+    "create_invoice",
+    "record_credit_sale",
+    "create_quotation",
+}
+
+
+async def _party_resolution_question(
+    *,
+    organization_id: uuid.UUID,
+    execution_plan,
+) -> Optional[Dict[str, Any]]:
+    """Party resolution for the deterministic fast path (Work Stream R2).
+
+    * EXACT party match            -> None (proceed to the tool call).
+    * SIMILAR matches (no exact)   -> a "Party check" question listing the
+      candidates (pick one, or create a new party ledger).
+    * NOTHING found                -> a confirmation question before a new
+      party ledger is created (never silently invented).
+    A confirmed creation is marked via the ``supplier_create_confirmed`` /
+    ``customer_create_confirmed`` entity and never asked twice.
+
+    R4.8: the gate is INTENT-aware — sale-side intents (create_invoice,
+    record_credit_sale, create_quotation) gate on the CUSTOMER, everything
+    else keeps the original supplier gate.  This keeps the answered-invoice
+    flow on the deterministic fast path when the named customer does not
+    exist yet, instead of falling to a 70-80s LLM planning round.
+    """
+    entities = execution_plan.extracted_entities or {}
+    kind = (
+        "customer"
+        if execution_plan.intent in _CUSTOMER_PARTY_INTENTS
+        else "supplier"
+    )
+    name = (entities.get(f"{kind}_name") or "").strip()
+    if not name:
+        return None  # the planner asks for the party in its own round
+    if entities.get(f"{kind}_create_confirmed"):
+        return None  # user already approved creating this party
+
+    from app.services import customer_service, supplier_service
+
+    service = customer_service if kind == "customer" else supplier_service
+    rows = await service.search(
+        organization_id, query=name, limit=10
+    ) or []
+    exact = next(
+        (
+            r for r in rows
+            if (r.get("name") or "").strip().lower() == name.lower()
+        ),
+        None,
+    )
+    if exact:
+        return None  # exact party exists - proceed
+    similar = [
+        (r.get("name") or "").strip()
+        for r in rows
+        if (r.get("name") or "").strip()
+    ]
+    if similar:
+        return {
+            "question": (
+                f"Party check: I found similar {kind}s for '{name}'. "
+                "Which one is the real party for this transaction? "
+                "(Or create a new party ledger instead.)"
+            ),
+            "options": [*similar[:4], f"Create new party '{name}'"],
+            "required_fields": [f"{kind}_name"],
+        }
+    return {
+        "question": (
+            f"Party check: no {kind} named '{name}' exists yet. "
+            f"Create '{name}' as a new {kind} ledger?"
+        ),
+        "options": [f"Yes - create '{name}'"],
+        "required_fields": [f"{kind}_name"],
+    }
+
+
+def _expense_fast_path_call(
+    entities: Dict[str, Any],
+    classification,
+) -> Optional[List[ToolCall]]:
+    """R3.5 generic-expense fast path — build the ``create_expense`` call
+    WITHOUT any LLM round-trip, or None whenever anything is unresolved
+    (the model path then handles it exactly as before).
+
+    Refusal rules (never guess):
+    * the purpose must be KNOWN and UNAMBIGUOUSLY an ordinary expense —
+      repairs/software/durable answers (capitalization ladder), equipment
+      purchases and resale-goods intents are never fast-pathed;
+    * the settlement must be confirmed (paid cash / bank) — credit and
+      prepaid go through their own paths;
+    * amount + underlying event date must both be present.
+    """
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    purpose = entities.get("transaction_purpose")
+    if amount is None or not txn_date or not purpose:
+        return None
+    opt = purpose_option(str(purpose))
+    if opt is None or opt.capital_class != "EXPENSE":
+        # Ambiguous / capitalization / inventory purposes complete the
+        # question ladder first — never executed here.
+        return None
+    if entities.get("transaction_nature") not in (None, "OPERATING_EXPENSE"):
+        return None
+    payment = str(entities.get("payment_method") or "").upper()
+    if payment not in ("CASH", "BANK_TRANSFER"):
+        return None
+    payee = str(entities.get("supplier_name") or "").strip() or "Local Vendor"
+    params: Dict[str, Any] = {
+        "expense_date": str(txn_date),
+        "payee_name": payee,
+        "description": str(
+            entities.get("description") or purpose_label(str(purpose))
+        ),
+        "subtotal": float(amount),
+        "total": float(amount),
+        "payment_mode": payment,
+    }
+    account_hint = (
+        getattr(classification, "account_hint_id", None)
+        if classification is not None
+        else None
+    )
+    if account_hint:
+        # Purpose-driven expense account hint — the journal debits THIS
+        # expense account (Dr expense, Cr cash/bank).
+        params["account_id"] = str(account_hint)
+    return [ToolCall(tool_name="create_expense", arguments=params)]
+
+
+def _settlement_fast_gate(
+    entities: Dict[str, Any],
+) -> Optional[tuple]:
+    """Shared R4.5 gate for receipt/payment fast paths: amount + date +
+    an EXPLICIT settlement channel (cash/bank — the ledger depends on it)
+    + a resolved business operation.  Anything unresolved => None (the
+    ladder/model path asks instead of guessing)."""
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    if amount is None or not txn_date:
+        return None
+    payment = str(entities.get("payment_method") or "").upper()
+    if payment not in ("CASH", "BANK_TRANSFER"):
+        return None
+    nature = str(entities.get("transaction_nature") or "").upper()
+    if nature not in ("ALLOCATION", "ADVANCE", "LOAN_OR_SETTLEMENT"):
+        return None
+    return amount, txn_date, payment, nature
+
+
+async def _settlement_party(
+    organization_id: uuid.UUID,
+    *,
+    kind: str,
+    name: str,
+    confirmed: bool,
+):
+    """R4.5 party gate for the settlement fast paths — EXACT match wins;
+    a new party ledger is created ONLY on explicit confirmation (never
+    silently invented).  Returns (party_row | None)."""
+    from app.services import customer_service, supplier_service
+
+    service = customer_service if kind == "customer" else supplier_service
+    rows = await service.search(organization_id, query=str(name), limit=5) or []
+    party = next(
+        (
+            r for r in rows
+            if (r.get("name") or "").strip().lower() == str(name).strip().lower()
+        ),
+        None,
+    )
+    if party is not None:
+        return party
+    if not confirmed:
+        return None
+    if kind == "customer":
+        return await customer_service.create(organization_id, name=str(name))
+    return await supplier_service.create(organization_id, name=str(name))
+
+
+async def _receipt_fast_path_call(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """R4.5 receipt fast path — build ``record_customer_receipt`` WITHOUT
+    an LLM round-trip once the ladder is fully answered."""
+    gate = _settlement_fast_gate(entities)
+    if not gate:
+        return None
+    amount, txn_date, payment, nature = gate
+    customer_name = (entities.get("customer_name") or "").strip()
+    if not customer_name:
+        return None
+    customer = await _settlement_party(
+        organization_id,
+        kind="customer",
+        name=customer_name,
+        confirmed=bool(entities.get("customer_create_confirmed")),
+    )
+    if customer is None:
+        return None  # the party gate question handles this
+    params: Dict[str, Any] = {
+        "customer_id": str(customer["id"]),
+        "amount": float(amount),
+        "receipt_date": str(txn_date),
+        "payment_method": payment,
+        "transaction_nature": nature,
+    }
+    reference = entities.get("item_description") or entities.get("description")
+    if reference:
+        params["reference"] = str(reference)
+    return [ToolCall(tool_name="record_customer_receipt", arguments=params)]
+
+
+async def _payment_fast_path_call(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """R4.5 supplier-payment fast path — mirrors the receipt path."""
+    gate = _settlement_fast_gate(entities)
+    if not gate:
+        return None
+    amount, txn_date, payment, nature = gate
+    supplier_name = (entities.get("supplier_name") or "").strip()
+    if not supplier_name:
+        return None
+    supplier = await _settlement_party(
+        organization_id,
+        kind="supplier",
+        name=supplier_name,
+        confirmed=bool(entities.get("supplier_create_confirmed")),
+    )
+    if supplier is None:
+        return None
+    params: Dict[str, Any] = {
+        "supplier_id": str(supplier["id"]),
+        "amount": float(amount),
+        "payment_date": str(txn_date),
+        "payment_method": payment,
+        "transaction_nature": nature,
+    }
+    reference = entities.get("item_description") or entities.get("description")
+    if reference:
+        params["reference"] = str(reference)
+    return [ToolCall(tool_name="record_supplier_payment", arguments=params)]
+
+
+def _cash_sale_fast_path_call(
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """R4.5 cash-sale fast path — the trusted ``record_cash_sale`` tool
+    resolves the Cash and Revenue accounts itself; the ladder must have
+    resolved amount + date + a goods/service nature (other income needs
+    a revenue-account decision, so it stays on the model path)."""
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    if amount is None or not txn_date:
+        return None
+    nature = str(entities.get("transaction_nature") or "").upper()
+    if nature not in ("GOODS", "SERVICE"):
+        return None
+    params: Dict[str, Any] = {
+        "amount": float(amount),
+        "transaction_date": str(txn_date),
+        "description": str(
+            entities.get("item_description") or entities.get("description")
+            or "Cash sale"
+        ),
+    }
+    return [ToolCall(tool_name="record_cash_sale", arguments=params)]
+
+
+def _transfer_fast_path_call(
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """R4.5 bank-transfer fast path — both bank NAMES must be resolved
+    (the trusted tool resolves names to ids and refuses unknown banks;
+    accounts are never invented)."""
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    source = (entities.get("source_bank_name") or "").strip()
+    destination = (entities.get("destination_bank_name") or "").strip()
+    if amount is None or not txn_date or not source or not destination:
+        return None
+    params: Dict[str, Any] = {
+        "source_bank_account_id": source,
+        "destination_bank_account_id": destination,
+        "amount": float(amount),
+        "transfer_date": str(txn_date),
+    }
+    return [ToolCall(tool_name="record_bank_transfer", arguments=params)]
+
+
+def _invoice_fast_path_call(
+    entities: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """R4.7 invoice fast path — build the ``create_invoice`` call WITHOUT
+    an LLM round-trip once the ladder is fully answered (nature =
+    goods/service, customer, amount, date).  Other-income and asset-
+    disposal natures need account decisions the model must make."""
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    if amount is None or not txn_date:
+        return None
+    nature = str(entities.get("transaction_nature") or "").upper()
+    if nature not in ("GOODS", "SERVICE"):
+        return None
+    customer_name = (entities.get("customer_name") or "").strip()
+    if not customer_name:
+        return None  # the party gate question handles this
+    # Work Stream R4.10 — MULTI-LINE items: when DISTINCT lines were
+    # parsed (or multi-item answer given) each becomes its own invoice
+    # line.  The stated amount MUST equal Σ(qty × price) — any mismatch
+    # is never guessed away; the plan falls back to clarification/model.
+    parsed_lines = entities.get("line_items")
+    if parsed_lines:
+        try:
+            items = [
+                {
+                    "description": str(l.get("description") or "").strip(),
+                    "quantity": float(l.get("quantity")),
+                    "unit_price": float(l.get("unit_price")),
+                }
+                for l in parsed_lines
+            ]
+        except (TypeError, ValueError):
+            return None
+        if not items or any(
+            not i["description"] or i["quantity"] <= 0 or i["unit_price"] < 0
+            for i in items
+        ):
+            return None
+        derived = round(
+            sum(i["quantity"] * i["unit_price"] for i in items), 2
+        )
+        if abs(derived - float(amount)) > 0.01:
+            return None  # stated total ≠ Σ lines — never reconcile by guess
+        return {"invoice_date": str(txn_date), "items": items}
+    # Work Stream R4.9 — the ladder now ASKS for the line description and
+    # quantity (parity with the manual form's mandatory line item).  The
+    # header total is divided across the units so the derived unit price
+    # reconciles with the amount the user actually stated.
+    raw_quantity = entities.get("quantity")
+    try:
+        quantity = float(raw_quantity) if raw_quantity is not None else 1.0
+    except (TypeError, ValueError):
+        quantity = 1.0
+    if quantity <= 0:
+        quantity = 1.0
+    params: Dict[str, Any] = {
+        "invoice_date": str(txn_date),
+        "items": [{
+            "description": str(
+                entities.get("item_description")
+                or entities.get("description")
+                or ("Service" if nature == "SERVICE" else "Goods")
+            ),
+            "quantity": quantity,
+            "unit_price": round(float(amount) / quantity, 2),
+        }],
+    }
+    return params
+
+
+async def _invoice_fast_path_party(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """Customer gate for the invoice fast path (EXACT match or an
+    explicitly confirmed new customer ledger — never invented)."""
+    customer_name = (entities.get("customer_name") or "").strip()
+    customer = await _settlement_party(
+        organization_id,
+        kind="customer",
+        name=customer_name,
+        confirmed=bool(entities.get("customer_create_confirmed")),
+    )
+    if customer is None:
+        return None
+    params["customer_id"] = str(customer["id"])
+    # R4.10 — resolve line items against the product/service catalog:
+    # EXACT matches are linked; unresolved ones are created ONLY when the
+    # user answered the "Catalog check" round with YES (never invented).
+    await _link_or_create_catalog_items(organization_id, entities, params)
+    return [ToolCall(tool_name="create_invoice", arguments=params)]
+
+
+def _invoice_line_names(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the invoice items (description + unit_price) for catalog work."""
+    items = params.get("items") or []
+    return [
+        {"description": str(i.get("description") or "").strip(),
+         "unit_price": float(i.get("unit_price") or 0)}
+        for i in items if str(i.get("description") or "").strip()
+    ]
+
+
+async def _catalog_unmatched_names(
+    organization_id: uuid.UUID,
+    nature: str,
+    items: List[Dict[str, Any]],
+) -> List[str]:
+    """Return the line descriptions with NO EXACT catalog entry.
+
+    ``nature`` GOODS  → the PRODUCT catalog is searched.
+    ``nature`` SERVICE → the SERVICE catalog is searched.
+    Matching is exact-name (case/space-insensitive) — deterministic,
+    never guessed from a fuzzy similarity.
+    """
+    from app.services import product_service, service_service
+
+    unmatched: List[str] = []
+    for line in items:
+        name = line["description"]
+        if nature == "SERVICE":
+            rows = await service_service.search(organization_id, query=name, limit=5)
+        else:
+            rows = await product_service.search(organization_id, query=name, limit=5)
+        if not any(
+            str(r.get("name", "")).strip().lower() == name.lower()
+            for r in rows
+        ):
+            if name.lower() not in (n.lower() for n in unmatched):
+                unmatched.append(name)
+    return unmatched
+
+
+async def _catalog_check_question(
+    organization_id: uuid.UUID,
+    execution_plan,
+) -> Optional[Dict[str, Any]]:
+    """R4.10 "Catalog check" — invoice lines naming items that are NOT in
+    the product/service catalog.  Asks ONCE, in the user's own words:
+
+      YES  → the missing entries are created in the catalog (with the
+              unit prices from this invoice) and linked to the lines.
+      NO   → the lines stay one-off free-text lines (catalog untouched).
+
+    The invoice itself is NEVER blocked by this gate — it only decides
+    whether the catalog grows.  Returns None when there is nothing to
+    ask (no buildable invoice, everything matched, or already answered).
+    """
+    entities = execution_plan.extracted_entities or {}
+    if execution_plan.intent not in ("create_invoice", "record_credit_sale"):
+        return None
+    if entities.get("catalog_create_confirmed") or entities.get("catalog_skip"):
+        return None  # answered in an earlier round — never re-asked
+    params = _invoice_fast_path_call(entities)
+    if not params:
+        return None  # ladder incomplete — other gates ask first
+    nature = str(entities.get("transaction_nature") or "").upper()
+    if nature not in ("GOODS", "SERVICE"):
+        return None
+    unmatched = await _catalog_unmatched_names(
+        organization_id, nature, _invoice_line_names(params)
+    )
+    if not unmatched:
+        return None
+    names = ", ".join(f"'{n}'" for n in unmatched)
+    catalog = "service" if nature == "SERVICE" else "product"
+    return {
+        "question": (
+            f"Catalog check: {names} {'are' if len(unmatched) > 1 else 'is'} "
+            f"not in your {catalog} catalog yet. Add "
+            f"{'them' if len(unmatched) > 1 else 'it'} to the catalog (with "
+            "the unit prices from this invoice)? Reply YES to add, or NO "
+            "to invoice as one-off free-text lines."
+        ),
+        "options": [
+            "Yes - add to catalog",
+            "No - one-off lines only",
+        ],
+    }
+
+
+async def _link_or_create_catalog_items(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+    params: Dict[str, Any],
+) -> None:
+    """Link each invoice line to its EXACT catalog entry; create missing
+    entries when (and only when) the user confirmed the catalog check."""
+    from app.services import product_service, service_service
+
+    nature = str(entities.get("transaction_nature") or "").upper()
+    confirmed = bool(entities.get("catalog_create_confirmed"))
+    for item in params.get("items") or []:
+        name = str(item.get("description") or "").strip()
+        if not name:
+            continue
+        if nature == "SERVICE":
+            rows = await service_service.search(organization_id, query=name, limit=5)
+        else:
+            rows = await product_service.search(organization_id, query=name, limit=5)
+        exact = next(
+            (
+                r for r in rows
+                if str(r.get("name", "")).strip().lower() == name.lower()
+            ),
+            None,
+        )
+        if exact:
+            key = "service_id" if nature == "SERVICE" else "product_id"
+            item[key] = str(exact["id"])
+            continue
+        if not confirmed:
+            continue  # catalog_skip or unanswered — one-off free-text line
+        try:
+            if nature == "SERVICE":
+                created = await service_service.create(
+                    organization_id,
+                    name=name,
+                    billing_unit="ITEM",
+                    standard_rate=float(item.get("unit_price") or 0),
+                )
+                item["service_id"] = str(created["id"])
+            else:
+                created = await product_service.create(
+                    organization_id,
+                    name=name,
+                    unit_price=float(item.get("unit_price") or 0),
+                )
+                item["product_id"] = str(created["id"])
+        except Exception as exc:  # noqa: BLE001 — catalog write is best-effort
+            log.warning(
+                "catalog.create_failed",
+                name=name,
+                error=str(exc)[:200],
+            )
+
+
+async def _deterministic_mutation_calls(
+    *,
+    organization_id: uuid.UUID,
+    execution_plan,
+    classification,
+) -> Optional[List[ToolCall]]:
+    """Build the tool calls WITHOUT the LLM, or return None when the plan
+    is not fully resolved (the normal model path then handles it)."""
+    if execution_plan.intent not in _FAST_PATH_INTENTS:
+        return None
+    if execution_plan.batch_items:
+        return None
+    entities = execution_plan.extracted_entities or {}
+    if execution_plan.intent == "record_expense":
+        # R3.5: the generic-expense fast path (purpose + settlement
+        # confirmed, unambiguous).  None => the ladder continues instead.
+        return _expense_fast_path_call(entities, classification)
+    if execution_plan.intent == "record_receipt":
+        # R4.5: the receipt fast path (operation + channel + party
+        # resolved).  None => the ladder/model path asks instead.
+        return await _receipt_fast_path_call(organization_id, entities)
+    if execution_plan.intent == "record_payment":
+        return await _payment_fast_path_call(organization_id, entities)
+    if execution_plan.intent == "record_cash_sale":
+        return _cash_sale_fast_path_call(entities)
+    if execution_plan.intent == "record_bank_transfer":
+        return _transfer_fast_path_call(entities)
+    if execution_plan.intent in ("create_invoice", "record_credit_sale"):
+        # R4.7: the invoice fast path (nature goods/service + customer +
+        # amount + date resolved) — builds the invoice tool call without
+        # the LLM; the confirmation gate still applies downstream.
+        invoice_params = _invoice_fast_path_call(entities)
+        if invoice_params is None:
+            return None
+        return await _invoice_fast_path_party(
+            organization_id, entities, invoice_params
+        )
+    if classification is not None and getattr(
+        classification, "requires_clarification", False
+    ):
+        # Configuration/nature gap - asking is the safe behaviour.
+        return None
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    supplier_name = entities.get("supplier_name")
+    if amount is None or not txn_date or not supplier_name:
+        # Incomplete plan - never guess; the model path asks for gaps.
+        return None
+    if classification is not None and getattr(
+        classification, "requires_clarification", False
+    ):
+        # Configuration/nature gap - asking is the safe behaviour.
+        return None
+
+    # Party resolution (Work Stream R2): EXACT match -> reuse.  Otherwise
+    # a new party is created ONLY when the user explicitly confirmed it
+    # (supplier_create_confirmed from the "Party check" round) - never
+    # silently invented.  Anything unresolved goes back to the question.
+    from app.services import supplier_service
+
+    confirmed = bool(entities.get("supplier_create_confirmed"))
+    rows = await supplier_service.search(
+        organization_id, query=str(supplier_name), limit=5
+    ) or []
+    supplier = next(
+        (
+            r for r in rows
+            if (r.get("name") or "").strip().lower()
+            == str(supplier_name).strip().lower()
+        ),
+        None,
+    )
+    if supplier is None:
+        if not confirmed:
+            return None  # the party-resolution question handles this
+        supplier = await supplier_service.create(
+            organization_id, name=str(supplier_name)
+        )
+
+    params: Dict[str, Any] = {
+        "supplier_id": str(supplier["id"]),
+        "bill_date": str(txn_date),
+        "subtotal": float(amount),
+        "total": float(amount),
+    }
+    notes = entities.get("item_description") or (
+        "Credit purchase recorded by the agent"
+    )
+    if notes:
+        params["notes"] = str(notes)
+    account_hint = (
+        getattr(classification, "account_hint_id", None)
+        if classification is not None
+        else None
+    )
+    if account_hint:
+        # Nature-driven expense/asset account hint - the journal debits
+        # THIS account (Dr expense/asset, Cr party payable).
+        params["account_id"] = str(account_hint)
+    return [ToolCall(tool_name="create_purchase_bill", arguments=params)]
+from app.models.schemas import (
+    AgentContext,
+    AgentResponse,
+    AttachmentRef,
+    ExecutionPlan,
+    ExecutionStatus,
+    ToolCall,
+    ToolResult,
+)
+from app.planner import plan as run_planner
+from app.tool_execution import execute_planned_tool_calls
+from app.tool_router import route_tool_call
+from app.tools import get_handler
+from app.accounting_engine import verify_journal
+from app.entity_contract import (
+    build_accounting_impact,
+    build_affected_entities,
+)
+from app.repositories import account_repository as account_repo
+
+log = structlog.get_logger(__name__)
+
+MAX_TOOL_ITERATIONS = 10
+
+
+def _make_account_label_resolver(organization_id: uuid.UUID):
+    """Return an async resolver: account UUID (or UUID-able str) -> GL label."""
+
+    async def _resolve(account_id: Any) -> Optional[str]:
+        try:
+            account = await account_repo.get_account(
+                organization_id, account_id=uuid.UUID(str(account_id))
+            )
+        except Exception:  # noqa: BLE001 — label fallback handled by caller
+            return None
+        return account.get("name") if account else None
+
+    return _resolve
+# Hard ceiling on planner-driven clarification rounds per conversation.
+# After this the request is passed to Gemini with whatever is known —
+# Gemini may still ask via its own question routing, but the planner
+# gate can no longer loop.
+MAX_CLARIFICATION_ROUNDS = 3
+# Ceiling for MODEL-driven clarification rounds.  Missing information is
+# resolved RECURSIVELY: each answer may reveal another genuinely-required
+# dependency (amount → payment treatment → supplier creation → tax
+# treatment …), and the agent must keep asking in the SAME conversation
+# until nothing material is missing.  The model is instructed to ask ONLY
+# when material information is genuinely absent, so this ceiling is just
+# a runaway guard, not a question quota.
+MODEL_MAX_CLARIFICATION_ROUNDS = 8
+
+# Maps a 13-value execution phase (ai.execution_phase_code, written to
+# current_phase) onto the 7-value session lifecycle (ai.session_status_code,
+# written to status) and whether the session is now complete.
+
+
+def _looks_like_question(text: str) -> bool:
+    """Heuristic: does this model response ask the user for information?
+
+    The model is instructed to ask at most ONE question when material
+    information is missing; such responses contain a question mark.  Used
+    to route text-only model responses into the clarification mechanism
+    instead of reporting a completed (never verified) ERP operation.
+    """
+    return "?" in (text or "")
+
+
+def _usable_question(text: str) -> Optional[str]:
+    """Return the model's question if it is real and meaningful.
+
+    Guards against empty/whitespace-only model responses being stored as
+    clarification questions (which would strand the user with nothing to
+    answer).
+    """
+    t = (text or "").strip()
+    if t and _looks_like_question(t) and re.search(r"[A-Za-z]{3}", t):
+        return t
+    return None
+
+
+def _mutation_executed(tool_calls: List[ToolCall]) -> bool:
+    """True if any executed tool MUTATES ERP state (not read-only).
+
+    A model question after only read-only lookups (search/get/list) is a
+    safe clarification point — no ERP state has changed.  After a mutation
+    the run must proceed to verification instead.
+    """
+    for tc in tool_calls:
+        entry = get_handler(tc.tool_name)
+        if entry and not entry.get("read_only", True):
+            return True
+    return False
+
+_PHASE_STATUS_MAP: Dict[ExecutionStatus, tuple] = {
+    ExecutionStatus.RECEIVED: ("PENDING", False),
+    ExecutionStatus.INTERPRETING: ("PLANNING", False),
+    ExecutionStatus.PLANNING: ("PLANNING", False),
+    ExecutionStatus.CONTEXT_LOADING: ("PLANNING", False),
+    ExecutionStatus.AWAITING_CLARIFICATION: ("WAITING_FOR_USER", False),
+    ExecutionStatus.AWAITING_CONFIRMATION: ("WAITING_FOR_USER", False),
+    ExecutionStatus.VALIDATING: ("EXECUTING", False),
+    ExecutionStatus.EXECUTING: ("EXECUTING", False),
+    ExecutionStatus.VERIFYING: ("EXECUTING", False),
+    ExecutionStatus.COMPLETED: ("COMPLETED", True),
+    ExecutionStatus.FAILED: ("FAILED", True),
+    ExecutionStatus.CANCELLED: ("CANCELLED", True),
+    ExecutionStatus.REJECTED: ("CANCELLED", True),
+}
+
+
+# ---------------------------------------------------------------------------
+# Confirmation disclosure — the user must be told WHAT WILL HAPPEN before
+# approving: transaction, amount, party, and every entity that will be
+# created (supplier/customer/account/document).  A bare intent label is NOT
+# sufficient disclosure.
+# ---------------------------------------------------------------------------
+
+_CASH_INTENTS = {"record_cash_purchase", "record_cash_sale"}
+# Party ledgers are NEVER required for cash transactions (one-off-cash
+# rule): the named party is informational and must not be created.
+_CASH_BLOCKED_PARTY_TOOLS = {"create_supplier", "create_customer"}
+
+
+def cash_party_creation_blocked(intent: str, tool_name: str) -> bool:
+    """True when a party-creation tool must be refused for a cash intent."""
+    return (intent in _CASH_INTENTS
+            and tool_name in _CASH_BLOCKED_PARTY_TOOLS)
+
+
+def event_prohibited_tools(
+    prohibited_actions: Optional[List[Dict[str, str]]]
+) -> set:
+    """Tool slugs forbidden by the event's PROHIBITED-ACTION analysis.
+
+    Generic negative-reasoning enforcement: the refusal set is derived
+    from the economic-event profile (cash ⇒ no party ledger; SERVICE ⇒ no
+    inventory movement; expense ⇒ no capitalisation; REPORTING ⇒ no
+    mutations) — never from per-scenario special cases.
+    """
+    from app.reasoning import (
+        EconomicEvent,
+        EventProfile,
+        ProhibitedAction,
+        prohibited_tool_names,
+    )
+
+    profile = EventProfile(
+        event=EconomicEvent.UNKNOWN,
+        intent="",
+        affected={},
+        prohibited=[
+            ProhibitedAction(
+                action=(a or {}).get("action", ""),
+                reason=(a or {}).get("reason", ""),
+            )
+            for a in (prohibited_actions or [])
+        ],
+    )
+    return prohibited_tool_names(profile)
+
+
+
+def party_resolved_in_search(
+    result_data: Any, entity_name: Optional[str]
+) -> bool:
+    """True when a successful supplier/customer search resolved the named party.
+
+    Used by the executor to disable the corresponding creation tool
+    (reasoning-level fix): once the party exists, the model must reuse it
+    and is no longer offered the creation tool.
+
+    Delegates to :func:`app.reasoning.classify_party_match`, which also
+    distinguishes EXACT / RESOLVED_PARTIAL / AMBIGUOUS / NONE so the
+    executor can detect multiple-candidate ambiguity instead of silently
+    reusing an arbitrary "first hit".
+    """
+    from app.reasoning import PartyMatchState, classify_party_match
+
+    state, _matches = classify_party_match(result_data, entity_name)
+    return state in (
+        PartyMatchState.EXACT,
+        PartyMatchState.RESOLVED_PARTIAL,
+        PartyMatchState.AMBIGUOUS,
+    )
+
+
+def party_search_directive(
+    state: "PartyMatchState", entity_name: Optional[str], created_tool: str
+) -> str:
+    """Executor directive fed back to the model after a party search."""
+    from app.reasoning import PartyMatchState
+
+    if state is PartyMatchState.AMBIGUOUS:
+        return (
+            f"Several existing records partially match "
+            f"'{entity_name}' and none is an exact match. Do NOT guess and "
+            f"do NOT create a duplicate: either confirm with the user which "
+            f"existing record to use, or record the transaction without the "
+            f"party ledger when the transaction type allows it. "
+            f"{created_tool} has been disabled for this request."
+        )
+    if state is PartyMatchState.EXACT:
+        return (
+            f"An exact existing record for '{entity_name}' was found above — "
+            f"reuse its authoritative id. {created_tool} has been disabled "
+            "for this request."
+        )
+    return (
+        f"An existing record for '{entity_name}' was found above — reuse it. "
+        f"{created_tool} has been disabled for this request."
+    )
+
+
+
+def _confirmation_summary(plan) -> str:
+    """Human-readable disclosure of what approval will execute."""
+    entities = getattr(plan, "extracted_entities", None) or {}
+    bits: list = [f"record {plan.intent.replace('_', ' ')}"]
+    amount = entities.get("amount")
+    if amount:
+        try:
+            bits.append(f"amount {float(amount):,.0f} PKR")
+        except (TypeError, ValueError):
+            pass
+    if getattr(plan, "entity_name", None):
+        bits.append(f"party: {plan.entity_name}")
+    tools = set(getattr(plan, "potential_tools", None) or [])
+    creations: list = []
+    if "create_supplier" in tools:
+        creations.append(
+            f"supplier '{plan.entity_name}' if it does not already exist")
+    if "create_customer" in tools:
+        creations.append(
+            f"customer '{plan.entity_name}' if it does not already exist")
+    if "create_account" in tools:
+        creations.append(
+            "a new chart-of-accounts account if none suitable exists")
+    if "create_purchase_bill" in tools:
+        creations.append("a purchase bill")
+    if "create_invoice" in tools:
+        creations.append("a sales invoice")
+    if "create_expense" in tools:
+        creations.append("an expense record")
+    if creations:
+        bits.append("will create: " + "; ".join(creations))
+    if "credit" in plan.intent:
+        bits.append("a payable/receivable balance will be recorded")
+    return "Pending confirmation — " + "; ".join(bits) + "."
+
+
+# ---------------------------------------------------------------------------
+# Work Stream B - deterministic report fast-path.  Standard reports and
+# simple lookups skip the LLM entirely: the planner's intent is enough to
+# call the read-only reporting tools directly and format the rows with
+# deterministic code.  Step data records BYPASS_LLM so the audit trail
+# honestly shows no model was involved.
+# ---------------------------------------------------------------------------
+_REPORT_FAST_TOOLS = {
+    "generate_trial_balance": "get_trial_balance",
+    "generate_balance_sheet": "get_balance_sheet",
+    "generate_profit_loss": "get_profit_loss",
+    "generate_cash_flow": "get_cash_flow",
+    "generate_general_ledger": "get_general_ledger",
+    "list_bank_accounts": "list_bank_accounts",
+}
+_PARTY_LEDGER_FAST = {
+    # intent: (search tool, ledger tool, entity field, id argument)
+    "customer_balance": ("search_customer", "get_customer_ledger", "customer_name", "customer_id"),
+    "supplier_balance": ("search_supplier", "get_supplier_ledger", "supplier_name", "supplier_id"),
+}
+# Tiered routing (Work Stream B): these intents are simple lookups.  When
+# they reach the model at all (fast-path did not apply), they get a light
+# output budget instead of the full mutation-sized one.
+_LIGHT_BUDGET_INTENTS = set(_REPORT_FAST_TOOLS) | set(_PARTY_LEDGER_FAST)
+_FAST_PATH_NUM_KEYS = (
+    "debit", "credit", "total", "balance", "amount", "net",
+    "inflow", "outflow", "opening_balance", "closing_balance",
+)
+
+_FAST_PATH_TITLES = {
+    "generate_trial_balance": "Trial Balance",
+    "generate_balance_sheet": "Balance Sheet",
+    "generate_profit_loss": "Profit & Loss",
+    "generate_cash_flow": "Cash Flow",
+    "generate_general_ledger": "General Ledger",
+    "list_bank_accounts": "Bank Accounts",
+    "customer_balance": "Customer Ledger",
+    "supplier_balance": "Supplier Ledger",
+}
+
+
+def _fmt_num(value: Any) -> str:
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_report_rows(rows: Any) -> str:
+    """Deterministic row rendering for the fast-path (never an LLM)."""
+    lines: List[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        label = (
+            row.get("account_name") or row.get("name") or row.get("description")
+            or row.get("account") or "row"
+        )
+        code = row.get("account_code") or row.get("code")
+        head = f"{code} {label}" if code else str(label)
+        parts: List[str] = [
+            f"{k.replace('_', ' ')} {_fmt_num(row[k])}"
+            for k in _FAST_PATH_NUM_KEYS
+            if row.get(k) is not None
+        ]
+        extra = row.get("activity") or row.get("type") or row.get("status")
+        if extra:
+            parts.insert(0, str(extra))
+        lines.append(f"- {head}" + (": " + "; ".join(parts) if parts else ""))
+    return "\n".join(lines)
+
+
+def _party_exact_matches(data: Any, name: str) -> List[Dict[str, Any]]:
+    """Exact case-insensitive name matches from a party search result."""
+    if isinstance(data, dict):
+        rows = (
+            data.get("results") or data.get("customers")
+            or data.get("suppliers") or data.get("data") or []
+        )
+    else:
+        rows = data or []
+    low = (name or "").strip().lower()
+    return [
+        r for r in rows
+        if isinstance(r, dict)
+        and (r.get("name") or "").strip().lower() == low
+    ]
+
+
+async def _load_org_preferences(organization_id: uuid.UUID) -> Dict[str, str]:
+    """Load learned org preferences (Work Stream F); best-effort, {} on failure."""
+    try:
+        from app.services import preference_service
+
+        return await preference_service.get_all_preferences(organization_id)
+    except Exception as exc:  # noqa: BLE001 - defaults must never block a run
+        log.warning("agent.org_preferences_load_failed", error=str(exc)[:200])
+        return {}
+
+
+def _preference_memory_hint(
+    org_prefs: Dict[str, str],
+    questions: List[str],
+) -> str:
+    """Clarification-memory hint (Work Stream F).
+
+    When a pending question is preference-shaped AND the org already has a
+    learned value, offer it inside the question text ("previously: cash -
+    reply SAME to reuse") - one round, no extra calls.
+    """
+    from app.services import preference_service
+
+    for q in questions or []:
+        key = preference_service.preference_key_for_question(q)
+        if key and org_prefs.get(key):
+            return f"previously: {org_prefs[key]} - reply SAME to reuse"
+    return ""
+
+
+async def _try_report_fast_path(
+    *,
+    execution_plan: ExecutionPlan,
+    session_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    auth: Optional[AuthContext],
+) -> Optional[AgentResponse]:
+    """Run a deterministic report/lookup without any LLM involvement.
+
+    Returns ``None`` whenever the request is NOT a plain deterministic
+    report (unknown shape, missing/ambiguous party) so the normal model
+    path handles it - the fast-path never guesses.
+    """
+    intent = execution_plan.intent
+    calls: List[ToolCall] = []
+
+    tool_slug = _REPORT_FAST_TOOLS.get(intent)
+    if tool_slug:
+        args: Dict[str, Any] = {}
+        if intent == "generate_general_ledger":
+            ents = execution_plan.extracted_entities or {}
+            if ents.get("date_from"):
+                args["from_date"] = ents["date_from"]
+            if ents.get("date_to"):
+                args["to_date"] = ents["date_to"]
+        calls.append(ToolCall(tool_name=tool_slug, arguments=args))
+    elif intent in _PARTY_LEDGER_FAST:
+        search_slug, ledger_slug, name_field, id_arg = _PARTY_LEDGER_FAST[intent]
+        name = (execution_plan.extracted_entities or {}).get(name_field)
+        if not name:
+            return None  # no party named - the normal path resolves/asks
+        search_res = await route_tool_call(
+            ToolCall(tool_name=search_slug, arguments={"query": str(name), "limit": 25}),
+            organization_id=organization_id,
+            user_id=user_id,
+            session_id=session_id,
+            auth=auth,
+        )
+        matches = (
+            _party_exact_matches(search_res.data, str(name))
+            if search_res.success else []
+        )
+        if len(matches) != 1:
+            # Zero or multiple matches: NEVER first-hit.  The normal model
+            # path surfaces the ambiguity to the user.
+            return None
+        calls.append(ToolCall(
+            tool_name=ledger_slug,
+            arguments={id_arg: str(matches[0]["id"])},
+        ))
+    else:
+        return None
+
+    await _log_step(session_id, "EXECUTING_TOOLS", {
+        "BYPASS_LLM": True,
+        "fast_path": True,
+        "tools": [c.tool_name for c in calls],
+    })
+
+    results: List[ToolResult] = []
+    for call in calls:
+        results.append(await route_tool_call(
+            call,
+            organization_id=organization_id,
+            user_id=user_id,
+            session_id=session_id,
+            auth=auth,
+        ))
+
+    failed = [r for r in results if not r.success]
+    if failed:
+        await _log_step(session_id, "TOOL_FAILURE", {
+            "BYPASS_LLM": True,
+            "tool": failed[0].tool_name,
+            "error": (failed[0].error or "")[:300],
+        })
+        await _update_status(session_id, ExecutionStatus.FAILED)
+        await create_execution_result(
+            session_id=session_id,
+            result_data={
+                "error": failed[0].error or "report failed",
+                "tool": failed[0].tool_name,
+                "BYPASS_LLM": True,
+            },
+            summary=f"Report failed: {failed[0].tool_name}",
+            action_type=intent,
+            verification_status="FAILED",
+            status="FAILED",
+        )
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            execution_id=session_id,
+            action=intent,
+            summary=f"The {intent} could not be completed: {failed[0].error}",
+            verification_status="FAILED",
+            data={"bypass_llm": True},
+        )
+
+    all_rows: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r.data, list):
+            all_rows.extend(r.data)
+        elif isinstance(r.data, dict):
+            inner = r.data.get("rows") or r.data.get("results") or r.data.get("data")
+            if isinstance(inner, list):
+                all_rows.extend(inner)
+    rows_text = _format_report_rows(all_rows)
+    title = _FAST_PATH_TITLES.get(intent, intent.replace("_", " ").title())
+    summary = (
+        f"{title} - {len(all_rows)} rows (deterministic fast-path, no LLM used)"
+        + (f":\n{rows_text}" if rows_text else "")
+    )
+
+    await _log_step(session_id, "COMPLETED", {
+        "BYPASS_LLM": True,
+        "fast_path": True,
+        "rows": len(all_rows),
+    })
+    await create_execution_result(
+        session_id=session_id,
+        result_data={
+            "summary": summary,
+            "tool_count": len(results),
+            "rows": len(all_rows),
+            "BYPASS_LLM": True,
+        },
+        summary=summary,
+        action_type=intent,
+        verification_status="UNVERIFIED",
+        status="COMPLETED",
+    )
+    return AgentResponse(
+        status=ExecutionStatus.COMPLETED,
+        execution_id=session_id,
+        action=intent,
+        summary=summary,
+        verification_status="UNVERIFIED",
+        data={"bypass_llm": True, "rows": len(all_rows)},
+    )
+
+
+async def execute(
+    *,
+    user_message: str,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    auth: Optional[AuthContext] = None,
+    conversation_id: Optional[str] = None,
+    clarification_history: Optional[List[Dict[str, str]]] = None,
+    confirmation_granted: bool = False,
+    attachments: Optional[List[AttachmentRef]] = None,
+) -> AgentResponse:
+    """Main entry point — process a user message through the full agent lifecycle.
+
+    ``clarification_history`` carries prior Q&A from earlier rounds of the
+    SAME conversation.  It is (a) merged into entity extraction so answered
+    questions are never re-asked, and (b) forwarded to Gemini as context.
+
+    ``confirmation_granted`` is set by ``resume_with_confirmation`` after the
+    user approved the pending confirmation, so the PHASE 5 gate does not
+    re-raise a new confirmation and execution can actually proceed.
+    """
+
+    session_id: Optional[uuid.UUID] = None
+    prior_qa: List[Dict[str, str]] = clarification_history or []
+    _t0 = time.monotonic()
+
+    def _phase_elapsed(marker: str, **extra) -> None:
+        log.info(
+            "agent.phase_timing",
+            phase=marker,
+            elapsed=round(time.monotonic() - _t0, 2),
+            **extra,
+        )
+
+    try:
+        # ---- PHASE 1: RECEIVED -------------------------------------------
+        session = await create_execution_session(
+            organization_id=organization_id,
+            user_id=user_id,
+            user_message=user_message,
+            conversation_id=conversation_id,
+        )
+        session_id = uuid.UUID(session["id"])
+        await _log_step(session_id, "RECEIVED", {"message": user_message})
+
+        # Carry Q&A answered in earlier rounds of this conversation into the
+        # resumed session, so its clarification history stays complete and
+        # nothing already answered can ever be re-asked.
+        await seed_clarification_history(session_id, prior_qa)
+
+        # Work Stream F: capture preference-shaped answers so future runs
+        # start with the user's established defaults (best-effort, never
+        # blocks the run).
+        if prior_qa:
+            last_qa = prior_qa[-1] or {}
+            from app.services import preference_service
+
+            await preference_service.record_answer_preference(
+                organization_id,
+                last_qa.get("question") or "",
+                last_qa.get("answer") or "",
+            )
+
+        # ---- PHASE 1b: DOCUMENT / VISION EXTRACTION ------------------------
+        # Attachments are processed in-memory by the vision-capable Qwen
+        # chain (qwen3-vl-*). The structured extraction becomes FACTUAL
+        # CONTEXT appended to the user message — the ERP Agent (planner,
+        # classifier, accounting engine), NOT the vision model, decides
+        # what the document means operationally.
+        if attachments:
+            from app.document_extractor import (
+                DocumentValidationError,
+                extract_attachments,
+            )
+            try:
+                document_context = await extract_attachments(
+                    attachments, orchestrator=get_client()
+                )
+            except DocumentValidationError as exc:
+                # User-fixable upload problem — never a provider fallback.
+                await _update_status(session_id, ExecutionStatus.FAILED)
+                await _log_step(session_id, "FAILED", {"reason": str(exc)[:300]})
+                return AgentResponse(
+                    status=ExecutionStatus.FAILED,
+                    execution_id=session_id,
+                    summary=str(exc),
+                )
+            if document_context:
+                user_message = (
+                    f"{user_message}\n\n[Attached document information]\n"
+                    f"{document_context}"
+                )
+                # Persist the enriched request so the extracted facts
+                # survive clarification/confirmation resume (continuity
+                # rule): resume_with_clarification / resume_with_confirmation
+                # re-enter execute() with session.user_request as the
+                # message — the document context must still be there.
+                await update_one(
+                    "ai_execution_sessions",
+                    row_id=session_id,
+                    data={"user_request": user_message},
+                )
+                await _log_step(session_id, "DOCUMENT_EXTRACTED", {
+                    "attachments": len(attachments),
+                    "context_chars": len(document_context),
+                })
+
+        # ---- PHASE 2: INTERPRETING / PLANNING ----------------------------
+        await _update_status(session_id, ExecutionStatus.INTERPRETING)
+        # Work Stream F: learned org defaults feed the planner as
+        # answered-for entities (an explicit user value always wins).
+        org_prefs = await _load_org_preferences(organization_id)
+        execution_plan = run_planner(
+            user_message,
+            clarification_history=prior_qa,
+            org_preferences=org_prefs,
+        )
+        _phase_elapsed("planner.done", intent=execution_plan.intent)
+
+        # Work Stream E: deterministic semantic tool shortlist.  Seeds the
+        # exclusion set so the model only SEES the tools relevant to this
+        # economic event plus its entity-type lookups (<= 15 tools).
+        # NEVER excludes a planner-listed tool; batch plans keep the full
+        # toolset - every sub-intent needs its own tools.
+        from app.tool_selector import excluded_for_intent
+        from app.tools import list_tools as _list_all_tools
+
+        excluded_tools: set = set()
+        if not execution_plan.batch_items:
+            excluded_tools |= excluded_for_intent(
+                execution_plan.intent,
+                execution_plan.potential_tools,
+                _list_all_tools(),
+            )
+        # Work Stream R: the audit trail records WHY the treatment was
+        # chosen - the resolved nature and its source (USER_ANSWER /
+        # PREFERENCE / DETERMINISTIC_RULE).
+        planning_details: Dict[str, Any] = {
+            "intent": execution_plan.intent,
+            "extracted_entities": execution_plan.extracted_entities,
+        }
+        if execution_plan.transaction_nature:
+            planning_details["transaction_nature"] = (
+                execution_plan.transaction_nature
+            )
+            planning_details["nature_source"] = (
+                execution_plan.transaction_nature_source
+            )
+        await _log_step(session_id, "PLANNING", planning_details)
+        await _log_step(session_id, "ECONOMIC_EVENT", {
+            "event": execution_plan.economic_event,
+            "impact_map": execution_plan.impact_map,
+            "prohibited_actions": execution_plan.prohibited_actions,
+        })
+        if prior_qa:
+            # Post-answer FULL re-evaluation marker: after clarification
+            # answers the complete operation is re-planned from scratch —
+            # original request + all answers + merged entities — never a
+            # narrow "just the newly answered field" pass.
+            await _log_step(session_id, "RE_EVALUATION", {
+                "prior_answers": len(prior_qa),
+                "merged_entities": execution_plan.extracted_entities,
+                "intent": execution_plan.intent,
+            })
+        await _update_status(session_id, ExecutionStatus.PLANNING)
+
+        # ---- PHASE 2b: CONSOLIDATED clarification check -------------------
+        # Ask ONLY when the planner found genuinely-missing material info
+        # AND the clarification budget is not exhausted.  Everything already
+        # provided in the message (any format) or answered in prior rounds
+        # has been merged into extracted_entities by the planner, so it is
+        # never re-asked here.  ALL independent gaps are gathered into ONE
+        # questionnaire — the user answers everything in a single round
+        # (360° analysis is mandatory; 360° questioning is minimal).
+        if (
+            execution_plan.requires_clarification
+            and len(prior_qa) < MAX_CLARIFICATION_ROUNDS
+        ):
+            from app.reasoning import plan_clarification_text
+
+            question = (
+                plan_clarification_text(
+                    execution_plan.clarification_questions,
+                    execution_plan.missing_fields,
+                )
+                or "Please provide more details."
+            )
+            # Work Stream F: offer the learned default inside the question
+            # ("previously: cash - reply SAME to reuse").
+            memory_hint = _preference_memory_hint(
+                org_prefs, execution_plan.clarification_questions
+            )
+            if memory_hint:
+                question = f"{question}\n({memory_hint})"
+            # R3.4a: never render model markdown in the question card.
+            question = strip_markdown(question) or question
+            # R3.4b: data-driven tap-to-answer options — the backend
+            # emits one [{value, label}] list per question that has a
+            # finite option set (purpose, capitalization, settlement,
+            # operation, channel, nature, dates).  R4.6 FIX: empty
+            # entries are kept as None placeholders so each list stays
+            # INDEX-ALIGNED with its numbered sub-question — compacting
+            # the array shifted the chips onto the wrong questions.
+            question_options = [
+                options_for_question(q) or []
+                for q in execution_plan.clarification_questions
+            ]
+            question_options = (
+                question_options if any(question_options) else None
+            )
+            clarification = await create_clarification(
+                session_id=session_id,
+                question=question,
+                required_fields=execution_plan.missing_fields,
+            )
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=clarification.get("question", question),
+                required_information=execution_plan.missing_fields,
+                question_options=question_options,
+                requires_user_input=True,
+            )
+        if execution_plan.requires_clarification:
+            log.warning(
+                "agent.clarification_budget_exhausted",
+                rounds=len(prior_qa),
+                proceeding_with_partial_info=True,
+            )
+
+        # ---- PHASE 2c: DETERMINISTIC REPORT FAST-PATH (Work Stream B) ----
+        # Plain reports/lookups with no open questions skip the LLM: the
+        # planner's intent directly drives the read-only tools and the
+        # rows are formatted deterministically.  Returns None for anything
+        # ambiguous - the normal model path then handles it.
+        fast_response = await _try_report_fast_path(
+            execution_plan=execution_plan,
+            session_id=session_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            auth=auth,
+        )
+        if fast_response is not None:
+            return fast_response
+
+        # ---- P5 GUARD: bank accounts are never invented. ------------------
+        # A transfer needs EXISTING bank accounts; an empty lookup is a
+        # configuration state the user must resolve — the agent must not
+        # create bank accounts (and GL accounts) on its own initiative.
+        if execution_plan.intent == "record_bank_transfer" and not confirmation_granted:
+            from app.services import bank_service
+
+            # Ask ONCE per conversation — after the user has answered the
+            # bank-configuration question, the model proceeds (creation is
+            # then user-sanctioned or explicitly declined).
+            already_asked = any(
+                "bank account" in (qa.get("question") or "").lower()
+                for qa in prior_qa
+            )
+            banks = await bank_service.list_bank_accounts(organization_id)
+            if not banks and not already_asked:
+                question = (
+                    "No bank accounts are configured for this organization, "
+                    "so a bank-to-cash transfer cannot be recorded yet. I "
+                    "will not create bank accounts on my own. Please add "
+                    "them under Banking → Bank Accounts (or tell me to "
+                    "create them, including the bank name and account "
+                    "details), then ask me again."
+                )
+                await create_clarification(
+                    session_id=session_id,
+                    question=question,
+                    required_fields=["bank_accounts_configuration"],
+                )
+                await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+                await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                    "source": "bank_accounts_configuration",
+                    "question": question[:500],
+                })
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=question,
+                    required_information=["bank_accounts_configuration"],
+                    requires_user_input=True,
+                )
+
+        _phase_elapsed("context.start")
+        # ---- PHASE 3: CONTEXT LOADING ------------------------------------
+        await _update_status(session_id, ExecutionStatus.CONTEXT_LOADING)
+        # All entities extracted from the request (plus merged clarification
+        # answers) flow into the context — Gemini reuses them instead of
+        # re-parsing the raw text.
+        entity_hints: Dict[str, Any] = dict(execution_plan.extracted_entities)
+        if execution_plan.entity_name and execution_plan.entity_type:
+            entity_hints.setdefault(
+                f"{execution_plan.entity_type}_name", execution_plan.entity_name
+            )
+
+        context = await build_context(
+            organization_id=organization_id,
+            user_id=user_id,
+            intent=execution_plan.intent,
+            entity_hints=entity_hints,
+            clarification_history=prior_qa,
+        )
+        await _log_step(session_id, "CONTEXT_LOADING", {
+            "customers": len(context.relevant_customers),
+            "suppliers": len(context.relevant_suppliers),
+            "accounts": len(context.relevant_accounts),
+        })
+
+        _phase_elapsed("context.built")
+        # ---- PHASE 3b: INTELLIGENT TRANSACTION CLASSIFICATION (360°) ------
+        # Deterministic (no LLM): ERP configuration → item/account mapping →
+        # business rules → user answers.  If the treatment is MATERIALLY
+        # AMBIGUOUS (e.g. laptop: fixed asset vs expense) and no authoritative
+        # configuration exists, ASK — never default to a generic expense.
+        from app.classifier import classify_transaction, _classification_question
+
+        classification = await classify_transaction(
+            organization_id=organization_id,
+            intent=execution_plan.intent,
+            entities=context.extracted_entities,
+            message=user_message,
+        )
+        execution_plan.classification = classification
+        context.classification = classification
+        await _log_step(session_id, "CLASSIFICATION", {
+            "transaction_nature": classification.transaction_nature,
+            "confidence": classification.confidence,
+            "source": classification.source,
+            "account_hint": classification.account_hint_code,
+            "requires_clarification": classification.requires_clarification,
+        })
+
+        _phase_elapsed("classification.done", nature=classification.transaction_nature)
+        # ---- PHASE 3c: 360° DEPENDENCY GRAPH (requirement gap analysis) ---
+        # Every materially relevant dimension gets an explicit resolution
+        # state; only genuinely-open user decisions become questions.  An
+        # empty ERP context is valid information — never a failure.
+        from app.reasoning import analyze_requirements, collect_open_questions
+
+        dependency_nodes = analyze_requirements(
+            intent=execution_plan.intent,
+            entities=execution_plan.extracted_entities,
+            missing_fields=execution_plan.missing_fields,
+            classification=classification,
+            relevant_customers=context.relevant_customers,
+            relevant_suppliers=context.relevant_suppliers,
+            relevant_bank_accounts=context.relevant_bank_accounts,
+        )
+        open_questions = collect_open_questions(dependency_nodes)
+        await _log_step(session_id, "REQUIREMENT_ANALYSIS", {
+            "dependencies": [n.as_dict() for n in dependency_nodes],
+            "open_questions": [q["field"] for q in open_questions],
+        })
+
+        _phase_elapsed("requirements.done", open_questions=[q["field"] for q in open_questions])
+        # ---- PHASE 3d: NATURE-REFINED IMPACT MAP (negative reasoning) -----
+        # With the economic NATURE known, refine the event profile: the
+        # 360° impact map becomes precise (INVENTORY stock vs FIXED_ASSET
+        # capitalisation vs EXPENSE vs SERVICE) and the PROHIBITED mutation
+        # set is finalised.  This is authoritative context for the model
+        # and enforced by the executor below.
+        from app.reasoning import build_event_profile as build_refined_profile
+
+        event_profile = build_refined_profile(
+            execution_plan.intent, classification=classification
+        )
+        execution_plan.impact_map = dict(event_profile.affected)
+        execution_plan.prohibited_actions = [
+            p.as_dict() for p in event_profile.prohibited
+        ]
+        context.economic_event = event_profile.event.value
+        context.impact_map = dict(event_profile.affected)
+        context.prohibited_actions = [
+            p.as_dict() for p in event_profile.prohibited
+        ]
+        await _log_step(session_id, "IMPACT_ANALYSIS", event_profile.as_dict())
+
+        if (
+            classification.requires_clarification
+            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+        ):
+            if classification.transaction_nature:
+                # Configuration gap: the nature is decided (user answer /
+                # rules) but no matching account exists.  Ask a targeted
+                # CONFIGURATION question — asked only ONCE per conversation
+                # (afterwards the model creates/selects the account itself).
+                already_asked = any(
+                    "chart of accounts" in (qa.get("question") or "").lower()
+                    for qa in prior_qa
+                )
+                if already_asked:
+                    pass  # continue to the model with the config-gap context
+                else:
+                    nature_label = classification.transaction_nature.replace("_", " ").lower()
+                    # Smart account resolution: offer the user the most
+                    # relevant EXISTING accounts (e.g. 'bonus' → Salaries /
+                    # Wages) AND the option to create a dedicated account.
+                    candidates = list(
+                        getattr(classification, "candidate_accounts", None) or []
+                    )
+                    if candidates:
+                        suggestion = ", ".join(
+                            f"'{c}'" for c in candidates[:4]
+                        )
+                        question = (
+                            f"There is no dedicated account for this entry "
+                            f"(nature: {nature_label}). You can classify it "
+                            f"under an existing account — for example "
+                            f"{suggestion} — or I can create a new dedicated "
+                            f"account for it. Which do you prefer? "
+                            f"(Say 'create' for a new account, or name the "
+                            f"account to use.)"
+                        )
+                        options = [*candidates[:4], "Create new account"]
+                    else:
+                        question = (
+                            f"There is no {nature_label} account in your chart of "
+                            f"accounts for this entry. Should I create one (for "
+                            f"example a 'Computer Equipment' fixed-asset account), "
+                            f"or do you want to use a specific existing account?"
+                        )
+                        options = ["Create new account"]
+                    # R3.4: account NAMES only in user-facing text (never
+                    # internal codes) and tappable options.
+                    question = strip_markdown(question) or question
+                    clarification = await create_clarification(
+                        session_id=session_id,
+                        question=question,
+                        required_fields=["account_configuration"],
+                    )
+                    return AgentResponse(
+                        status=ExecutionStatus.AWAITING_CLARIFICATION,
+                        execution_id=session_id,
+                        question=clarification.get("question", question),
+                        required_information=["account_configuration"],
+                        options=options,
+                        question_options=[
+                            [
+                                {"value": str(o), "label": str(o)}
+                                for o in options
+                            ]
+                        ],
+                        requires_user_input=True,
+                    )
+            else:
+                question = _classification_question(classification)
+                # R3.4: the 4-way nature decision is tap-to-answer too.
+                nature_options = options_for_question(question)
+                question = strip_markdown(question) or question
+                clarification = await create_clarification(
+                    session_id=session_id,
+                    question=question,
+                    required_fields=["transaction_nature"],
+                )
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=clarification.get("question", question),
+                    required_information=["transaction_nature"],
+                    question_options=[nature_options] if nature_options else None,
+                    requires_user_input=True,
+                )
+
+        # ---- PHASE 3.5: DETERMINISTIC MUTATION FAST PATH (instant mode) ---
+        # When the reasoning layers have fully resolved the transaction,
+        # the tool call is built here and the 30-85s LLM planning call is
+        # SKIPPED entirely (see _deterministic_mutation_calls).  Returns
+        # None whenever anything is unresolved - the model path below then
+        # handles it exactly as before.
+        # Work Stream R2: BEFORE the tool call, the named party is
+        # RESOLVED like a chartered accountant would - exact match → use
+        # it; similar matches → the user picks the real party; nothing
+        # found → the user confirms the new party ledger.  Never silently
+        # invented.
+        _phase_elapsed("party_question.start")
+        party_question = await _party_resolution_question(
+            organization_id=organization_id,
+            execution_plan=execution_plan,
+        )
+        if party_question:
+            party_required = party_question.get("required_fields") or [
+                "supplier_name"
+            ]
+            clarification = await create_clarification(
+                session_id=session_id,
+                question=party_question["question"],
+                required_fields=party_required,
+            )
+            await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                "source": "party_resolution",
+                "question": party_question["question"][:300],
+            })
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=clarification.get("question", party_question["question"]),
+                options=party_question.get("options"),
+                required_information=party_required,
+                requires_user_input=True,
+            )
+        _phase_elapsed("party_question.done", asked=bool(party_question))
+        # Work Stream R4.10 — CATALOG CHECK: invoice lines naming items
+        # that are not in the product/service catalog are resolved the
+        # same way the party gate works — the user decides ONCE whether
+        # the catalog grows; nothing is silently invented.
+        _phase_elapsed("catalog_question.start")
+        catalog_question = await _catalog_check_question(
+            organization_id=organization_id,
+            execution_plan=execution_plan,
+        )
+        if catalog_question:
+            clarification = await create_clarification(
+                session_id=session_id,
+                question=catalog_question["question"],
+                required_fields=["item_description"],
+            )
+            await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                "source": "catalog_check",
+                "question": catalog_question["question"][:300],
+            })
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=clarification.get(
+                    "question", catalog_question["question"]
+                ),
+                options=catalog_question.get("options"),
+                required_information=["item_description"],
+                requires_user_input=True,
+            )
+        _phase_elapsed("catalog_question.done", asked=bool(catalog_question))
+        deterministic_calls = await _deterministic_mutation_calls(
+            organization_id=organization_id,
+            execution_plan=execution_plan,
+            classification=classification,
+        )
+        _phase_elapsed("deterministic.done", fast=deterministic_calls is not None)
+        llm_text = ""
+        planned_tool_calls: List[ToolCall] = []
+        if deterministic_calls is not None:
+            planned_tool_calls = deterministic_calls
+            await _log_step(session_id, "DETERMINISTIC_EXECUTION", {
+                "intent": execution_plan.intent,
+                "bypass_llm": True,
+                "tools": [tc.tool_name for tc in planned_tool_calls],
+            })
+        else:
+            # ---- PHASE 4: AI REASONING (planning call — Qwen → Gemini) ----
+            # First call WITHOUT executor — gets the model's planned tool calls
+            # so we can check the confirmation gate BEFORE executing anything.
+            # The orchestrator dispatches to Qwen (primary) and falls back to
+            # Gemini only on genuine provider failure.
+            client = get_client()
+            # Work Stream B tiered routing: simple lookup intents that reached
+            # the model (the deterministic fast-path did not apply - ambiguous
+            # phrasing) get a lighter output budget.
+            light_budget = execution_plan.intent in _LIGHT_BUDGET_INTENTS
+            _phase_elapsed("llm_call.start")
+            planning_result = await client.generate_with_tools(
+                user_message=user_message,
+                context=context,
+                light_budget=light_budget,
+                excluded_tools=excluded_tools or None,
+            )
+            _phase_elapsed("llm_call.done")
+            llm_text = planning_result.get("text", "")
+            planned_tool_calls = planning_result.get("tool_calls", [])
+
+        # ---- PHASE 4b: Model-driven clarification gate ---------------------
+        # The model may respond with a TEXT-ONLY question (no tool calls)
+        # when it genuinely cannot proceed — e.g. the supplier named in the
+        # request does not exist.  An AI response is NOT a completed ERP
+        # operation: route it through the existing clarification mechanism
+        # so the user can answer and the SAME conversation resumes.
+        if (
+            not planned_tool_calls
+            and _usable_question(llm_text)
+            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+        ):
+            await create_clarification(
+                session_id=session_id,
+                question=_usable_question(llm_text),
+                required_fields=execution_plan.missing_fields,
+            )
+            await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                "source": "model",
+                "question": _usable_question(llm_text)[:500],
+            })
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=_usable_question(llm_text),
+                required_information=execution_plan.missing_fields,
+                requires_user_input=True,
+            )
+
+
+        # ---- PHASE 5: CONFIRMATION GATE (BEFORE execution) ---------------
+        # Skipped when resuming an already-approved session
+        # (confirmation_granted=True from resume_with_confirmation).
+        _phase_elapsed("confirmation_gate.start")
+        if (
+            execution_plan.requires_confirmation
+            and planned_tool_calls
+            and not confirmation_granted
+        ):
+            confirmation = await create_confirmation(
+                session_id=session_id,
+                action_type=execution_plan.intent,
+                description=(
+                    f"Execute: {execution_plan.intent}"
+                    f" — {execution_plan.entity_name or ''}"
+                ),
+                risk_level="MEDIUM",
+            )
+            await _log_step(session_id, "AWAITING_CONFIRMATION", {"confirmation_id": confirmation.get("id")})
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CONFIRMATION,
+                execution_id=session_id,
+                action=execution_plan.intent,
+                summary=_confirmation_summary(execution_plan),
+                confirmation_required=True,
+                risk_level="MEDIUM",
+            )
+
+        # ---- PHASE 6: TOOL EXECUTION (iterative with Gemini) -------------
+        await _update_status(session_id, ExecutionStatus.EXECUTING)
+
+        # Deterministic execution state used by the reasoning guards below:
+        # - excluded_tools: seeded BEFORE the planning call with the Work
+        #   Stream E semantic shortlist; party/account-creation tools are
+        #   REMOVED from the model's offered tool set once a search has
+        #   resolved the party - the model cannot attempt what it is not
+        #   offered.
+        # - account_creation: an explicit account-creation request that has
+        #   not succeeded BLOCKS default-account mutations — no silent
+        #   degradation to the default expense account.
+        account_creation = {"requested": False, "succeeded": False}
+
+        # Build an executor closure that routes through the full
+        # security + validation + handler stack.
+        async def _executor(tool_name: str, args: dict) -> dict:
+            # GENERIC negative-reasoning gate: refuse any tool the economic
+            # event profile PROHIBITS (cash ⇒ party-ledger creation; SERVICE
+            # ⇒ inventory movement; expense/consumable ⇒ fixed-asset
+            # capitalisation; REPORTING ⇒ any mutation).  Correct execution
+            # includes correct NON-execution.
+            _prohibited = event_prohibited_tools(
+                execution_plan.prohibited_actions
+            )
+            if tool_name in _prohibited:
+                _reason = next(
+                    (
+                        a.get("reason", "")
+                        for a in execution_plan.prohibited_actions
+                        if tool_name in event_prohibited_tools([a])
+                    ),
+                    "prohibited by the economic event classification",
+                )
+                log.warning(
+                    "agent.event_prohibited_tool_blocked",
+                    session_id=str(session_id),
+                    intent=execution_plan.intent,
+                    tool=tool_name,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"BUSINESS_RULE_VIOLATION: {tool_name} is prohibited "
+                        f"for this economic event — {_reason}. Do NOT retry "
+                        "the same call; adapt the plan accordingly."
+                    ),
+                    "error_category": "BUSINESS_RULE_VIOLATION",
+                }
+            # Reasoning-level enforcement of the one-off-cash rule: for
+            # cash transactions a party ledger is NEVER required — the
+            # named supplier/customer is informational.  Block the CREATE
+            # at the plan owner (here), not merely at the DB service
+            # layer, so the model's dependency plan itself stays correct.
+            if cash_party_creation_blocked(execution_plan.intent, tool_name):
+                log.warning(
+                    "agent.cash_party_creation_blocked",
+                    session_id=str(session_id),
+                    intent=execution_plan.intent,
+                    tool=tool_name,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "BUSINESS_RULE_VIOLATION: a supplier/customer ledger "
+                        "is NOT required for a cash transaction — the named "
+                        "party is informational only. Do not create party "
+                        "records for cash transactions; record the "
+                        "transaction without it."
+                    ),
+                    "error_category": "BUSINESS_RULE_VIOLATION",
+                }
+            # Reasoning-level guard: once a party has been resolved by
+            # search, its creation tool is disabled — refuse any attempt so
+            # the model reuses the resolved record instead.
+            if tool_name in excluded_tools:
+                return {
+                    "success": False,
+                    "error": (
+                        "BUSINESS_RULE_VIOLATION: an existing record was "
+                        "already found for this party — reuse it. Creating "
+                        "a duplicate is forbidden."
+                    ),
+                    "error_category": "BUSINESS_RULE_VIOLATION",
+                }
+            # Reasoning-level guard: the user explicitly requested a new
+            # account; until that account is successfully created, default-
+            # account mutations are forbidden (no silent degradation).
+            if (
+                tool_name in ("create_expense", "create_purchase_bill", "create_invoice")
+                and account_creation["requested"]
+                and not account_creation["succeeded"]
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        "BLOCKED: the user explicitly requested a NEW account "
+                        "and it has not been created yet. Create the requested "
+                        "account first (the create_account tool resolves a "
+                        "free code automatically), or ask the user. Do NOT "
+                        "record this transaction against a default account."
+                    ),
+                    "error_category": "BUSINESS_RULE_VIOLATION",
+                }
+            if tool_name == "create_account":
+                account_creation["requested"] = True
+
+            tc = ToolCall(tool_name=tool_name, arguments=args)
+            result = await route_tool_call(
+                tc,
+                organization_id=organization_id,
+                user_id=user_id,
+                session_id=session_id,
+                auth=auth,
+            )
+            if tool_name == "create_account":
+                if result.success:
+                    account_creation["succeeded"] = True
+                    # The explicit account now exists — no further
+                    # create_account attempts are needed.
+                    excluded_tools.add("create_account")
+            # Reasoning-level narrowing: a successful party search that
+            # resolved the named party disables the corresponding creation
+            # tool for all subsequent iterations (planning-level fix — the
+            # model is no longer OFFERED the creation tool).
+            if tool_name in ("search_supplier", "search_customer") and result.success:
+                from app.reasoning import PartyMatchState, classify_party_match
+
+                match_state, _matches = classify_party_match(
+                    result.data, execution_plan.entity_name
+                )
+                if match_state in (
+                    PartyMatchState.EXACT,
+                    PartyMatchState.RESOLVED_PARTIAL,
+                    PartyMatchState.AMBIGUOUS,
+                ):
+                    created_tool = (
+                        "create_supplier" if tool_name == "search_supplier"
+                        else "create_customer"
+                    )
+                    excluded_tools.add(created_tool)
+                    await _log_step(session_id, "PLANNING", {
+                        "party_resolved": execution_plan.entity_name,
+                        "party_match_state": match_state.value,
+                        "creation_tool_disabled": created_tool,
+                    })
+                    # Explicit directive fed back with the tool result — the
+                    # model must reuse the resolved record, not create one.
+                    # For AMBIGUOUS matches the model must NOT silently pick
+                    # a candidate: it asks the user or proceeds without the
+                    # party ledger — never "first hit", never a duplicate.
+                    directive = party_search_directive(
+                        match_state, execution_plan.entity_name, created_tool
+                    )
+                    if isinstance(result.data, dict):
+                        return {
+                            "success": result.success,
+                            **result.data,
+                            "directive": directive,
+                        }
+                    if isinstance(result.data, list):
+                        return {
+                            "success": result.success,
+                            "count": len(result.data),
+                            "results": result.data,
+                            "directive": directive,
+                        }
+            # ROOT-CAUSE FIX (S4/S7/S2/S6 live failures): search tools return
+            # LISTS (supplier_service.search etc.) — the old dict-only branch
+            # DROPPED them, so the model received {"success": true} with no
+            # rows and kept re-searching / created records blindly. All
+            # result shapes are now fed back.
+            if result.data is not None:
+                if isinstance(result.data, dict):
+                    return {"success": result.success, **result.data}
+                if isinstance(result.data, list):
+                    return {
+                        "success": result.success,
+                        "count": len(result.data),
+                        "results": result.data,
+                    }
+                return {"success": result.success, "data": result.data}
+            return {"success": result.success, "error": result.error}
+
+        # Second AI call WITH executor — full iterative tool loop.
+        # The model receives real parameters, executes tools, gets results
+        # fed back, and can make follow-up calls until done.
+        #
+        # CRASH FIX (live defect, session 3662feeb): this call used to run
+        # UNCONDITIONALLY, but `client` and `light_budget` are only bound on
+        # the LLM planning path (the `else` above).  On the deterministic
+        # fast path every confirmed mutation therefore died with
+        # ``UnboundLocalError: cannot access local variable 'client'``
+        # the moment it resumed after user approval.  The fast path now
+        # executes its pre-built tool calls DIRECTLY — no LLM round-trip,
+        # exactly what "bypass_llm" always promised.
+        if deterministic_calls is not None:
+            executed = await execute_planned_tool_calls(
+                planned_tool_calls, _executor
+            )
+            final_result = {
+                "text": "",
+                "tool_calls": planned_tool_calls,
+                "tool_results": [
+                    ToolResult(
+                        tool_name=tc.tool_name,
+                        success=bool(data.get("success", True)),
+                        data=data,
+                        error=data.get("error"),
+                    )
+                    for tc, data in zip(planned_tool_calls, executed)
+                ],
+            }
+        else:
+            final_result = await client.generate_with_tools(
+                user_message=user_message,
+                context=context,
+                executor=_executor,
+                excluded_tools=excluded_tools,
+                light_budget=light_budget,
+            )
+        llm_text = final_result.get("text", "") or llm_text
+        tool_calls: List[ToolCall] = final_result.get("tool_calls", [])
+        tool_results: List[ToolResult] = final_result.get("tool_results", [])
+
+        # ---- Work Stream B: BATCH per-document result breakdown -----------
+        # Every sub-document is an INDEPENDENT mutation: a failed one never
+        # rolls back its successful siblings. The result card must state
+        # EXACTLY which documents succeeded and which failed - honestly,
+        # derived from actual tool results, never assumed.
+        if execution_plan.batch_items:
+            breakdown = _build_batch_breakdown(
+                execution_plan.batch_items, tool_calls, tool_results
+            )
+            if breakdown:
+                await _log_step(session_id, "BATCH_EXECUTION", {
+                    "documents": len(execution_plan.batch_items),
+                    "breakdown": breakdown,
+                })
+                llm_text = (llm_text + "\n\n" + breakdown).strip()
+
+        # Log every tool call for the audit trail (fire-and-forget -
+        # Work Stream A3; drained by flush_step_logs before return).
+        for i, tc in enumerate(tool_calls):
+            tr = tool_results[i] if i < len(tool_results) else None
+            _spawn_step_write(
+                log_tool_call(
+                    session_id=session_id,
+                    tool_name=tc.tool_name,
+                    tool_input=tc.arguments,
+                    tool_output=(
+                        {"data": str(tr.data)[:2000], "success": tr.success}
+                        if tr else None
+                    ),
+                    status="COMPLETED" if (tr and tr.success) else "FAILED",
+                )
+            )
+
+        # ---- NO ERP STATE CHANGED: the model wants user input, or answered
+        # informationally.  An AI response is NOT a completed ERP operation.
+        # If only read-only lookups ran (search/get/list) and the model asks
+        # a question, route it to the clarification mechanism so the user
+        # can answer and the SAME conversation resumes.  Anything else with
+        # no mutations is an informational answer: COMPLETED but explicitly
+        # NOT VERIFIED.
+        if not _mutation_executed(tool_calls):
+            model_question = _usable_question(llm_text)
+            if model_question and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                await create_clarification(
+                    session_id=session_id,
+                    question=model_question,
+                    required_fields=execution_plan.missing_fields,
+                )
+                await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                    "source": "model",
+                    "stage": "execution",
+                    "question": model_question[:500],
+                })
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=model_question,
+                    required_information=execution_plan.missing_fields,
+                    requires_user_input=True,
+                )
+            if not (llm_text or "").strip():
+                # The model stalled (empty response) after only read-only
+                # lookups — nothing was recorded.  Continue the conversation
+                # instead of stranding the user.
+                generic_question = (
+                    "I couldn't complete this request with the information "
+                    "available. Could you confirm or provide the remaining "
+                    "details (e.g. the payee/vendor, the account to use, or "
+                    "the exact amounts)?"
+                )
+                if len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                    await create_clarification(
+                        session_id=session_id,
+                        question=generic_question,
+                        required_fields=["missing_details"],
+                    )
+                    return AgentResponse(
+                        status=ExecutionStatus.AWAITING_CLARIFICATION,
+                        execution_id=session_id,
+                        question=generic_question,
+                        required_information=["missing_details"],
+                        requires_user_input=True,
+                    )
+            await _update_status(session_id, ExecutionStatus.COMPLETED)
+            await create_execution_result(
+                session_id=session_id,
+                result_data={
+                    "summary": llm_text,
+                    "tool_count": len(tool_results),
+                    "mutations": 0,
+                },
+                summary=llm_text or execution_plan.expected_outcome or "Done.",
+                action_type=execution_plan.intent,
+                verification_status="UNVERIFIED",
+                status="COMPLETED",
+            )
+            return AgentResponse(
+                status=ExecutionStatus.COMPLETED,
+                execution_id=session_id,
+                action=execution_plan.intent,
+                summary=llm_text or execution_plan.expected_outcome or "Done.",
+                verification_status="UNVERIFIED",
+            )
+
+        # ---- PHASE 7: VALIDATION -----------------------------------------
+        # FAILED must mean a GENUINE execution/system/validation failure —
+        # never "the user hasn't provided enough information yet" (that is
+        # AWAITING_CLARIFICATION, handled earlier) and never a tool error
+        # the model already recovered from (a later successful tool call
+        # completed the operation).
+        successful_results = [tr for tr in tool_results if tr.success]
+        failed_results = [tr for tr in tool_results if not tr.success]
+
+        # ---- PHASE 6b: recoverable missing mandatory fields → clarify -----
+        # A tool that failed because a MANDATORY backend value is missing
+        # (e.g. PostgreSQL NOT NULL) must NOT terminate the operation: ask
+        # the user a targeted question and resume the same pending
+        # operation.  Genuine infrastructure failures never take this path
+        # (they carry requires_user_input=False).
+        user_input_failures = [
+            tr for tr in failed_results
+            if (tr.error_details or {}).get("requires_user_input")
+        ]
+        if (
+            user_input_failures
+            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+        ):
+            det = user_input_failures[0].error_details or {}
+            question = build_missing_field_question(
+                det.get("entity"),
+                det.get("field"),
+                record_name=(
+                    context.extracted_entities.get("supplier_name")
+                    or context.extracted_entities.get("customer_name")
+                    or context.extracted_entities.get("entity_name")
+                ),
+            )
+            await create_clarification(
+                session_id=session_id,
+                question=question,
+                required_fields=[det.get("field") or "missing_value"],
+            )
+            await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                "source": "semantic_error",
+                "category": det.get("category"),
+                "operation": det.get("operation"),
+                "field": det.get("field"),
+                "question": question[:500],
+            })
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=question,
+                required_information=[det.get("field") or "missing_value"],
+                requires_user_input=True,
+            )
+
+        if execution_plan.requires_validation and tool_results:
+            await _update_status(session_id, ExecutionStatus.VALIDATING)
+            if not successful_results:
+                # Nothing succeeded — the operation genuinely failed.
+                first_error = failed_results[0].error or "unknown error"
+                await _update_status(session_id, ExecutionStatus.FAILED)
+                await create_execution_result(
+                    session_id=session_id,
+                    result_data={
+                        "error": first_error,
+                        "tool": failed_results[0].tool_name,
+                        "failed_tools": [
+                            {"tool": tr.tool_name, "error": tr.error}
+                            for tr in failed_results
+                        ],
+                    },
+                    verification_status="FAILED",
+                )
+                return AgentResponse(
+                    status=ExecutionStatus.FAILED,
+                    execution_id=session_id,
+                    summary=f"Operation failed: {first_error}",
+                )
+            if failed_results:
+                # Recovered partial failure — keep executing; the failed
+                # steps are reported transparently in the final summary.
+                await _log_step(session_id, "VALIDATING", {
+                    "recovered_failures": [
+                        {"tool": tr.tool_name, "error": (tr.error or "")[:300]}
+                        for tr in failed_results
+                    ],
+                })
+
+        # ---- PHASE 8: VERIFICATION ---------------------------------------
+        # VERIFIED means the ERP operation actually executed and its
+        # resulting DB state was verified (accounting engine).  A response
+        # with no executed tools can never be VERIFIED.
+        await _update_status(session_id, ExecutionStatus.VERIFYING)
+        verified = bool(successful_results)
+        for tr in tool_results:
+            if tr.success and tr.data and isinstance(tr.data, dict):
+                entry = tr.data.get("entry")
+                if entry and entry.get("id"):
+                    vr = await verify_journal(
+                        organization_id=organization_id,
+                        entry_id=uuid.UUID(entry["id"]),
+                    )
+                    if not vr.get("verified"):
+                        verified = False
+
+        # ---- PHASE 9: COMPLETED ------------------------------------------
+        status = ExecutionStatus.COMPLETED if verified else ExecutionStatus.FAILED
+        await _update_status(session_id, status)
+
+        # Build canonical affected entities + accounting impact.
+        # Contracts are defined in app/entity_contract.py and mirrored in
+        # frontend/src/lib/types/api.ts — the builders guarantee the shape
+        # (e.g. affected_entities[].type is always a non-empty string).
+        affected = build_affected_entities(tool_results)
+        accounting_impact = await build_accounting_impact(
+            tool_results,
+            resolve_account_name=_make_account_label_resolver(organization_id),
+        )
+
+        # Work Stream A: surface the recorded transaction date so the result
+        # card can state "Dated: YYYY-MM-DD" honestly (including a defaulted
+        # today-assumption flagged by the tool router).
+        recorded_date, date_defaulted = _extract_recorded_date(tool_results)
+        # Work Stream R: surface the resolved nature (and its source) so
+        # the result card can state "Nature: Fixed Asset - you confirmed"
+        # honestly, next to the Dated badge.
+        nature_data: Dict[str, Any] = (
+            {
+                "transaction_nature": execution_plan.transaction_nature,
+                "transaction_nature_source": (
+                    execution_plan.transaction_nature_source
+                ),
+            }
+            if execution_plan.transaction_nature
+            else {}
+        )
+        response_data = (
+            {
+                "transaction_date": recorded_date,
+                "date_defaulted": date_defaulted,
+                **nature_data,
+            }
+            if recorded_date or nature_data
+            else None
+        )
+
+        result_summary = llm_text or execution_plan.expected_outcome or "Operation completed."
+        if failed_results:
+            # Transparently report recovered partial failures.
+            recovered = "; ".join(
+                f"{tr.tool_name}: {(tr.error or 'failed')[:120]}"
+                for tr in failed_results
+            )
+            result_summary = f"{result_summary}\n\nNote — some steps needed retries: {recovered}"
+
+        await create_execution_result(
+            session_id=session_id,
+            result_data={
+                "summary": result_summary,
+                "tool_count": len(tool_results),
+                "affected_entities": affected,
+                "accounting_impact": accounting_impact,
+                **({"transaction_date": recorded_date,
+                    "date_defaulted": date_defaulted} if recorded_date else {}),
+                **nature_data,
+            },
+            summary=result_summary,
+            action_type=execution_plan.intent,
+            affected_entities=affected,
+            verification_status="VERIFIED" if verified else "FAILED",
+            status="COMPLETED" if verified else "FAILED",
+        )
+
+        return AgentResponse(
+            status=status,
+            execution_id=session_id,
+            action=execution_plan.intent,
+            summary=result_summary,
+            affected_entities=affected if affected else None,
+            accounting_impact=accounting_impact if accounting_impact else None,
+            verification_status="VERIFIED" if verified else "FAILED",
+            data=response_data,
+        )
+
+    except Exception as exc:
+        log.error("agent.execute.error", error=str(exc), session_id=str(session_id) if session_id else None)
+        if session_id:
+            await _update_status(session_id, ExecutionStatus.FAILED)
+            await create_execution_result(
+                session_id=session_id,
+                result_data={"error": str(exc)},
+                summary=f"Error: {exc}",
+                verification_status="FAILED",
+                status="FAILED",
+            )
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            execution_id=session_id,
+            summary="An unexpected error occurred. Please try again.",
+        )
+    finally:
+        # Work Stream A3: all fire-and-forget audit writes are drained
+        # before the request returns - the user never waited on them,
+        # but every one of them has landed by now.
+        await flush_step_logs()
+
+
+async def resume_with_clarification(
+    *,
+    session_id: uuid.UUID,
+    user_answer: str,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    auth: Optional[AuthContext] = None,
+) -> AgentResponse:
+    """Resume a session after the user answered a clarification.
+
+    The answer is merged with the ORIGINAL request (not treated as a new
+    isolated request): the full Q&A history for this session — including
+    the just-answered question — is reloaded from the database and passed
+    through ``execute(clarification_history=...)`` so the Planner folds
+    every answered value into entity extraction and never re-asks it.
+    """
+    session = await fetch_one("ai_execution_sessions", filters={"id": str(session_id)})
+    if not session:
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            summary="Session not found.",
+        )
+
+    # Record the user's answer on the pending clarification.
+    await resolve_clarification(session_id=session_id, user_response=user_answer)
+
+    # Rebuild the COMPLETE Q&A history for this conversation — the planner
+    # merges each answer into the entity set, and Gemini receives both the
+    # original request and the structured history as context.
+    history = await get_clarification_history(session_id)
+
+    original_request = session.get("user_request", "") or ""
+    return await execute(
+        user_message=original_request,
+        user_id=user_id,
+        organization_id=organization_id,
+        auth=auth,
+        conversation_id=session.get("conversation_id"),
+        clarification_history=history,
+    )
+
+
+async def resume_with_confirmation(
+    *,
+    session_id: uuid.UUID,
+    approved: bool,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    auth: Optional[AuthContext] = None,
+) -> AgentResponse:
+    """Resume a session after the user confirmed/rejected an action."""
+    await resolve_confirmation(
+        session_id=session_id, approved=approved, user_id=user_id
+    )
+    if not approved:
+        await _update_status(session_id, ExecutionStatus.REJECTED)
+        return AgentResponse(
+            status=ExecutionStatus.REJECTED,
+            execution_id=session_id,
+            summary="Action was rejected by the user.",
+        )
+    # If approved, continue execution — carrying any clarification history
+    # from this session forward so answered questions stay answered.
+    session = await fetch_one("ai_execution_sessions", filters={"id": str(session_id)})
+    if not session:
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            summary="Session not found.",
+        )
+    history = await get_clarification_history(session_id)
+    return await execute(
+        user_message=session.get("user_request", ""),
+        user_id=user_id,
+        organization_id=organization_id,
+        auth=auth,
+        conversation_id=session.get("conversation_id"),
+        clarification_history=history,
+        # The user just approved this action — skip the PHASE 5 gate so
+        # execution proceeds instead of re-raising a new confirmation.
+        confirmation_granted=True,
+    )
+
+
+# ---- Private helpers -------------------------------------------------------
+
+async def _update_status(session_id: uuid.UUID, phase: ExecutionStatus) -> None:
+    """Persist the execution phase and its derived session status."""
+    status, completed = _PHASE_STATUS_MAP.get(phase, ("EXECUTING", False))
+    await set_session_phase(
+        session_id, phase=phase.value, status=status, completed=completed
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fire-and-forget step logging (Work Stream A3).
+#
+# Step/control-plane writes (RECEIVED, CLASSIFICATION, ... plus the
+# per-tool-call audit rows) must NEVER sit in the user's critical path:
+# they are scheduled onto a background task queue with a bounded backlog
+# and exception swallowing. flush_step_logs() drains the queue right
+# before the request returns, so audit writes still LAND - they just stop
+# making the user wait.
+# ---------------------------------------------------------------------------
+_STEP_TASK_MAX_PENDING = 64
+_pending_step_tasks: "deque[asyncio.Task]" = deque()
+
+
+def _spawn_step_write(coro) -> None:
+    """Schedule a control-plane write on the background queue (bounded)."""
+    task = asyncio.create_task(coro)
+    _pending_step_tasks.append(task)
+    # Bounded backlog: under a pathological burst (>64 unwritten writes)
+    # the OLDEST write is awaited inline - audit rows are never dropped.
+    while len(_pending_step_tasks) > _STEP_TASK_MAX_PENDING:
+        oldest = _pending_step_tasks.popleft()
+        if not oldest.done():
+            try:
+                asyncio.get_running_loop().create_task(
+                    _await_and_swallow(oldest)
+                )
+            except Exception:  # noqa: BLE001 - never break the caller
+                pass
+
+
+async def _await_and_swallow(task: asyncio.Task) -> None:
+    try:
+        await task
+    except Exception as exc:  # noqa: BLE001 - audit write failure is logged
+        log.warning("agent.step_log_failed", error=str(exc))
+
+
+async def flush_step_logs() -> None:
+    """Drain the background step-write queue before the response returns.
+
+    Called in execute()'s finally block: every scheduled audit write has
+    landed (or been individually swallowed with a warning) by the time the
+    caller regains control.
+    """
+    while _pending_step_tasks:
+        task = _pending_step_tasks.popleft()
+        if task.done():
+            # Surface (and swallow) any background exception now.
+            exc = task.exception() if not task.cancelled() else None
+            if exc is not None:
+                log.warning("agent.step_log_failed", error=str(exc))
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            # The write task was cancelled (shutdown) - nothing to log.
+            continue
+        except Exception as exc:  # noqa: BLE001 - audit write failure is logged
+            log.warning("agent.step_log_failed", error=str(exc))
+
+
+async def _log_step(session_id: uuid.UUID, step_type: str, data: Dict[str, Any]) -> None:
+    """Fire-and-forget step write: scheduled on the background queue."""
+    _spawn_step_write(
+        create_execution_step(
+            session_id=session_id,
+            step_type=step_type,
+            step_data=data,
+        )
+    )
+
+
+def _mutation_date(
+    tc: ToolCall, tr: Optional[ToolResult]
+) -> Optional[str]:
+    """Best-effort recorded date of a mutation (Work Stream A result cards)."""
+    from app.tool_router import _TXN_DATE_PARAM
+
+    param = _TXN_DATE_PARAM.get(tc.tool_name)
+    args = tc.arguments or {}
+    for key in (param, "transaction_date"):
+        if key and args.get(key):
+            return str(args[key])
+    if tr is not None and isinstance(getattr(tr, "data", None), dict):
+        if tr.data.get("transaction_date"):
+            return str(tr.data["transaction_date"])
+    return None
+
+
+# Work Stream A: every key a mutation tool may use for its accounting date.
+_RECORDED_DATE_KEYS = (
+    "transaction_date", "invoice_date", "bill_date", "expense_date",
+    "quotation_date", "credit_note_date", "return_date", "receipt_date",
+    "payment_date", "transfer_date",
+)
+
+
+def _extract_recorded_date(
+    tool_results: List[ToolResult],
+) -> tuple[Optional[str], bool]:
+    """Recorded transaction date + defaulted flag from mutation results.
+
+    Returns ``(iso_date_or_document_date, date_defaulted)``; the date is
+    ``None`` when no executed tool reported one (read-only runs).
+    """
+    date_val: Optional[str] = None
+    defaulted = False
+    for tr in tool_results or []:
+        data = tr.data if isinstance(tr.data, dict) else {}
+        if not date_val:
+            for key in _RECORDED_DATE_KEYS:
+                if data.get(key):
+                    date_val = str(data[key])[:10]
+                    break
+        defaulted = defaulted or bool(data.get("date_defaulted"))
+        if date_val and defaulted:
+            break
+    return date_val, defaulted
+
+
+def _build_batch_breakdown(
+    batch_items: List[Dict[str, Any]],
+    tool_calls: List[ToolCall],
+    tool_results: List[ToolResult],
+) -> str:
+    """Per-document result summary for a BATCH plan (Work Stream B).
+
+    Mutations are collected in execution order and reported one per line.
+    The report is honest: fewer mutations executed than documents planned,
+    or any failure, is stated explicitly.  Work Stream A: each created
+    document also states its recorded transaction date.
+    """
+    from app.tools import get_handler as _registry_entry
+
+    mutations: List[tuple] = []
+    for idx, tc in enumerate(tool_calls):
+        entry = _registry_entry(tc.tool_name)
+        if entry and not entry.get("read_only", False):
+            tr = tool_results[idx] if idx < len(tool_results) else None
+            mutations.append((tc, tr))
+
+    planned = len(batch_items)
+    lines = [f"Batch execution - {planned} documents requested:"]
+    for i, (tc, tr) in enumerate(mutations, start=1):
+        if tr is not None and tr.success:
+            dated = _mutation_date(tc, tr)
+            suffix = f" Dated {dated}." if dated else ""
+            lines.append(f"  Document {i} ({tc.tool_name}): created.{suffix}")
+        else:
+            err = (tr.error if tr is not None else "not executed") or "unknown error"
+            lines.append(f"  Document {i} ({tc.tool_name}): FAILED - {err}")
+
+    succeeded = sum(1 for _, tr in mutations if tr is not None and tr.success)
+    failed = len(mutations) - succeeded
+    lines.append(
+        f"  Total: {succeeded} succeeded, {failed} failed"
+        + (f", {planned - len(mutations)} not executed" if len(mutations) < planned else "")
+        + ". Each document is independent - successful siblings were not rolled back."
+    )
+    return "\n".join(lines)

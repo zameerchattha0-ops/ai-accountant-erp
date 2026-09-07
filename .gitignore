@@ -1,0 +1,79 @@
+# =============================================================================
+# ERP AI Agent — Git ignore rules
+# =============================================================================
+
+# ---- Secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+
+# ---- Python virtual environments ----
+venv/
+env/
+.venv/
+
+# ---- Python artifacts ----
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ---- Node / Next.js ----
+node_modules/
+.next/
+out/
+coverage/
+next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# ---- Generated diagnostics & run logs (local debugging leftovers) ----
+runapp_log.txt
+runapp_test_out.txt
+backend.log
+frontend.log
+dir_grep*.txt
+stepmap.txt
+syn.txt
+sync.txt
+pb.txt
+pil_ok.txt
+r2_*.txt
+r3_*.txt
+r4_*.txt
+reg2_*.txt
+reg3_*.txt
+reasoning_*.txt
+# Session verification outputs (Work Stream K2)
+pytest_*.txt
+build*.txt
+tsc*.txt
+vitest*.txt
+eval_*.txt
+suite_check*.txt
+probe.txt
+scripts/test_invoice.png
+
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+
+# ---- Any local log files ----
+*.log
+
+# ---- Tests & test artifacts (excluded per project policy) ----
+tests/
+app/tests/
+frontend/tests/
+scripts/test_*.py
+scripts/smoke_test.py
+.env.local
+*.png.tmp
+

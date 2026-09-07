@@ -1,0 +1,590 @@
+"""
+ERP AI Agent — FastAPI Application
+=====================================
+HTTP endpoints for the AI agent.
+
+Endpoints:
+  POST /api/ai/execute         — Send a natural-language message
+  POST /api/ai/clarify         — Answer a clarification question
+  POST /api/ai/confirm         — Approve/reject a confirmation
+  GET  /api/ai/sessions        — List recent execution sessions
+  GET  /api/ai/sessions/{id}   — Get a single session with details
+  GET  /api/health             — Health check
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
+import structlog
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from app.agent import execute, resume_with_clarification, resume_with_confirmation
+from app.auth import AuthContext, authenticate_header
+from app.config import get_settings
+from app.database import fetch_many, fetch_one, insert_one
+from app.models.schemas import (
+    AgentResponse,
+    ClarificationAnswer,
+    ConfirmationDecision,
+    UserRequest,
+)
+
+log = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown hooks."""
+    settings = get_settings()
+    log.info("app.startup", env=settings.app_env, port=settings.app_port)
+
+    # Pre-warm the AI orchestrator (Qwen primary / Gemini fallback).
+    # Provider initialisation is lazy and MUST NEVER block or crash
+    # startup — a broken/missing provider only degrades availability.
+    try:
+        from app.ai_orchestrator import get_client
+        client = get_client()
+        try:
+            client._get_qwen()
+            log.info("app.qwen_client", status="ready",
+                     model=get_settings().qwen_model)
+        except Exception as exc:
+            log.warning("app.qwen_client_warm_failed", error=str(exc))
+        try:
+            client._get_gemini()
+            log.info("app.gemini_client", status="ready")
+        except Exception as exc:
+            log.warning("app.gemini_client_warm_failed", error=str(exc))
+    except Exception as exc:
+        log.warning("app.ai_orchestrator_warm_failed", error=str(exc))
+    yield
+    log.info("app.shutdown")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="ERP AI Agent",
+    description="AI-powered accounting & financial ERP agent",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS — added at module level before any requests are served
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency — supports JWT (production) and header fallback (dev)
+# ---------------------------------------------------------------------------
+async def get_current_user(
+    auth: AuthContext = Depends(authenticate_header),
+) -> AuthContext:
+    """FastAPI dependency: authenticate via JWT or legacy headers.
+
+    Returns an AuthContext with user_id, organization_id, role, and permissions.
+    The organisation_id is ALWAYS resolved from the user's membership,
+    never trusted from client-supplied headers alone.
+    """
+    return auth
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/health")
+async def health_check():
+    """Simple health check."""
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/api/ai/providers")
+async def ai_providers(force: bool = False):
+    """AI provider health/status — is Qwen (primary) or Gemini (fallback) available?
+
+    Never raises: each provider reports configured/available/detail
+    independently, so the ERP can degrade gracefully. Results are cached
+    briefly (see provider_health_ttl_seconds); pass ?force=true to refresh.
+    """
+    from app.ai_orchestrator import get_client
+
+    try:
+        status = await get_client().get_providers_status(force=force)
+        return {"status": "ok", **status}
+    except Exception as exc:  # noqa: BLE001 — status must never 500
+        return {"status": "error", "detail": str(exc)[:200], "providers": {}}
+
+
+@app.post("/api/ai/execute", response_model=AgentResponse)
+async def ai_execute(
+    request: UserRequest,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Process a natural-language message through the AI agent."""
+    log.info(
+        "api.execute",
+        user_id=str(auth.user_id),
+        org_id=str(auth.organization_id),
+        role=auth.role_code,
+        message_len=len(request.message),
+    )
+
+    response = await execute(
+        user_message=request.message,
+        user_id=auth.user_id,
+        organization_id=auth.organization_id,
+        auth=auth,
+        conversation_id=request.conversation_id,
+        attachments=request.attachments,
+    )
+    return response
+
+
+@app.post("/api/ai/clarify", response_model=AgentResponse)
+async def ai_clarify(
+    answer: ClarificationAnswer,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Resume a session with the user's answer to a clarification."""
+    response = await resume_with_clarification(
+        session_id=answer.session_id,
+        user_answer=answer.answer,
+        user_id=auth.user_id,
+        organization_id=auth.organization_id,
+        auth=auth,
+    )
+    return response
+
+
+@app.post("/api/ai/confirm", response_model=AgentResponse)
+async def ai_confirm(
+    decision: ConfirmationDecision,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Approve or reject a pending confirmation."""
+    response = await resume_with_confirmation(
+        session_id=decision.session_id,
+        approved=decision.approved,
+        user_id=auth.user_id,
+        organization_id=auth.organization_id,
+        auth=auth,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Work Stream C: BACKGROUND AI RUNS (DB claim/lease queue + worker process)
+# ---------------------------------------------------------------------------
+# POST /api/ai/jobs queues the run and returns IMMEDIATELY; a supervised
+# worker process (scripts/ai_worker.py) claims and executes it via the same
+# trusted execute() pipeline. Clients poll GET /api/ai/jobs/{id} or the
+# existing /api/ai/progress endpoint for the live state.
+# ---------------------------------------------------------------------------
+@app.post("/api/ai/jobs")
+async def enqueue_ai_job(
+    request: UserRequest,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Queue a natural-language AI run and return without waiting."""
+    job = await insert_one(
+        "ai_worker_jobs",
+        data={
+            "organization_id": str(auth.organization_id),
+            "user_id": str(auth.user_id),
+            "job_type": "ai_execute",
+            "payload": {
+                "message": request.message,
+                "conversation_id": request.conversation_id,
+                "attachments": [
+                    a.model_dump(mode="json")
+                    for a in (request.attachments or [])
+                ],
+            },
+        },
+    )
+    log.info("api.job_queued", job_id=job["id"], user_id=str(auth.user_id))
+    return {
+        "queued": True,
+        "job_id": job["id"],
+        "conversation_id": request.conversation_id,
+    }
+
+
+@app.get("/api/ai/jobs/{job_id}")
+async def get_ai_job(
+    job_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Status/result of a queued AI run (owner-scoped)."""
+    job = await fetch_one(
+        "ai_worker_jobs",
+        filters={
+            "id": str(job_id),
+            "organization_id": str(auth.organization_id),
+            "user_id": str(auth.user_id),
+        },
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    payload = job.get("payload") or {}
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "conversation_id": payload.get("conversation_id"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "created_at": job.get("created_at"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Work Stream D: STREAMING EXECUTION (SSE)
+# ---------------------------------------------------------------------------
+# Same trusted execute() pipeline as POST /api/ai/execute, but the response
+# streams progress: an `event: step` message for every reasoning step as it
+# is recorded, and one `event: final` message with the complete
+# AgentResponse once verification finished (the result card only renders on
+# `final`). The non-streaming POST contract is unchanged.
+# ---------------------------------------------------------------------------
+@app.post("/api/ai/execute-stream")
+async def ai_execute_stream(
+    request: UserRequest,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Run the agent and stream steps + the final response over SSE."""
+
+    async def event_stream():
+        run_task = asyncio.create_task(
+            execute(
+                user_message=request.message,
+                user_id=auth.user_id,
+                organization_id=auth.organization_id,
+                auth=auth,
+                conversation_id=request.conversation_id,
+                attachments=request.attachments,
+            )
+        )
+        seen_step_ids: set[str] = set()
+        session_row: Optional[Dict[str, Any]] = None
+        heartbeat = 0
+
+        while not run_task.done():
+            # Resolve the session once via the conversation_id.
+            if session_row is None:
+                session_row = await fetch_one(
+                    "ai_execution_sessions",
+                    filters={"conversation_id": request.conversation_id},
+                )
+            if session_row is not None:
+                steps = await fetch_many(
+                    "ai_execution_steps",
+                    filters={
+                        "execution_session_id": session_row["id"],
+                    },
+                    order="created_at.asc",
+                    limit=200,
+                )
+                for step in steps:
+                    sid = str(step.get("id"))
+                    if sid in seen_step_ids:
+                        continue
+                    seen_step_ids.add(sid)
+                    yield (
+                        "event: step\n"
+                        + "data: "
+                        + json.dumps(
+                            {
+                                "step_type": step.get("step_type"),
+                                "phase": step.get("step_type"),
+                                "status": step.get("status"),
+                                "created_at": str(step.get("created_at")),
+                            }
+                        )
+                        + "\n\n"
+                    )
+            # Keepalive comment every ~15 polls so proxies never time out.
+            heartbeat += 1
+            if heartbeat % 15 == 0:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(0.4)
+
+        response = await run_task
+        yield (
+            "event: final\n"
+            + "data: "
+            + response.model_dump_json()
+            + "\n\n"
+        )
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reasoning progress — SAFE projection of real agent state (no chain-of-thought)
+# ---------------------------------------------------------------------------
+@app.get("/api/ai/progress")
+async def ai_progress(
+    conversation_id: str,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Real-time, user-safe reasoning progress for an in-flight execution.
+
+    The frontend polls this while POST /api/ai/execute runs. It returns the
+    REAL recorded execution steps from ai.execution_steps (plus tool slugs
+    from ai.tool_calls) — never model prompts, raw reasoning, or hidden
+    chain-of-thought. Scoping is strict: session rows must match BOTH the
+    caller's organization and user.
+    """
+    # conversation_id is a UUID column — reject malformed ids gracefully.
+    try:
+        uuid.UUID(conversation_id)
+    except (ValueError, AttributeError):
+        return {
+            "found": False,
+            "current_phase": None,
+            "status": None,
+            "steps": [],
+            "tools": [],
+        }
+
+    sessions = await fetch_many(
+        "ai_execution_sessions",
+        filters={
+            "conversation_id": conversation_id,
+            "organization_id": str(auth.organization_id),
+            "user_id": str(auth.user_id),
+        },
+        order="created_at.desc",
+        limit=1,
+    )
+    if not sessions:
+        return {
+            "found": False,
+            "current_phase": None,
+            "status": None,
+            "steps": [],
+            "tools": [],
+        }
+
+    session = sessions[0]
+    session_id = session["id"]
+
+    steps: List[Dict[str, Any]] = []
+    raw_steps = await fetch_many(
+        "ai_execution_steps",
+        filters={"execution_session_id": session_id},
+        order="created_at.asc",
+        limit=50,
+    )
+    # Whitelisted summary keys — safe for user display.
+    allowed_keys = {
+        "intent",
+        "extracted_entities",
+        "attachments",
+        "context_chars",
+        "customers",
+        "suppliers",
+        "accounts",
+        "projects",
+        "documents",
+        "transaction_nature",
+        "confidence",
+        "source",
+        "question",
+        "reason",
+        "reason_failed",
+    }
+    for step in raw_steps:
+        summary: Dict[str, Any] = {}
+        raw_summary = step.get("input_summary")
+        if isinstance(raw_summary, str) and raw_summary:
+            try:
+                parsed = json.loads(raw_summary)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in allowed_keys:
+                    if key in parsed and parsed[key] is not None:
+                        summary[key] = parsed[key]
+        steps.append(
+            {
+                "step_type": step.get("step_type"),
+                "phase": step.get("description"),
+                "status": step.get("status"),
+                "created_at": step.get("created_at"),
+                "summary": summary,
+            }
+        )
+
+    # Tool calls — slugs + status only (never payloads, which may carry data).
+    tool_calls = await fetch_many(
+        "ai_tool_calls",
+        filters={"execution_session_id": session_id},
+        limit=50,
+    )
+    tool_slugs: List[Dict[str, Any]] = []
+    if tool_calls:
+        tool_rows = await fetch_many("ai_tools", filters={}, limit=200)
+        slug_by_id = {t.get("id"): t.get("slug") for t in tool_rows}
+        tool_slugs = [
+            {
+                "tool": slug_by_id.get(tc.get("tool_id")) or "unknown",
+                "status": tc.get("status"),
+            }
+            for tc in tool_calls
+        ]
+
+    return {
+        "found": True,
+        "current_phase": session.get("current_phase"),
+        "status": session.get("status"),
+        "steps": steps,
+        "tools": tool_slugs,
+    }
+
+
+@app.get("/api/ai/sessions")
+async def list_sessions(
+    limit: int = 20,
+    offset: int = 0,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """List recent execution sessions for the current user."""
+    sessions = await fetch_many(
+        "ai_execution_sessions",
+        filters={
+            "organization_id": str(auth.organization_id),
+            "user_id": str(auth.user_id),
+        },
+        order="created_at.desc",
+        limit=limit,
+        offset=offset,
+    )
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@app.get("/api/ai/sessions/latest-active")
+async def latest_active_session(
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Work Stream C: resume-by-conversation.
+
+    Returns the latest NON-TERMINAL execution session (status PENDING /
+    PLANNING / WAITING_FOR_USER / EXECUTING) for this user+org, so the
+    frontend can reattach the progress view after a browser refresh
+    instead of losing the live run. Terminal sessions (COMPLETED / FAILED /
+    CANCELLED) are never returned.
+    """
+    non_terminal = {"PENDING", "PLANNING", "WAITING_FOR_USER", "EXECUTING"}
+    sessions = await fetch_many(
+        "ai_execution_sessions",
+        filters={
+            "organization_id": str(auth.organization_id),
+            "user_id": str(auth.user_id),
+        },
+        order="created_at.desc",
+        limit=10,
+    )
+    for s in sessions or []:
+        if str(s.get("status") or "").upper() in non_terminal:
+            return {
+                "found": True,
+                "session": {
+                    "session_id": s.get("id"),
+                    "conversation_id": s.get("conversation_id"),
+                    "status": s.get("status"),
+                    "current_phase": s.get("current_phase"),
+                    "created_at": s.get("created_at"),
+                },
+            }
+    return {"found": False, "session": None}
+
+
+@app.get("/api/ai/sessions/{session_id}")
+async def get_session(
+    session_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Get a single execution session with details."""
+    session = await fetch_one(
+        "ai_execution_sessions",
+        filters={
+            "id": str(session_id),
+            "organization_id": str(auth.organization_id),
+        },
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Fetch related records
+    steps = await fetch_many(
+        "ai_execution_steps",
+        filters={"execution_session_id": str(session_id)},
+        order="created_at.asc",
+    )
+    tool_calls = await fetch_many(
+        "ai_tool_calls",
+        filters={"execution_session_id": str(session_id)},
+        order="created_at.asc",
+    )
+    clarifications = await fetch_many(
+        "ai_clarifications",
+        filters={"execution_session_id": str(session_id)},
+        order="created_at.asc",
+    )
+    confirmations = await fetch_many(
+        "ai_confirmations",
+        filters={"execution_session_id": str(session_id)},
+        order="created_at.asc",
+    )
+
+    return {
+        "session": session,
+        "steps": steps,
+        "tool_calls": tool_calls,
+        "clarifications": clarifications,
+        "confirmations": confirmations,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    settings = get_settings()
+    uvicorn.run(
+        "app.main:app",
+        host=settings.app_host,
+        port=settings.app_port,
+        reload=not settings.is_production,
+    )
