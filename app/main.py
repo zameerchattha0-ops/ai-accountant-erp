@@ -25,7 +25,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from app.agent import execute, resume_with_clarification, resume_with_confirmation
 from app.auth import AuthContext, authenticate_header
 from app.config import get_settings
 from app.database import fetch_many, fetch_one, insert_one
@@ -35,6 +34,12 @@ from app.models.schemas import (
     ConfirmationDecision,
     UserRequest,
 )
+
+# NOTE: `app.agent` (planner → reasoning → tools → AI providers) is
+# intentionally NOT imported at module level. On serverless platforms the
+# whole module graph is imported per cold start; importing the agent stack
+# here pushed initialisation past the function time limit ("Worker timed
+# out"). Each AI endpoint lazy-imports what it needs instead.
 
 log = structlog.get_logger(__name__)
 
@@ -153,6 +158,8 @@ async def ai_execute(
     auth: AuthContext = Depends(get_current_user),
 ):
     """Process a natural-language message through the AI agent."""
+    from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
+
     log.info(
         "api.execute",
         user_id=str(auth.user_id),
@@ -178,6 +185,10 @@ async def ai_clarify(
     auth: AuthContext = Depends(get_current_user),
 ):
     """Resume a session with the user's answer to a clarification."""
+    from app.agent import (  # lazy: heavy agent stack (serverless cold-start)
+        resume_with_clarification,
+    )
+
     response = await resume_with_clarification(
         session_id=answer.session_id,
         user_answer=answer.answer,
@@ -194,6 +205,10 @@ async def ai_confirm(
     auth: AuthContext = Depends(get_current_user),
 ):
     """Approve or reject a pending confirmation."""
+    from app.agent import (  # lazy: heavy agent stack (serverless cold-start)
+        resume_with_confirmation,
+    )
+
     response = await resume_with_confirmation(
         session_id=decision.session_id,
         approved=decision.approved,
@@ -286,6 +301,8 @@ async def ai_execute_stream(
     """Run the agent and stream steps + the final response over SSE."""
 
     async def event_stream():
+        from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
+
         run_task = asyncio.create_task(
             execute(
                 user_message=request.message,
