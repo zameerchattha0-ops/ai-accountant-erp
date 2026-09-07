@@ -21,6 +21,9 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
+  // Node.js runtime (stable since Next.js 15.5): Vercel "services" does not
+  // support Edge Function output, and this middleware does not need Edge.
+  runtime: "nodejs",
   matcher: [
     "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
