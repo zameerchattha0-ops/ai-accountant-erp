@@ -1,14 +1,33 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { Cinzel, Cormorant_Garamond } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   UserPlus, Settings2, TrendingUp, ArrowRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
+import HeroCanvas from "@/components/welcome/HeroCanvas";
+
+/* Premium editorial type: Cinzel = Roman inscriptional display capitals
+   (Trajan-style, extended edges) for the hero; Cormorant Garamond italic
+   for the accent word. Body text keeps the app's sans stack. */
+const cinzel = Cinzel({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-cinzel",
+  display: "swap",
+});
+const cormorant = Cormorant_Garamond({
+  subsets: ["latin"],
+  weight: ["400", "500", "600"],
+  style: ["normal", "italic"],
+  variable: "--font-cormorant",
+  display: "swap",
+});
 
 /* ---- Reusable animated section wrapper ---- */
 function Section({
@@ -135,12 +154,30 @@ function StepCard({
 /* ================================================================== */
 export default function WelcomePage() {
   const [scrolled, setScrolled] = useState(false);
+  const heroRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 40);
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
+
+  /* Cursor parallax: writes normalised pointer offsets into --px/--py on
+     the hero stage; the aurora glows drift AGAINST the cursor while the
+     copy lifts WITH it — a subtle, physical sense of depth. */
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const el = heroRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    el.style.setProperty("--px", ((e.clientX - r.left) / r.width - 0.5).toFixed(3));
+    el.style.setProperty("--py", ((e.clientY - r.top) / r.height - 0.5).toFixed(3));
+  };
+  const handlePointerLeave = () => {
+    const el = heroRef.current;
+    if (!el) return;
+    el.style.setProperty("--px", "0");
+    el.style.setProperty("--py", "0");
+  };
 
   const features = [
     {
@@ -182,39 +219,43 @@ export default function WelcomePage() {
   ];
 
   return (
-    <div className="min-h-screen bg-bg-primary">
+    <div className={cn(cinzel.variable, cormorant.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
-      {/* NAVBAR                                                        */}
+      {/* NAVBAR — high contrast against the dark stage                */}
       {/* ============================================================ */}
       <nav
         className={cn(
-          "fixed top-0 left-0 right-0 z-50 transition-all duration-300",
+          "fixed top-0 left-0 right-0 z-50 transition-all duration-500",
           scrolled
-            ? "glass border-b border-border-subtle/50 py-2.5"
-            : "bg-transparent py-4",
+            ? "bg-[#04070d]/85 backdrop-blur-xl border-b border-white/10 py-2.5"
+            : "bg-gradient-to-b from-[#04070d]/85 via-[#04070d]/40 to-transparent py-4",
         )}
       >
         <div className="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between">
-          <Link href="/welcome" className="flex items-center gap-2.5">
-            <Image
-              src="/ai-accountant.png"
-              alt="AI Accountant"
-              width={140}
-              height={38}
-              className="h-8 w-auto object-contain"
-              priority
-            />
+          <Link href="/" className="flex items-center">
+            {/* The logo artwork is dark navy — seat it on a light chip so it
+                always reads against the dark stage. */}
+            <span className="inline-flex items-center rounded-lg bg-white px-3 py-1.5 shadow-lg shadow-black/50">
+              <Image
+                src="/ai-accountant.png"
+                alt="AI Accountant"
+                width={132}
+                height={36}
+                className="h-6 w-auto object-contain"
+                priority
+              />
+            </span>
           </Link>
           <div className="flex items-center gap-3">
             <Link
               href="/login"
-              className="px-4 py-2 rounded-xl text-sm font-medium text-text-secondary hover:text-text-primary transition-colors"
+              className="px-4 py-2 rounded-xl text-sm font-medium text-white/85 hover:text-white border border-white/15 hover:border-white/35 hover:bg-white/5 backdrop-blur-sm transition-all"
             >
               Login
             </Link>
             <Link
               href="/signup"
-              className="px-5 py-2 rounded-xl bg-brand-teal hover:bg-brand-navy text-white text-sm font-semibold transition-colors shadow-md shadow-brand-teal/20"
+              className="px-5 py-2 rounded-xl bg-brand-teal hover:bg-teal-400 text-[#03150f] text-sm font-semibold transition-all shadow-lg shadow-brand-teal/25 hover:shadow-brand-teal/45 hover:-translate-y-px"
             >
               Get Started
             </Link>
@@ -223,70 +264,96 @@ export default function WelcomePage() {
       </nav>
 
       {/* ============================================================ */}
-      {/* HERO                                                          */}
+      {/* HERO — the elite universe                                    */}
       {/* ============================================================ */}
-      <section className="relative min-h-screen flex items-center overflow-hidden">
-        {/* Background image */}
-        <div className="absolute inset-0">
-          <Image
-            src="/hero-bg.png"
-            alt=""
-            fill
-            className="object-cover"
-            priority
-          />
-          {/* Dark gradient overlay for text readability */}
-          <div className="absolute inset-0 bg-gradient-to-r from-brand-navy/92 via-brand-navy/75 to-brand-navy/50" />
-        </div>
+      <section
+        ref={heroRef}
+        onPointerMove={handlePointerMove}
+        onPointerLeave={handlePointerLeave}
+        className="hero-stage relative min-h-screen flex items-center"
+      >
+        {/* Interactive constellation layer */}
+        <HeroCanvas />
 
-        <div className="relative z-10 max-w-6xl mx-auto px-4 sm:px-6 py-32">
-          <div className="max-w-2xl">
-            <Section animation="animate-fade-in-up" delay="100ms">
-              <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 backdrop-blur-sm border border-white/10 text-xs font-medium text-white/80 mb-6">
-                <span className="w-1.5 h-1.5 rounded-full bg-brand-teal animate-pulse" />
-                AI-native accounting for modern businesses
+        {/* Ambient scene layers */}
+        <div className="hero-aurora hero-aurora-a" />
+        <div className="hero-aurora hero-aurora-b" />
+        <div className="hero-grid" />
+        <div className="hero-grain" />
+        <div className="hero-vignette" />
+
+        <div className="hero-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
+          <div className="max-w-3xl">
+            <p
+              className="hero-eyebrow inline-flex items-center gap-3 text-[11px] font-medium uppercase text-teal-200/90 mb-7"
+              style={{ animationDelay: "80ms" }}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-teal-300 animate-pulse" />
+              AI-native accounting for modern businesses
+            </p>
+
+            <h1
+              className="text-white text-5xl sm:text-6xl lg:text-7xl leading-[1.08] font-semibold"
+              style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+            >
+              <span className="reveal-line">
+                <span style={{ "--d": "200ms" } as React.CSSProperties}>Your books,</span>
               </span>
-            </Section>
+              <span className="reveal-line">
+                <span style={{ "--d": "420ms" } as React.CSSProperties}>
+                  <span
+                    className="hero-gradient-word font-medium italic"
+                    style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
+                  >
+                    balanced
+                  </span>{" "}
+                  by AI.
+                </span>
+              </span>
+            </h1>
 
-            <Section animation="animate-fade-in-up" delay="250ms">
-              <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white leading-[1.1] mb-6">
-                Your books,{" "}
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-brand-teal to-emerald-300">
-                  balanced
-                </span>{" "}
-                by AI.
-              </h1>
-            </Section>
+            <p
+              className="mt-7 text-lg sm:text-xl text-white/85 leading-relaxed max-w-xl font-light"
+              style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 650ms both" }}
+            >
+              Record transactions in plain English. Get instant financial
+              reports. Let the AI handle debits, credits, and compliance
+              while you focus on growing your business.
+            </p>
 
-            <Section animation="animate-fade-in-up" delay="400ms">
-              <p className="text-lg sm:text-xl text-white/70 leading-relaxed mb-8 max-w-xl">
-                Record transactions in plain English. Get instant financial
-                reports. Let the AI handle debits, credits, and compliance
-                while you focus on growing your business.
-              </p>
-            </Section>
-
-            <Section animation="animate-fade-in-up" delay="550ms">
-              <div className="flex flex-wrap gap-3">
-                <Link
-                  href="/signup"
-                  className="px-7 py-3.5 rounded-xl bg-brand-teal hover:bg-teal-400 text-white font-semibold text-base transition-all shadow-lg shadow-brand-teal/30 hover:shadow-brand-teal/40 flex items-center gap-2"
-                >
-                  Start Free <ArrowRight className="w-4 h-4" />
-                </Link>
-                <Link
-                  href="/login"
-                  className="px-7 py-3.5 rounded-xl bg-white/10 hover:bg-white/15 text-white font-medium text-base backdrop-blur-sm border border-white/10 transition-all"
-                >
-                  Sign In
-                </Link>
-              </div>
-            </Section>
+            <div
+              className="flex flex-wrap gap-4 mt-10"
+              style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 820ms both" }}
+            >
+              <Link
+                href="/signup"
+                className="hero-btn-primary inline-flex items-center gap-2 px-8 py-4 rounded-xl bg-gradient-to-b from-teal-300 to-teal-500 text-[#03150f] font-semibold text-base transition-all shadow-xl shadow-teal-500/25 hover:shadow-teal-400/45 hover:-translate-y-0.5"
+              >
+                Start Free <ArrowRight className="w-4 h-4" />
+              </Link>
+              <Link
+                href="/login"
+                className="inline-flex items-center px-8 py-4 rounded-xl text-white font-medium text-base border border-white/20 bg-white/5 hover:bg-white/10 hover:border-white/40 backdrop-blur-sm transition-all"
+              >
+                Sign In
+              </Link>
+            </div>
           </div>
         </div>
 
-        {/* Bottom gradient fade */}
-        <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-bg-primary to-transparent" />
+        {/* Scroll cue */}
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-2 text-white/60">
+          <span
+            className="text-[10px] uppercase tracking-[0.3em]"
+            style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+          >
+            Scroll
+          </span>
+          <span className="hero-scrollcue block w-px h-9 bg-gradient-to-b from-teal-300/80 to-transparent" />
+        </div>
+
+        {/* Bottom gradient fade into the page */}
+        <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-bg-primary to-transparent z-[5]" />
       </section>
 
       {/* ============================================================ */}

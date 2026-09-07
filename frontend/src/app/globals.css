@@ -605,3 +605,197 @@ body {
     print-color-adjust: exact;
   }
 }
+
+/* ============================================================
+   LANDING HERO — "ELITE UNIVERSE"
+   Pure-CSS premium scene (aurora, perspective grid, grain,
+   vignette) + cinematic text choreography. No hero image.
+   ============================================================ */
+
+.hero-stage {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 78% -10%, #0d2036 0%, transparent 55%),
+    radial-gradient(90% 70% at 12% 110%, #07182b 0%, transparent 60%),
+    linear-gradient(180deg, #04070d 0%, #060b16 55%, #04070d 100%);
+}
+
+/* Slow-breathing aurora glows (parallax via --px/--py set on the stage) */
+.hero-aurora {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(90px);
+  pointer-events: none;
+  will-change: transform;
+  transform: translate3d(calc(var(--px, 0) * -34px), calc(var(--py, 0) * -24px), 0);
+  transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.hero-aurora-a {
+  width: 42rem;
+  height: 42rem;
+  top: -18rem;
+  right: -10rem;
+  background: radial-gradient(circle, rgba(20, 184, 166, 0.22), transparent 65%);
+  animation: heroBreathe 11s ease-in-out infinite;
+}
+.hero-aurora-b {
+  width: 36rem;
+  height: 36rem;
+  bottom: -16rem;
+  left: -12rem;
+  background: radial-gradient(circle, rgba(45, 100, 190, 0.18), transparent 65%);
+  animation: heroBreathe 13s ease-in-out 1.8s infinite reverse;
+}
+@keyframes heroBreathe {
+  0%, 100% { opacity: 0.75; scale: 1; }
+  50% { opacity: 1; scale: 1.08; }
+}
+
+/* Perspective "ledger" grid floor — precision, order, depth */
+.hero-grid {
+  position: absolute;
+  inset-inline: -40%;
+  bottom: -12%;
+  height: 62%;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(148, 233, 220, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 233, 220, 0.09) 1px, transparent 1px);
+  background-size: 72px 72px;
+  transform: perspective(600px) rotateX(62deg);
+  transform-origin: 50% 0;
+  mask-image: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.85) 45%, transparent 95%);
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.85) 45%, transparent 95%);
+  animation: heroGridDrift 26s linear infinite;
+}
+@keyframes heroGridDrift {
+  from { background-position: 0 0; }
+  to { background-position: 0 72px; }
+}
+
+/* Cinematic film grain */
+.hero-grain {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.32'/%3E%3C/svg%3E");
+}
+
+/* Vignette to pull focus to the copy */
+.hero-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 90% at 50% 42%, transparent 52%, rgba(2, 5, 10, 0.55) 100%),
+    linear-gradient(180deg, rgba(2, 5, 10, 0.55) 0%, transparent 22%);
+}
+
+/* Hero copy layer lifts subtly toward the cursor */
+.hero-copy {
+  will-change: transform;
+  transform: translate3d(calc(var(--px, 0) * 12px), calc(var(--py, 0) * 9px), 0);
+  transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* --- Text choreography: masked line reveals ------------------- */
+.reveal-line {
+  display: block;
+  overflow: hidden;
+  padding-bottom: 0.08em; /* keep descenders (y, g) inside the mask */
+}
+.reveal-line > span {
+  display: inline-block;
+  transform: translateY(118%);
+  filter: blur(10px);
+  opacity: 0;
+  animation: heroRise 1s cubic-bezier(0.19, 1, 0.22, 1) forwards;
+  animation-delay: var(--d, 0ms);
+  will-change: transform, filter, opacity;
+}
+@keyframes heroRise {
+  to {
+    transform: translateY(0);
+    filter: blur(0);
+    opacity: 1;
+  }
+}
+
+/* The gradient word gets a slow light sweep (polished, not glossy) */
+.hero-gradient-word {
+  background: linear-gradient(
+    105deg,
+    #99f6e4 0%,
+    #2dd4bf 30%,
+    #f0fdfa 50%,
+    #2dd4bf 70%,
+    #99f6e4 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: heroSheen 7s ease-in-out infinite;
+}
+@keyframes heroSheen {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+/* Eyebrow: wide-tracked small caps that settle into place */
+.hero-eyebrow {
+  animation: heroTrack 1.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes heroTrack {
+  from { letter-spacing: 0.55em; opacity: 0; transform: translateY(6px); }
+  to { letter-spacing: 0.32em; opacity: 1; transform: translateY(0); }
+}
+
+/* Buttons: quiet shine on hover */
+.hero-btn-primary {
+  position: relative;
+  overflow: hidden;
+}
+.hero-btn-primary::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 30%, rgba(255, 255, 255, 0.35) 50%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform 0.7s ease;
+}
+.hero-btn-primary:hover::after {
+  transform: translateX(120%);
+}
+
+/* Scroll cue */
+.hero-scrollcue {
+  animation: heroCue 2.6s ease-in-out infinite;
+}
+@keyframes heroCue {
+  0%, 100% { transform: translateY(0); opacity: 0.55; }
+  50% { transform: translateY(8px); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-aurora,
+  .hero-grid,
+  .hero-gradient-word,
+  .hero-eyebrow,
+  .hero-scrollcue {
+    animation: none !important;
+  }
+  .reveal-line > span {
+    animation: none !important;
+    transform: none;
+    filter: none;
+    opacity: 1;
+  }
+  .hero-copy,
+  .hero-aurora {
+    transform: none;
+  }
+}
