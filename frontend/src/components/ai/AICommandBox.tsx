@@ -26,12 +26,18 @@ const PLACEHOLDERS = [
   "Upload a receipt and I'll help record it.",
 ];
 
-// Work Stream C: background runs are the DEFAULT path. A request is
-// enqueued (POST /api/ai/jobs), progress is shown by AIProgress polling
-// the run's conversation_id, and the result card renders when the job
-// reaches a terminal state. Set this constant to false to restore the
-// synchronous SSE path as the primary route.
-const USE_BACKGROUND_RUNS = true;
+// Work Stream C: background runs are the DEFAULT path when a supervised
+// worker is draining ai.worker_jobs (local dev: `python scripts/ai_worker.py`).
+// A SERVERLESS host (Vercel) has no worker process, so background runs would
+// sit QUEUED forever and hit the 90s stall warning. Background mode is
+// therefore enabled only when the backend is local (NEXT_PUBLIC_API_URL
+// points at localhost) or when explicitly forced with
+// NEXT_PUBLIC_BACKGROUND_RUNS=1. On Vercel the run streams in the foreground.
+const USE_BACKGROUND_RUNS =
+  process.env.NEXT_PUBLIC_BACKGROUND_RUNS === "1" ||
+  /^(https?:)?\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(
+    process.env.NEXT_PUBLIC_API_URL ?? ""
+  );
 
 /** Fired whenever the agent FINISHES a mutation (or fails one) so every
  *  listening page reloads its data instantly - no manual browser refresh. */
