@@ -6,7 +6,8 @@ import Link from "next/link";
 import { Cinzel, Cormorant_Garamond } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
-  UserPlus, Settings2, TrendingUp, ArrowRight,
+  ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
+  FileBarChart, PencilLine, Linkedin, Mail, MessageCircle, ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
@@ -125,20 +126,20 @@ function FeatureCard({
   );
 }
 
-/* ---- Step card for How It Works — claymorphic disc ---- */
-function StepCard({
-  step,
+/* ---- Workflow step card — one stage of the core AI pipeline ---- */
+function WorkflowCard({
   icon: Icon,
+  step,
   title,
   description,
   tone,
   delay,
 }: {
-  step: number;
   icon: React.ElementType;
+  step: number;
   title: string;
   description: string;
-  tone: { disc: string; stepText: string; badge: string };
+  tone: { chip: string; icon: string; badge: string; from: string; to: string };
   delay: string;
 }) {
   const { ref, inView } = useInView();
@@ -146,29 +147,36 @@ function StepCard({
     <div
       ref={ref}
       className={cn(
-        "opacity-0 flex flex-col items-center text-center",
-        inView && "animate-slide-in-left",
+        "opacity-0 group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5",
+        inView && "animate-scale-in",
       )}
-      style={{ animationDelay: delay }}
+      style={{
+        animationDelay: delay,
+        background: `linear-gradient(135deg, ${tone.from}, ${tone.to})`,
+      }}
     >
-      <div
-        className={cn(
-          "relative w-16 h-16 rounded-3xl flex items-center justify-center mb-4 clay-chip transition-transform duration-300 hover:scale-110",
-          tone.disc,
-        )}
-      >
-        <Icon className={cn("w-7 h-7", tone.stepText)} />
-        <span
-          className={cn(
-            "absolute -top-2 -right-2 w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center shadow-md",
-            tone.badge,
-          )}
-        >
-          {step}
-        </span>
+      <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-5 h-full">
+        <div className="flex items-center justify-between mb-4">
+          <div
+            className={cn(
+              "w-11 h-11 rounded-xl flex items-center justify-center clay-chip transition-transform duration-300 group-hover:scale-110 group-hover:rotate-3",
+              tone.chip,
+            )}
+          >
+            <Icon className={cn("w-5 h-5", tone.icon)} />
+          </div>
+          <span
+            className={cn(
+              "w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center shadow-md",
+              tone.badge,
+            )}
+          >
+            {step}
+          </span>
+        </div>
+        <h3 className="text-sm font-semibold text-brand-navy mb-1.5">{title}</h3>
+        <p className="text-xs text-[#3d4b66] leading-relaxed">{description}</p>
       </div>
-      <h3 className="text-base font-semibold text-text-primary mb-2">{title}</h3>
-      <p className="text-sm text-text-secondary leading-relaxed max-w-64">{description}</p>
     </div>
   );
 }
@@ -278,6 +286,72 @@ export default function WelcomePage() {
     },
   ];
 
+  /* Core workflow — from the project summary */
+  const workflow = [
+    {
+      icon: MessageSquareText,
+      title: "Describe",
+      description: "Tell the AI what happened in natural language — no forms, no tabs.",
+      tone: { chip: "bg-gradient-to-br from-teal-100 to-teal-50", icon: "text-teal-600", badge: "bg-teal-500", from: "#2dd4bf", to: "#0ea5e9" },
+    },
+    {
+      icon: Brain,
+      title: "Understand",
+      description: "The AI identifies the transaction and reasons about its accounting nature.",
+      tone: { chip: "bg-gradient-to-br from-indigo-100 to-indigo-50", icon: "text-indigo-600", badge: "bg-indigo-500", from: "#818cf8", to: "#6366f1" },
+    },
+    {
+      icon: HelpCircle,
+      title: "Clarify",
+      description: "Targeted questions for anything missing: amount, purpose, cash or credit, party, asset or expense.",
+      tone: { chip: "bg-gradient-to-br from-amber-100 to-amber-50", icon: "text-amber-600", badge: "bg-amber-500", from: "#fbbf24", to: "#f59e0b" },
+    },
+    {
+      icon: ShieldCheck,
+      title: "Confirm",
+      description: "You approve the understanding and the proposed accounting treatment where required.",
+      tone: { chip: "bg-gradient-to-br from-rose-100 to-rose-50", icon: "text-rose-600", badge: "bg-rose-500", from: "#fb7185", to: "#e11d48" },
+    },
+    {
+      icon: Zap,
+      title: "Execute",
+      description: "The AI creates the journal entry and updates the ledger automatically — no manual tab-by-tab entry.",
+      tone: { chip: "bg-gradient-to-br from-sky-100 to-sky-50", icon: "text-sky-600", badge: "bg-sky-500", from: "#38bdf8", to: "#0284c7" },
+    },
+    {
+      icon: Workflow,
+      title: "Connect",
+      description: "Entries flow through Journal → Ledger → Trial Balance → Chart of Accounts → Financial Statements.",
+      tone: { chip: "bg-gradient-to-br from-violet-100 to-violet-50", icon: "text-violet-600", badge: "bg-violet-500", from: "#a78bfa", to: "#7c3aed" },
+    },
+    {
+      icon: FileBarChart,
+      title: "Report & Document",
+      description: "Invoices, quotations, aging, receivable/payable and financial reports — from the same system.",
+      tone: { chip: "bg-gradient-to-br from-emerald-100 to-emerald-50", icon: "text-emerald-600", badge: "bg-emerald-500", from: "#34d399", to: "#059669" },
+    },
+    {
+      icon: PencilLine,
+      title: "Manual Recording",
+      description: "Prefer traditional control? Record journal entries and transactions manually, anytime.",
+      tone: { chip: "bg-gradient-to-br from-pink-100 to-pink-50", icon: "text-pink-600", badge: "bg-pink-500", from: "#f472b6", to: "#db2777" },
+    },
+  ];
+
+  /* Overall flow strip */
+  const FLOW = [
+    "Business Activity",
+    "AI Input",
+    "Reasoning",
+    "Clarification",
+    "Confirmation",
+    "Recording",
+    "Ledger",
+    "Trial Balance",
+    "Financial Statements",
+  ];
+  const FLOW_DOTS = ["bg-teal-500", "bg-indigo-500", "bg-amber-500", "bg-rose-500", "bg-sky-500", "bg-violet-500", "bg-emerald-500", "bg-pink-500", "bg-teal-500"];
+
   return (
     <div className={cn(cinzel.variable, cormorant.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
@@ -336,9 +410,9 @@ export default function WelcomePage() {
         <div className="lp-blob lp-blob-b" />
         <div className="lp-blob lp-blob-c" />
 
-        {/* Floating glass geometry */}
-        <div className="lp-shape lp-shape-square" />
-        <div className="lp-shape lp-shape-square-2" />
+        {/* Floating glass geometry — traced by perpetual multi-colour light */}
+        <div className="lp-shape lp-shape-square lp-trace" />
+        <div className="lp-shape lp-shape-square-2 lp-trace" />
         <div className="lp-shape lp-shape-ring" />
 
         {/* Whisper of grain */}
@@ -450,50 +524,53 @@ export default function WelcomePage() {
       </section>
 
       {/* ============================================================ */}
-      {/* HOW IT WORKS                                                   */}
+      {/* CORE WORKFLOW                                                  */}
       {/* ============================================================ */}
       <section className="relative py-24 sm:py-32">
-        {/* Surreal colour wash behind the steps */}
+        {/* Surreal colour wash behind the pipeline */}
         <div className="absolute inset-0 bg-gradient-to-b from-transparent via-brand-aqua-soft/70 to-transparent pointer-events-none" />
         <div className="relative max-w-6xl mx-auto px-4 sm:px-6">
           <Section className="text-center mb-16">
             <span className="text-xs font-bold text-indigo-600 uppercase tracking-widest mb-3 block">
-              How It Works
+              The Core Workflow
             </span>
             <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-              Up and running in <span className="text-aurora">minutes</span>
+              From <span className="text-aurora">words</span> to financial statements
             </h2>
-            <p className="text-[#3d4b66] text-lg max-w-xl mx-auto">
-              Three simple steps to transform how you manage your finances.
+            <p className="text-[#3d4b66] text-lg max-w-2xl mx-auto">
+              One connected pipeline — describe what happened, and the AI
+              reasons, clarifies, confirms, and records it all the way to
+              your financial statements.
             </p>
           </Section>
 
-          <div className="grid md:grid-cols-3 gap-12 md:gap-8">
-            <StepCard
-              step={1}
-              icon={UserPlus}
-              title="Create Your Account"
-              description="Sign up with your email. Verify your identity and you are ready to go."
-              tone={{ disc: "bg-teal-50", stepText: "text-teal-600", badge: "bg-teal-500" }}
-              delay="0ms"
-            />
-            <StepCard
-              step={2}
-              icon={Settings2}
-              title="Set Up Your Organization"
-              description="Enter your business details. Your chart of accounts, financial year, and document numbering are created automatically."
-              tone={{ disc: "bg-indigo-50", stepText: "text-indigo-600", badge: "bg-indigo-500" }}
-              delay="150ms"
-            />
-            <StepCard
-              step={3}
-              icon={TrendingUp}
-              title="Start Accounting"
-              description="Tell the AI about your transactions. Invoices, purchases, expenses, and reports are handled end to end."
-              tone={{ disc: "bg-amber-50", stepText: "text-amber-600", badge: "bg-amber-500" }}
-              delay="300ms"
-            />
+          <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-5">
+            {workflow.map((s, i) => (
+              <WorkflowCard
+                key={s.title}
+                {...s}
+                step={i + 1}
+                delay={`${i * 70}ms`}
+              />
+            ))}
           </div>
+
+          {/* Overall flow strip */}
+          <Section className="mt-14">
+            <div className="glass-panel rounded-3xl px-6 py-5 flex flex-wrap items-center justify-center gap-x-1.5 gap-y-3">
+              {FLOW.map((label, i) => (
+                <span key={label} className="inline-flex items-center gap-1.5">
+                  <span className="inline-flex items-center gap-2 rounded-full bg-white/80 border border-white px-3 py-1.5 text-xs font-semibold text-brand-navy shadow-sm">
+                    <span className={cn("w-1.5 h-1.5 rounded-full", FLOW_DOTS[i])} />
+                    {label}
+                  </span>
+                  {i < FLOW.length - 1 && (
+                    <ChevronRight className="w-3.5 h-3.5 text-brand-navy/30 shrink-0" />
+                  )}
+                </span>
+              ))}
+            </div>
+          </Section>
         </div>
       </section>
 
@@ -575,6 +652,83 @@ export default function WelcomePage() {
       </section>
 
       {/* ============================================================ */}
+      {/* CONTACT                                                        */}
+      {/* ============================================================ */}
+      <section className="py-24 sm:py-32">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6">
+          <Section className="text-center mb-12">
+            <span className="text-xs font-bold text-rose-600 uppercase tracking-widest mb-3 block">
+              Contact
+            </span>
+            <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
+              Built by <span className="text-aurora">Zameer Haider</span>
+            </h2>
+            <p className="text-[#3d4b66] text-lg max-w-xl mx-auto">
+              Questions, feedback, or a live demo for your business — reach
+              out on whichever channel suits you.
+            </p>
+          </Section>
+
+          <div className="grid sm:grid-cols-3 gap-6">
+            {/* LinkedIn */}
+            <a
+              href="https://pk.linkedin.com/in/zameerhaiderchattha"
+              target="_blank"
+              rel="noreferrer"
+              className="group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5"
+              style={{ background: "linear-gradient(135deg, #38bdf8, #0284c7)" }}
+            >
+              <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-6 h-full flex items-center gap-4">
+                <span className="w-12 h-12 rounded-2xl bg-gradient-to-br from-sky-100 to-sky-50 clay-chip flex items-center justify-center shrink-0 transition-transform duration-300 group-hover:scale-110">
+                  <Linkedin className="w-5 h-5 text-sky-600" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold text-brand-navy">LinkedIn</span>
+                  <span className="block text-xs text-[#3d4b66] truncate">zameerhaiderchattha</span>
+                </span>
+              </div>
+            </a>
+
+            {/* Email */}
+            <a
+              href="mailto:ZAMEERCHATTHA0@GMAIL.COM"
+              className="group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5"
+              style={{ background: "linear-gradient(135deg, #fbbf24, #f59e0b)" }}
+            >
+              <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-6 h-full flex items-center gap-4">
+                <span className="w-12 h-12 rounded-2xl bg-gradient-to-br from-amber-100 to-amber-50 clay-chip flex items-center justify-center shrink-0 transition-transform duration-300 group-hover:scale-110">
+                  <Mail className="w-5 h-5 text-amber-600" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold text-brand-navy">Email</span>
+                  <span className="block text-xs text-[#3d4b66] truncate">ZAMEERCHATTHA0@GMAIL.COM</span>
+                </span>
+              </div>
+            </a>
+
+            {/* WhatsApp */}
+            <a
+              href="https://wa.me/923230714288"
+              target="_blank"
+              rel="noreferrer"
+              className="group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5"
+              style={{ background: "linear-gradient(135deg, #34d399, #059669)" }}
+            >
+              <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-6 h-full flex items-center gap-4">
+                <span className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-100 to-emerald-50 clay-chip flex items-center justify-center shrink-0 transition-transform duration-300 group-hover:scale-110">
+                  <MessageCircle className="w-5 h-5 text-emerald-600" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold text-brand-navy">WhatsApp</span>
+                  <span className="block text-xs text-[#3d4b66]">+92 323 0714288</span>
+                </span>
+              </div>
+            </a>
+          </div>
+        </div>
+      </section>
+
+      {/* ============================================================ */}
       {/* FOOTER                                                         */}
       {/* ============================================================ */}
       <footer className="border-t border-border-subtle py-8">
@@ -592,6 +746,32 @@ export default function WelcomePage() {
             &copy; {new Date().getFullYear()} AI Accountant. Developed by Zameer Haider.
           </p>
           <div className="flex items-center gap-4 text-xs text-text-muted">
+            <a
+              href="https://pk.linkedin.com/in/zameerhaiderchattha"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="LinkedIn"
+              className="hover:text-sky-600 transition-colors"
+            >
+              <Linkedin className="w-4 h-4" />
+            </a>
+            <a
+              href="mailto:ZAMEERCHATTHA0@GMAIL.COM"
+              aria-label="Email"
+              className="hover:text-amber-600 transition-colors"
+            >
+              <Mail className="w-4 h-4" />
+            </a>
+            <a
+              href="https://wa.me/923230714288"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="WhatsApp"
+              className="hover:text-emerald-600 transition-colors"
+            >
+              <MessageCircle className="w-4 h-4" />
+            </a>
+            <span className="w-px h-4 bg-border-default" />
             <Link href="/login" className="hover:text-text-primary transition-colors">
               Login
             </Link>

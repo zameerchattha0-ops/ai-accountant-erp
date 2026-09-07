@@ -971,6 +971,49 @@ body {
   animation: heroCue 2.6s ease-in-out infinite;
 }
 
+/* Perpetual multi-colour edge tracing for the moving hero shapes.
+   A conic gradient is masked to a 2px ring and its rotation angle is
+   animated via @property, so a light "runs" around the perimeter forever. */
+@property --trace-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+.lp-trace {
+  position: relative;
+}
+.lp-trace::before {
+  content: "";
+  position: absolute;
+  inset: -2.5px;
+  border-radius: inherit;
+  padding: 2.5px;
+  background: conic-gradient(
+    from var(--trace-angle),
+    #2dd4bf 0%,
+    #6366f1 22%,
+    #f59e0b 45%,
+    #ec4899 68%,
+    #2dd4bf 90%,
+    #6366f1 100%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  animation: lpTrace 4.5s linear infinite;
+}
+@keyframes lpTrace {
+  to { --trace-angle: 360deg; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-trace::before {
+    animation: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .lp-blob,
   .lp-shape,
