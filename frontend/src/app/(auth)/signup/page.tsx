@@ -7,8 +7,8 @@ import { createClient } from "@/lib/supabase/client";
 import { Eye, EyeOff, Loader2, CheckCircle } from "lucide-react";
 import dynamic from "next/dynamic";
 
-/* "Ledger" — free-roaming 3D companion, client-only */
-const RobotCompanion = dynamic(() => import("@/components/welcome/HeroRobot"), {
+/* "Ledger" — 3D mascot, client-only (WebGL never runs on the server) */
+const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
   ssr: false,
   loading: () => null,
 });
@@ -74,7 +74,14 @@ export default function SignupPage() {
   }
 
   return (
-    <div className="bg-bg-surface/80 backdrop-blur-sm rounded-2xl shadow-lg border border-border-subtle p-8 space-y-6">
+    <div className="relative">
+      {/* Ledger peeks over the card's shoulder — adds no height to the card.
+          The bubble pops up at random intervals, never sticking around. */}
+      <div className="absolute -top-16 right-0 sm:-right-12 sm:-top-24 z-20 w-36 h-32 sm:w-52 sm:h-48 pointer-events-none select-none">
+        <HeroRobotStage variant="compact" />
+      </div>
+
+      <div className="bg-bg-surface/80 backdrop-blur-sm rounded-2xl shadow-lg border border-border-subtle p-8 space-y-6">
       <div className="text-center">
         <div className="flex justify-center mb-5 logo-enter">
           <Image
@@ -160,8 +167,7 @@ export default function SignupPage() {
         </Link>
       </p>
 
-      {/* "Ledger" roams beside the card — never inside it */}
-      <RobotCompanion mode="auth" />
+      </div>
     </div>
   );
 }

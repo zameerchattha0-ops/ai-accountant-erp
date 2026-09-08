@@ -1190,3 +1190,21 @@ body {
     animation: none;
   }
 }
+
+/* ================================================================
+   Hero reference layout — floating glass chips around Ledger's stage
+   ================================================================ */
+@keyframes floaty {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-float {
+    animation: none !important;
+  }
+}

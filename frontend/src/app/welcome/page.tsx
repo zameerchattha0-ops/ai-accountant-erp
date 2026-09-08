@@ -8,6 +8,8 @@ import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
   FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
+  BadgeCheck, FileText, Send, ShoppingCart, Sparkles,
+  TrendingUp, TrendingDown,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
@@ -15,9 +17,9 @@ import { useInView } from "@/lib/hooks/useInView";
 import HeroCanvas from "@/components/welcome/HeroCanvas";
 import dynamic from "next/dynamic";
 
-/* "Ledger" — free-roaming 3D companion. Client-only: WebGL never runs on
+/* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
    the server; renders nothing until the scene is interactive. */
-const RobotCompanion = dynamic(() => import("@/components/welcome/HeroRobot"), {
+const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
   ssr: false,
   loading: () => null,
 });
@@ -200,6 +202,48 @@ function WorkflowCard({
     </div>
   );
 }
+
+/* ---- Floating glass chip that orbits Ledger's hero stage ---- */
+function FloatChip({
+  icon: Icon,
+  chip,
+  icon2,
+  title,
+  sub,
+  delay,
+}: {
+  icon: LucideIcon;
+  chip: string;
+  icon2: string;
+  title: string;
+  sub: string;
+  delay: string;
+}) {
+  return (
+    <div
+      className="hero-float glass-panel rounded-2xl px-4 py-3 flex items-center gap-3 shadow-lg"
+      style={{ animation: `floaty 6s ease-in-out ${delay} infinite` }}
+    >
+      <span className={cn("w-9 h-9 rounded-xl clay-chip flex items-center justify-center shrink-0", chip)}>
+        <Icon className={cn("w-4 h-4", icon2)} />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-[13px] font-semibold text-brand-navy">{title}</span>
+        <span className="block text-[11px] text-[#3d4b66]">{sub}</span>
+      </span>
+    </div>
+  );
+}
+
+/* ---- Mini feature strip along the hero's bottom edge ---- */
+const HERO_STRIP: { icon: LucideIcon; label: string; chip: string; icon2: string }[] = [
+  { icon: Sparkles, label: "AI-Powered Accounting", chip: "bg-gradient-to-br from-violet-100 to-violet-50", icon2: "text-violet-600" },
+  { icon: FileText, label: "Invoicing & Receivables", chip: "bg-gradient-to-br from-sky-100 to-sky-50", icon2: "text-sky-600" },
+  { icon: ShoppingCart, label: "Purchases & Payables", chip: "bg-gradient-to-br from-amber-100 to-amber-50", icon2: "text-amber-600" },
+  { icon: BarChart3, label: "Ledger to Financial Statements", chip: "bg-gradient-to-br from-indigo-100 to-indigo-50", icon2: "text-indigo-600" },
+  { icon: PencilLine, label: "Manual Entry Supported", chip: "bg-gradient-to-br from-rose-100 to-rose-50", icon2: "text-rose-600" },
+  { icon: ShieldCheck, label: "Secure & Compliant", chip: "bg-gradient-to-br from-emerald-100 to-emerald-50", icon2: "text-emerald-600" },
+];
 
 /* ================================================================== */
 /* LANDING PAGE                                                         */
@@ -438,9 +482,10 @@ export default function WelcomePage() {
         {/* Whisper of grain */}
         <div className="lp-grain" />
 
-        <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
-          <div>
-            <div className="max-w-3xl min-w-0">
+        <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-28 pb-24 lg:pt-32 lg:pb-28">
+          <div className="grid lg:grid-cols-[1.05fr_1fr] gap-6 lg:gap-4 items-center">
+            {/* LEFT — copy. Ledger lives in the stage beside this, never over it. */}
+            <div className="max-w-xl min-w-0">
             <p
               className="hero-eyebrow lp-eyebrow inline-flex items-center gap-2.5 sm:gap-3 text-[10px] sm:text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
               style={{ animationDelay: "80ms" }}
@@ -498,7 +543,146 @@ export default function WelcomePage() {
               >
                 Sign In
               </Link>
+              </div>
+
+              {/* trust badges */}
+              <div
+                className="flex flex-wrap gap-x-6 gap-y-2.5 mt-8"
+                style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 950ms both" }}
+              >
+                {["No credit card required", "Set up in minutes", "Built for startups & SMEs"].map((tb) => (
+                  <span key={tb} className="inline-flex items-center gap-2 text-[13px] font-medium text-[#3d4b66]">
+                    <BadgeCheck className="w-[18px] h-[18px] text-emerald-500 shrink-0" />
+                    {tb}
+                  </span>
+                ))}
+              </div>
             </div>
+
+            {/* RIGHT — Ledger's stage. He roams THIS area only; the floating
+                cards are pointer-transparent glass orbiting him. */}
+            <div
+              className="relative h-[340px] sm:h-[420px] lg:h-[540px] -mx-3 sm:mx-0"
+              style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
+            >
+              <div className="absolute inset-0">
+                <HeroRobotStage variant="hero" />
+              </div>
+
+              {/* document chips — left edge */}
+              <div className="absolute left-0 top-[10%] hidden md:flex flex-col gap-6 pointer-events-none">
+                <FloatChip
+                  icon={FileText}
+                  chip="bg-gradient-to-br from-emerald-100 to-emerald-50"
+                  icon2="text-emerald-600"
+                  title="Sales Invoice"
+                  sub="Created Successfully ✓ INV-2025-001"
+                  delay="0s"
+                />
+                <FloatChip
+                  icon={BookOpen}
+                  chip="bg-gradient-to-br from-indigo-100 to-indigo-50"
+                  icon2="text-indigo-600"
+                  title="Journal Entry"
+                  sub="Recorded ✓ 2 Lines Posted"
+                  delay="1.1s"
+                />
+                <FloatChip
+                  icon={BarChart3}
+                  chip="bg-gradient-to-br from-sky-100 to-sky-50"
+                  icon2="text-sky-600"
+                  title="Trial Balance"
+                  sub="Updated ✓ As of today"
+                  delay="2.2s"
+                />
+              </div>
+              {/* Business Overview card — right edge */}
+              <div
+                className="absolute right-0 top-[16%] hidden md:block pointer-events-none"
+                style={{ animation: "floaty 7s ease-in-out 0.8s infinite" }}
+              >
+                <div className="hero-float glass-panel rounded-2xl p-4 w-60 lg:w-64 shadow-xl">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs font-bold text-brand-navy">Business Overview</span>
+                    <span className="text-[10px] font-medium text-[#3d4b66] bg-white/80 border border-white rounded-full px-2 py-0.5">
+                      This Month
+                    </span>
+                  </div>
+                  <div className="flex items-end gap-[3px] h-16 mb-3">
+                    {[38, 55, 42, 70, 48, 62, 80, 58, 90, 66, 74, 95, 60, 85, 52, 78, 68, 88].map((h, i) => (
+                      <span
+                        key={i}
+                        className="flex-1 rounded-full"
+                        style={{ height: `${h}%`, background: "linear-gradient(180deg, #818cf8, #2dd4bf)" }}
+                      />
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 1.25M</div>
+                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
+                        Revenue <TrendingUp className="w-3 h-3 text-emerald-500" />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 420K</div>
+                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
+                        Expenses <TrendingDown className="w-3 h-3 text-rose-500" />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 830K</div>
+                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
+                        Net Profit <TrendingUp className="w-3 h-3 text-emerald-500" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Ask-anything card — bottom right */}
+              <div
+                className="absolute right-2 bottom-[7%] hidden md:flex pointer-events-none"
+                style={{ animation: "floaty 6.5s ease-in-out 1.4s infinite" }}
+              >
+                <div className="hero-float glass-panel rounded-2xl pl-4 pr-2 py-2 flex items-center gap-3 shadow-xl w-72">
+                  <Sparkles className="w-4 h-4 text-indigo-500 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-brand-navy">Ask anything…</div>
+                    <div className="text-[11px] text-[#3d4b66] truncate">&quot;Create an invoice for ABC Tech&quot;</div>
+                  </div>
+                  <span className="w-8 h-8 rounded-xl bg-gradient-to-br from-teal-500 to-indigo-500 flex items-center justify-center shrink-0 shadow-md">
+                    <Send className="w-3.5 h-3.5 text-white" />
+                  </span>
+                </div>
+              </div>
+
+              {/* handwritten whisper — bottom left */}
+              <div className="absolute left-1 bottom-[4%] hidden lg:block pointer-events-none">
+                <span
+                  className="text-2xl text-indigo-500/80 italic"
+                  style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
+                >
+                  More time for what matters
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* mini feature strip */}
+          <div
+            className="mt-12 lg:mt-16 border-t border-white/70 pt-6"
+            style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 1100ms both" }}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
+              {HERO_STRIP.map(({ icon: Icon, label, chip, icon2 }) => (
+                <span key={label} className="inline-flex items-center gap-2.5">
+                  <span className={cn("w-9 h-9 rounded-xl clay-chip flex items-center justify-center shrink-0", chip)}>
+                    <Icon className={cn("w-4 h-4", icon2)} />
+                  </span>
+                  <span className="text-[13px] font-semibold text-brand-navy max-w-[9rem] leading-tight">{label}</span>
+                </span>
+              ))}
             </div>
           </div>
         </div>
@@ -514,9 +698,6 @@ export default function WelcomePage() {
           <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-indigo-500/70 to-transparent" />
         </div>
       </section>
-
-      {/* "Ledger" — the free-roaming 3D companion (fixed viewport overlay) */}
-      <RobotCompanion mode="free" />
 
       {/* ============================================================ */}
       {/* FEATURES                                                      */}
