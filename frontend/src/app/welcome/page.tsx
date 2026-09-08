@@ -15,15 +15,11 @@ import { useInView } from "@/lib/hooks/useInView";
 import HeroCanvas from "@/components/welcome/HeroCanvas";
 import dynamic from "next/dynamic";
 
-/* 3D mascot ("Ledger") — client-only: WebGL never renders on the server.
-   A quiet shimmer pane takes its place until the scene is interactive. */
-const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+/* "Ledger" — free-roaming 3D companion. Client-only: WebGL never runs on
+   the server; renders nothing until the scene is interactive. */
+const RobotCompanion = dynamic(() => import("@/components/welcome/HeroRobot"), {
   ssr: false,
-  loading: () => (
-    <div className="relative w-full h-[250px] sm:h-[300px] lg:h-[430px]">
-      <div className="absolute inset-0 rounded-[2rem] border border-white/70 bg-white/40 backdrop-blur-md animate-pulse" />
-    </div>
-  ),
+  loading: () => null,
 });
 
 
@@ -443,7 +439,7 @@ export default function WelcomePage() {
         <div className="lp-grain" />
 
         <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
-          <div className="grid lg:grid-cols-[minmax(0,1fr)_400px] lg:gap-10 items-center">
+          <div>
             <div className="max-w-3xl min-w-0">
             <p
               className="hero-eyebrow lp-eyebrow inline-flex items-center gap-2.5 sm:gap-3 text-[10px] sm:text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
@@ -504,11 +500,6 @@ export default function WelcomePage() {
               </Link>
             </div>
             </div>
-
-            {/* 3D mascot — Ledger waves, patrols, and greets visitors */}
-            <div className="mt-12 lg:mt-0 hero-eyebrow" style={{ animationDelay: "1000ms" }}>
-              <HeroRobotStage variant="hero" />
-            </div>
           </div>
         </div>
 
@@ -523,6 +514,9 @@ export default function WelcomePage() {
           <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-indigo-500/70 to-transparent" />
         </div>
       </section>
+
+      {/* "Ledger" — the free-roaming 3D companion (fixed viewport overlay) */}
+      <RobotCompanion mode="free" />
 
       {/* ============================================================ */}
       {/* FEATURES                                                      */}

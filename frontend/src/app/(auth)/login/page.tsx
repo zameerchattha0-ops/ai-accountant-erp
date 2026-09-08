@@ -8,10 +8,10 @@ import { createClient } from "@/lib/supabase/client";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
 import dynamic from "next/dynamic";
 
-/* 3D mascot — client-only so WebGL never touches the server */
-const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+/* "Ledger" — free-roaming 3D companion, client-only */
+const RobotCompanion = dynamic(() => import("@/components/welcome/HeroRobot"), {
   ssr: false,
-  loading: () => <div className="h-[185px] rounded-[2rem] bg-white/40 animate-pulse" />,
+  loading: () => null,
 });
 
 export default function LoginPage() {
@@ -55,9 +55,6 @@ export default function LoginPage() {
         </div>
         <h1 className="text-2xl font-semibold text-brand-navy">Welcome back</h1>
         <p className="text-sm text-text-secondary mt-1">Sign in to your AI Accountant</p>
-        <div className="mt-4 -mx-4">
-          <HeroRobotStage variant="compact" />
-        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -116,6 +113,9 @@ export default function LoginPage() {
           Create one
         </Link>
       </p>
+
+      {/* "Ledger" roams beside the card — never inside it */}
+      <RobotCompanion mode="auth" />
     </div>
   );
 }
