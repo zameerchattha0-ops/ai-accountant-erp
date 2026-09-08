@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { AlertCircle, ArrowRight, Clock, TrendingUp, Wallet, BarChart3, UserCheck, CreditCard, Landmark, FileText, FilePlus, UserPlus, ShoppingCart, Scale } from "lucide-react";
+import { AlertCircle, ArrowRight, Clock, TrendingUp, Wallet, BarChart3, UserCheck, CreditCard, Landmark, FileText, FilePlus, UserPlus, ShoppingCart, Scale, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { formatCompact } from "@/lib/utils/currency";
 import { createClient } from "@/lib/supabase/client";
@@ -68,7 +68,7 @@ const isOverdue = (due: string | null) => {
 /* ---- KPI Card ---- */
 function KPICard({ label, value, hint, currency, icon: Icon, iconColor, iconBg }: KPIData & {
   currency?: string;
-  icon: React.ElementType;
+  icon: LucideIcon;
   iconColor: string;
   iconBg: string;
 }) {
@@ -97,7 +97,7 @@ function KPICard({ label, value, hint, currency, icon: Icon, iconColor, iconBg }
 function QuickAction({ label, href, icon: Icon, iconColor }: {
   label: string;
   href: string;
-  icon: React.ElementType;
+  icon: LucideIcon;
   iconColor: string;
 }) {
   return (

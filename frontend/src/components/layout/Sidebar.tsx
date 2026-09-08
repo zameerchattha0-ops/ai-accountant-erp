@@ -9,13 +9,14 @@ import {
   FolderKanban, Receipt, CreditCard, Landmark, BookOpen,
   BarChart3, Settings, ChevronDown, ChevronRight, Menu, X,
   Sparkles, PanelLeftClose, PanelLeft, Wallet,
+  type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 
 interface NavItem {
   label: string;
   href?: string;
-  icon: React.ElementType;
+  icon: LucideIcon;
   /** Per-module identity colours (multi-colour navigation). */
   tone?: { icon: string; chip: string };
   children?: { label: string; href: string }[];

@@ -6,6 +6,13 @@ import Link from "next/link";
 import Image from "next/image";
 import { createClient } from "@/lib/supabase/client";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
+import dynamic from "next/dynamic";
+
+/* 3D mascot — client-only so WebGL never touches the server */
+const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+  ssr: false,
+  loading: () => <div className="h-[185px] rounded-[2rem] bg-white/40 animate-pulse" />,
+});
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -48,6 +55,9 @@ export default function LoginPage() {
         </div>
         <h1 className="text-2xl font-semibold text-brand-navy">Welcome back</h1>
         <p className="text-sm text-text-secondary mt-1">Sign in to your AI Accountant</p>
+        <div className="mt-4 -mx-4">
+          <HeroRobotStage variant="compact" />
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">

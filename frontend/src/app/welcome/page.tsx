@@ -8,10 +8,24 @@ import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
   FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
+  type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
 import HeroCanvas from "@/components/welcome/HeroCanvas";
+import dynamic from "next/dynamic";
+
+/* 3D mascot ("Ledger") — client-only: WebGL never renders on the server.
+   A quiet shimmer pane takes its place until the scene is interactive. */
+const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+  ssr: false,
+  loading: () => (
+    <div className="relative w-full h-[250px] sm:h-[300px] lg:h-[430px]">
+      <div className="absolute inset-0 rounded-[2rem] border border-white/70 bg-white/40 backdrop-blur-md animate-pulse" />
+    </div>
+  ),
+});
+
 
 /* Premium editorial type: Cinzel = Roman inscriptional display capitals
    (Trajan-style, extended edges) for the hero; Cormorant Garamond italic
@@ -101,7 +115,7 @@ function FeatureCard({
   tone,
   delay,
 }: {
-  icon: React.ElementType;
+  icon: LucideIcon;
   title: string;
   description: string;
   tone: { chip: string; icon: string; from: string; to: string };
@@ -145,7 +159,7 @@ function WorkflowCard({
   tone,
   delay,
 }: {
-  icon: React.ElementType;
+  icon: LucideIcon;
   step: number;
   title: string;
   description: string;
@@ -429,7 +443,8 @@ export default function WelcomePage() {
         <div className="lp-grain" />
 
         <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
-          <div className="max-w-3xl">
+          <div className="grid lg:grid-cols-[minmax(0,1fr)_400px] lg:gap-10 items-center">
+            <div className="max-w-3xl min-w-0">
             <p
               className="hero-eyebrow lp-eyebrow inline-flex items-center gap-2.5 sm:gap-3 text-[10px] sm:text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
               style={{ animationDelay: "80ms" }}
@@ -487,6 +502,12 @@ export default function WelcomePage() {
               >
                 Sign In
               </Link>
+            </div>
+            </div>
+
+            {/* 3D mascot — Ledger waves, patrols, and greets visitors */}
+            <div className="mt-12 lg:mt-0 hero-eyebrow" style={{ animationDelay: "1000ms" }}>
+              <HeroRobotStage variant="hero" />
             </div>
           </div>
         </div>
