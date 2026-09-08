@@ -1011,33 +1011,36 @@ body {
   }
 }
 
-/* --- Mobile: pull the surreal geometry to the edges so it never
-   crosses the copy column, and quiet the colour clouds a touch. --- */
+/* --- Mobile: pull the surreal geometry fully into the corners so it
+   never crosses the copy column, quiet the colour clouds a touch, and
+   relax the eyebrow tracking (0.32em cannot fit a 360px line). --- */
+@keyframes heroTrackMobile {
+  from { letter-spacing: 0.4em; opacity: 0; transform: translateY(6px); }
+  to { letter-spacing: 0.13em; opacity: 1; transform: translateY(0); }
+}
 @media (max-width: 640px) {
   .lp-shape-square {
-    top: 4%;
-    right: -36px;
-    width: 96px;
-    height: 96px;
-    opacity: 0.6;
+    top: 2.5%;
+    right: -42px;
+    width: 82px;
+    height: 82px;
+    opacity: 0.5;
   }
   .lp-shape-square-2 {
-    bottom: 3%;
-    left: -32px;
-    width: 64px;
-    height: 64px;
-    opacity: 0.6;
+    bottom: 2%;
+    left: -38px;
+    width: 54px;
+    height: 54px;
+    opacity: 0.45;
   }
   .lp-shape-ring {
-    top: auto;
-    bottom: 12%;
-    right: -70px;
-    width: 150px;
-    height: 150px;
-    opacity: 0.55;
+    display: none;
   }
   .lp-blob {
-    opacity: 0.8;
+    opacity: 0.7;
+  }
+  .lp-eyebrow {
+    animation: heroTrackMobile 1.5s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
 }
 

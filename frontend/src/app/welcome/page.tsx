@@ -431,19 +431,19 @@ export default function WelcomePage() {
         <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 py-32">
           <div className="max-w-3xl">
             <p
-              className="hero-eyebrow inline-flex items-center gap-3 text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
+              className="hero-eyebrow lp-eyebrow inline-flex items-center gap-2.5 sm:gap-3 text-[10px] sm:text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
               style={{ animationDelay: "80ms" }}
             >
-              <span className="flex gap-1">
+              <span className="flex gap-1 shrink-0">
                 <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse" />
                 <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse [animation-delay:200ms]" />
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse [animation-delay:400ms]" />
               </span>
-              AI-native accounting for modern businesses
+              <span className="min-w-0">AI-native accounting for modern businesses</span>
             </p>
 
             <h1
-              className="text-brand-navy text-5xl sm:text-6xl lg:text-7xl leading-[1.08] font-semibold"
+              className="text-brand-navy text-[2.5rem] sm:text-6xl lg:text-7xl leading-[1.1] font-semibold"
               style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
             >
               <span className="reveal-line">
