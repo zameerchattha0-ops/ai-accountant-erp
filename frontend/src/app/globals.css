@@ -919,6 +919,14 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, 0.95);
 }
 
+/* Softer glass for cards inside Ledger's hero stage — Ledger walks BEHIND
+   these, so they stay translucent enough to read him through the frost */
+.glass-soft {
+  background: rgba(255, 255, 255, 0.42);
+  backdrop-filter: blur(10px) saturate(1.35);
+  -webkit-backdrop-filter: blur(10px) saturate(1.35);
+}
+
 /* Signature CLAY chip (puffy, light) */
 .clay-chip {
   background: linear-gradient(145deg, #ffffff 0%, #eef2f8 100%);
