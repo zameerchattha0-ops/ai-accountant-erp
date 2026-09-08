@@ -25,7 +25,7 @@
 
 import { Component, Suspense, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { ContactShadows, useAnimations, useGLTF } from "@react-three/drei";
 
 type RobotVariant = "hero" | "compact";
@@ -38,6 +38,7 @@ const ONESHOT = new Set(["Wave", "Dance", "ThumbsUp", "Yes", "No", "Jump"]);
 
 function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: boolean }) {
   const group = useRef<THREE.Group>(null);
+  const inner = useRef<THREE.Group>(null);
   const { scene, animations } = useGLTF(MODEL_URL);
   const { actions, mixer } = useAnimations(animations, group);
 
@@ -77,6 +78,20 @@ function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: bool
       }
     });
 
+    /* Auto-fit: measure the model's real bounding box and scale it to a
+       cute, small size — never trust hard-coded dimensions. Feet land at
+       y=0, centered on x/z, so the robot stands exactly on its shadow. */
+    const box = new THREE.Box3().setFromObject(scene);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const targetHeight = variant === "hero" ? 1.45 : 1.2;
+    const s = targetHeight / size.y;
+    const g = inner.current;
+    if (g && Number.isFinite(s) && s > 0) {
+      g.scale.setScalar(s);
+      g.position.set(-center.x * s, -box.min.y * s, -center.z * s);
+    }
+
     const onFinished = (e: { action?: THREE.AnimationAction }) => {
       const clipName = e.action?.getClip().name;
       if (clipName && ONESHOT.has(clipName)) enterIdle(1.6 + Math.random() * 1.6);
@@ -98,7 +113,7 @@ function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: bool
       mixer.stopAllAction();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scene, actions, mixer, reduced]);
+  }, [scene, actions, mixer, reduced, variant]);
 
   useFrame((state, rawDelta) => {
     const g = group.current;
@@ -157,11 +172,12 @@ function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: bool
   return (
     <group
       ref={group}
-      scale={variant === "hero" ? 0.5 : 0.42}
       onPointerOver={hoverGreet}
       onClick={interact}
     >
-      <primitive object={scene} />
+      <group ref={inner}>
+        <primitive object={scene} />
+      </group>
     </group>
   );
 }
@@ -188,8 +204,20 @@ class RobotErrorBoundary extends Component<
 }
 
 /* ================================================================== */
-/* Stage — glass platform + lighting rig + canvas                      */
+/* Stage — transparent canvas + lighting rig                           */
 /* ================================================================== */
+
+/* Positions the camera around the auto-fitted robot (1.45 / 1.2 units tall) */
+function CameraRig({ variant }: { variant: RobotVariant }) {
+  const { camera } = useThree();
+  useEffect(() => {
+    const hero = variant === "hero";
+    camera.position.set(0, hero ? 0.85 : 0.68, hero ? 3.1 : 2.7);
+    camera.lookAt(0, hero ? 0.72 : 0.58, 0);
+  }, [camera, variant]);
+  return null;
+}
+
 export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVariant }) {
   const [reduced, setReduced] = useState(false);
 
@@ -208,8 +236,9 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
 
   return (
     <div className={`relative w-full ${stageHeight}`} aria-hidden="true">
-      {/* Frosted glass stage the robot stands on */}
-      <div className="absolute inset-0 rounded-[2rem] border border-white/70 bg-gradient-to-b from-white/60 via-white/30 to-white/10 shadow-xl shadow-indigo-500/10 backdrop-blur-md overflow-hidden" />
+      {/* No dedicated background — the robot floats directly over the page UI.
+          A faint glow keeps him readable on busy sections without a "box". */}
+      <div className="absolute inset-x-8 bottom-2 h-24 rounded-full bg-teal-200/30 blur-3xl pointer-events-none" />
 
       {/* Speech bubble — the mascot introduces itself */}
       <div className="absolute left-4 top-4 z-10">
@@ -225,12 +254,15 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
 
       <div className="absolute inset-0 cursor-pointer [&>canvas]:outline-none">
         <Canvas
-          dpr={[1, 1.75]}
+          dpr={[1, 2]}
           performance={{ min: 0.5 }}
           gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-          camera={{ position: [0, 1.05, 2.5], fov: 42 }}
-          onCreated={({ camera }) => camera.lookAt(0, 0.82, 0)}
+          camera={{ position: [0, 0.85, 3.1], fov: 42 }}
         >
+          {/* Frame the fitted robot: robot stands 1.45 (hero) / 1.2 (compact)
+             world-units tall; camera looks at its chest height with headroom. */}
+          <CameraRig variant={variant} />
+
           {/* Lighting rig: soft ambient + warm key + teal rim = premium studio look */}
           <ambientLight intensity={0.55} />
           <hemisphereLight args={["#e0f2fe", "#fdf2f8", 0.55]} />
@@ -244,33 +276,18 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
           <pointLight position={[0, 0.4, 2.2]} intensity={0.35} color="#fef3c7" />
 
           <Suspense fallback={null}>
-            {/* Glass platform disc + teal rim */}
-            <mesh rotation-x={-Math.PI / 2} position={[0, 0, 0]}>
-              <circleGeometry args={[variant === "hero" ? 1.0 : 0.85, 64]} />
-              <meshPhysicalMaterial
-                color="#bae6fd"
-                transparent
-                opacity={0.28}
-                roughness={0.18}
-                metalness={0.12}
-                clearcoat={0.8}
-              />
-            </mesh>
-            <mesh rotation-x={-Math.PI / 2} position={[0, -0.002, 0]}>
-              <ringGeometry args={[variant === "hero" ? 0.97 : 0.82, variant === "hero" ? 1.02 : 0.87, 64]} />
-              <meshBasicMaterial color="#67e8f9" transparent opacity={0.35} />
-            </mesh>
-
             <RobotErrorBoundary>
               <RobotModel variant={variant} reduced={reduced} />
             </RobotErrorBoundary>
 
+            {/* Soft floating shadow ellipse — grounds the robot without a
+                dedicated platform, so he sits "on" the page itself */}
             <ContactShadows
-              position={[0, 0.005, 0]}
-              opacity={0.32}
-              scale={4}
-              blur={2.4}
-              far={1.6}
+              position={[0, 0, 0]}
+              opacity={0.22}
+              scale={2.6}
+              blur={2.8}
+              far={1.4}
               color="#1e3a5f"
             />
           </Suspense>
