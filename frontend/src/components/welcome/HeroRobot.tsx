@@ -122,10 +122,12 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
   }, []);
 
   const { viewport } = useThree();
+  /* Hero: stay in the open centre corridor between the floating cards
+     (chips on the left edge, overview card on the right edge). */
   const bound =
     variant === "hero"
-      ? Math.max(0.55, viewport.width / 2 - 0.75)
-      : Math.max(0.35, viewport.width / 2 - 0.85);
+      ? Math.min(Math.max(0.55, viewport.width / 2 - 1.0), 1.0)
+      : Math.max(0.3, viewport.width / 2 - 0.95);
 
   /* --- speech bubble: appears at RANDOM intervals, never sticky --- */
   const clock = useRef(0);
@@ -252,7 +254,7 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
   });
 
   return (
-    <group ref={root} scale={variant === "compact" ? 0.82 : 1}>
+    <group ref={root} scale={variant === "compact" ? 0.82 : 0.85}>
       {/* legs */}
       <group ref={legL} position={[-0.15, 0.46, 0]}>
         <mesh position={[0, -0.14, 0]} material={mats.dark}>

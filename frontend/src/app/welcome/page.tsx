@@ -227,9 +227,9 @@ function FloatChip({
       <span className={cn("w-9 h-9 rounded-xl clay-chip flex items-center justify-center shrink-0", chip)}>
         <Icon className={cn("w-4 h-4", icon2)} />
       </span>
-      <span className="min-w-0">
+      <span className="min-w-0 max-w-[10.5rem]">
         <span className="block text-[13px] font-semibold text-brand-navy">{title}</span>
-        <span className="block text-[11px] text-[#3d4b66]">{sub}</span>
+        <span className="block text-[11px] text-[#3d4b66] truncate">{sub}</span>
       </span>
     </div>
   );
@@ -569,8 +569,8 @@ export default function WelcomePage() {
                 <HeroRobotStage variant="hero" />
               </div>
 
-              {/* document chips — left edge */}
-              <div className="absolute left-0 top-[10%] hidden md:flex flex-col gap-6 pointer-events-none">
+              {/* document chips — left edge, narrow */}
+              <div className="absolute left-0 top-[7%] hidden md:flex flex-col gap-5 pointer-events-none">
                 <FloatChip
                   icon={FileText}
                   chip="bg-gradient-to-br from-emerald-100 to-emerald-50"
@@ -596,12 +596,12 @@ export default function WelcomePage() {
                   delay="2.2s"
                 />
               </div>
-              {/* Business Overview card — right edge */}
+              {/* Business Overview card — right edge, below the chip zone */}
               <div
-                className="absolute right-0 top-[16%] hidden md:block pointer-events-none"
+                className="absolute right-0 top-[30%] hidden md:block pointer-events-none"
                 style={{ animation: "floaty 7s ease-in-out 0.8s infinite" }}
               >
-                <div className="hero-float glass-panel rounded-2xl p-4 w-60 lg:w-64 shadow-xl">
+                <div className="hero-float glass-panel rounded-2xl p-4 w-56 shadow-xl">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-xs font-bold text-brand-navy">Business Overview</span>
                     <span className="text-[10px] font-medium text-[#3d4b66] bg-white/80 border border-white rounded-full px-2 py-0.5">
