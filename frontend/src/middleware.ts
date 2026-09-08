@@ -32,6 +32,10 @@ export const config = {
   // support Edge Function output, and this middleware does not need Edge.
   runtime: "nodejs",
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    // Skip internal assets, the 3D model directory, and ALL static file
+    // extensions — otherwise asset requests (e.g. /models/*.glb) get treated
+    // as page navigations and redirected to /login, which serves HTML where
+    // loaders expect binary/JSON and crashes the client.
+    "/((?!_next/static|_next/image|favicon.ico|models/|.*\\.(?:svg|png|jpg|jpeg|gif|webp|avif|glb|gltf|ico|txt|json|xml|webmanifest|mp4|webm|mov|mp3|wav|ogg|woff|woff2|ttf|otf|eot|wasm|bin|hdr|ktx2)$).*)",
   ],
 };

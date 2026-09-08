@@ -23,7 +23,7 @@
 /*   motion and pauses rendering when the tab is hidden.                */
 /* ================================================================== */
 
-import { Suspense, useEffect, useRef, useState } from "react";
+import { Component, Suspense, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { ContactShadows, useAnimations, useGLTF } from "@react-three/drei";
@@ -168,6 +168,25 @@ function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: bool
 
 useGLTF.preload(MODEL_URL);
 
+/* If the model ever fails to load (network hiccup, bad asset, WebGL context
+   loss), degrade to an empty glass stage instead of crashing the page. */
+class RobotErrorBoundary extends Component<
+  { children: React.ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  componentDidCatch(error: unknown) {
+    console.warn("[Ledger] 3D mascot unavailable:", error);
+  }
+  render() {
+    if (this.state.failed) return null;
+    return this.props.children;
+  }
+}
+
 /* ================================================================== */
 /* Stage — glass platform + lighting rig + canvas                      */
 /* ================================================================== */
@@ -242,7 +261,9 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
               <meshBasicMaterial color="#67e8f9" transparent opacity={0.35} />
             </mesh>
 
-            <RobotModel variant={variant} reduced={reduced} />
+            <RobotErrorBoundary>
+              <RobotModel variant={variant} reduced={reduced} />
+            </RobotErrorBoundary>
 
             <ContactShadows
               position={[0, 0.005, 0]}
