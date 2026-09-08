@@ -7,7 +7,7 @@ import { Cinzel, Cormorant_Garamond } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
-  FileBarChart, PencilLine, Linkedin, Mail, MessageCircle, ChevronRight,
+  FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
@@ -29,6 +29,16 @@ const cormorant = Cormorant_Garamond({
   variable: "--font-cormorant",
   display: "swap",
 });
+
+/* Brand glyph — lucide-react no longer ships brand icons (Linkedin was
+   removed from the library), so the LinkedIn mark is inlined here. */
+function LinkedInIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 1 1 0-4.125 2.062 2.062 0 0 1 0 4.125zM7.119 20.452H3.555V9h3.564v11.452z" />
+    </svg>
+  );
+}
 
 /* ---- Reusable animated section wrapper ---- */
 function Section({
@@ -680,7 +690,7 @@ export default function WelcomePage() {
             >
               <div className="glass-panel rounded-[calc(1.5rem-1.5px)] p-6 h-full flex items-center gap-4">
                 <span className="w-12 h-12 rounded-2xl bg-gradient-to-br from-sky-100 to-sky-50 clay-chip flex items-center justify-center shrink-0 transition-transform duration-300 group-hover:scale-110">
-                  <Linkedin className="w-5 h-5 text-sky-600" />
+                  <LinkedInIcon className="w-5 h-5 text-sky-600" />
                 </span>
                 <span className="min-w-0">
                   <span className="block text-sm font-semibold text-brand-navy">LinkedIn</span>
@@ -753,7 +763,7 @@ export default function WelcomePage() {
               aria-label="LinkedIn"
               className="hover:text-sky-600 transition-colors"
             >
-              <Linkedin className="w-4 h-4" />
+              <LinkedInIcon className="w-4 h-4" />
             </a>
             <a
               href="mailto:ZAMEERCHATTHA0@GMAIL.COM"
