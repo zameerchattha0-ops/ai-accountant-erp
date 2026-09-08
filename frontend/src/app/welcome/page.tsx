@@ -8,7 +8,7 @@ import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
   FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
-  FileText, Send, ShoppingCart, Sparkles, Check, Play,
+  FileText, Send, Sparkles, Check,
   TrendingUp, TrendingDown,
   type LucideIcon,
 } from "lucide-react";
@@ -257,16 +257,6 @@ function FloatChip({
   );
 }
 
-/* ---- Mini feature strip along the hero's bottom edge ---- */
-const HERO_STRIP: { icon: LucideIcon; label: string; chip: string; icon2: string }[] = [
-  { icon: Sparkles, label: "AI-Powered Accounting", chip: "bg-gradient-to-br from-violet-100 to-violet-50", icon2: "text-violet-600" },
-  { icon: FileText, label: "Invoicing & Receivables", chip: "bg-gradient-to-br from-sky-100 to-sky-50", icon2: "text-sky-600" },
-  { icon: ShoppingCart, label: "Purchases & Payables", chip: "bg-gradient-to-br from-amber-100 to-amber-50", icon2: "text-amber-600" },
-  { icon: BarChart3, label: "Ledger to Financial Statements", chip: "bg-gradient-to-br from-indigo-100 to-indigo-50", icon2: "text-indigo-600" },
-  { icon: PencilLine, label: "Manual Entry Supported", chip: "bg-gradient-to-br from-rose-100 to-rose-50", icon2: "text-rose-600" },
-  { icon: ShieldCheck, label: "Secure & Compliant", chip: "bg-gradient-to-br from-emerald-100 to-emerald-50", icon2: "text-emerald-600" },
-];
-
 /* ================================================================== */
 /* LANDING PAGE                                                         */
 /* ================================================================== */
@@ -480,17 +470,23 @@ export default function WelcomePage() {
             <Image
               src="/ai-accountant.png"
               alt="AI Accountant"
-              width={140}
-              height={38}
-              className="h-8 w-auto object-contain"
+              width={220}
+              height={60}
+              className="h-12 sm:h-14 w-auto object-contain [filter:none] [box-shadow:none] [border:none]"
               priority
             />
           </Link>
           <div className="hidden lg:flex items-center gap-7 text-sm font-medium text-[#3d4b66]">
-            {["Features", "How It Works", "Solutions", "Pricing", "Resources"].map((l) => (
-              <a key={l} href={`#${l.toLowerCase().replace(/\s+/g, "-")}`} className="hover:text-brand-navy transition-colors">
-                {l}
-              </a>
+            {[
+              { label: "Features", href: "/features" },
+              { label: "How It Works", href: "/how-it-works" },
+              { label: "Solutions", href: "/solutions" },
+              { label: "Pricing", href: "/pricing" },
+              { label: "Resources", href: "/resources" },
+            ].map((l) => (
+              <Link key={l.label} href={l.href} className="hover:text-brand-navy transition-colors">
+                {l.label}
+              </Link>
             ))}
           </div>
           <div className="flex items-center gap-3">
@@ -581,13 +577,15 @@ export default function WelcomePage() {
                 Start Free <ArrowRight className="w-4 h-4" />
               </Link>
               <a
-                href="#how-it-works"
+                href="https://pk.linkedin.com/in/zameerhaiderchattha"
+                target="_blank"
+                rel="noopener noreferrer"
                 className="inline-flex items-center gap-3 pl-3 pr-7 py-3 rounded-full bg-white/90 backdrop-blur border border-white text-brand-navy font-semibold text-base transition-all shadow-[0_18px_40px_-18px_rgba(27,42,74,0.35)] hover:-translate-y-0.5 hover:shadow-[0_22px_46px_-18px_rgba(27,42,74,0.45)]"
               >
-                <span className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-md shadow-blue-500/30">
-                  <Play className="w-3.5 h-3.5 text-white fill-white" />
+                <span className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-600 to-sky-500 flex items-center justify-center shadow-md shadow-blue-500/30">
+                  <LinkedInIcon className="w-4 h-4 text-white" />
                 </span>
-                Watch Demo
+                Contact Zameer Haider
               </a>
             </div>
 
@@ -770,23 +768,6 @@ export default function WelcomePage() {
                 <span className="block text-[12px] font-bold text-brand-navy">Ask anything…</span>
                 <span className="block text-[10px] text-[#64748b] truncate">&quot;Invoice for ABC Tech&quot;</span>
               </div>
-            </div>
-          </div>
-
-          {/* mini feature strip */}
-          <div
-            className="mt-12 lg:mt-16 border-t border-white/70 pt-6"
-            style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 1100ms both" }}
-          >
-            <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
-              {HERO_STRIP.map(({ icon: Icon, label, chip, icon2 }) => (
-                <span key={label} className="inline-flex items-center gap-2.5">
-                  <span className={cn("w-9 h-9 rounded-xl clay-chip flex items-center justify-center shrink-0", chip)}>
-                    <Icon className={cn("w-4 h-4", icon2)} />
-                  </span>
-                  <span className="text-[13px] font-semibold text-brand-navy max-w-[9rem] leading-tight">{label}</span>
-                </span>
-              ))}
             </div>
           </div>
         </div>

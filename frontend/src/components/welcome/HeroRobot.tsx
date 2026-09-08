@@ -196,6 +196,14 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     clock.current += d;
     const time = state.clock.elapsedTime;
 
+    /* perpetual multi-colour: every warm accent part (shoulders, hands,
+       feet, belt, ear discs, book cover) cycles through the spectrum
+       forever; the chest core + antenna counter-cycle. */
+    if (!reduced) {
+      mats.accent.color.setHSL((time * 0.055) % 1, 0.68, 0.56);
+      mats.glow.emissive.setHSL((time * 0.055 + 0.45) % 1, 0.9, 0.6);
+    }
+
     /* random speech timing */
     if (!reduced) {
       if (!lineRef.current && clock.current >= nextLine.current) {
@@ -442,9 +450,10 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
         </mesh>
       </group>
 
-      {/* speech bubble — anchored above the head, follows him while roaming */}
+      {/* speech bubble — anchored above the head, follows him while roaming.
+          The compact variant anchors lower so it never crops out of frame. */}
       {!reduced && (
-        <Html position={[0, 2.3, 0]} center zIndexRange={[40, 0]} style={{ pointerEvents: "none" }}>
+        <Html position={[0, variant === "hero" ? 2.3 : 2.02, 0]} center zIndexRange={[40, 0]} style={{ pointerEvents: "none" }}>
           {line && (
             <div key={line.k} className="ledger-bubble">
               <div className="ledger-bubble-head">
@@ -473,11 +482,68 @@ class RobotErrorBoundary extends Component<{ children: ReactNode }, { failed: bo
   }
 }
 
+/* Colour-cycling glass podium. Soft, low-opacity, hue-cycling halo rings —
+   it reads as part of the page's own gradient UI, not a bolt-on platform. */
+function Podium({ compact }: { compact?: boolean }) {
+  const haloA = useRef<THREE.MeshBasicMaterial>(null);
+  const haloB = useRef<THREE.MeshBasicMaterial>(null);
+  const haloC = useRef<THREE.MeshBasicMaterial>(null);
+  const glowM = useRef<THREE.MeshBasicMaterial>(null);
+  const top = useRef<THREE.MeshStandardMaterial>(null);
+  const rim = useRef<THREE.MeshStandardMaterial>(null);
+
+  useFrame((s) => {
+    const t = s.clock.elapsedTime;
+    if (haloA.current) haloA.current.color.setHSL((t * 0.045) % 1, 0.85, 0.6);
+    if (haloB.current) haloB.current.color.setHSL((t * 0.045 + 0.33) % 1, 0.85, 0.6);
+    if (haloC.current) haloC.current.color.setHSL((t * 0.045 + 0.66) % 1, 0.85, 0.64);
+    if (glowM.current) glowM.current.color.setHSL((t * 0.045 + 0.2) % 1, 0.85, 0.7);
+    if (top.current) top.current.color.setHSL((t * 0.03) % 1, 0.4, 0.97);
+    if (rim.current) rim.current.color.setHSL((t * 0.03 + 0.5) % 1, 0.5, 0.93);
+  });
+
+  const R = compact ? 0.95 : 1.42;
+
+  return (
+    <group scale={compact ? [1.12, 1, 0.8] : [1.9, 1, 0.75]}>
+      {/* glow halo bleeding onto the page — makes the disc feel native */}
+      <mesh position={[0, -0.002, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[R * 1.4, 64]} />
+        <meshBasicMaterial ref={glowM} transparent opacity={0.14} depthWrite={false} />
+      </mesh>
+      {/* body — whisper-clear glass, no hard edges */}
+      <mesh position={[0, -0.08, 0]}>
+        <cylinderGeometry args={[R, R * 1.08, 0.16, 64]} />
+        <meshStandardMaterial ref={rim} color="#ffffff" roughness={0.15} metalness={0.05} transparent opacity={0.32} />
+      </mesh>
+      {/* top — faintly tinted glass */}
+      <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[R, 64]} />
+        <meshStandardMaterial ref={top} color="#f6f9ff" roughness={0.3} metalness={0.04} transparent opacity={0.68} />
+      </mesh>
+      {/* three perpetually hue-cycling halo rings */}
+      <mesh position={[0, 0.006, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[R * 0.85, R, 64]} />
+        <meshBasicMaterial ref={haloA} transparent opacity={0.85} depthWrite={false} />
+      </mesh>
+      <mesh position={[0, 0.011, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[R * 0.6, R * 0.68, 64]} />
+        <meshBasicMaterial ref={haloB} transparent opacity={0.45} depthWrite={false} />
+      </mesh>
+      <mesh position={[0, 0.014, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[R * 0.28, R * 0.36, 48]} />
+        <meshBasicMaterial ref={haloC} transparent opacity={0.32} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}
+
 function CameraRig({ variant }: { variant: Variant }) {
   const { camera } = useThree();
   useEffect(() => {
-    camera.position.set(0, variant === "hero" ? 1.15 : 1.1, variant === "hero" ? 4.9 : 4.4);
-    camera.lookAt(0, 0.95, 0);
+    /* compact pulls back + lifts the framing so the bubble never crops */
+    camera.position.set(0, variant === "hero" ? 1.15 : 1.18, variant === "hero" ? 4.9 : 4.75);
+    camera.lookAt(0, variant === "hero" ? 0.95 : 1.02, 0);
   }, [camera, variant]);
   return null;
 }
@@ -518,42 +584,8 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
           <RobotErrorBoundary>
             <RobotCharacter variant={variant} reduced={reduced} />
           </RobotErrorBoundary>
-          {/* Dedicated glass podium — the visible platform Ledger stands on */}
-          {variant === "hero" ? (
-            <group scale={[1.95, 1, 0.78]}>
-              <mesh position={[0, -0.07, 0]}>
-                <cylinderGeometry args={[1.42, 1.52, 0.14, 64]} />
-                <meshStandardMaterial color="#ffffff" roughness={0.22} metalness={0.06} transparent opacity={0.94} />
-              </mesh>
-              <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <circleGeometry args={[1.42, 64]} />
-                <meshStandardMaterial color="#eef4ff" roughness={0.32} metalness={0.04} />
-              </mesh>
-              <mesh position={[0, 0.012, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <ringGeometry args={[1.3, 1.42, 64]} />
-                <meshBasicMaterial color="#8fb7ff" transparent opacity={0.5} />
-              </mesh>
-              <mesh position={[0, 0.008, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <circleGeometry args={[0.62, 48]} />
-                <meshBasicMaterial color="#bae6fd" transparent opacity={0.28} />
-              </mesh>
-            </group>
-          ) : (
-            <group scale={[1.15, 1, 0.8]}>
-              <mesh position={[0, -0.06, 0]}>
-                <cylinderGeometry args={[0.98, 1.06, 0.12, 48]} />
-                <meshStandardMaterial color="#ffffff" roughness={0.22} metalness={0.06} transparent opacity={0.94} />
-              </mesh>
-              <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <circleGeometry args={[0.98, 48]} />
-                <meshStandardMaterial color="#eef4ff" roughness={0.32} metalness={0.04} />
-              </mesh>
-              <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <ringGeometry args={[0.88, 0.98, 48]} />
-                <meshBasicMaterial color="#8fb7ff" transparent opacity={0.5} />
-              </mesh>
-            </group>
-          )}
+          {/* Colour-cycling glass podium — melts into the page UI */}
+          <Podium compact={variant !== "hero"} />
           {/* Soft contact shadow grounds him on the platform */}
           <ContactShadows
             position={[0, 0.001, 0]}

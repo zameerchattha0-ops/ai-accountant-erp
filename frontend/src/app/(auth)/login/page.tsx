@@ -42,9 +42,9 @@ export default function LoginPage() {
 
   return (
     <div className="relative">
-      {/* Ledger peeks over the card's shoulder — adds no height to the card.
+      {/* Ledger peeks over the card's shoulder — larger, uncropped window.
           The bubble pops up at random intervals, never sticking around. */}
-      <div className="absolute -top-16 right-0 sm:-right-12 sm:-top-24 z-20 w-36 h-32 sm:w-52 sm:h-48 pointer-events-none select-none">
+      <div className="absolute -top-24 right-0 sm:-right-16 sm:-top-28 z-20 w-48 h-44 sm:w-64 sm:h-60 pointer-events-none select-none">
         <HeroRobotStage variant="compact" />
       </div>
 
