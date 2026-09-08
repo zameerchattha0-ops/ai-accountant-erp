@@ -1,191 +1,322 @@
 "use client";
 
-/* eslint-disable react-hooks/immutability */
-/* Reason: three.js AnimationMixer / AnimationAction objects (via drei's
-   useAnimations) are imperative WebGL-side systems, not React state.
-   Mutating them — setting loops, crossfading clips — is the library's
-   intended API; the immutability rule is designed for React state and
-   cannot model external object graphs. */
-
 /* ================================================================== */
 /* "Ledger" — the 3D robot mascot                                      */
 /*                                                                      */
-/* Rendered with react-three-fiber + drei (industry-standard React 3D   */
-/* stack). The character is the CC0-licensed RobotExpressive glTF       */
-/* (three.js official sample by Tomás Laulhé, modified by Don McCurdy), */
-/* which ships 14 baked animation clips — no hand keyframing needed.    */
+/* Built 100% procedurally with react-three-fiber — no external model.  */
+/* Every surface is a high-segment smooth primitive with a glossy       */
+/* studio material: white shell, orange accents, dark glass visor and   */
+/* glowing cyan eyes — a premium chibi toy-robot look (no low-poly      */
+/* facets, no pixelation).                                              */
 /*                                                                      */
 /* Behaviour state machine:                                             */
-/*   entrance Wave → Idle (leans toward the visitor's cursor) →         */
-/*   patrols left/right on its platform (Walking) → faces viewer →      */
-/*   hover triggers a Wave · click triggers Dance (hero) / ThumbsUp     */
-/*   (auth cards). Falls back to a calm Idle under prefers-reduced-     */
-/*   motion and pauses rendering when the tab is hidden.                */
+/*   entrance Wave → Idle (breathes, blinks, follows your cursor with   */
+/*   head and body) → patrols left/right (hero only) → hover triggers   */
+/*   a Wave · click triggers a hop-and-spin. Falls back to a calm Idle  */
+/*   under prefers-reduced-motion.                                      */
 /* ================================================================== */
 
-import { Component, Suspense, useEffect, useRef, useState } from "react";
+import { Component, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { ContactShadows, useAnimations, useGLTF } from "@react-three/drei";
+import { ContactShadows } from "@react-three/drei";
 
 type RobotVariant = "hero" | "compact";
-type Phase = "wave" | "idle" | "walk" | "dance" | "thumbsup";
+type Phase = "wave" | "idle" | "walk" | "hop";
 
-const MODEL_URL = "/models/RobotExpressive.glb";
+/* Shared smooth materials — glossy white shell, orange accents,
+   dark glass visor, glowing cyan eyes. Created once per instance. */
+function useRobotMaterials() {
+  return useMemo(
+    () => ({
+      shell: new THREE.MeshStandardMaterial({ color: "#f5f7fa", roughness: 0.32, metalness: 0.08 }),
+      accent: new THREE.MeshStandardMaterial({ color: "#ef8b2c", roughness: 0.38, metalness: 0.12 }),
+      visor: new THREE.MeshStandardMaterial({ color: "#0c1420", roughness: 0.12, metalness: 0.45 }),
+      eye: new THREE.MeshStandardMaterial({
+        color: "#061018",
+        emissive: new THREE.Color("#3ee5ff"),
+        emissiveIntensity: 2.6,
+        roughness: 0.2,
+      }),
+      glow: new THREE.MeshStandardMaterial({
+        color: "#04211f",
+        emissive: new THREE.Color("#2dd4bf"),
+        emissiveIntensity: 2.2,
+        roughness: 0.3,
+      }),
+      dark: new THREE.MeshStandardMaterial({ color: "#2b3340", roughness: 0.5, metalness: 0.35 }),
+    }),
+    [],
+  );
+}
 
-/* One-shot clips that automatically hand control back to Idle when done */
-const ONESHOT = new Set(["Wave", "Dance", "ThumbsUp", "Yes", "No", "Jump"]);
+function RobotCharacter({ variant, reduced }: { variant: RobotVariant; reduced: boolean }) {
+  const mats = useRobotMaterials();
 
-function RobotModel({ variant, reduced }: { variant: RobotVariant; reduced: boolean }) {
-  const group = useRef<THREE.Group>(null);
-  const inner = useRef<THREE.Group>(null);
-  const { scene, animations } = useGLTF(MODEL_URL);
-  const { actions, mixer } = useAnimations(animations, group);
+  const root = useRef<THREE.Group>(null);
+  const squash = useRef<THREE.Group>(null);
+  const patrolG = useRef<THREE.Group>(null);
+  const head = useRef<THREE.Group>(null);
+  const armL = useRef<THREE.Group>(null);
+  const armR = useRef<THREE.Group>(null);
+  const legL = useRef<THREE.Group>(null);
+  const legR = useRef<THREE.Group>(null);
+  const eyeL = useRef<THREE.Mesh>(null);
+  const eyeR = useRef<THREE.Mesh>(null);
 
+  /* --- behaviour state (kept out of React state on purpose: 60fps) --- */
   const phase = useRef<Phase>("wave");
-  const timer = useRef(0);
-  const dir = useRef(1);
-  const patrol = variant === "hero" && !reduced;
-  const WALK_TIME = 2.1;
-  const RANGE = 0.42;
-  const SPEED = 0.38;
+  const timer = useRef(reduced ? 0 : 2.4);
+  const walkDir = useRef<1 | -1>(1);
+  const canPatrol = variant === "hero" && !reduced;
 
-  /* Crossfade helper — fades out whatever is playing, fades the next clip in */
-  const play = (name: string, once: boolean) => {
-    const next = actions[name] ?? actions["Idle"];
-    if (!next) return;
-    Object.entries(actions).forEach(([key, action]) => {
-      if (action && key !== next.getClip().name) action.fadeOut(0.35);
-    });
-    next.reset();
-    next.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat, once ? 1 : Infinity);
-    next.clampWhenFinished = once;
-    next.timeScale = variant === "compact" ? 0.9 : 1;
-    next.fadeIn(0.35).play();
+  const setPhase = (p: Phase, seconds: number) => {
+    phase.current = p;
+    timer.current = seconds;
   };
-
-  const enterIdle = (dwell: number) => {
-    phase.current = "idle";
-    timer.current = dwell;
-    play("Idle", false);
-  };
-
-  useEffect(() => {
-    /* Robots cast soft shadows on the glass platform */
-    scene.traverse((obj) => {
-      if ((obj as THREE.Mesh).isMesh) {
-        obj.castShadow = true;
-      }
-    });
-
-    /* Auto-fit: measure the model's real bounding box and scale it to a
-       cute, small size — never trust hard-coded dimensions. Feet land at
-       y=0, centered on x/z, so the robot stands exactly on its shadow. */
-    const box = new THREE.Box3().setFromObject(scene);
-    const size = box.getSize(new THREE.Vector3());
-    const center = box.getCenter(new THREE.Vector3());
-    const targetHeight = variant === "hero" ? 1.45 : 1.2;
-    const s = targetHeight / size.y;
-    const g = inner.current;
-    if (g && Number.isFinite(s) && s > 0) {
-      g.scale.setScalar(s);
-      g.position.set(-center.x * s, -box.min.y * s, -center.z * s);
-    }
-
-    const onFinished = (e: { action?: THREE.AnimationAction }) => {
-      const clipName = e.action?.getClip().name;
-      if (clipName && ONESHOT.has(clipName)) enterIdle(1.6 + Math.random() * 1.6);
-    };
-    mixer.addEventListener("finished", onFinished as (e: THREE.Event) => void);
-
-    if (reduced) {
-      /* Calm static loop for reduced-motion users — no entrance, no patrol */
-      play("Idle", false);
-      phase.current = "idle";
-    } else {
-      /* Entrance: a friendly wave, then settle into idle */
-      phase.current = "wave";
-      play("Wave", true);
-    }
-
-    return () => {
-      mixer.removeEventListener("finished", onFinished as (e: THREE.Event) => void);
-      mixer.stopAllAction();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scene, actions, mixer, reduced, variant]);
 
   useFrame((state, rawDelta) => {
-    const g = group.current;
+    const g = root.current;
     if (!g) return;
-    const delta = Math.min(rawDelta, 0.05); // clamp tab-switch jumps
-    timer.current -= delta;
+    const d = Math.min(rawDelta, 0.05); // clamp tab-switch jumps
+    const t = state.clock.elapsedTime;
 
-    if (phase.current === "idle" && timer.current <= 0 && patrol) {
-      /* Set off on patrol — walk to the other side of the platform */
-      dir.current *= -1;
-      phase.current = "walk";
-      timer.current = WALK_TIME;
-      play("Walking", false);
-    }
-
-    if (phase.current === "walk") {
-      g.position.x = THREE.MathUtils.clamp(
-        g.position.x + dir.current * SPEED * delta,
-        -RANGE,
-        RANGE,
-      );
-      /* Face the direction of travel */
-      const targetYaw = dir.current > 0 ? Math.PI / 2.4 : -Math.PI / 2.4;
-      g.rotation.y = THREE.MathUtils.lerp(g.rotation.y, targetYaw, delta * 6);
+    /* -------- phase machine -------- */
+    if (!reduced) {
+      timer.current -= d;
       if (timer.current <= 0) {
-        enterIdle(2.2 + Math.random() * 2.4);
-      }
-    } else {
-      /* Face the viewer, then lean toward the visitor's cursor */
-      const pointerYaw = reduced ? 0 : state.pointer.x * 0.45;
-      g.rotation.y = THREE.MathUtils.lerp(g.rotation.y, pointerYaw, delta * 4);
-      /* Gentle idle bob (suppressed for reduced motion) */
-      if (!reduced) {
-        g.position.y = Math.sin(state.clock.elapsedTime * 1.6) * 0.015;
+        if (phase.current === "wave") setPhase("idle", 2.6 + Math.random() * 1.6);
+        else if (phase.current === "idle") {
+          if (canPatrol) {
+            walkDir.current = Math.random() > 0.5 ? 1 : -1;
+            setPhase("walk", 1.9 + Math.random() * 1.2);
+          } else setPhase("idle", 3 + Math.random() * 2);
+        } else if (phase.current === "walk") setPhase("idle", 2.5 + Math.random() * 2);
+        else if (phase.current === "hop") setPhase("idle", 2.5);
       }
     }
+    const p = phase.current;
+
+    /* -------- locomotion: patrol on foot, otherwise breathe -------- */
+    let bob = 0;
+    let legSwing = 0;
+    if (p === "walk" && patrolG.current) {
+      patrolG.current.position.x = THREE.MathUtils.damp(
+        patrolG.current.position.x,
+        walkDir.current * 0.5,
+        1.4,
+        d,
+      );
+      legSwing = Math.sin(t * 8);
+      bob = Math.abs(Math.sin(t * 8)) * 0.045;
+    } else if (patrolG.current) {
+      patrolG.current.position.x = THREE.MathUtils.damp(patrolG.current.position.x, 0, 1.8, d);
+      bob = reduced ? 0 : Math.sin(t * 2.1) * 0.028;
+    }
+
+    /* -------- hop-and-spin (click) -------- */
+    let hopY = 0;
+    let stretch = 1;
+    let spinDelta = 0;
+    if (p === "hop") {
+      const u = Math.min(1, Math.max(0, 1 - timer.current / 0.75));
+      hopY = 1.36 * u * (1 - u);
+      stretch = 1 + 0.14 * Math.sin(u * Math.PI);
+      spinDelta = (d * u * Math.PI * 2) / 0.75;
+    }
+    g.position.y = THREE.MathUtils.lerp(g.position.y, hopY + bob, 0.5);
+    if (squash.current) {
+      squash.current.scale.y = THREE.MathUtils.damp(squash.current.scale.y, stretch, 10, d);
+      squash.current.scale.x = THREE.MathUtils.damp(squash.current.scale.x, 2 - stretch, 10, d);
+      if (p === "hop") squash.current.rotation.y += spinDelta;
+      else squash.current.rotation.y = THREE.MathUtils.damp(squash.current.rotation.y, 0, 4, d);
+    }
+
+    /* -------- arms: swing while walking, raise when waving -------- */
+    const swing = p === "walk" ? Math.sin(t * 8) * 0.35 : 0;
+    let armRTarget = 0.16 + swing;
+    const armLTarget = -0.16 - swing;
+    if (p === "wave") armRTarget = 2.35 + Math.sin(t * 7.5) * 0.3;
+    if (armR.current)
+      armR.current.rotation.z = THREE.MathUtils.damp(armR.current.rotation.z, armRTarget, 7, d);
+    if (armL.current)
+      armL.current.rotation.z = THREE.MathUtils.damp(armL.current.rotation.z, armLTarget, 7, d);
+
+    /* -------- legs -------- */
+    if (legL.current)
+      legL.current.rotation.x = THREE.MathUtils.damp(
+        legL.current.rotation.x,
+        legSwing * 0.5,
+        10,
+        d,
+      );
+    if (legR.current)
+      legR.current.rotation.x = THREE.MathUtils.damp(
+        legR.current.rotation.x,
+        -legSwing * 0.5,
+        10,
+        d,
+      );
+
+    /* -------- head follows the visitor's cursor + idle tilt -------- */
+    if (head.current) {
+      const fx = reduced ? 0 : state.pointer.x * 0.4;
+      const fy = reduced ? 0 : -state.pointer.y * 0.18;
+      head.current.rotation.y = THREE.MathUtils.damp(head.current.rotation.y, fx, 5, d);
+      head.current.rotation.x = THREE.MathUtils.damp(
+        head.current.rotation.x,
+        fy + (reduced ? 0 : Math.sin(t * 1.7) * 0.04),
+        5,
+        d,
+      );
+    }
+
+    /* -------- body leans toward the cursor -------- */
+    if (!reduced) g.rotation.y = THREE.MathUtils.damp(g.rotation.y, state.pointer.x * 0.12, 4, d);
+
+    /* -------- blink -------- */
+    const blinkT = (t + 1.2) % 3.7;
+    const eyeScale = blinkT < 0.14 ? 0.12 : 1;
+    if (eyeL.current)
+      eyeL.current.scale.y = THREE.MathUtils.lerp(eyeL.current.scale.y, eyeScale, 0.5);
+    if (eyeR.current)
+      eyeR.current.scale.y = THREE.MathUtils.lerp(eyeR.current.scale.y, eyeScale, 0.5);
   });
 
-  const hoverGreet = () => {
-    if (reduced || phase.current !== "idle") return;
-    phase.current = "wave";
-    play("Wave", true);
+  const triggerWave = () => {
+    if (!reduced) setPhase("wave", 2.1);
+  };
+  const triggerHop = () => {
+    if (!reduced) setPhase("hop", 0.75);
   };
 
-  const interact = () => {
-    if (reduced || (phase.current !== "idle" && phase.current !== "wave")) return;
-    if (variant === "hero") {
-      phase.current = "dance";
-      play("Dance", true);
-    } else {
-      phase.current = "thumbsup";
-      play("ThumbsUp", true);
-    }
-  };
+  /* Proportions (world units, ground at y=0):
+     feet → hip 0.42 · body capsule 0.33→1.23 · shoulders 0.95 ·
+     head centre 1.58 (r 0.58) · antenna tip ≈ 2.42.
+     Chibi ratio: head ≈ 2× body — big-head cute, like a premium toy.
+     Scaled down per-variant so he stays small and never crops. */
+  const hipY = 0.42;
 
   return (
     <group
-      ref={group}
-      onPointerOver={hoverGreet}
-      onClick={interact}
+      ref={root}
+      scale={variant === "hero" ? 0.72 : 0.56}
+      onPointerOver={(e) => {
+        e.stopPropagation();
+        triggerWave();
+      }}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        triggerHop();
+      }}
     >
-      <group ref={inner}>
-        <primitive object={scene} />
+      {/* generous invisible hit-area so hover/click feels effortless */}
+      <mesh visible={false} position={[0, 1.15, 0]}>
+        <sphereGeometry args={[1.4, 8, 8]} />
+        <meshBasicMaterial />
+      </mesh>
+
+      <group ref={squash}>
+        <group ref={patrolG}>
+          {/* ===== LEGS ===== */}
+          {([["L", -0.17, legL], ["R", 0.17, legR]] as const).map(([side, x, ref]) => (
+            <group key={side} ref={ref} position={[x, hipY, 0]}>
+              <mesh material={mats.shell}>
+                <capsuleGeometry args={[0.085, 0.16, 8, 24]} />
+              </mesh>
+              {/* boot */}
+              <mesh material={mats.accent} position={[0, -0.34, 0.05]} scale={[1, 0.55, 1.35]}>
+                <sphereGeometry args={[0.135, 32, 24]} />
+              </mesh>
+            </group>
+          ))}
+
+          {/* ===== BODY ===== */}
+          <mesh material={mats.shell} position={[0, 0.78, 0]}>
+            <capsuleGeometry args={[0.3, 0.3, 12, 48]} />
+          </mesh>
+          {/* orange belly panel */}
+          <mesh material={mats.accent} position={[0, 0.76, 0.17]} scale={[1, 0.85, 0.5]}>
+            <sphereGeometry args={[0.21, 32, 24]} />
+          </mesh>
+          {/* belly light */}
+          <mesh material={mats.glow} position={[0, 0.76, 0.3]}>
+            <sphereGeometry args={[0.045, 16, 16]} />
+          </mesh>
+          {/* waist ring */}
+          <mesh material={mats.dark} position={[0, 0.47, 0]} rotation={[Math.PI / 2, 0, 0]}>
+            <torusGeometry args={[0.265, 0.035, 12, 48]} />
+          </mesh>
+
+          {/* ===== ARMS ===== */}
+          {([["L", -0.34, armL], ["R", 0.34, armR]] as const).map(([side, x, ref]) => (
+            <group key={side} ref={ref} position={[x, 0.95, 0]}>
+              {/* shoulder ball */}
+              <mesh material={mats.dark}>
+                <sphereGeometry args={[0.105, 24, 20]} />
+              </mesh>
+              <mesh material={mats.shell} position={[0, -0.18, 0]}>
+                <capsuleGeometry args={[0.068, 0.2, 8, 24]} />
+              </mesh>
+              {/* mitten hand */}
+              <mesh material={mats.accent} position={[0, -0.37, 0]}>
+                <sphereGeometry args={[0.105, 24, 20]} />
+              </mesh>
+            </group>
+          ))}
+
+          {/* ===== HEAD (oversized = cute) ===== */}
+          <group ref={head} position={[0, 1.2, 0]}>
+            <mesh material={mats.shell} position={[0, 0.38, 0]} scale={[1, 0.92, 0.95]}>
+              <sphereGeometry args={[0.58, 48, 40]} />
+            </mesh>
+            {/* glossy dark visor */}
+            <mesh material={mats.visor} position={[0, 0.4, 0.26]} scale={[1.02, 0.74, 0.62]}>
+              <sphereGeometry args={[0.44, 48, 36]} />
+            </mesh>
+            {/* glowing cyan eyes (blink by scaling Y) */}
+            {([["L", -0.16, eyeL], ["R", 0.16, eyeR]] as const).map(([side, x, ref]) => (
+              <mesh
+                key={side}
+                ref={ref}
+                material={mats.eye}
+                position={[x, 0.41, 0.5]}
+                scale={[1, 1.5, 0.5]}
+              >
+                <sphereGeometry args={[0.062, 24, 20]} />
+              </mesh>
+            ))}
+            {/* ear pods */}
+            {([["L", -0.56], ["R", 0.56]] as const).map(([side, x]) => (
+              <group key={side} position={[x, 0.4, 0]} rotation={[0, 0, Math.PI / 2]}>
+                <mesh material={mats.accent}>
+                  <cylinderGeometry args={[0.1, 0.1, 0.07, 24]} />
+                </mesh>
+                <mesh material={mats.shell} position={[side === "L" ? -0.045 : 0.045, 0, 0]}>
+                  <cylinderGeometry args={[0.06, 0.06, 0.02, 24]} />
+                </mesh>
+              </group>
+            ))}
+            {/* antenna + glowing tip */}
+            <mesh material={mats.dark} position={[0, 1.02, 0]}>
+              <cylinderGeometry args={[0.02, 0.028, 0.2, 12]} />
+            </mesh>
+            <mesh material={mats.glow} position={[0, 1.16, 0]}>
+              <sphereGeometry args={[0.055, 20, 16]} />
+            </mesh>
+            {/* forehead seam */}
+            <mesh material={mats.accent} position={[0, 0.74, 0]} rotation={[Math.PI / 2, 0, 0]}>
+              <torusGeometry args={[0.5, 0.018, 10, 48]} />
+            </mesh>
+          </group>
+        </group>
       </group>
     </group>
   );
 }
 
-useGLTF.preload(MODEL_URL);
-
-/* If the model ever fails to load (network hiccup, bad asset, WebGL context
-   loss), degrade to an empty glass stage instead of crashing the page. */
+/* If anything in the 3D scene throws (WebGL context loss, driver glitch),
+   degrade to an empty stage instead of crashing the page. */
 class RobotErrorBoundary extends Component<
   { children: React.ReactNode },
   { failed: boolean }
@@ -207,13 +338,14 @@ class RobotErrorBoundary extends Component<
 /* Stage — transparent canvas + lighting rig                           */
 /* ================================================================== */
 
-/* Positions the camera around the auto-fitted robot (1.45 / 1.2 units tall) */
+/* Frames the robot (≈1.74 / 1.36 world-units tall after scaling) with
+   generous headroom — small, cute, never cropped or over-zoomed. */
 function CameraRig({ variant }: { variant: RobotVariant }) {
   const { camera } = useThree();
   useEffect(() => {
     const hero = variant === "hero";
-    camera.position.set(0, hero ? 0.85 : 0.68, hero ? 3.1 : 2.7);
-    camera.lookAt(0, hero ? 0.72 : 0.58, 0);
+    camera.position.set(0, hero ? 1.05 : 0.85, hero ? 4.5 : 3.7);
+    camera.lookAt(0, hero ? 0.88 : 0.72, 0);
   }, [camera, variant]);
   return null;
 }
@@ -257,10 +389,10 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
           dpr={[1, 2]}
           performance={{ min: 0.5 }}
           gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-          camera={{ position: [0, 0.85, 3.1], fov: 42 }}
+          camera={{ position: [0, 1.05, 4.5], fov: 33 }}
         >
-          {/* Frame the fitted robot: robot stands 1.45 (hero) / 1.2 (compact)
-             world-units tall; camera looks at its chest height with headroom. */}
+          {/* Frame the robot (1.74 / 1.36 units tall after scaling): camera
+              looks at chest height with generous headroom — never cropped. */}
           <CameraRig variant={variant} />
 
           {/* Lighting rig: soft ambient + warm key + teal rim = premium studio look */}
@@ -277,7 +409,7 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: RobotVa
 
           <Suspense fallback={null}>
             <RobotErrorBoundary>
-              <RobotModel variant={variant} reduced={reduced} />
+              <RobotCharacter variant={variant} reduced={reduced} />
             </RobotErrorBoundary>
 
             {/* Soft floating shadow ellipse — grounds the robot without a
