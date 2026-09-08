@@ -3,12 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { Cinzel, Cormorant_Garamond } from "next/font/google";
+import { Cinzel, Cormorant_Garamond, Fraunces } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
   FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
-  BadgeCheck, FileText, Send, ShoppingCart, Sparkles,
+  FileText, Send, ShoppingCart, Sparkles, Check, Play,
   TrendingUp, TrendingDown,
   type LucideIcon,
 } from "lucide-react";
@@ -39,6 +39,13 @@ const cormorant = Cormorant_Garamond({
   weight: ["400", "500", "600"],
   style: ["normal", "italic"],
   variable: "--font-cormorant",
+  display: "swap",
+});
+/* Fraunces — soft premium editorial serif (reference headline face) */
+const fraunces = Fraunces({
+  subsets: ["latin"],
+  style: ["normal", "italic"],
+  variable: "--font-fraunces",
   display: "swap",
 });
 
@@ -210,7 +217,9 @@ function FloatChip({
   icon2,
   title,
   sub,
+  note,
   delay,
+  tilt,
   target,
 }: {
   icon: LucideIcon;
@@ -218,21 +227,31 @@ function FloatChip({
   icon2: string;
   title: string;
   sub: string;
+  note?: string;
   delay: string;
+  tilt: string;
   target?: string;
 }) {
   return (
     <div
       data-ledger-target={target}
-      className="hero-float glass-panel glass-soft rounded-2xl px-4 py-3 flex items-center gap-3 shadow-lg"
+      className={cn(
+        "hero-float rounded-[1.5rem] bg-white/90 backdrop-blur border border-white/80",
+        "shadow-[0_24px_50px_-20px_rgba(27,42,74,0.35)] px-4 py-3.5 flex items-center gap-3",
+        tilt,
+      )}
       style={{ animation: `floaty 6s ease-in-out ${delay} infinite` }}
     >
-      <span className={cn("w-9 h-9 rounded-xl clay-chip flex items-center justify-center shrink-0", chip)}>
-        <Icon className={cn("w-4 h-4", icon2)} />
+      <span className={cn("w-11 h-11 rounded-2xl clay-chip flex items-center justify-center shrink-0 shadow-sm", chip)}>
+        <Icon className={cn("w-5 h-5", icon2)} />
       </span>
-      <span className="min-w-0 max-w-[10.5rem]">
-        <span className="block text-[13px] font-semibold text-brand-navy">{title}</span>
-        <span className="block text-[11px] text-[#3d4b66] truncate">{sub}</span>
+      <span className="min-w-0 max-w-[11rem]">
+        <span className="block text-[14px] font-bold text-brand-navy">{title}</span>
+        <span className="flex items-center gap-1 text-[11px] font-semibold text-emerald-600">
+          <Check className="w-3 h-3" strokeWidth={3} />
+          {sub}
+        </span>
+        {note ? <span className="block text-[10px] text-[#64748b] truncate">{note}</span> : null}
       </span>
     </div>
   );
@@ -444,7 +463,7 @@ export default function WelcomePage() {
   const FLOW_DOTS = ["bg-teal-500", "bg-indigo-500", "bg-amber-500", "bg-rose-500", "bg-sky-500", "bg-violet-500", "bg-emerald-500", "bg-pink-500", "bg-teal-500"];
 
   return (
-    <div className={cn(cinzel.variable, cormorant.variable, "min-h-screen bg-bg-primary")}>
+    <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
       {/* NAVBAR — light floating glass                                 */}
       {/* ============================================================ */}
@@ -467,6 +486,13 @@ export default function WelcomePage() {
               priority
             />
           </Link>
+          <div className="hidden lg:flex items-center gap-7 text-sm font-medium text-[#3d4b66]">
+            {["Features", "How It Works", "Solutions", "Pricing", "Resources"].map((l) => (
+              <a key={l} href={`#${l.toLowerCase().replace(/\s+/g, "-")}`} className="hover:text-brand-navy transition-colors">
+                {l}
+              </a>
+            ))}
+          </div>
           <div className="flex items-center gap-3">
             <Link
               href="/login"
@@ -514,33 +540,23 @@ export default function WelcomePage() {
             {/* LEFT — copy. Ledger lives in the stage beside this, never over it. */}
             <div className="max-w-xl min-w-0">
             <p
-              className="hero-eyebrow lp-eyebrow inline-flex items-center gap-2.5 sm:gap-3 text-[10px] sm:text-[11px] font-bold uppercase text-brand-navy/70 mb-7"
+              className="hero-eyebrow inline-flex items-center gap-2.5 rounded-full bg-white/80 border border-white shadow-[0_10px_30px_-14px_rgba(27,42,74,0.25)] px-4 py-2 text-[10px] sm:text-[11px] font-bold uppercase tracking-[0.16em] text-brand-navy/80 mb-7"
               style={{ animationDelay: "80ms" }}
             >
-              <span className="flex gap-1 shrink-0">
-                <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse" />
-                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse [animation-delay:200ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse [animation-delay:400ms]" />
-              </span>
+              <Sparkles className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
               <span className="min-w-0">AI-native accounting for modern businesses</span>
             </p>
 
             <h1
-              className="text-brand-navy text-[2.5rem] sm:text-6xl lg:text-7xl leading-[1.1] font-semibold"
-              style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+              className="text-brand-navy text-[2.6rem] sm:text-6xl lg:text-[4.1rem] leading-[1.08] font-semibold tracking-tight"
+              style={{ fontFamily: "var(--font-fraunces), Georgia, serif" }}
             >
               <span className="reveal-line">
-                <span style={{ "--d": "200ms" } as React.CSSProperties}>Your books,</span>
+                <span style={{ "--d": "200ms" } as React.CSSProperties}>Your Books,</span>
               </span>
               <span className="reveal-line">
                 <span style={{ "--d": "420ms" } as React.CSSProperties}>
-                  <span
-                    className="text-aurora font-medium italic"
-                    style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
-                  >
-                    balanced
-                  </span>{" "}
-                  by AI.
+                  <span className="text-aurora font-semibold italic">Smarter</span> with AI.
                 </span>
               </span>
             </h1>
@@ -555,31 +571,36 @@ export default function WelcomePage() {
             </p>
 
             <div
-              className="flex flex-wrap gap-4 mt-10"
+              className="flex flex-wrap items-center gap-4 mt-10"
               style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 820ms both" }}
             >
               <Link
                 href="/signup"
-                className="lp-btn-primary inline-flex items-center gap-2 px-8 py-4 rounded-2xl bg-gradient-to-r from-teal-500 to-indigo-500 text-white font-semibold text-base transition-all shadow-xl shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5"
+                className="lp-btn-primary inline-flex items-center gap-2.5 px-8 py-4 rounded-full bg-gradient-to-r from-teal-400 via-blue-600 to-indigo-600 text-white font-semibold text-base transition-all shadow-xl shadow-blue-600/30 hover:shadow-indigo-600/50 hover:-translate-y-0.5"
               >
                 Start Free <ArrowRight className="w-4 h-4" />
               </Link>
-              <Link
-                href="/login"
-                className="inline-flex items-center px-8 py-4 rounded-2xl glass-panel text-brand-navy font-semibold text-base transition-all hover:-translate-y-0.5"
+              <a
+                href="#how-it-works"
+                className="inline-flex items-center gap-3 pl-3 pr-7 py-3 rounded-full bg-white/90 backdrop-blur border border-white text-brand-navy font-semibold text-base transition-all shadow-[0_18px_40px_-18px_rgba(27,42,74,0.35)] hover:-translate-y-0.5 hover:shadow-[0_22px_46px_-18px_rgba(27,42,74,0.45)]"
               >
-                Sign In
-              </Link>
-              </div>
+                <span className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-md shadow-blue-500/30">
+                  <Play className="w-3.5 h-3.5 text-white fill-white" />
+                </span>
+                Watch Demo
+              </a>
+            </div>
 
               {/* trust badges */}
               <div
                 className="flex flex-wrap gap-x-6 gap-y-2.5 mt-8"
                 style={{ animation: "heroRise 1s cubic-bezier(0.19,1,0.22,1) 950ms both" }}
               >
-                {["No credit card required", "Set up in minutes", "Built for startups & SMEs"].map((tb) => (
+                {[["No credit card required"], ["Set up in minutes"], ["Built for startups & SMEs"]].map(([tb]) => (
                   <span key={tb} className="inline-flex items-center gap-2 text-[13px] font-medium text-[#3d4b66]">
-                    <BadgeCheck className="w-[18px] h-[18px] text-emerald-500 shrink-0" />
+                    <span className="w-[18px] h-[18px] rounded-full bg-emerald-500 flex items-center justify-center shrink-0 shadow-sm shadow-emerald-500/40">
+                      <Check className="w-3 h-3 text-white" strokeWidth={3.5} />
+                    </span>
                     {tb}
                   </span>
                 ))}
@@ -605,8 +626,10 @@ export default function WelcomePage() {
                   chip="bg-gradient-to-br from-emerald-100 to-emerald-50"
                   icon2="text-emerald-600"
                   title="Sales Invoice"
-                  sub="Created Successfully ✓ INV-2025-001"
+                  sub="Created Successfully"
+                  note="INV-2025-001"
                   delay="0s"
+                  tilt="-rotate-2"
                   target="invoice"
                 />
                 <FloatChip
@@ -614,8 +637,10 @@ export default function WelcomePage() {
                   chip="bg-gradient-to-br from-indigo-100 to-indigo-50"
                   icon2="text-indigo-600"
                   title="Journal Entry"
-                  sub="Recorded ✓ 2 Lines Posted"
+                  sub="Recorded"
+                  note="2 Lines Posted"
                   delay="1.1s"
+                  tilt="rotate-1"
                   target="journal"
                 />
                 <FloatChip
@@ -623,8 +648,10 @@ export default function WelcomePage() {
                   chip="bg-gradient-to-br from-sky-100 to-sky-50"
                   icon2="text-sky-600"
                   title="Trial Balance"
-                  sub="Updated ✓ As of today"
+                  sub="Updated"
+                  note="As of today"
                   delay="2.2s"
+                  tilt="rotate-2"
                   target="trial"
                 />
               </div>
@@ -654,20 +681,23 @@ export default function WelcomePage() {
                   <div className="grid grid-cols-3 gap-2">
                     <div>
                       <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 1.25M</div>
-                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
-                        Revenue <TrendingUp className="w-3 h-3 text-emerald-500" />
+                      <div className="text-[9px] text-[#64748b]">Revenue</div>
+                      <div className="text-[9px] font-bold text-emerald-600 flex items-center gap-0.5">
+                        <TrendingUp className="w-2.5 h-2.5" /> 12%
                       </div>
                     </div>
                     <div>
                       <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 420K</div>
-                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
-                        Expenses <TrendingDown className="w-3 h-3 text-rose-500" />
+                      <div className="text-[9px] text-[#64748b]">Expenses</div>
+                      <div className="text-[9px] font-bold text-rose-500 flex items-center gap-0.5">
+                        <TrendingDown className="w-2.5 h-2.5" /> 8%
                       </div>
                     </div>
                     <div>
                       <div className="text-[11px] font-bold text-brand-navy whitespace-nowrap">PKR 830K</div>
-                      <div className="text-[9px] text-[#3d4b66] flex items-center gap-1">
-                        Net Profit <TrendingUp className="w-3 h-3 text-emerald-500" />
+                      <div className="text-[9px] text-[#64748b]">Net Profit</div>
+                      <div className="text-[9px] font-bold text-emerald-600 flex items-center gap-0.5">
+                        <TrendingUp className="w-2.5 h-2.5" /> 18%
                       </div>
                     </div>
                   </div>
@@ -700,6 +730,45 @@ export default function WelcomePage() {
                 >
                   More time for what matters
                 </span>
+              </div>
+            </div>
+
+            {/* MOBILE — same cards as the desktop stage, shown as a 2-column
+                grid directly under Ledger (never a vertical list). */}
+            <div className="md:hidden grid grid-cols-2 gap-3 mt-1 pointer-events-none">
+              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
+                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-emerald-100 to-emerald-50 clay-chip flex items-center justify-center mb-2">
+                  <FileText className="w-4 h-4 text-emerald-600" />
+                </span>
+                <span className="block text-[12px] font-bold text-brand-navy">Sales Invoice</span>
+                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Created · INV-2025-001
+                </span>
+              </div>
+              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
+                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-indigo-100 to-indigo-50 clay-chip flex items-center justify-center mb-2">
+                  <BookOpen className="w-4 h-4 text-indigo-600" />
+                </span>
+                <span className="block text-[12px] font-bold text-brand-navy">Journal Entry</span>
+                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Recorded · 2 Lines
+                </span>
+              </div>
+              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
+                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-sky-100 to-sky-50 clay-chip flex items-center justify-center mb-2">
+                  <BarChart3 className="w-4 h-4 text-sky-600" />
+                </span>
+                <span className="block text-[12px] font-bold text-brand-navy">Trial Balance</span>
+                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Updated · As of today
+                </span>
+              </div>
+              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
+                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-violet-100 to-violet-50 clay-chip flex items-center justify-center mb-2">
+                  <Sparkles className="w-4 h-4 text-violet-600" />
+                </span>
+                <span className="block text-[12px] font-bold text-brand-navy">Ask anything…</span>
+                <span className="block text-[10px] text-[#64748b] truncate">&quot;Invoice for ABC Tech&quot;</span>
               </div>
             </div>
           </div>

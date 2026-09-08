@@ -518,7 +518,43 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
           <RobotErrorBoundary>
             <RobotCharacter variant={variant} reduced={reduced} />
           </RobotErrorBoundary>
-          {/* Soft contact shadow grounds him without any platform */}
+          {/* Dedicated glass podium — the visible platform Ledger stands on */}
+          {variant === "hero" ? (
+            <group scale={[1.95, 1, 0.78]}>
+              <mesh position={[0, -0.07, 0]}>
+                <cylinderGeometry args={[1.42, 1.52, 0.14, 64]} />
+                <meshStandardMaterial color="#ffffff" roughness={0.22} metalness={0.06} transparent opacity={0.94} />
+              </mesh>
+              <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <circleGeometry args={[1.42, 64]} />
+                <meshStandardMaterial color="#eef4ff" roughness={0.32} metalness={0.04} />
+              </mesh>
+              <mesh position={[0, 0.012, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <ringGeometry args={[1.3, 1.42, 64]} />
+                <meshBasicMaterial color="#8fb7ff" transparent opacity={0.5} />
+              </mesh>
+              <mesh position={[0, 0.008, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <circleGeometry args={[0.62, 48]} />
+                <meshBasicMaterial color="#bae6fd" transparent opacity={0.28} />
+              </mesh>
+            </group>
+          ) : (
+            <group scale={[1.15, 1, 0.8]}>
+              <mesh position={[0, -0.06, 0]}>
+                <cylinderGeometry args={[0.98, 1.06, 0.12, 48]} />
+                <meshStandardMaterial color="#ffffff" roughness={0.22} metalness={0.06} transparent opacity={0.94} />
+              </mesh>
+              <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <circleGeometry args={[0.98, 48]} />
+                <meshStandardMaterial color="#eef4ff" roughness={0.32} metalness={0.04} />
+              </mesh>
+              <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <ringGeometry args={[0.88, 0.98, 48]} />
+                <meshBasicMaterial color="#8fb7ff" transparent opacity={0.5} />
+              </mesh>
+            </group>
+          )}
+          {/* Soft contact shadow grounds him on the platform */}
           <ContactShadows
             position={[0, 0.001, 0]}
             opacity={0.2}
