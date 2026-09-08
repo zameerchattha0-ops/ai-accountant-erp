@@ -1216,3 +1216,89 @@ body {
     animation: none !important;
   }
 }
+
+/* ---- Ledger's physical interactions with the hero elements ---- */
+/* He walks up to a card, reaches out, and the element reacts: chips pop,
+   the overview card wiggles + its chart refreshes, the ask pill glows. */
+@keyframes ledgerChipPop {
+  0% {
+    transform: translateY(0) scale(1) rotate(0deg);
+  }
+  28% {
+    transform: translateY(-10px) scale(1.08) rotate(-2.5deg);
+    box-shadow: 0 18px 40px -12px rgba(16, 185, 129, 0.45);
+  }
+  55% {
+    transform: translateY(2px) scale(0.97) rotate(1.5deg);
+  }
+  100% {
+    transform: translateY(0) scale(1) rotate(0deg);
+  }
+}
+@keyframes ledgerCardWiggle {
+  0% {
+    transform: translateY(0) rotate(0deg);
+  }
+  20% {
+    transform: translateY(-8px) rotate(1.6deg);
+    box-shadow: 0 22px 48px -14px rgba(99, 102, 241, 0.5);
+  }
+  45% {
+    transform: translateY(2px) rotate(-1.8deg);
+  }
+  70% {
+    transform: translateY(-4px) rotate(0.9deg);
+  }
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+}
+@keyframes ledgerAskGlow {
+  0% {
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0);
+  }
+  30% {
+    box-shadow:
+      0 0 0 6px rgba(45, 212, 191, 0.25),
+      0 14px 36px -10px rgba(45, 212, 191, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0);
+  }
+}
+@keyframes ledgerSendPulse {
+  0%,
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
+  35% {
+    transform: scale(1.25) rotate(12deg);
+  }
+  65% {
+    transform: scale(0.92) rotate(-6deg);
+  }
+}
+
+[data-ledger-target].ledger-poked {
+  will-change: transform;
+}
+[data-ledger-target="invoice"].ledger-poked,
+[data-ledger-target="journal"].ledger-poked,
+[data-ledger-target="trial"].ledger-poked {
+  animation: ledgerChipPop 0.95s cubic-bezier(0.34, 1.56, 0.64, 1) !important;
+}
+[data-ledger-target="overview"].ledger-poked {
+  animation: ledgerCardWiggle 1.15s cubic-bezier(0.34, 1.56, 0.64, 1) !important;
+}
+[data-ledger-target="ask"].ledger-poked {
+  animation: ledgerAskGlow 1.2s ease-out !important;
+}
+[data-ledger-target="ask"].ledger-poked .ledger-send {
+  animation: ledgerSendPulse 0.8s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-ledger-target].ledger-poked,
+  [data-ledger-target="ask"].ledger-poked .ledger-send {
+    animation: none !important;
+  }
+}

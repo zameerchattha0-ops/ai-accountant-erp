@@ -24,8 +24,41 @@ import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { ContactShadows, Html } from "@react-three/drei";
 
 type Variant = "hero" | "compact";
-type Phase = "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit";
+type Phase = "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit" | "interact";
 type SpeechLine = { k: number; text: string };
+type PokeTarget = "invoice" | "journal" | "trial" | "overview" | "ask";
+
+/* Hero hotspots Ledger can walk up to and physically interact with.
+   xf = x position as a fraction of the roam bound; reach = [armX, armZ]
+   tailored to where the element sits (high card vs low pill). */
+const HOTSPOTS: Record<PokeTarget, { xf: number; line: string; reach: [number, number] }> = {
+  invoice: {
+    xf: -0.92,
+    line: "Invoice INV-2025-001 — created and posted!",
+    reach: [-0.6, 1.9],
+  },
+  journal: {
+    xf: -0.88,
+    line: "Journal entry recorded. Debits equal credits — always.",
+    reach: [-0.55, 1.8],
+  },
+  trial: {
+    xf: -0.84,
+    line: "Trial balance updated. Everything adds up.",
+    reach: [-0.5, 1.7],
+  },
+  overview: {
+    xf: 0.95,
+    line: "Fresh numbers, hot off the ledger!",
+    reach: [-0.35, 2.15],
+  },
+  ask: {
+    xf: 0.7,
+    line: "Ask me anything — I speak fluent accounting.",
+    reach: [-0.95, 1.15],
+  },
+};
+const POKEABLE: PokeTarget[] = ["invoice", "journal", "trial", "overview", "ask"];
 
 /* Random AI / accounting wit for the speech bubble */
 const SPEECH: string[] = [
@@ -122,12 +155,22 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
   }, []);
 
   const { viewport } = useThree();
-  /* Hero: stay in the open centre corridor between the floating cards
-     (chips on the left edge, overview card on the right edge). */
+  /* Hero: roam the open centre corridor, plus the card edges when he is
+     off to interact with them. The floating cards only render ≥ md. */
   const bound =
     variant === "hero"
       ? Math.min(Math.max(0.55, viewport.width / 2 - 1.0), 1.0)
       : Math.max(0.3, viewport.width / 2 - 0.95);
+
+  /* Cards exist only from md up — track so mobile never "pokes" air */
+  const [wide, setWide] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 768px)");
+    setWide(mq.matches);
+    const on = () => setWide(mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
 
   /* --- speech bubble: appears at RANDOM intervals, never sticky --- */
   const clock = useRef(0);
@@ -139,6 +182,11 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     lineRef.current = l;
     setLine(l);
   };
+
+  /* --- interaction state --- */
+  const targetRef = useRef<PokeTarget>("invoice");
+  const firedRef = useRef(false);
+  const zTarget = useRef(0);
 
   useFrame((state, rawDelta) => {
     const g = root.current;
@@ -162,27 +210,60 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     /* random activity loop */
     if (t.current >= dur.current && !reduced) {
       t.current = 0;
-      const pool: Phase[] = ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop"];
+      const canPoke = wide && variant === "hero";
+      const pool: Phase[] = canPoke
+        ? ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop", "interact", "interact"]
+        : ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop"];
       let next = pick(pool);
       if (next === phase.current) next = pick(pool);
       phase.current = next;
-      dur.current = next === "walk" ? rand(3.5, 6.5) : rand(2.6, 4.4);
+      if (next === "interact") {
+        targetRef.current = pick(POKEABLE);
+        firedRef.current = false;
+        dur.current = 4.6;
+        zTarget.current = 0.55; // step forward, off his usual spot
+      } else if (next === "walk") {
+        dur.current = rand(3.5, 6.5);
+        zTarget.current = rand(-0.15, 0.5); // wander the depth of the stage too
+      } else {
+        dur.current = rand(2.6, 4.4);
+        zTarget.current = 0.08;
+      }
     }
     if (reduced) phase.current = "idle";
     const p = phase.current;
 
-    /* roam the stage's empty floor */
-    if (p === "walk") {
+    /* movement: roam the floor, or walk UP TO a card and interact with it */
+    let faceY: number;
+    const hs = p === "interact" ? HOTSPOTS[targetRef.current] : null;
+    if (hs) {
+      const tx = hs.xf * bound;
+      const dx = tx - g.position.x;
+      g.position.x = THREE.MathUtils.damp(g.position.x, tx, 1.9, d);
+      /* face where he is walking, then face the visitor once in position */
+      faceY =
+        t.current < 1.0 && Math.abs(dx) > 0.06
+          ? THREE.MathUtils.clamp(dx, -1, 1) * 0.9
+          : Math.sin(time * 0.6) * 0.06;
+      /* the actual "poke": fire once as his hand lands */
+      if (t.current > 1.5 && !firedRef.current) {
+        firedRef.current = true;
+        window.dispatchEvent(new CustomEvent("ledger-poke", { detail: { target: targetRef.current } }));
+        say({ k: clock.current, text: hs.line });
+        hideAt.current = clock.current + 6.0;
+        nextLine.current = clock.current + rand(8, 14);
+      }
+    } else if (p === "walk") {
       g.position.x += dir.current * 0.5 * d;
       if (g.position.x > bound) dir.current = -1;
       else if (g.position.x < -bound) dir.current = 1;
+      faceY = dir.current * 0.55;
+    } else if (p === "clap" || p === "read" || p === "sit") {
+      faceY = 0;
+    } else {
+      faceY = Math.sin(time * 0.6) * 0.12;
     }
-    const faceY =
-      p === "walk"
-        ? dir.current * 0.55
-        : p === "clap" || p === "read" || p === "sit"
-          ? 0
-          : Math.sin(time * 0.6) * 0.12;
+    g.position.z = THREE.MathUtils.damp(g.position.z, zTarget.current, 2, d);
     g.rotation.y = THREE.MathUtils.damp(g.rotation.y, faceY, 4, d);
     g.rotation.z = p === "dance" ? Math.sin(t.current * 4) * 0.1 : THREE.MathUtils.damp(g.rotation.z, 0, 4, d);
 
@@ -224,6 +305,13 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     } else if (p === "walk") {
       axL = swing;
       axR = -swing;
+    } else if (p === "interact") {
+      /* reach out to the element; a small press-bounce as the hand lands */
+      const [rx, rz] = HOTSPOTS[targetRef.current].reach;
+      const press = t.current > 1.5 ? Math.max(0, Math.sin((t.current - 1.5) * 9)) * 0.3 : 0;
+      axR = rx;
+      azR = rz + press;
+      azL = -0.1 + Math.sin(time * 1.7) * 0.05;
     } else {
       azL = -0.08 + Math.sin(time * 1.7) * 0.05;
       azR = 0.08 - Math.sin(time * 1.7) * 0.05;

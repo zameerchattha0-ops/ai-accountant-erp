@@ -211,6 +211,7 @@ function FloatChip({
   title,
   sub,
   delay,
+  target,
 }: {
   icon: LucideIcon;
   chip: string;
@@ -218,9 +219,11 @@ function FloatChip({
   title: string;
   sub: string;
   delay: string;
+  target?: string;
 }) {
   return (
     <div
+      data-ledger-target={target}
       className="hero-float glass-panel glass-soft rounded-2xl px-4 py-3 flex items-center gap-3 shadow-lg"
       style={{ animation: `floaty 6s ease-in-out ${delay} infinite` }}
     >
@@ -251,11 +254,35 @@ const HERO_STRIP: { icon: LucideIcon; label: string; chip: string; icon2: string
 export default function WelcomePage() {
   const [scrolled, setScrolled] = useState(false);
   const heroRef = useRef<HTMLElement>(null);
+  /* Business Overview chart bars — Ledger re-randomises them when he pokes the card */
+  const DEFAULT_BARS = [38, 55, 42, 70, 48, 62, 80, 58, 90, 66, 74, 95, 60, 85, 52, 78, 68, 88];
+  const [bars, setBars] = useState<number[]>(DEFAULT_BARS);
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 40);
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  /* Ledger's interactions: when he pokes a hero element, that element
+     pops/glows; the Business Overview chart also gets fresh data. */
+  useEffect(() => {
+    const onPoke = (e: Event) => {
+      const target = (e as CustomEvent<{ target: string }>).detail?.target;
+      if (!target) return;
+      const el = document.querySelector(`[data-ledger-target="${target}"]`);
+      if (el) {
+        el.classList.remove("ledger-poked");
+        void (el as HTMLElement).offsetWidth; // restart the animation
+        el.classList.add("ledger-poked");
+        window.setTimeout(() => el.classList.remove("ledger-poked"), 1500);
+      }
+      if (target === "overview") {
+        setBars(Array.from({ length: 18 }, () => Math.round(30 + Math.random() * 65)));
+      }
+    };
+    window.addEventListener("ledger-poke", onPoke);
+    return () => window.removeEventListener("ledger-poke", onPoke);
   }, []);
 
   /* Cursor parallax: writes normalised pointer offsets into --px/--py on
@@ -570,7 +597,8 @@ export default function WelcomePage() {
                 <HeroRobotStage variant="hero" />
               </div>
 
-              {/* document chips — left edge, narrow */}
+              {/* document chips — left edge, narrow. Ledger walks over and
+                  "posts" each one; the chip pops when his hand lands. */}
               <div className="absolute left-0 top-[7%] hidden md:flex flex-col gap-5 pointer-events-none">
                 <FloatChip
                   icon={FileText}
@@ -579,6 +607,7 @@ export default function WelcomePage() {
                   title="Sales Invoice"
                   sub="Created Successfully ✓ INV-2025-001"
                   delay="0s"
+                  target="invoice"
                 />
                 <FloatChip
                   icon={BookOpen}
@@ -587,6 +616,7 @@ export default function WelcomePage() {
                   title="Journal Entry"
                   sub="Recorded ✓ 2 Lines Posted"
                   delay="1.1s"
+                  target="journal"
                 />
                 <FloatChip
                   icon={BarChart3}
@@ -595,10 +625,13 @@ export default function WelcomePage() {
                   title="Trial Balance"
                   sub="Updated ✓ As of today"
                   delay="2.2s"
+                  target="trial"
                 />
               </div>
-              {/* Business Overview card — right edge, below the chip zone */}
+              {/* Business Overview card — right edge, below the chip zone.
+                  Ledger pokes it → card wiggles and the chart refreshes. */}
               <div
+                data-ledger-target="overview"
                 className="absolute right-0 top-[30%] hidden md:block pointer-events-none"
                 style={{ animation: "floaty 7s ease-in-out 0.8s infinite" }}
               >
@@ -610,10 +643,10 @@ export default function WelcomePage() {
                     </span>
                   </div>
                   <div className="flex items-end gap-[3px] h-16 mb-3">
-                    {[38, 55, 42, 70, 48, 62, 80, 58, 90, 66, 74, 95, 60, 85, 52, 78, 68, 88].map((h, i) => (
+                    {bars.map((h, i) => (
                       <span
                         key={i}
-                        className="flex-1 rounded-full"
+                        className="flex-1 rounded-full transition-all duration-700 ease-out"
                         style={{ height: `${h}%`, background: "linear-gradient(180deg, #818cf8, #2dd4bf)" }}
                       />
                     ))}
@@ -641,8 +674,9 @@ export default function WelcomePage() {
                 </div>
               </div>
 
-              {/* Ask-anything card — bottom right */}
+              {/* Ask-anything card — bottom right. Ledger taps it → glow + send pulse. */}
               <div
+                data-ledger-target="ask"
                 className="absolute right-2 bottom-[7%] hidden md:flex pointer-events-none"
                 style={{ animation: "floaty 6.5s ease-in-out 1.4s infinite" }}
               >
@@ -652,7 +686,7 @@ export default function WelcomePage() {
                     <div className="text-xs font-semibold text-brand-navy">Ask anything…</div>
                     <div className="text-[11px] text-[#3d4b66] truncate">&quot;Create an invoice for ABC Tech&quot;</div>
                   </div>
-                  <span className="w-8 h-8 rounded-xl bg-gradient-to-br from-teal-500 to-indigo-500 flex items-center justify-center shrink-0 shadow-md">
+                  <span className="ledger-send w-8 h-8 rounded-xl bg-gradient-to-br from-teal-500 to-indigo-500 flex items-center justify-center shrink-0 shadow-md">
                     <Send className="w-3.5 h-3.5 text-white" />
                   </span>
                 </div>
