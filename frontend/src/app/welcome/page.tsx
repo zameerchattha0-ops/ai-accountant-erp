@@ -565,7 +565,8 @@ export default function WelcomePage() {
               className="relative h-[340px] sm:h-[420px] lg:h-[540px] -mx-3 sm:mx-0"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
             >
-              <div className="absolute inset-0">
+              {/* canvas above the chips so Ledger walks IN FRONT of them */}
+              <div className="absolute inset-0 z-10">
                 <HeroRobotStage variant="hero" />
               </div>
 
