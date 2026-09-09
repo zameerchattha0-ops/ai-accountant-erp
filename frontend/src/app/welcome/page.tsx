@@ -532,8 +532,8 @@ export default function WelcomePage() {
         <div className="lp-grain" />
 
         <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-28 pb-24 lg:pt-32 lg:pb-28">
-          <div className="grid lg:grid-cols-[1.05fr_1fr] gap-6 lg:gap-4 items-center">
-            {/* LEFT — copy. Ledger lives in the stage beside this, never over it. */}
+          <div className="grid grid-cols-1 gap-6 items-start">
+            {/* TOP — copy. Ledger lives in the stage below this, never over it. */}
             <div className="max-w-xl min-w-0">
             <p
               className="hero-eyebrow inline-flex items-center gap-2.5 rounded-full bg-white/80 border border-white shadow-[0_10px_30px_-14px_rgba(27,42,74,0.25)] px-4 py-2 text-[10px] sm:text-[11px] font-bold uppercase tracking-[0.16em] text-brand-navy/80 mb-7"
@@ -544,7 +544,7 @@ export default function WelcomePage() {
             </p>
 
             <h1
-              className="text-brand-navy text-[2.6rem] sm:text-6xl lg:text-[4.1rem] leading-[1.08] font-semibold tracking-tight"
+              className="text-brand-navy text-[2.6rem] sm:text-6xl leading-[1.08] font-semibold tracking-tight"
               style={{ fontFamily: "var(--font-fraunces), Georgia, serif" }}
             >
               <span className="reveal-line">
@@ -605,10 +605,10 @@ export default function WelcomePage() {
               </div>
             </div>
 
-            {/* RIGHT — Ledger's stage. He roams THIS area only; the floating
+            {/* BELOW — Ledger's stage. He roams THIS area only; the floating
                 cards are pointer-transparent glass orbiting him. */}
             <div
-              className="relative h-[340px] sm:h-[420px] lg:h-[540px] -mx-3 sm:mx-0"
+              className="relative h-[340px] sm:h-[420px] md:h-[460px] lg:h-[560px] xl:h-[620px] -mx-3 sm:mx-0"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
             >
               {/* canvas above the chips so Ledger walks IN FRONT of them */}
@@ -720,8 +720,10 @@ export default function WelcomePage() {
                 </div>
               </div>
 
-              {/* handwritten whisper — bottom left */}
-              <div className="absolute left-1 bottom-[4%] hidden lg:block pointer-events-none">
+              {/* handwritten whisper — retired with the split-screen hero;
+                  kept out of the stacked stage so it matches the reference
+                  layout exactly on every screen size */}
+              <div className="hidden pointer-events-none">
                 <span
                   className="text-2xl text-indigo-500/80 italic"
                   style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}

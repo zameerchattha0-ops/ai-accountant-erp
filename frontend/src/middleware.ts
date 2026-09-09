@@ -1,6 +1,18 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-const PUBLIC_ROUTES = ["/login", "/signup", "/verify-email", "/welcome"];
+const PUBLIC_ROUTES = [
+  "/login",
+  "/signup",
+  "/verify-email",
+  "/auth",
+  "/welcome",
+  // Marketing pages linked from the header — accessible to everyone
+  "/features",
+  "/how-it-works",
+  "/solutions",
+  "/pricing",
+  "/resources",
+];
 
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
