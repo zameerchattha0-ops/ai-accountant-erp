@@ -85,10 +85,20 @@ export default function SignupPage() {
       );
       return;
     }
-    const { error } = await supabase.auth.signInWithOAuth({
+    const { data: oauthData, error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: `${getSiteUrl()}/auth/callback` },
     });
+    /* The auth server drops the `sb_flow_id` param from the final redirect;
+       persist the flow id so /auth/callback can pick the right PKCE
+       verifier slot for the exchange. */
+    if (!error && oauthData?.flowId) {
+      try {
+        sessionStorage.setItem("pkce_flow_id", oauthData.flowId);
+      } catch {
+        /* storage unavailable — the callback falls back to cookie scanning */
+      }
+    }
     if (error) {
       setError(error.message);
       setGoogleLoading(false);
