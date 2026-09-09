@@ -5,6 +5,7 @@ import Link from "next/link";
 import Image from "next/image";
 import { createClient } from "@/lib/supabase/client";
 import { getSiteUrl } from "@/lib/site-url";
+import { isGoogleProviderEnabled } from "@/lib/auth/google";
 import { Eye, EyeOff, Loader2, CheckCircle } from "lucide-react";
 import dynamic from "next/dynamic";
 
@@ -35,6 +36,7 @@ export default function SignupPage() {
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
+  const [googleHint, setGoogleHint] = useState<string | null>(null);
   const supabase = createClient();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -68,10 +70,21 @@ export default function SignupPage() {
   };
 
   /* Google OAuth (Supabase Auth). Signing up with Google creates the auth
-     user instantly; organization setup continues via /onboarding. */
+     user instantly; organization setup continues via /onboarding.
+     Pre-checks that the provider is enabled so users get a friendly
+     notice instead of a raw "provider is not enabled" JSON page. */
   const handleGoogleSignUp = async () => {
     setError("");
+    setGoogleHint(null);
     setGoogleLoading(true);
+    const enabled = await isGoogleProviderEnabled();
+    if (!enabled) {
+      setGoogleLoading(false);
+      setGoogleHint(
+        "Google sign-in isn't enabled yet — we're finishing the setup. Please create your account with email & password for now."
+      );
+      return;
+    }
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: `${getSiteUrl()}/auth/callback` },
@@ -208,6 +221,11 @@ export default function SignupPage() {
         )}
         {googleLoading ? "Redirecting to Google..." : "Sign up with Google"}
       </button>
+      {googleHint && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-center">
+          {googleHint}
+        </p>
+      )}
 
       <p className="text-center text-sm text-text-secondary">
         Already have an account?{" "}

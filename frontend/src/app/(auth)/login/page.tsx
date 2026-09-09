@@ -6,6 +6,7 @@ import Link from "next/link";
 import Image from "next/image";
 import { createClient } from "@/lib/supabase/client";
 import { getSiteUrl } from "@/lib/site-url";
+import { isGoogleProviderEnabled } from "@/lib/auth/google";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
 import dynamic from "next/dynamic";
 
@@ -34,6 +35,7 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
+  const [googleHint, setGoogleHint] = useState<string | null>(null);
   const router = useRouter();
   const supabase = createClient();
 
@@ -55,10 +57,21 @@ export default function LoginPage() {
   };
 
   /* Google OAuth (Supabase Auth). PKCE flow: Google bounces back to
-     /auth/callback, where the browser client exchanges the code. */
+     /auth/callback, where the browser client exchanges the code.
+     Pre-checks that the provider is enabled so users get a friendly
+     notice instead of a raw "provider is not enabled" JSON page. */
   const handleGoogleSignIn = async () => {
     setError("");
+    setGoogleHint(null);
     setGoogleLoading(true);
+    const enabled = await isGoogleProviderEnabled();
+    if (!enabled) {
+      setGoogleLoading(false);
+      setGoogleHint(
+        "Google sign-in isn't enabled yet — we're finishing the setup. Please sign in with email & password for now."
+      );
+      return;
+    }
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: `${getSiteUrl()}/auth/callback` },
@@ -162,6 +175,11 @@ export default function LoginPage() {
         )}
         {googleLoading ? "Redirecting to Google..." : "Continue with Google"}
       </button>
+      {googleHint && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-center">
+          {googleHint}
+        </p>
+      )}
 
       <p className="text-center text-sm text-text-secondary">
         Don&apos;t have an account?{" "}
