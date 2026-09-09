@@ -172,6 +172,11 @@ def resolve_date_range(
     base = today or date.today()
     text = (raw or "").strip().lower()
 
+    # Common synonyms users type instead of "this month".
+    text = text.replace("current month", "this month").replace(
+        "present month", "this month"
+    )
+
     if "this month" in text:
         s, e = _month_bounds(base)
         return s.isoformat(), e.isoformat()

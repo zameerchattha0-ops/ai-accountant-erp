@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.date_parser import parse_transaction_date
+from app.date_parser import parse_transaction_date, resolve_date_range
 from app.reasoning import (
     DATE_REQUIRED_INTENTS,
     NATURE_DECISION_QUESTION,
@@ -76,6 +76,19 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("project_profitability", [r"project.*profit", r"profitability"]),
     ("generate_customer_ledger", [r"customer.*ledger"]),
     ("generate_supplier_ledger", [r"supplier.*ledger"]),
+    # Expense LOOKUPS must win over record_expense: the bare "expense"
+    # keyword in record_expense used to swallow query phrasings like
+    # "provide details of current month expenses" and drag them into the
+    # recording clarification ladder (live defect).  Query-shaped
+    # phrasings are matched FIRST and routed to the read-only listing.
+    ("list_expenses", [
+        r"(?:show|list|give|provide|tell|view|display|details?|summary|"
+        r"summar\w*|breakdown|what|which|how much|any|all)[^.\n]*expenses?",
+        r"expenses?[^.\n]*\b(?:details?|report|summary|list|history|"
+        r"breakdown|this month|last month|this week|last month)",
+        r"expense\s+report",
+        r"(?:how much|what|total)[^.\n]*\bspen[td]\b",
+    ]),
     # New document types
     # convert_quotation MUST precede create_quotation: "convert quotation to
     # invoice" also matches the generic quotation pattern below.
@@ -90,7 +103,15 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("record_cash_sale", [r"sold.*cash", r"cash\s*sale", r"received\s*payment.*for"]),
     ("record_credit_purchase", [r"bought.*credit", r"credit\s*purchase", r"on\s*credit.*bought", r"purchased.*credit"]),
     ("record_cash_purchase", [r"bought.*cash", r"cash\s*purchase", r"purchased.*cash", r"bought.*paid"]),
-    ("record_expense", [r"expense", r"spent", r"record.*expense"]),
+    # record_expense requires a RECORDING verb (or an amount-bearing
+    # "expense of/for <figure>" phrasing) — a bare "expense" keyword
+    # swallowed query phrasings and sent them into the recording ladder.
+    ("record_expense", [
+        r"record[^.\n]*expense",
+        r"(?:log|book|add|track|enter|submit|file)[^.\n]*expense",
+        r"expense\s+(?:of|for)\s+(?:rs\.?|pkr)?\s*[\d,]",
+        r"spent",
+    ]),
     ("record_receipt", [r"receipt", r"received.*from.*customer", r"customer.*paid", r"payment.*received"]),
     ("record_payment", [r"paid.*supplier", r"supplier.*payment", r"payment.*to.*supplier"]),
     ("record_bank_transfer", [r"transfer.*bank", r"bank.*transfer", r"transfer.*from.*to.*account", r"move.*money.*from", r"transfer.*hbl\b", r"transfer.*meezan\b"]),
@@ -460,6 +481,18 @@ def plan(
     txn_date = _extract_date(msg, msg_lower)
     if txn_date:
         entities["transaction_date"] = txn_date
+    # Report/list intents accept a relative period ("this month", "last
+    # quarter", …) which becomes an explicit date_from/date_to pair so the
+    # read-only fast path can filter deterministically ("current month"
+    # is normalised to "this month" by the parser).
+    _RANGE_INTENTS = {
+        "list_expenses", "generate_general_ledger",
+    }
+    if intent in _RANGE_INTENTS:
+        rng = resolve_date_range(msg)
+        if rng:
+            entities.setdefault("date_from", rng[0])
+            entities.setdefault("date_to", rng[1])
     item = _extract_item(msg)
     if item:
         entities["item_description"] = item
@@ -1395,6 +1428,14 @@ def _identify_intent(msg_lower: str) -> str:
     if re.search(r"\d{3,}", msg_lower) and re.search(
         r"expens|expence|expenz|explan|expln|spent|spend\b", msg_lower
     ):
+        # Query-shaped expense mentions are lookups, never recordings
+        # ("details of current month expences" with a typo'd spelling).
+        if re.search(
+            r"show|list|give|provide|tell|view|display|details?|summary|"
+            r"summar\w*|breakdown|report|what|which|how much",
+            msg_lower,
+        ):
+            return "list_expenses"
         return "record_expense"
     # Work Stream R4.4 — "received payment" WITHOUT a sale/purchase verb
     # is a customer receipt ("received payment of Rs.20,000"); a sale
@@ -1650,6 +1691,7 @@ def _tools_for_intent(intent: str) -> List[str]:
         "generate_general_ledger": ["get_general_ledger"],
         "generate_customer_ledger": ["search_customer", "get_customer_ledger"],
         "generate_supplier_ledger": ["search_supplier", "get_supplier_ledger"],
+        "list_expenses": ["list_expenses"],
         "project_profitability": ["search_project", "get_project_profitability"],
     }
     return mapping.get(intent, [])
@@ -1717,5 +1759,6 @@ def _outcome(intent: str) -> str:
         "generate_trial_balance": "Trial balance report generated",
         "generate_balance_sheet": "Balance sheet generated",
         "generate_profit_loss": "Profit & Loss statement generated",
+        "list_expenses": "Expense details retrieved",
     }
     return outcomes.get(intent, "Operation completed")

@@ -977,6 +977,7 @@ _REPORT_FAST_TOOLS = {
     "generate_profit_loss": "get_profit_loss",
     "generate_cash_flow": "get_cash_flow",
     "generate_general_ledger": "get_general_ledger",
+    "list_expenses": "list_expenses",
     "list_bank_accounts": "list_bank_accounts",
 }
 _PARTY_LEDGER_FAST = {
@@ -999,6 +1000,7 @@ _FAST_PATH_TITLES = {
     "generate_profit_loss": "Profit & Loss",
     "generate_cash_flow": "Cash Flow",
     "generate_general_ledger": "General Ledger",
+    "list_expenses": "Expense Details",
     "list_bank_accounts": "Bank Accounts",
     "customer_balance": "Customer Ledger",
     "supplier_balance": "Supplier Ledger",
@@ -1103,8 +1105,8 @@ async def _try_report_fast_path(
     tool_slug = _REPORT_FAST_TOOLS.get(intent)
     if tool_slug:
         args: Dict[str, Any] = {}
-        if intent == "generate_general_ledger":
-            ents = execution_plan.extracted_entities or {}
+        ents = execution_plan.extracted_entities or {}
+        if intent in ("generate_general_ledger", "list_expenses"):
             if ents.get("date_from"):
                 args["from_date"] = ents["date_from"]
             if ents.get("date_to"):
@@ -1196,6 +1198,17 @@ async def _try_report_fast_path(
         f"{title} - {len(all_rows)} rows (deterministic fast-path, no LLM used)"
         + (f":\n{rows_text}" if rows_text else "")
     )
+    if intent == "list_expenses" and all_rows:
+        total = 0.0
+        for row in all_rows:
+            try:
+                total += float(row.get("total") or 0)
+            except (TypeError, ValueError):
+                continue
+        summary = (
+            f"{title} - {len(all_rows)} expenses, total {total:,.2f}"
+            + (f":\n{rows_text}" if rows_text else "")
+        )
 
     await _log_step(session_id, "COMPLETED", {
         "BYPASS_LLM": True,

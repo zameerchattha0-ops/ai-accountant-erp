@@ -125,7 +125,7 @@ _ALWAYS_ALLOWED = {
     "search_supplier", "get_supplier", "get_supplier_ledger",
     "search_account", "get_chart_of_accounts",
     "get_invoice", "get_purchase_bill",
-    "classify_expense",
+    "classify_expense", "list_expenses",
     "search_product", "search_fixed_asset", "get_fixed_asset",
     "search_service",
 }

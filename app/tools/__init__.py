@@ -572,6 +572,21 @@ async def _get_cash_flow(organization_id: uuid.UUID, **kw) -> ToolResult:
     data = await reporting_service.get_cash_flow(organization_id)
     return ToolResult(tool_name="get_cash_flow", success=True, data=data)
 
+async def _list_expenses(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """List recorded expenses (read-only).  Supports optional
+    ``from_date``/``to_date`` (ISO) — used by the deterministic
+    expense-details fast path ("details of this month's expenses")."""
+    from app.repositories import expense_repository
+
+    rows = await expense_repository.list_expenses(organization_id, limit=100)
+    from_date = kw.get("from_date")
+    to_date = kw.get("to_date")
+    if from_date:
+        rows = [r for r in rows if (r.get("expense_date") or "") >= str(from_date)]
+    if to_date:
+        rows = [r for r in rows if (r.get("expense_date") or "") <= str(to_date)]
+    return ToolResult(tool_name="list_expenses", success=True, data=rows)
+
 async def _generate_report(organization_id: uuid.UUID, **kw) -> ToolResult:
     data = await reporting_service.generate_report(organization_id, **kw)
     return ToolResult(tool_name="generate_report", success=True, data=data)
@@ -690,6 +705,7 @@ register("get_trial_balance", handler=_get_trial_balance, read_only=True, descri
 register("get_profit_loss", handler=_get_profit_loss, read_only=True, description="Get profit & loss statement")
 register("get_balance_sheet", handler=_get_balance_sheet, read_only=True, description="Get balance sheet")
 register("get_cash_flow", handler=_get_cash_flow, read_only=True, description="Get cash flow data")
+register("list_expenses", handler=_list_expenses, read_only=True, description="List recorded expenses with dates, payees and totals (supports from_date/to_date)")
 register("generate_report", handler=_generate_report, read_only=True, description="Generate a custom report")
 
 # Project

@@ -355,7 +355,9 @@ async def ai_execute_stream(
             heartbeat += 1
             if heartbeat % 15 == 0:
                 yield ": keepalive\n\n"
-            await asyncio.sleep(0.4)
+            # 150ms poll: stage updates land in the same tick the DB step
+            # is written — the run feels instant instead of chunky.
+            await asyncio.sleep(0.15)
 
         response = await run_task
         yield (

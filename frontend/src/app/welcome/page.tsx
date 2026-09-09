@@ -494,9 +494,36 @@ export default function WelcomePage() {
               priority
             />
           </Link>
-          {/* Hamburger approach — one menu button on every viewport (incl. PC)
-              holding the nav links + auth actions in a glass dropdown. */}
-          <div ref={menuRef} className="relative flex items-center">
+          {/* Desktop (lg+): classic header — inline links + auth actions.
+              The hamburger is reserved for smaller viewports. */}
+          <div className="hidden lg:flex items-center gap-7 text-sm font-medium text-[#3d4b66]">
+            {[
+              { label: "Features", href: "/features" },
+              { label: "How It Works", href: "/how-it-works" },
+              { label: "Solutions", href: "/solutions" },
+              { label: "Pricing", href: "/pricing" },
+              { label: "Resources", href: "/resources" },
+            ].map((l) => (
+              <Link key={l.label} href={l.href} className="hover:text-brand-navy transition-colors">
+                {l.label}
+              </Link>
+            ))}
+            <Link
+              href="/login"
+              className="px-4 py-2 rounded-full text-sm font-semibold text-brand-navy border border-slate-200/90 bg-white/70 hover:bg-white transition-colors"
+            >
+              Login
+            </Link>
+            <Link
+              href="/signup"
+              className="px-5 py-2 rounded-full bg-gradient-to-r from-teal-500 to-cyan-500 text-white text-sm font-semibold shadow-lg shadow-teal-500/25 hover:shadow-cyan-500/45 transition-all"
+            >
+              Get Started
+            </Link>
+          </div>
+          {/* Hamburger approach — one menu button below lg holding the nav
+              links + auth actions in a glass dropdown. */}
+          <div ref={menuRef} className="relative flex items-center lg:hidden">
             <button
               type="button"
               aria-label={menuOpen ? "Close menu" : "Open menu"}
@@ -661,9 +688,11 @@ export default function WelcomePage() {
             </div>
 
             {/* RIGHT / FRONT — Ledger's stage, lifted level with the headline.
-                He roams THIS area, walking IN FRONT of his floating chips. */}
+                He roams THIS area, walking IN FRONT of his floating chips.
+                On lg+ the canvas stretches the FULL hero row height so he
+                has the entire section as his stage. */}
             <div
-              className="relative h-[420px] sm:h-[500px] md:h-[540px] lg:h-[640px] xl:h-[720px] lg:-mt-10 lg:-mb-24 xl:-mb-28 -mx-3 sm:mx-0"
+              className="relative h-[420px] sm:h-[500px] md:h-[540px] lg:h-auto lg:self-stretch lg:min-h-[620px] lg:-mt-10 lg:-mb-16 -mx-3 sm:mx-0"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
             >
               {/* canvas above the chips so Ledger walks IN FRONT of them */}
@@ -672,9 +701,9 @@ export default function WelcomePage() {
               </div>
 
               {/* MOBILE — same cards as the desktop stage, but laid BEHIND
-                  Ledger near the bottom of his stage (canvas z-10 paints the
-                  robot over them). */}
-              <div className="md:hidden absolute inset-x-2 bottom-3 z-0 grid grid-cols-2 gap-3 pointer-events-none">
+                  Ledger starting at his SHOULDERS and extending up past his
+                  head (canvas z-10 paints the robot over them). */}
+              <div className="md:hidden absolute inset-x-2 bottom-[36%] z-0 grid grid-cols-2 gap-3 pointer-events-none">
                 <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
                   <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-emerald-100 to-emerald-50 clay-chip flex items-center justify-center mb-2">
                     <FileText className="w-4 h-4 text-emerald-600" />

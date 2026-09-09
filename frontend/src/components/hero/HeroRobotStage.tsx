@@ -23,7 +23,9 @@ import { ContactShadows } from "@react-three/drei";
 import { RobotModel, type FaceMode } from "@/components/robot/RobotModel";
 
 type Variant = "hero" | "compact";
-type Phase = "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit" | "interact";
+type Phase =
+  | "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit"
+  | "interact" | "spin" | "stretch" | "think" | "march" | "peek" | "jumpingjack";
 type PokeTarget = "invoice" | "journal" | "trial" | "overview" | "ask";
 
 /* Hero hotspots Ledger can walk up to and physically interact with.
@@ -69,7 +71,8 @@ function rand(min: number, max: number): number {
 function faceForPhase(p: Phase): FaceMode {
   if (p === "dance" || p === "clap" || p === "hop" || p === "wave") return "excited";
   if (p === "sit") return "sleepy";
-  if (p === "read") return "focus";
+  if (p === "read" || p === "think") return "focus";
+  if (p === "spin" || p === "jumpingjack" || p === "march" || p === "peek" || p === "stretch") return "excited";
   return "happy";
 }
 
@@ -92,11 +95,11 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
   }, []);
 
   const { viewport } = useThree();
-  /* Hero: roam the open centre corridor, plus the card edges when he is
-     off to interact with them. The floating cards only render ≥ md. */
+  /* Hero: roam the FULL stage width — he owns the whole right column now.
+     The floating cards only render ≥ md; he still walks up to them. */
   const bound =
     variant === "hero"
-      ? Math.min(Math.max(0.55, viewport.width / 2 - 1.0), 1.0)
+      ? Math.min(Math.max(0.7, viewport.width / 2 - 0.85), 1.55)
       : Math.max(0.3, viewport.width / 2 - 0.95);
 
   /* Cards exist only from md up — track so mobile never "pokes" air */
@@ -121,13 +124,15 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
     t.current += d;
     const time = state.clock.elapsedTime;
 
-    /* random activity loop */
+    /* random activity loop — bigger repertoire, weighted toward motion */
     if (t.current >= dur.current && !reduced) {
       t.current = 0;
       const canPoke = wide && variant === "hero";
       const pool: Phase[] = canPoke
-        ? ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop", "interact", "interact"]
-        : ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop"];
+        ? ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop",
+           "interact", "interact", "spin", "stretch", "think", "march", "peek", "jumpingjack"]
+        : ["walk", "walk", "idle", "wave", "dance", "clap", "read", "sit", "hop",
+           "spin", "stretch", "think", "march", "peek", "jumpingjack"];
       let next = pick(pool);
       if (next === phase.current) next = pick(pool);
       phase.current = next;
@@ -139,6 +144,15 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
       } else if (next === "walk") {
         dur.current = rand(3.5, 6.5);
         zTarget.current = rand(-0.15, 0.5); // wander the depth of the stage too
+      } else if (next === "spin") {
+        dur.current = rand(1.6, 2.2);
+        zTarget.current = 0.1;
+      } else if (next === "jumpingjack" || next === "march") {
+        dur.current = rand(2.4, 3.6);
+        zTarget.current = 0.12;
+      } else if (next === "think" || next === "peek") {
+        dur.current = rand(2.2, 3.4);
+        zTarget.current = 0.08;
       } else {
         dur.current = rand(2.6, 4.4);
         zTarget.current = 0.08;
@@ -170,19 +184,34 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
       if (g.position.x > bound) dir.current = -1;
       else if (g.position.x < -bound) dir.current = 1;
       faceY = dir.current * 0.55;
-    } else if (p === "clap" || p === "read" || p === "sit") {
+    } else if (p === "clap" || p === "read" || p === "sit" || p === "spin"
+      || p === "march" || p === "jumpingjack" || p === "stretch" || p === "think") {
       faceY = 0;
     } else {
       faceY = Math.sin(time * 0.6) * 0.12;
     }
     g.position.z = THREE.MathUtils.damp(g.position.z, zTarget.current, 2, d);
     g.rotation.y = THREE.MathUtils.damp(g.rotation.y, faceY, 4, d);
-    g.rotation.z = p === "dance" ? Math.sin(t.current * 4) * 0.1 : THREE.MathUtils.damp(g.rotation.z, 0, 4, d);
+    if (p === "spin") g.rotation.y = t.current * 5.2; // a full twirl
+    g.rotation.z =
+      p === "dance"
+        ? Math.sin(t.current * 4) * 0.1
+        : p === "peek"
+          ? Math.sin(Math.min(t.current * 1.6, Math.PI)) * 0.3
+          : THREE.MathUtils.damp(g.rotation.z, 0, 4, d);
 
     const bob = p === "walk" ? Math.abs(Math.sin(t.current * 9)) * 0.05 : Math.sin(time * 2) * 0.035;
-    const hopY = p === "hop" ? Math.max(0, Math.sin(t.current * 5.5)) * 0.42 : 0;
+    const hopY =
+      p === "hop"
+        ? Math.max(0, Math.sin(t.current * 5.5)) * 0.42
+        : p === "jumpingjack"
+          ? Math.abs(Math.sin(t.current * 6)) * 0.16
+          : p === "march"
+            ? Math.abs(Math.sin(t.current * 7)) * 0.08
+            : 0;
     const sitY = p === "sit" ? -0.3 : 0;
-    g.position.y = THREE.MathUtils.damp(g.position.y, bob + hopY + sitY, 10, d);
+    const toeY = p === "stretch" ? 0.06 : 0;
+    g.position.y = THREE.MathUtils.damp(g.position.y, bob + hopY + sitY + toeY, 10, d);
 
     /* limbs */
     const dampTo = (o: RefObject<THREE.Group | null>, x: number, z: number) => {
@@ -226,6 +255,35 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
       axR = rx;
       azR = rz + press;
       azL = -0.1 + Math.sin(time * 1.7) * 0.05;
+    } else if (p === "spin") {
+      /* arms tucked for the twirl */
+      azL = -1.5;
+      azR = 1.5;
+      axL = axR = -0.2;
+    } else if (p === "stretch") {
+      /* both arms reach for the sky with a slow sway, up on his toes */
+      const sway = Math.sin(t.current * 2.4) * 0.18;
+      azL = -2.55 + sway;
+      azR = 2.55 - sway;
+      axL = axR = -0.3;
+    } else if (p === "think") {
+      /* hand to chin, pondering */
+      axR = -2.15;
+      azR = 0.4;
+      azL = -0.12;
+    } else if (p === "march") {
+      /*vigorous arm pump opposite the knees */
+      axL = Math.sin(t.current * 7) * 0.9;
+      axR = -Math.sin(t.current * 7) * 0.9;
+    } else if (p === "jumpingjack") {
+      /* arms sweep up-and-out together with each beat */
+      const up = (Math.sin(t.current * 6) + 1) / 2;
+      azL = -(0.25 + up * 2.2);
+      azR = 0.25 + up * 2.2;
+    } else if (p === "peek") {
+      /* hands cupped, leaning to peek around */
+      azL = -0.5;
+      azR = 0.5;
     } else {
       azL = -0.08 + Math.sin(time * 1.7) * 0.05;
       azR = 0.08 - Math.sin(time * 1.7) * 0.05;
@@ -233,19 +291,35 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
     dampTo(armL, axL, azL);
     dampTo(armR, axR, azR);
 
-    const legSwing = p === "walk" ? Math.sin(t.current * 9) * 0.5 : 0;
+    const legSwing =
+      p === "walk"
+        ? Math.sin(t.current * 9) * 0.5
+        : p === "march"
+          ? Math.sin(t.current * 7) * 0.95
+          : p === "jumpingjack"
+            ? Math.sin(t.current * 6) * 0.35
+            : 0;
     const sitLeg = p === "sit" ? -1.45 : 0;
     dampTo(legL, sitLeg + legSwing, 0);
     dampTo(legR, sitLeg - legSwing, 0);
 
-    /* head: look down while reading, follow the cursor otherwise */
+    /* head: look down while reading, ponder upward while thinking, tilt
+       into the peek, follow the cursor otherwise */
     if (head.current) {
       const look = reduced ? 0 : -state.pointer.y * 0.12;
-      const down = (p === "read" ? 0.42 : 0) + (p === "sit" ? 0.08 : 0);
+      const down =
+        (p === "read" ? 0.42 : 0) + (p === "sit" ? 0.08 : 0) + (p === "think" ? -0.24 : 0);
+      const tilt =
+        p === "peek"
+          ? Math.sin(Math.min(t.current * 1.6, Math.PI)) * 0.3
+          : p === "think"
+            ? 0.14
+            : 0;
       head.current.rotation.x = THREE.MathUtils.damp(head.current.rotation.x, down + look, 5, d);
       head.current.rotation.y = reduced
         ? 0
         : THREE.MathUtils.damp(head.current.rotation.y, state.pointer.x * 0.25, 5, d);
+      head.current.rotation.z = THREE.MathUtils.damp(head.current.rotation.z, tilt, 5, d);
     }
   });
 
@@ -275,70 +349,16 @@ class RobotErrorBoundary extends Component<{ children: ReactNode }, { failed: bo
   }
 }
 
-/* Colour-cycling glass podium. Soft, low-opacity, hue-cycling halo rings —
-   it reads as part of the page's own gradient UI, not a bolt-on platform. */
-function Podium({ compact }: { compact?: boolean }) {
-  const haloA = useRef<THREE.MeshBasicMaterial>(null);
-  const haloB = useRef<THREE.MeshBasicMaterial>(null);
-  const haloC = useRef<THREE.MeshBasicMaterial>(null);
-  const glowM = useRef<THREE.MeshBasicMaterial>(null);
-  const top = useRef<THREE.MeshStandardMaterial>(null);
-  const rim = useRef<THREE.MeshStandardMaterial>(null);
-
-  useFrame((s) => {
-    const t = s.clock.elapsedTime;
-    if (haloA.current) haloA.current.color.setHSL((t * 0.045) % 1, 0.85, 0.6);
-    if (haloB.current) haloB.current.color.setHSL((t * 0.045 + 0.33) % 1, 0.85, 0.6);
-    if (haloC.current) haloC.current.color.setHSL((t * 0.045 + 0.66) % 1, 0.85, 0.64);
-    if (glowM.current) glowM.current.color.setHSL((t * 0.045 + 0.2) % 1, 0.85, 0.7);
-    if (top.current) top.current.color.setHSL((t * 0.03) % 1, 0.4, 0.97);
-    if (rim.current) rim.current.color.setHSL((t * 0.03 + 0.5) % 1, 0.5, 0.93);
-  });
-
-  const R = compact ? 0.95 : 1.42;
-
-  return (
-    <group scale={compact ? [1.12, 1, 0.8] : [1.9, 1, 0.75]}>
-      {/* glow halo bleeding onto the page — makes the disc feel native */}
-      <mesh position={[0, -0.002, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[R * 1.4, 64]} />
-        <meshBasicMaterial ref={glowM} transparent opacity={0.14} depthWrite={false} />
-      </mesh>
-      {/* body — whisper-clear glass, no hard edges */}
-      <mesh position={[0, -0.08, 0]}>
-        <cylinderGeometry args={[R, R * 1.08, 0.16, 64]} />
-        <meshStandardMaterial ref={rim} color="#ffffff" roughness={0.15} metalness={0.05} transparent opacity={0.32} />
-      </mesh>
-      {/* top — faintly tinted glass */}
-      <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[R, 64]} />
-        <meshStandardMaterial ref={top} color="#f6f9ff" roughness={0.3} metalness={0.04} transparent opacity={0.68} />
-      </mesh>
-      {/* three perpetually hue-cycling halo rings */}
-      <mesh position={[0, 0.006, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[R * 0.85, R, 64]} />
-        <meshBasicMaterial ref={haloA} transparent opacity={0.85} depthWrite={false} />
-      </mesh>
-      <mesh position={[0, 0.011, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[R * 0.6, R * 0.68, 64]} />
-        <meshBasicMaterial ref={haloB} transparent opacity={0.45} depthWrite={false} />
-      </mesh>
-      <mesh position={[0, 0.014, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[R * 0.28, R * 0.36, 48]} />
-        <meshBasicMaterial ref={haloC} transparent opacity={0.32} depthWrite={false} />
-      </mesh>
-    </group>
-  );
-}
 
 function CameraRig({ variant }: { variant: Variant }) {
   const { camera } = useThree();
   useEffect(() => {
-    /* hero: framing pinned LOW — his feet + podium sit at the bottom edge
-       of the canvas, which itself reaches the backdrop's bottom border.
-       compact pulls back + lifts the framing for the auth-page corner. */
-    camera.position.set(0, variant === "hero" ? 1.4 : 1.18, variant === "hero" ? 4.6 : 4.75);
-    camera.lookAt(0, variant === "hero" ? 1.2 : 1.02, 0);
+    /* hero: closer + centred — the canvas now spans the FULL hero row, so
+       framing him larger keeps him prominent while his head and boots both
+       stay inside the frame at any height. compact pulls back + lifts the
+       framing for the auth-page corner. */
+    camera.position.set(0, variant === "hero" ? 1.35 : 1.18, variant === "hero" ? 4.0 : 4.75);
+    camera.lookAt(0, variant === "hero" ? 1.18 : 1.02, 0);
   }, [camera, variant]);
   return null;
 }
@@ -363,7 +383,7 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
         dpr={[1, 2]}
         performance={{ min: 0.5 }}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-        camera={{ position: [0, 1.4, 4.6], fov: 33 }}
+        camera={{ position: [0, 1.35, 4.0], fov: 33 }}
         style={{ background: "transparent" }}
       >
         <CameraRig variant={variant} />
@@ -379,14 +399,13 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
           <RobotErrorBoundary>
             <RobotActor variant={variant} reduced={reduced} />
           </RobotErrorBoundary>
-          {/* Colour-cycling glass podium — melts into the page UI */}
-          <Podium compact={variant !== "hero"} />
-          {/* Soft contact shadow grounds him on the platform */}
+          {/* Robot only — no podium, no platform elements. A soft contact
+              shadow is all that grounds him on the page backdrop. */}
           <ContactShadows
             position={[0, 0.001, 0]}
-            opacity={0.2}
-            scale={3.4}
-            blur={2.6}
+            opacity={0.16}
+            scale={3.0}
+            blur={2.8}
             far={1.8}
             color="#1e3a5f"
           />
