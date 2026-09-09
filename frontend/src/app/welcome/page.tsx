@@ -14,12 +14,11 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
-import HeroCanvas from "@/components/welcome/HeroCanvas";
 import dynamic from "next/dynamic";
 
 /* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
    the server; renders nothing until the scene is interactive. */
-const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"), {
   ssr: false,
   loading: () => null,
 });
@@ -262,6 +261,8 @@ function FloatChip({
 /* ================================================================== */
 export default function WelcomePage() {
   const [scrolled, setScrolled] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const heroRef = useRef<HTMLElement>(null);
   /* Business Overview chart bars — Ledger re-randomises them when he pokes the card */
   const DEFAULT_BARS = [38, 55, 42, 70, 48, 62, 80, 58, 90, 66, 74, 95, 60, 85, 52, 78, 68, 88];
@@ -272,6 +273,23 @@ export default function WelcomePage() {
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
+
+  /* Hamburger menu: close on outside pointer-down or Escape */
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
 
   /* Ledger's interactions: when he pokes a hero element, that element
      pops/glows; the Business Overview chart also gets fresh data. */
@@ -476,32 +494,59 @@ export default function WelcomePage() {
               priority
             />
           </Link>
-          <div className="hidden lg:flex items-center gap-7 text-sm font-medium text-[#3d4b66]">
-            {[
-              { label: "Features", href: "/features" },
-              { label: "How It Works", href: "/how-it-works" },
-              { label: "Solutions", href: "/solutions" },
-              { label: "Pricing", href: "/pricing" },
-              { label: "Resources", href: "/resources" },
-            ].map((l) => (
-              <Link key={l.label} href={l.href} className="hover:text-brand-navy transition-colors">
-                {l.label}
-              </Link>
-            ))}
-          </div>
-          <div className="flex items-center gap-3">
-            <Link
-              href="/login"
-              className="px-4 py-2 rounded-xl text-sm font-semibold text-brand-navy hover:text-ai-700 border border-transparent hover:border-border-default hover:bg-white/70 transition-all"
+          {/* Hamburger approach — one menu button on every viewport (incl. PC)
+              holding the nav links + auth actions in a glass dropdown. */}
+          <div ref={menuRef} className="relative flex items-center">
+            <button
+              type="button"
+              aria-label={menuOpen ? "Close menu" : "Open menu"}
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen((v) => !v)}
+              className="w-11 h-11 rounded-xl bg-white/85 backdrop-blur border border-white shadow-[0_10px_30px_-14px_rgba(27,42,74,0.35)] flex flex-col items-center justify-center gap-[5px] transition-all hover:bg-white hover:shadow-[0_14px_34px_-14px_rgba(27,42,74,0.45)] active:scale-95"
             >
-              Login
-            </Link>
-            <Link
-              href="/signup"
-              className="lp-btn-primary px-5 py-2 rounded-xl bg-gradient-to-r from-teal-500 to-indigo-500 text-white text-sm font-semibold transition-all shadow-lg shadow-indigo-500/25 hover:shadow-indigo-500/45 hover:-translate-y-px"
-            >
-              Get Started
-            </Link>
+              <span className={cn("block w-5 h-[2px] rounded-full bg-brand-navy transition-all duration-300", menuOpen && "translate-y-[7px] rotate-45")} />
+              <span className={cn("block w-5 h-[2px] rounded-full bg-brand-navy transition-all duration-300", menuOpen && "opacity-0")} />
+              <span className={cn("block w-5 h-[2px] rounded-full bg-brand-navy transition-all duration-300", menuOpen && "-translate-y-[7px] -rotate-45")} />
+            </button>
+
+            {menuOpen && (
+              <div
+                className="absolute right-0 top-[calc(100%+12px)] w-64 rounded-2xl bg-white/95 backdrop-blur-2xl border border-white shadow-[0_30px_70px_-24px_rgba(27,42,74,0.45)] p-2.5 flex flex-col"
+                style={{ animation: "heroRise 0.35s cubic-bezier(0.19,1,0.22,1) both" }}
+              >
+                {[
+                  { label: "Features", href: "/features" },
+                  { label: "How It Works", href: "/how-it-works" },
+                  { label: "Solutions", href: "/solutions" },
+                  { label: "Pricing", href: "/pricing" },
+                  { label: "Resources", href: "/resources" },
+                ].map((l) => (
+                  <Link
+                    key={l.label}
+                    href={l.href}
+                    onClick={() => setMenuOpen(false)}
+                    className="px-3.5 py-2.5 rounded-xl text-sm font-medium text-[#3d4b66] hover:text-brand-navy hover:bg-teal-50/70 transition-colors"
+                  >
+                    {l.label}
+                  </Link>
+                ))}
+                <div className="h-px bg-slate-200/80 my-2" />
+                <Link
+                  href="/login"
+                  onClick={() => setMenuOpen(false)}
+                  className="px-3.5 py-2.5 rounded-xl text-sm font-semibold text-brand-navy hover:bg-slate-100 transition-colors text-center"
+                >
+                  Login
+                </Link>
+                <Link
+                  href="/signup"
+                  onClick={() => setMenuOpen(false)}
+                  className="mt-1 px-3.5 py-2.5 rounded-xl bg-gradient-to-r from-teal-500 to-cyan-500 text-white text-sm font-semibold text-center shadow-lg shadow-teal-500/25 hover:shadow-cyan-500/45 transition-all"
+                >
+                  Get Started
+                </Link>
+              </div>
+            )}
           </div>
         </div>
       </nav>
@@ -515,44 +560,54 @@ export default function WelcomePage() {
         onPointerLeave={handlePointerLeave}
         className="lp-stage relative min-h-screen flex items-center"
       >
-        {/* Interactive multi-colour constellation */}
-        <HeroCanvas />
-
-        {/* Surrealist colour clouds */}
-        <div className="lp-blob lp-blob-a" />
-        <div className="lp-blob lp-blob-b" />
-        <div className="lp-blob lp-blob-c" />
-
-        {/* Floating glass geometry — traced by perpetual multi-colour light */}
-        <div className="lp-shape lp-shape-square lp-trace" />
-        <div className="lp-shape lp-shape-square-2 lp-trace" />
-        <div className="lp-shape lp-shape-ring" />
+        {/* Editorial backdrop — the bright white-teal office. The photo IS
+            the stage; soft white veils keep the copy side readable while the
+            city view breathes on the right, where Ledger stands. */}
+        <div className="absolute inset-0">
+          <Image
+            src="/hero-office.png"
+            alt=""
+            fill
+            priority
+            sizes="100vw"
+            className="object-cover object-center select-none pointer-events-none"
+          />
+          <div className="absolute inset-0 bg-gradient-to-r from-white/95 via-white/70 to-white/5" />
+          <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/85 to-transparent" />
+          <div className="absolute inset-x-0 bottom-0 h-36 bg-gradient-to-b from-transparent to-white" />
+        </div>
 
         {/* Whisper of grain */}
         <div className="lp-grain" />
 
         <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-28 pb-24 lg:pt-32 lg:pb-28">
-          <div className="grid grid-cols-1 gap-6 items-start">
+          <div className="grid grid-cols-1 lg:grid-cols-[1.04fr_0.96fr] gap-6 lg:gap-8 items-center">
             {/* TOP — copy. Ledger lives in the stage below this, never over it. */}
             <div className="max-w-xl min-w-0">
             <p
               className="hero-eyebrow inline-flex items-center gap-2.5 rounded-full bg-white/80 border border-white shadow-[0_10px_30px_-14px_rgba(27,42,74,0.25)] px-4 py-2 text-[10px] sm:text-[11px] font-bold uppercase tracking-[0.16em] text-brand-navy/80 mb-7"
               style={{ animationDelay: "80ms" }}
             >
-              <Sparkles className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+              <Sparkles className="w-3.5 h-3.5 text-teal-600 shrink-0" />
               <span className="min-w-0">AI-native accounting for modern businesses</span>
             </p>
 
             <h1
-              className="text-brand-navy text-[2.6rem] sm:text-6xl leading-[1.08] font-semibold tracking-tight"
-              style={{ fontFamily: "var(--font-fraunces), Georgia, serif" }}
+              className="text-brand-navy text-[2.3rem] sm:text-5xl lg:text-[3.4rem] leading-[1.14] tracking-[0.03em] font-semibold"
+              style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
             >
               <span className="reveal-line">
                 <span style={{ "--d": "200ms" } as React.CSSProperties}>Your Books,</span>
               </span>
               <span className="reveal-line">
                 <span style={{ "--d": "420ms" } as React.CSSProperties}>
-                  <span className="text-aurora font-semibold italic">Smarter</span> with AI.
+                  <span
+                    className="text-aurora italic font-medium text-[1.18em]"
+                    style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
+                  >
+                    Smarter
+                  </span>{" "}
+                  with AI.
                 </span>
               </span>
             </h1>
@@ -572,7 +627,7 @@ export default function WelcomePage() {
             >
               <Link
                 href="/signup"
-                className="lp-btn-primary inline-flex items-center gap-2.5 px-8 py-4 rounded-full bg-gradient-to-r from-teal-400 via-blue-600 to-indigo-600 text-white font-semibold text-base transition-all shadow-xl shadow-blue-600/30 hover:shadow-indigo-600/50 hover:-translate-y-0.5"
+                className="lp-btn-primary inline-flex items-center gap-2.5 px-8 py-4 rounded-full bg-gradient-to-r from-teal-500 to-cyan-500 text-white font-semibold text-base transition-all shadow-xl shadow-teal-500/30 hover:shadow-cyan-500/45 hover:-translate-y-0.5"
               >
                 Start Free <ArrowRight className="w-4 h-4" />
               </Link>
@@ -605,15 +660,55 @@ export default function WelcomePage() {
               </div>
             </div>
 
-            {/* BELOW — Ledger's stage. He roams THIS area only; the floating
-                cards are pointer-transparent glass orbiting him. */}
+            {/* RIGHT / FRONT — Ledger's stage, lifted level with the headline.
+                He roams THIS area, walking IN FRONT of his floating chips. */}
             <div
-              className="relative h-[340px] sm:h-[420px] md:h-[460px] lg:h-[560px] xl:h-[620px] -mx-3 sm:mx-0"
+              className="relative h-[420px] sm:h-[500px] md:h-[540px] lg:h-[640px] xl:h-[720px] lg:-mt-10 lg:-mb-24 xl:-mb-28 -mx-3 sm:mx-0"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
             >
               {/* canvas above the chips so Ledger walks IN FRONT of them */}
               <div className="absolute inset-0 z-10">
                 <HeroRobotStage variant="hero" />
+              </div>
+
+              {/* MOBILE — same cards as the desktop stage, but laid BEHIND
+                  Ledger near the bottom of his stage (canvas z-10 paints the
+                  robot over them). */}
+              <div className="md:hidden absolute inset-x-2 bottom-3 z-0 grid grid-cols-2 gap-3 pointer-events-none">
+                <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
+                  <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-emerald-100 to-emerald-50 clay-chip flex items-center justify-center mb-2">
+                    <FileText className="w-4 h-4 text-emerald-600" />
+                  </span>
+                  <span className="block text-[12px] font-bold text-brand-navy">Sales Invoice</span>
+                  <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                    <Check className="w-2.5 h-2.5" strokeWidth={3} /> Created · INV-2025-001
+                  </span>
+                </div>
+                <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
+                  <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-indigo-100 to-indigo-50 clay-chip flex items-center justify-center mb-2">
+                    <BookOpen className="w-4 h-4 text-indigo-600" />
+                  </span>
+                  <span className="block text-[12px] font-bold text-brand-navy">Journal Entry</span>
+                  <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                    <Check className="w-2.5 h-2.5" strokeWidth={3} /> Recorded · 2 Lines
+                  </span>
+                </div>
+                <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
+                  <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-sky-100 to-sky-50 clay-chip flex items-center justify-center mb-2">
+                    <BarChart3 className="w-4 h-4 text-sky-600" />
+                  </span>
+                  <span className="block text-[12px] font-bold text-brand-navy">Trial Balance</span>
+                  <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+                    <Check className="w-2.5 h-2.5" strokeWidth={3} /> Updated · As of today
+                  </span>
+                </div>
+                <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
+                  <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-violet-100 to-violet-50 clay-chip flex items-center justify-center mb-2">
+                    <Sparkles className="w-4 h-4 text-violet-600" />
+                  </span>
+                  <span className="block text-[12px] font-bold text-brand-navy">Ask anything…</span>
+                  <span className="block text-[10px] text-[#64748b] truncate">&quot;Invoice for ABC Tech&quot;</span>
+                </div>
               </div>
 
               {/* document chips — left edge, narrow. Ledger walks over and
@@ -732,45 +827,6 @@ export default function WelcomePage() {
                 </span>
               </div>
             </div>
-
-            {/* MOBILE — same cards as the desktop stage, shown as a 2-column
-                grid directly under Ledger (never a vertical list). */}
-            <div className="md:hidden grid grid-cols-2 gap-3 mt-1 pointer-events-none">
-              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
-                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-emerald-100 to-emerald-50 clay-chip flex items-center justify-center mb-2">
-                  <FileText className="w-4 h-4 text-emerald-600" />
-                </span>
-                <span className="block text-[12px] font-bold text-brand-navy">Sales Invoice</span>
-                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
-                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Created · INV-2025-001
-                </span>
-              </div>
-              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
-                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-indigo-100 to-indigo-50 clay-chip flex items-center justify-center mb-2">
-                  <BookOpen className="w-4 h-4 text-indigo-600" />
-                </span>
-                <span className="block text-[12px] font-bold text-brand-navy">Journal Entry</span>
-                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
-                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Recorded · 2 Lines
-                </span>
-              </div>
-              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 rotate-1">
-                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-sky-100 to-sky-50 clay-chip flex items-center justify-center mb-2">
-                  <BarChart3 className="w-4 h-4 text-sky-600" />
-                </span>
-                <span className="block text-[12px] font-bold text-brand-navy">Trial Balance</span>
-                <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
-                  <Check className="w-2.5 h-2.5" strokeWidth={3} /> Updated · As of today
-                </span>
-              </div>
-              <div className="rounded-3xl bg-white/90 backdrop-blur border border-white/80 shadow-[0_18px_38px_-18px_rgba(27,42,74,0.3)] px-3.5 py-3 -rotate-1">
-                <span className="w-9 h-9 rounded-2xl bg-gradient-to-br from-violet-100 to-violet-50 clay-chip flex items-center justify-center mb-2">
-                  <Sparkles className="w-4 h-4 text-violet-600" />
-                </span>
-                <span className="block text-[12px] font-bold text-brand-navy">Ask anything…</span>
-                <span className="block text-[10px] text-[#64748b] truncate">&quot;Invoice for ABC Tech&quot;</span>
-              </div>
-            </div>
           </div>
         </div>
 
@@ -782,7 +838,7 @@ export default function WelcomePage() {
           >
             Scroll
           </span>
-          <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-indigo-500/70 to-transparent" />
+          <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-teal-500/70 to-transparent" />
         </div>
       </section>
 
@@ -1032,6 +1088,7 @@ export default function WelcomePage() {
               alt="AI Accountant"
               width={100}
               height={28}
+              loading="eager"
               className="h-6 w-auto object-contain opacity-70"
             />
           </div>

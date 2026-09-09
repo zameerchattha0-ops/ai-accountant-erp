@@ -5,27 +5,25 @@
 /* right column / a corner of the auth pages) — never fixed to the     */
 /* viewport, never covering copy.                                      */
 /*                                                                      */
-/* 100% procedural (react-three-fiber): glossy white shell, orange     */
-/* accents, dark glass visor, glowing cyan eyes. Smooth surfaces,      */
-/* no textures, no model downloads.                                    */
+/* Geometry now matches the approved brand reference (ERP/Robot.png):  */
+/* white glossy shell, deep-teal accents, dark glass visor, glowing    */
+/* cyan face, "Ai" chest badge, tablet in hand (see robot/RobotModel). */
 /*                                                                      */
 /* Behaviour: a random activity loop — wave · idle · walk · hop ·      */
-/* dance · clap · read · sit — roaming the stage's empty areas. A      */
-/* premium glass speech bubble pops up at RANDOM intervals (it does    */
-/* not stick around) with AI/accounting wit, typed out letter by       */
-/* letter as if he is speaking it. Falls back to a calm idle under     */
-/* prefers-reduced-motion.                                             */
+/* dance · clap · read · sit — roaming the stage's empty areas. The    */
+/* facial expression follows the activity (excited / sleepy / focus).  */
+/* Falls back to a calm idle under prefers-reduced-motion.             */
 /* ================================================================== */
 
-import { Component, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Component, Suspense, useEffect, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { ContactShadows, Html } from "@react-three/drei";
+import { ContactShadows } from "@react-three/drei";
+import { RobotModel, type FaceMode } from "@/components/robot/RobotModel";
 
 type Variant = "hero" | "compact";
 type Phase = "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit" | "interact";
-type SpeechLine = { k: number; text: string };
 type PokeTarget = "invoice" | "journal" | "trial" | "overview" | "ask";
 
 /* Hero hotspots Ledger can walk up to and physically interact with.
@@ -60,22 +58,6 @@ const HOTSPOTS: Record<PokeTarget, { xf: number; line: string; reach: [number, n
 };
 const POKEABLE: PokeTarget[] = ["invoice", "journal", "trial", "overview", "ask"];
 
-/* Random AI / accounting wit for the speech bubble */
-const SPEECH: string[] = [
-  "Hi! I'm Ledger — your AI accountant.",
-  "Debits on the left, dreams on the right. I balance both.",
-  "Every entry tells a story. I write yours in real time.",
-  "One sentence from you. A perfect journal entry from me.",
-  "AI won't replace accountants — but AI-powered ones will replace the rest.",
-  "Your books, balanced while you sip your chai.",
-  "Trial balance happy? That's my love language.",
-  "Invoices, ledgers, reports — done before your coffee cools.",
-  "Focus on growing the business. I'll guard the numbers.",
-  "Reconciliation is my cardio.",
-  "Journal, Ledger, Trial Balance, Statements — I run the whole relay.",
-  "Accounting in plain English. That's the whole trick.",
-];
-
 function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -83,67 +65,22 @@ function rand(min: number, max: number): number {
   return min + Math.random() * (max - min);
 }
 
-/* Shared smooth materials — created once per instance */
-function useRobotMaterials() {
-  return useMemo(
-    () => ({
-      shell: new THREE.MeshStandardMaterial({ color: "#f5f7fa", roughness: 0.28, metalness: 0.06 }),
-      accent: new THREE.MeshStandardMaterial({ color: "#ef8b2c", roughness: 0.35, metalness: 0.12 }),
-      visor: new THREE.MeshStandardMaterial({ color: "#0c1420", roughness: 0.12, metalness: 0.45 }),
-      eye: new THREE.MeshStandardMaterial({
-        color: "#061018",
-        emissive: new THREE.Color("#3ee5ff"),
-        emissiveIntensity: 2.6,
-        roughness: 0.2,
-      }),
-      glow: new THREE.MeshStandardMaterial({
-        color: "#04211f",
-        emissive: new THREE.Color("#2dd4bf"),
-        emissiveIntensity: 2.2,
-        roughness: 0.3,
-      }),
-      dark: new THREE.MeshStandardMaterial({ color: "#2b3340", roughness: 0.5, metalness: 0.35 }),
-    }),
-    [],
-  );
+/* Facial expression follows the current activity */
+function faceForPhase(p: Phase): FaceMode {
+  if (p === "dance" || p === "clap" || p === "hop" || p === "wave") return "excited";
+  if (p === "sit") return "sleepy";
+  if (p === "read") return "focus";
+  return "happy";
 }
 
-/* Typewriter — the bubble "speaks" the line letter by letter */
-function TypedText({ text }: { text: string }) {
-  const [n, setN] = useState(0);
-  useEffect(() => {
-    setN(0);
-    const iv = setInterval(() => {
-      setN((v) => {
-        if (v >= text.length) {
-          clearInterval(iv);
-          return v;
-        }
-        return v + 1;
-      });
-    }, 26);
-    return () => clearInterval(iv);
-  }, [text]);
-  return (
-    <>
-      {text.slice(0, n)}
-      {n < text.length && <span className="ledger-caret" />}
-    </>
-  );
-}
-
-function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boolean }) {
-  const mats = useRobotMaterials();
-
+function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }) {
   const root = useRef<THREE.Group>(null);
   const head = useRef<THREE.Group>(null);
   const armL = useRef<THREE.Group>(null);
   const armR = useRef<THREE.Group>(null);
   const legL = useRef<THREE.Group>(null);
   const legR = useRef<THREE.Group>(null);
-  const book = useRef<THREE.Group>(null);
-  const eyeL = useRef<THREE.Mesh>(null);
-  const eyeR = useRef<THREE.Mesh>(null);
+  const face = useRef<FaceMode>("happy");
 
   /* --- behaviour state (refs on purpose: 60fps, no re-renders) --- */
   const phase = useRef<Phase>("wave");
@@ -172,17 +109,6 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     return () => mq.removeEventListener("change", on);
   }, []);
 
-  /* --- speech bubble: appears at RANDOM intervals, never sticky --- */
-  const clock = useRef(0);
-  const nextLine = useRef(2.2);
-  const hideAt = useRef(0);
-  const lineRef = useRef<SpeechLine | null>(null);
-  const [line, setLine] = useState<SpeechLine | null>(null);
-  const say = (l: SpeechLine | null) => {
-    lineRef.current = l;
-    setLine(l);
-  };
-
   /* --- interaction state --- */
   const targetRef = useRef<PokeTarget>("invoice");
   const firedRef = useRef(false);
@@ -193,27 +119,7 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     if (!g) return;
     const d = Math.min(rawDelta, 0.05);
     t.current += d;
-    clock.current += d;
     const time = state.clock.elapsedTime;
-
-    /* perpetual multi-colour: every warm accent part (shoulders, hands,
-       feet, belt, ear discs, book cover) cycles through the spectrum
-       forever; the chest core + antenna counter-cycle. */
-    if (!reduced) {
-      mats.accent.color.setHSL((time * 0.055) % 1, 0.68, 0.56);
-      mats.glow.emissive.setHSL((time * 0.055 + 0.45) % 1, 0.9, 0.6);
-    }
-
-    /* random speech timing */
-    if (!reduced) {
-      if (!lineRef.current && clock.current >= nextLine.current) {
-        say({ k: clock.current, text: pick(SPEECH) });
-        hideAt.current = clock.current + 6.5;
-      } else if (lineRef.current && clock.current >= hideAt.current) {
-        say(null);
-        nextLine.current = clock.current + rand(6, 13);
-      }
-    }
 
     /* random activity loop */
     if (t.current >= dur.current && !reduced) {
@@ -240,6 +146,7 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     }
     if (reduced) phase.current = "idle";
     const p = phase.current;
+    face.current = reduced ? "happy" : faceForPhase(p);
 
     /* movement: roam the floor, or walk UP TO a card and interact with it */
     let faceY: number;
@@ -257,9 +164,6 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
       if (t.current > 1.5 && !firedRef.current) {
         firedRef.current = true;
         window.dispatchEvent(new CustomEvent("ledger-poke", { detail: { target: targetRef.current } }));
-        say({ k: clock.current, text: hs.line });
-        hideAt.current = clock.current + 6.0;
-        nextLine.current = clock.current + rand(8, 14);
       }
     } else if (p === "walk") {
       g.position.x += dir.current * 0.5 * d;
@@ -302,9 +206,11 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
       azL = 0.32 + Math.max(0, Math.sin(t.current * 7)) * 0.5;
       azR = -azL;
     } else if (p === "read") {
-      axL = axR = -1.05;
-      azL = -0.12;
-      azR = 0.12;
+      /* tablet arm lifts so the screen faces him; he looks down at it */
+      axL = -1.15;
+      axR = -0.9;
+      azL = -0.25;
+      azR = 0.3;
     } else if (p === "sit") {
       axL = -0.45;
       axR = -0.45;
@@ -335,140 +241,27 @@ function RobotCharacter({ variant, reduced }: { variant: Variant; reduced: boole
     /* head: look down while reading, follow the cursor otherwise */
     if (head.current) {
       const look = reduced ? 0 : -state.pointer.y * 0.12;
-      const down = (p === "read" ? 0.38 : 0) + (p === "sit" ? 0.08 : 0);
+      const down = (p === "read" ? 0.42 : 0) + (p === "sit" ? 0.08 : 0);
       head.current.rotation.x = THREE.MathUtils.damp(head.current.rotation.x, down + look, 5, d);
       head.current.rotation.y = reduced
         ? 0
         : THREE.MathUtils.damp(head.current.rotation.y, state.pointer.x * 0.25, 5, d);
     }
-    if (book.current) book.current.visible = p === "read";
-
-    /* blink */
-    const blink = time % 3.7 < 0.12 ? 0.15 : 1;
-    if (eyeL.current) eyeL.current.scale.y = blink;
-    if (eyeR.current) eyeR.current.scale.y = blink;
   });
 
   return (
-    <group ref={root} scale={variant === "compact" ? 0.82 : 0.85}>
-      {/* legs */}
-      <group ref={legL} position={[-0.15, 0.46, 0]}>
-        <mesh position={[0, -0.14, 0]} material={mats.dark}>
-          <capsuleGeometry args={[0.05, 0.16, 6, 16]} />
-        </mesh>
-        <mesh position={[0, -0.3, 0.05]} scale={[1, 0.55, 1.4]} material={mats.accent}>
-          <sphereGeometry args={[0.085, 24, 24]} />
-        </mesh>
-      </group>
-      <group ref={legR} position={[0.15, 0.46, 0]}>
-        <mesh position={[0, -0.14, 0]} material={mats.dark}>
-          <capsuleGeometry args={[0.05, 0.16, 6, 16]} />
-        </mesh>
-        <mesh position={[0, -0.3, 0.05]} scale={[1, 0.55, 1.4]} material={mats.accent}>
-          <sphereGeometry args={[0.085, 24, 24]} />
-        </mesh>
-      </group>
-
-      {/* torso + glowing core + belt */}
-      <mesh position={[0, 0.88, 0]} material={mats.shell}>
-        <capsuleGeometry args={[0.3, 0.4, 12, 32]} />
-      </mesh>
-      <mesh position={[0, 0.95, 0.26]} material={mats.glow}>
-        <sphereGeometry args={[0.055, 20, 20]} />
-      </mesh>
-      <mesh position={[0, 0.62, 0]} rotation={[Math.PI / 2, 0, 0]} material={mats.accent}>
-        <torusGeometry args={[0.27, 0.03, 12, 40]} />
-      </mesh>
-
-      {/* arms */}
-      <group ref={armL} position={[-0.37, 1.06, 0]}>
-        <mesh material={mats.accent}>
-          <sphereGeometry args={[0.085, 20, 20]} />
-        </mesh>
-        <mesh position={[0, -0.18, 0]} material={mats.shell}>
-          <capsuleGeometry args={[0.05, 0.2, 6, 16]} />
-        </mesh>
-        <mesh position={[0, -0.34, 0]} material={mats.accent}>
-          <sphereGeometry args={[0.07, 20, 20]} />
-        </mesh>
-      </group>
-      <group ref={armR} position={[0.37, 1.06, 0]}>
-        <mesh material={mats.accent}>
-          <sphereGeometry args={[0.085, 20, 20]} />
-        </mesh>
-        <mesh position={[0, -0.18, 0]} material={mats.shell}>
-          <capsuleGeometry args={[0.05, 0.2, 6, 16]} />
-        </mesh>
-        <mesh position={[0, -0.34, 0]} material={mats.accent}>
-          <sphereGeometry args={[0.07, 20, 20]} />
-        </mesh>
-      </group>
-
-      {/* neck + head */}
-      <mesh position={[0, 1.24, 0]} material={mats.dark}>
-        <cylinderGeometry args={[0.06, 0.08, 0.1, 16]} />
-      </mesh>
-      <group ref={head} position={[0, 1.6, 0]}>
-        <mesh scale={[1, 0.92, 1]} material={mats.shell}>
-          <sphereGeometry args={[0.36, 48, 48]} />
-        </mesh>
-        <mesh position={[0, 0.02, 0.26]} scale={[1, 0.78, 0.45]} material={mats.visor}>
-          <sphereGeometry args={[0.24, 32, 32]} />
-        </mesh>
-        <mesh ref={eyeL} position={[-0.085, 0.04, 0.335]} material={mats.eye}>
-          <sphereGeometry args={[0.042, 16, 16]} />
-        </mesh>
-        <mesh ref={eyeR} position={[0.085, 0.04, 0.335]} material={mats.eye}>
-          <sphereGeometry args={[0.042, 16, 16]} />
-        </mesh>
-        {/* ear discs */}
-        <mesh position={[-0.38, 0, 0]} rotation={[0, 0, Math.PI / 2]} material={mats.accent}>
-          <cylinderGeometry args={[0.09, 0.09, 0.05, 24]} />
-        </mesh>
-        <mesh position={[0.38, 0, 0]} rotation={[0, 0, Math.PI / 2]} material={mats.accent}>
-          <cylinderGeometry args={[0.09, 0.09, 0.05, 24]} />
-        </mesh>
-        {/* antenna */}
-        <mesh position={[0, 0.4, 0]} material={mats.dark}>
-          <cylinderGeometry args={[0.015, 0.02, 0.12, 12]} />
-        </mesh>
-        <mesh position={[0, 0.5, 0]} material={mats.glow}>
-          <sphereGeometry args={[0.045, 16, 16]} />
-        </mesh>
-      </group>
-
-      {/* reading book — appears only while reading */}
-      <group ref={book} position={[0, 0.98, 0.42]} rotation={[-0.35, 0, 0]} visible={false}>
-        <mesh rotation={[0, 0.35, 0]} position={[-0.07, 0, 0]} material={mats.shell}>
-          <boxGeometry args={[0.16, 0.02, 0.22]} />
-        </mesh>
-        <mesh rotation={[0, -0.35, 0]} position={[0.07, 0, 0]} material={mats.shell}>
-          <boxGeometry args={[0.16, 0.02, 0.22]} />
-        </mesh>
-        <mesh position={[0, -0.015, 0]} material={mats.accent}>
-          <boxGeometry args={[0.3, 0.02, 0.24]} />
-        </mesh>
-      </group>
-
-      {/* speech bubble — anchored above the head, follows him while roaming.
-          The compact variant anchors lower so it never crops out of frame. */}
-      {!reduced && (
-        <Html position={[0, variant === "hero" ? 2.3 : 2.02, 0]} center zIndexRange={[40, 0]} style={{ pointerEvents: "none" }}>
-          {line && (
-            <div key={line.k} className="ledger-bubble">
-              <div className="ledger-bubble-head">
-                <span className="ledger-dot" />
-                <span className="ledger-tag">✦ Ledger says</span>
-              </div>
-              <div className="ledger-quote">
-                <TypedText text={line.text} />
-              </div>
-              <div className="ledger-tail" />
-            </div>
-          )}
-        </Html>
-      )}
-    </group>
+    <RobotModel
+      root={root}
+      head={head}
+      armL={armL}
+      armR={armR}
+      legL={legL}
+      legR={legR}
+      face={face}
+      variant={variant}
+      reduced={reduced}
+    >
+    </RobotModel>
   );
 }
 
@@ -541,9 +334,11 @@ function Podium({ compact }: { compact?: boolean }) {
 function CameraRig({ variant }: { variant: Variant }) {
   const { camera } = useThree();
   useEffect(() => {
-    /* compact pulls back + lifts the framing so the bubble never crops */
-    camera.position.set(0, variant === "hero" ? 1.15 : 1.18, variant === "hero" ? 4.9 : 4.75);
-    camera.lookAt(0, variant === "hero" ? 0.95 : 1.02, 0);
+    /* hero: framing pinned LOW — his feet + podium sit at the bottom edge
+       of the canvas, which itself reaches the backdrop's bottom border.
+       compact pulls back + lifts the framing for the auth-page corner. */
+    camera.position.set(0, variant === "hero" ? 1.4 : 1.18, variant === "hero" ? 4.6 : 4.75);
+    camera.lookAt(0, variant === "hero" ? 1.2 : 1.02, 0);
   }, [camera, variant]);
   return null;
 }
@@ -568,21 +363,21 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
         dpr={[1, 2]}
         performance={{ min: 0.5 }}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-        camera={{ position: [0, 1.15, 4.9], fov: 33 }}
+        camera={{ position: [0, 1.4, 4.6], fov: 33 }}
         style={{ background: "transparent" }}
       >
         <CameraRig variant={variant} />
 
         {/* Lighting rig: soft studio key + teal rim = premium toy look */}
         <ambientLight intensity={0.6} />
-        <hemisphereLight args={["#e0f2fe", "#fdf2f8", 0.6]} />
+        <hemisphereLight args={["#e0f2fe", "#ccfbf1", 0.6]} />
         <directionalLight position={[2.5, 4, 3]} intensity={1.5} />
-        <directionalLight position={[-3, 2, -2.5]} intensity={0.9} color="#67e8f9" />
-        <pointLight position={[0, 0.5, 2.4]} intensity={0.4} color="#fef3c7" />
+        <directionalLight position={[-3, 2, -2.5]} intensity={1.1} color="#5eead4" />
+        <pointLight position={[0, 0.5, 2.4]} intensity={0.4} color="#cffafe" />
 
         <Suspense fallback={null}>
           <RobotErrorBoundary>
-            <RobotCharacter variant={variant} reduced={reduced} />
+            <RobotActor variant={variant} reduced={reduced} />
           </RobotErrorBoundary>
           {/* Colour-cycling glass podium — melts into the page UI */}
           <Podium compact={variant !== "hero"} />

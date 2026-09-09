@@ -810,11 +810,7 @@ body {
 .lp-stage {
   position: relative;
   overflow: hidden;
-  background:
-    radial-gradient(58rem 34rem at 88% -10%, #ccfbf1 0%, transparent 58%),
-    radial-gradient(48rem 30rem at -12% 14%, #e0e7ff 0%, transparent 55%),
-    radial-gradient(44rem 30rem at 72% 112%, #fef3c7 0%, transparent 55%),
-    linear-gradient(180deg, #fbfdff 0%, #f5f7fc 52%, #f8f9fb 100%);
+  background: linear-gradient(180deg, #f8fcfd 0%, #eef6f8 55%, #f3f8fa 100%);
 }
 
 /* Surrealist colour clouds (parallax against the cursor) */
@@ -938,9 +934,9 @@ body {
     inset 0 -3px 6px rgba(27, 42, 74, 0.05);
 }
 
-/* Multi-colour aurora text */
+/* Calm trust gradient text — teal → cyan (clarity, finance-tech) */
 .text-aurora {
-  background: linear-gradient(100deg, #0d9488 0%, #4f46e5 38%, #d97706 68%, #db2777 100%);
+  background: linear-gradient(100deg, #0f766e 0%, #0891b2 52%, #22d3ee 100%);
   background-size: 200% 100%;
   -webkit-background-clip: text;
   background-clip: text;
@@ -1061,141 +1057,6 @@ body {
   .lp-copy,
   .lp-blob {
     transform: none;
-  }
-}
-
-/* ================================================================
-   "Ledger" — free-roaming 3D companion: premium speech bubble
-   (rendered through drei <Html>, anchored to the robot's head)
-   ================================================================ */
-.ledger-html {
-  pointer-events: none;
-}
-.ledger-bubble-wrap {
-  transform: translate(-50%, -100%);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-.ledger-bubble {
-  position: relative;
-  pointer-events: auto;
-  cursor: pointer;
-  width: max-content;
-  max-width: 240px;
-  padding: 10px 14px 9px;
-  border-radius: 1.1rem;
-  border: 1px solid rgba(255, 255, 255, 0.9);
-  background: linear-gradient(160deg, rgba(255, 255, 255, 0.94), rgba(244, 250, 255, 0.8));
-  backdrop-filter: blur(16px) saturate(1.4);
-  -webkit-backdrop-filter: blur(16px) saturate(1.4);
-  box-shadow:
-    0 18px 44px -16px rgba(27, 42, 74, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.95);
-  animation: ledgerPop 0.5s cubic-bezier(0.3, 1.6, 0.5, 1) both;
-}
-.ledger-bubble-sm {
-  max-width: 190px;
-  padding: 8px 11px 7px;
-  border-radius: 0.95rem;
-}
-.ledger-bubble-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 3px;
-}
-.ledger-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 9999px;
-  background: linear-gradient(135deg, #2dd4bf, #6366f1);
-  box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.18);
-  animation: ledgerPulse 2.2s ease-in-out infinite;
-}
-.ledger-tag {
-  font-size: 8.5px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: #0d9488;
-}
-.ledger-quote {
-  font-size: 12px;
-  line-height: 1.45;
-  font-weight: 600;
-  color: #1b2a4a;
-  min-height: 3.2em;
-}
-.ledger-bubble-sm .ledger-quote {
-  font-size: 11px;
-  min-height: 3.4em;
-}
-.ledger-qmark {
-  color: #0d9488;
-  font-weight: 800;
-}
-.ledger-by {
-  margin-top: 2px;
-  font-size: 10px;
-  font-style: italic;
-  color: #64748b;
-  text-align: right;
-}
-.ledger-caret::after {
-  content: "▍";
-  margin-left: 1px;
-  color: #0d9488;
-  animation: ledgerCaret 0.9s steps(1) infinite;
-}
-.ledger-tail {
-  width: 12px;
-  height: 12px;
-  margin-top: -7px;
-  background: rgba(250, 253, 255, 0.85);
-  border-right: 1px solid rgba(255, 255, 255, 0.9);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.9);
-  transform: rotate(45deg);
-  border-radius: 2px;
-}
-/* Phones: bubble flips BELOW the anchor (robot hovers in the top band) */
-.ledger-bubble-wrap.is-compact {
-  transform: translate(-50%, 30%);
-}
-.ledger-bubble-wrap.is-compact .ledger-tail {
-  order: -1;
-  margin: 0 0 -7px 0;
-  transform: rotate(225deg);
-}
-@keyframes ledgerPop {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.6);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-@keyframes ledgerPulse {
-  0%,
-  100% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(1.35);
-  }
-}
-@keyframes ledgerCaret {
-  50% {
-    opacity: 0;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ledger-bubble,
-  .ledger-dot,
-  .ledger-caret::after {
-    animation: none;
   }
 }
 

@@ -10,7 +10,7 @@ import { Eye, EyeOff, Loader2, CheckCircle } from "lucide-react";
 import dynamic from "next/dynamic";
 
 /* "Ledger" — 3D mascot, client-only (WebGL never runs on the server) */
-const HeroRobotStage = dynamic(() => import("@/components/welcome/HeroRobot"), {
+const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"), {
   ssr: false,
   loading: () => null,
 });
