@@ -99,7 +99,7 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
      The floating cards only render ≥ md; he still walks up to them. */
   const bound =
     variant === "hero"
-      ? Math.min(Math.max(0.7, viewport.width / 2 - 0.85), 1.55)
+      ? Math.min(Math.max(0.65, viewport.width / 2 - 1.0), 1.1)
       : Math.max(0.3, viewport.width / 2 - 0.95);
 
   /* Cards exist only from md up — track so mobile never "pokes" air */
@@ -140,7 +140,8 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
         targetRef.current = pick(POKEABLE);
         firedRef.current = false;
         dur.current = 4.6;
-        zTarget.current = 0.55; // step forward, off his usual spot
+        zTarget.current = 0.3; // small step forward — kept shallow so his
+        // feet and reaching hand always stay inside the frame (no-crop)
       } else if (next === "walk") {
         dur.current = rand(3.5, 6.5);
         zTarget.current = rand(-0.15, 0.5); // wander the depth of the stage too
@@ -166,7 +167,10 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
     let faceY: number;
     const hs = p === "interact" ? HOTSPOTS[targetRef.current] : null;
     if (hs) {
-      const tx = hs.xf * bound;
+      /* no-crop: clamp the step-in point so his raised reaching hand stays
+         inside the frame on every viewport size */
+      const maxX = Math.max(0.15, state.viewport.width / 2 - 1.05);
+      const tx = THREE.MathUtils.clamp(hs.xf * bound, -maxX, maxX);
       const dx = tx - g.position.x;
       g.position.x = THREE.MathUtils.damp(g.position.x, tx, 1.9, d);
       /* face where he is walking, then face the visitor once in position */
@@ -189,6 +193,13 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
       faceY = 0;
     } else {
       faceY = Math.sin(time * 0.6) * 0.12;
+    }
+    /* no-crop guard: while an arm sweeps out to the side (wave, dance,
+       clap, spin, stretch, jumping jacks) drift him back toward the centre
+       so his hand can never cross the canvas border */
+    if (!hs && (p === "wave" || p === "dance" || p === "clap" || p === "spin"
+      || p === "stretch" || p === "jumpingjack")) {
+      g.position.x = THREE.MathUtils.damp(g.position.x, g.position.x * 0.3, 1.5, d);
     }
     g.position.z = THREE.MathUtils.damp(g.position.z, zTarget.current, 2, d);
     g.rotation.y = THREE.MathUtils.damp(g.rotation.y, faceY, 4, d);
@@ -357,8 +368,8 @@ function CameraRig({ variant }: { variant: Variant }) {
        framing him larger keeps him prominent while his head and boots both
        stay inside the frame at any height. compact pulls back + lifts the
        framing for the auth-page corner. */
-    camera.position.set(0, variant === "hero" ? 1.35 : 1.18, variant === "hero" ? 4.0 : 4.75);
-    camera.lookAt(0, variant === "hero" ? 1.18 : 1.02, 0);
+    camera.position.set(0, variant === "hero" ? 1.5 : 1.18, variant === "hero" ? 5.8 : 4.75);
+    camera.lookAt(0, variant === "hero" ? 1.1 : 1.02, 0);
   }, [camera, variant]);
   return null;
 }
@@ -383,7 +394,7 @@ export default function HeroRobotStage({ variant = "hero" }: { variant?: Variant
         dpr={[1, 2]}
         performance={{ min: 0.5 }}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
-        camera={{ position: [0, 1.35, 4.0], fov: 33 }}
+        camera={{ position: [0, 1.5, 5.8], fov: 33 }}
         style={{ background: "transparent" }}
       >
         <CameraRig variant={variant} />

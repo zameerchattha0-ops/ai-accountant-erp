@@ -607,7 +607,7 @@ export default function WelcomePage() {
         {/* Whisper of grain */}
         <div className="lp-grain" />
 
-        <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-28 pb-24 lg:pt-32 lg:pb-28">
+        <div className="lp-copy relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-28 pb-24 lg:pt-32 lg:pb-28 lg:self-stretch lg:flex lg:flex-col lg:justify-center">
           <div className="grid grid-cols-1 lg:grid-cols-[1.04fr_0.96fr] gap-6 lg:gap-8 items-center">
             {/* TOP — copy. Ledger lives in the stage below this, never over it. */}
             <div className="max-w-xl min-w-0">
@@ -687,12 +687,14 @@ export default function WelcomePage() {
               </div>
             </div>
 
-            {/* RIGHT / FRONT — Ledger's stage, lifted level with the headline.
-                He roams THIS area, walking IN FRONT of his floating chips.
-                On lg+ the canvas stretches the FULL hero row height so he
-                has the entire section as his stage. */}
+            {/* RIGHT / FRONT — Ledger's stage. Below lg it flows under the
+                copy; on lg+ it becomes an absolute overlay spanning the FULL
+                hero-section height (top edge to bottom edge), so his canvas
+                bottom sits exactly on the backdrop image's bottom border —
+                a much bigger stage, and he can never be cropped by its
+                edges (camera + roam bounds guarantee it). */}
             <div
-              className="relative h-[420px] sm:h-[500px] md:h-[540px] lg:h-auto lg:self-stretch lg:min-h-[620px] lg:-mt-10 lg:-mb-16 -mx-3 sm:mx-0"
+              className="relative h-[420px] sm:h-[500px] md:h-[540px] -mx-3 sm:mx-0 lg:absolute lg:z-20 lg:inset-y-0 lg:mx-0 lg:h-auto lg:left-1/2 lg:w-[50vw]"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
             >
               {/* canvas above the chips so Ledger walks IN FRONT of them */}
@@ -742,7 +744,7 @@ export default function WelcomePage() {
 
               {/* document chips — left edge, narrow. Ledger walks over and
                   "posts" each one; the chip pops when his hand lands. */}
-              <div className="absolute left-0 top-[7%] hidden md:flex flex-col gap-5 pointer-events-none">
+              <div className="absolute left-0 top-[14%] hidden md:flex flex-col gap-5 pointer-events-none">
                 <FloatChip
                   icon={FileText}
                   chip="bg-gradient-to-br from-emerald-100 to-emerald-50"
