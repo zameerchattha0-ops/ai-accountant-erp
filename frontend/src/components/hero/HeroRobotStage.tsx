@@ -25,7 +25,8 @@ import { RobotModel, type FaceMode } from "@/components/robot/RobotModel";
 type Variant = "hero" | "compact";
 type Phase =
   | "wave" | "idle" | "walk" | "hop" | "dance" | "clap" | "read" | "sit"
-  | "interact" | "spin" | "stretch" | "think" | "march" | "peek" | "jumpingjack";
+  | "interact" | "spin" | "stretch" | "think" | "march" | "peek" | "jumpingjack"
+  | "robotdance" | "moonwalk" | "conductor" | "kungfu" | "bow" | "cartwheel" | "meditate";
 type PokeTarget = "invoice" | "journal" | "trial" | "overview" | "ask";
 
 /* Hero hotspots Ledger can walk up to and physically interact with.
@@ -73,8 +74,23 @@ function faceForPhase(p: Phase): FaceMode {
   if (p === "sit") return "sleepy";
   if (p === "read" || p === "think") return "focus";
   if (p === "spin" || p === "jumpingjack" || p === "march" || p === "peek" || p === "stretch") return "excited";
+  if (p === "robotdance" || p === "moonwalk" || p === "conductor" || p === "kungfu" || p === "cartwheel") return "excited";
+  if (p === "meditate") return "focus";
   return "happy";
 }
+
+/* On-demand command routines (dispatched via the `ledger-command`
+   CustomEvent from the command deck / direct mouse interaction).
+   Each maps to its run duration in seconds. */
+const COMMAND_DUR: Record<string, number> = {
+  robotdance: 3.2,
+  moonwalk: 3.6,
+  conductor: 3.6,
+  kungfu: 3.0,
+  bow: 2.8,
+  cartwheel: 1.7,
+  meditate: 3.8,
+};
 
 function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }) {
   const root = useRef<THREE.Group>(null);
@@ -116,6 +132,25 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
   const targetRef = useRef<PokeTarget>("invoice");
   const firedRef = useRef(false);
   const zTarget = useRef(0);
+
+  /* --- command channel: the command deck / direct clicks dispatch
+     `ledger-command`; the very next frame performs that routine. --- */
+  useEffect(() => {
+    const onCommand = (e: Event) => {
+      const cmd = (e as CustomEvent<{ command?: string }>).detail?.command;
+      if (!cmd || reduced) return;
+      const durSec = COMMAND_DUR[cmd];
+      if (!durSec) return;
+      phase.current = cmd as Phase;
+      t.current = 0;
+      dur.current = durSec;
+      zTarget.current = cmd === "moonwalk" ? 0.05 : 0;
+      dir.current = Math.random() > 0.5 ? 1 : -1;
+      firedRef.current = true; // routine runs instead of a hotspot poke
+    };
+    window.addEventListener("ledger-command", onCommand);
+    return () => window.removeEventListener("ledger-command", onCommand);
+  }, [reduced]);
 
   useFrame((state, rawDelta) => {
     const g = root.current;
@@ -183,13 +218,21 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
         firedRef.current = true;
         window.dispatchEvent(new CustomEvent("ledger-poke", { detail: { target: targetRef.current } }));
       }
+    } else if (p === "moonwalk") {
+      /* glides backwards across the stage — lean, slide, tiny toe-bounce */
+      g.position.x -= dir.current * 0.42 * d;
+      if (g.position.x > bound - 0.15) dir.current = -1;
+      else if (g.position.x < -bound + 0.15) dir.current = 1;
+      faceY = dir.current * 0.5;
     } else if (p === "walk") {
       g.position.x += dir.current * 0.5 * d;
       if (g.position.x > bound) dir.current = -1;
       else if (g.position.x < -bound) dir.current = 1;
       faceY = dir.current * 0.55;
     } else if (p === "clap" || p === "read" || p === "sit" || p === "spin"
-      || p === "march" || p === "jumpingjack" || p === "stretch" || p === "think") {
+      || p === "march" || p === "jumpingjack" || p === "stretch" || p === "think"
+      || p === "robotdance" || p === "conductor" || p === "kungfu" || p === "bow"
+      || p === "cartwheel" || p === "meditate") {
       faceY = 0;
     } else {
       faceY = Math.sin(time * 0.6) * 0.12;
@@ -198,12 +241,20 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
        clap, spin, stretch, jumping jacks) drift him back toward the centre
        so his hand can never cross the canvas border */
     if (!hs && (p === "wave" || p === "dance" || p === "clap" || p === "spin"
-      || p === "stretch" || p === "jumpingjack")) {
+      || p === "stretch" || p === "jumpingjack" || p === "cartwheel")) {
       g.position.x = THREE.MathUtils.damp(g.position.x, g.position.x * 0.3, 1.5, d);
     }
     g.position.z = THREE.MathUtils.damp(g.position.z, zTarget.current, 2, d);
     g.rotation.y = THREE.MathUtils.damp(g.rotation.y, faceY, 4, d);
     if (p === "spin") g.rotation.y = t.current * 5.2; // a full twirl
+    if (p === "bow") {
+      /* deep respectful bow — pitch forward and rise back gracefully */
+      const bowT = Math.sin(Math.min((t.current / 2.8) * Math.PI, Math.PI)) * 0.5;
+      g.rotation.x = THREE.MathUtils.damp(g.rotation.x, bowT, 6, d);
+    } else {
+      g.rotation.x = THREE.MathUtils.damp(g.rotation.x, 0, 4, d);
+    }
+    if (p === "cartwheel") g.rotation.z = (t.current / 1.7) * Math.PI * 2; // full side roll
     g.rotation.z =
       p === "dance"
         ? Math.sin(t.current * 4) * 0.1
@@ -219,10 +270,15 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
           ? Math.abs(Math.sin(t.current * 6)) * 0.16
           : p === "march"
             ? Math.abs(Math.sin(t.current * 7)) * 0.08
-            : 0;
+            : p === "moonwalk"
+              ? Math.max(0, Math.sin(t.current * 3.2)) * 0.04
+              : p === "cartwheel"
+                ? Math.sin(Math.min(t.current / 1.7, 1) * Math.PI) * 0.55
+                : 0;
     const sitY = p === "sit" ? -0.3 : 0;
     const toeY = p === "stretch" ? 0.06 : 0;
-    g.position.y = THREE.MathUtils.damp(g.position.y, bob + hopY + sitY + toeY, 10, d);
+    const medY = p === "meditate" ? 0.22 + Math.sin(t.current * 1.4) * 0.05 : 0;
+    g.position.y = THREE.MathUtils.damp(g.position.y, bob + hopY + sitY + toeY + medY, 10, d);
 
     /* limbs */
     const dampTo = (o: RefObject<THREE.Group | null>, x: number, z: number) => {
@@ -295,6 +351,50 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
       /* hands cupped, leaning to peek around */
       azL = -0.5;
       azR = 0.5;
+    } else if (p === "robotdance") {
+      /* "the robot" — staccato angles snapping on the half-beat */
+      const q = Math.floor(t.current * 2) % 2;
+      azL = -(1.15 + q * 0.45);
+      azR = 1.15 - (1 - q) * 0.45;
+      axL = axR = -0.15 - q * 0.25;
+    } else if (p === "conductor") {
+      /* conducts the numbers like an orchestra — grand slow sweeps */
+      azR = 2.1 + Math.sin(t.current * 2.2) * 0.6;
+      axR = -0.55;
+      azL = -0.75 + Math.cos(t.current * 2.2) * 0.35;
+      axL = -0.3;
+    } else if (p === "kungfu") {
+      /* three crisp poses: jab → high block → wide guard */
+      const pose = Math.floor(t.current / 1.0) % 3;
+      if (pose === 0) {
+        axR = -1.35;
+        azR = 0.55;
+        azL = -0.35;
+      } else if (pose === 1) {
+        azR = 2.35;
+        azL = -0.4;
+        axL = -0.2;
+      } else {
+        axL = axR = -0.5;
+        azL = -1.75;
+        azR = 1.75;
+      }
+    } else if (p === "bow") {
+      /* graceful flourish out as he bends, closing on the rise */
+      const rise = Math.sin(Math.min((t.current / 2.8) * Math.PI, Math.PI));
+      azL = -1.55 - rise * 0.4;
+      azR = 1.55 + rise * 0.4;
+      axL = axR = -0.25;
+    } else if (p === "cartwheel") {
+      /* arms locked out for the full side roll */
+      azL = -2.65;
+      azR = 2.65;
+      axL = axR = -0.1;
+    } else if (p === "meditate") {
+      /* hands resting toward the knees; he levitates while breathing slow */
+      axL = axR = -0.72;
+      azL = -0.3;
+      azR = 0.3;
     } else {
       azL = -0.08 + Math.sin(time * 1.7) * 0.05;
       azR = 0.08 - Math.sin(time * 1.7) * 0.05;
@@ -311,13 +411,21 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
             ? Math.sin(t.current * 6) * 0.35
             : 0;
     const sitLeg = p === "sit" ? -1.45 : 0;
-    dampTo(legL, sitLeg + legSwing, 0);
-    dampTo(legR, sitLeg - legSwing, 0);
+    if (p === "meditate") {
+      /* crossed-lotus suggestion while levitating */
+      dampTo(legL, 0.85, -0.55);
+      dampTo(legR, 0.85, 0.55);
+    } else {
+      const moonSwing = p === "moonwalk" ? Math.sin(t.current * 3) * 0.25 : 0;
+      dampTo(legL, sitLeg + legSwing + moonSwing, 0);
+      dampTo(legR, sitLeg - legSwing - moonSwing, 0);
+    }
 
     /* head: look down while reading, ponder upward while thinking, tilt
-       into the peek, follow the cursor otherwise */
+       into the peek, snap on the robot-dance beat, follow the cursor
+       generously otherwise (mouse control) */
     if (head.current) {
-      const look = reduced ? 0 : -state.pointer.y * 0.12;
+      const look = reduced ? 0 : -state.pointer.y * 0.2;
       const down =
         (p === "read" ? 0.42 : 0) + (p === "sit" ? 0.08 : 0) + (p === "think" ? -0.24 : 0);
       const tilt =
@@ -325,11 +433,15 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
           ? Math.sin(Math.min(t.current * 1.6, Math.PI)) * 0.3
           : p === "think"
             ? 0.14
-            : 0;
+            : p === "robotdance"
+              ? Math.floor(t.current * 2) % 2
+                ? 0.12
+                : -0.08
+              : 0;
       head.current.rotation.x = THREE.MathUtils.damp(head.current.rotation.x, down + look, 5, d);
       head.current.rotation.y = reduced
         ? 0
-        : THREE.MathUtils.damp(head.current.rotation.y, state.pointer.x * 0.25, 5, d);
+        : THREE.MathUtils.damp(head.current.rotation.y, state.pointer.x * 0.5, 5, d);
       head.current.rotation.z = THREE.MathUtils.damp(head.current.rotation.z, tilt, 5, d);
     }
   });

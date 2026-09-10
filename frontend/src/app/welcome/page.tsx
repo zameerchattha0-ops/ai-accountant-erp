@@ -3,13 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { Cinzel, Cormorant_Garamond, Fraunces } from "next/font/google";
+import { Cinzel, Cormorant_Garamond, Fraunces, DM_Serif_Display, Antic_Didone } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
   FileBarChart, PencilLine, Mail, MessageCircle, ChevronRight,
   FileText, Send, Sparkles, Check,
   TrendingUp, TrendingDown,
+  Bot, Footprints, Music, Hand, RefreshCw,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
@@ -47,6 +48,21 @@ const fraunces = Fraunces({
   variable: "--font-fraunces",
   display: "swap",
 });
+/* Tagline faces: DM Serif Display (italic didone elegance) + Antic Didone
+   (rendered bold via synthetic weight for the thick-hairline didone look) */
+const dmSerif = DM_Serif_Display({
+  subsets: ["latin"],
+  weight: "400",
+  style: ["normal", "italic"],
+  variable: "--font-dm-serif",
+  display: "swap",
+});
+const antic = Antic_Didone({
+  subsets: ["latin"],
+  weight: "400",
+  variable: "--font-antic",
+  display: "swap",
+});
 
 /* Brand glyph — lucide-react no longer ships brand icons (Linkedin was
    removed from the library), so the LinkedIn mark is inlined here. */
@@ -64,13 +80,13 @@ function LinkedInIcon({ className }: { className?: string }) {
    times vary 2.8–3.6s for an organic cadence. Rotation pauses under
    prefers-reduced-motion (the first variant then remains). */
 const HERO_TAGLINES = [
-  { text: "Smarter with AI.", from: "#0f766e", to: "#0e7490", dur: 3000 },
-  { text: "Effortless. Intelligent.", from: "#4338ca", to: "#7c3aed", dur: 3400 },
-  { text: "Always Balanced.", from: "#047857", to: "#0d9488", dur: 2800 },
-  { text: "Precision on Autopilot.", from: "#b45309", to: "#c2410c", dur: 3600 },
-  { text: "Powered by Intelligence.", from: "#be123c", to: "#a21caf", dur: 3000 },
-  { text: "Built to Grow With You.", from: "#1d4ed8", to: "#4f46e5", dur: 3200 },
-];
+  { text: "Smarter with AI.", from: "#0f766e", to: "#0e7490", dur: 3000, font: "dm-italic" },
+  { text: "Effortless. Intelligent.", from: "#4338ca", to: "#7c3aed", dur: 3400, font: "antic-bold" },
+  { text: "Always Balanced.", from: "#047857", to: "#0d9488", dur: 2800, font: "dm" },
+  { text: "Precision on Autopilot.", from: "#b45309", to: "#c2410c", dur: 3600, font: "antic-bold" },
+  { text: "Powered by Intelligence.", from: "#be123c", to: "#a21caf", dur: 3000, font: "dm-italic" },
+  { text: "Built to Grow With You.", from: "#1d4ed8", to: "#4f46e5", dur: 3200, font: "antic-bold" },
+] as const;
 
 function HeroTagline() {
   const [idx, setIdx] = useState(0);
@@ -97,16 +113,69 @@ function HeroTagline() {
   }, []);
 
   const t = HERO_TAGLINES[idx];
+  const fontCss: React.CSSProperties =
+    t.font === "antic-bold"
+      ? { fontFamily: "var(--font-antic), Georgia, serif", fontWeight: 700, letterSpacing: "0.01em" }
+      : t.font === "dm-italic"
+        ? { fontFamily: "var(--font-dm-serif), Georgia, serif", fontStyle: "italic" }
+        : { fontFamily: "var(--font-dm-serif), Georgia, serif" };
   return (
     <span
       key={idx}
       className="hero-tagline-rotate"
       style={{
+        ...fontCss,
         backgroundImage: `linear-gradient(100deg, ${t.from} 0%, ${t.to} 100%)`,
       }}
     >
       {t.text}
     </span>
+  );
+}
+
+/* ---- Ledger's command deck -------------------------------------
+   Premium click-to-run commands: every button dispatches a
+   `ledger-command` event; the robot's actor consumes it and
+   performs that exact routine on the spot. */
+const ROBOT_COMMANDS = [
+  { command: "robotdance", label: "The Robot", icon: Bot, chip: "from-indigo-500 to-violet-500" },
+  { command: "moonwalk", label: "Moonwalk", icon: Footprints, chip: "from-teal-500 to-emerald-500" },
+  { command: "conductor", label: "Conduct", icon: Music, chip: "from-amber-500 to-orange-500" },
+  { command: "kungfu", label: "Strike a Pose", icon: Zap, chip: "from-rose-500 to-pink-500" },
+  { command: "bow", label: "Take a Bow", icon: Hand, chip: "from-sky-500 to-cyan-500" },
+  { command: "cartwheel", label: "Cartwheel", icon: RefreshCw, chip: "from-violet-500 to-fuchsia-500" },
+  { command: "meditate", label: "Meditate", icon: Sparkles, chip: "from-emerald-500 to-teal-500" },
+] as const;
+
+function RobotCommandDeck() {
+  return (
+    <div
+      className="absolute bottom-3 right-3 md:bottom-[9%] md:right-4 z-30 flex md:flex-col flex-wrap gap-2 max-w-[calc(100%-1.5rem)]"
+      aria-label="Ledger commands"
+    >
+      <span className="hidden md:block text-[9px] font-bold uppercase tracking-[0.22em] text-brand-navy/60 pl-2">
+        Command Ledger
+      </span>
+      {ROBOT_COMMANDS.map((c) => (
+        <button
+          key={c.command}
+          type="button"
+          onClick={() =>
+            window.dispatchEvent(
+              new CustomEvent("ledger-command", { detail: { command: c.command } }),
+            )
+          }
+          className="pointer-events-auto inline-flex items-center gap-2 rounded-full bg-white/85 backdrop-blur border border-white shadow-[0_10px_26px_-12px_rgba(27,42,74,0.4)] pl-1.5 pr-3.5 py-1.5 text-[11px] font-bold text-brand-navy transition-all hover:-translate-y-0.5 hover:bg-white hover:shadow-[0_14px_30px_-12px_rgba(27,42,74,0.5)] active:scale-95"
+        >
+          <span
+            className={`w-6 h-6 rounded-full bg-gradient-to-br ${c.chip} flex items-center justify-center shadow-sm shrink-0`}
+          >
+            <c.icon className="w-3 h-3 text-white" strokeWidth={2.5} />
+          </span>
+          {c.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -525,7 +594,7 @@ export default function WelcomePage() {
   const FLOW_DOTS = ["bg-teal-500", "bg-indigo-500", "bg-amber-500", "bg-rose-500", "bg-sky-500", "bg-violet-500", "bg-emerald-500", "bg-pink-500", "bg-teal-500"];
 
   return (
-    <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, "min-h-screen bg-bg-primary")}>
+    <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, dmSerif.variable, antic.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
       {/* NAVBAR — light floating glass                                 */}
       {/* ============================================================ */}
@@ -747,11 +816,23 @@ export default function WelcomePage() {
             <div
               className="relative h-[420px] sm:h-[500px] md:h-[540px] -mx-3 sm:mx-0 lg:absolute lg:z-20 lg:inset-y-0 lg:mx-0 lg:h-auto lg:left-1/2 lg:w-[50vw]"
               style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
+              onPointerDown={(e) => {
+                /* Mouse control: click Ledger directly (the canvas) and he
+                   responds with an engaging routine. Clicks on cards/deck
+                   buttons bubble from their own elements and are ignored. */
+                if (!(e.target instanceof HTMLCanvasElement)) return;
+                const reactions = ["bow", "robotdance", "wave", "kungfu"] as const;
+                const cmd = reactions[Math.floor(Math.random() * reactions.length)];
+                window.dispatchEvent(new CustomEvent("ledger-command", { detail: { command: cmd } }));
+              }}
             >
               {/* canvas above the chips so Ledger walks IN FRONT of them */}
-              <div className="absolute inset-0 z-10">
+              <div className="absolute inset-0 z-10 cursor-pointer">
                 <HeroRobotStage variant="hero" />
               </div>
+
+              {/* Command deck — click any command and Ledger performs it */}
+              <RobotCommandDeck />
 
               {/* MOBILE — same cards as the desktop stage, but laid BEHIND
                   Ledger starting at his SHOULDERS and extending up past his
@@ -1122,7 +1203,7 @@ export default function WelcomePage() {
 
             {/* Email */}
             <a
-              href="mailto:ZAMEERCHATTHA0@GMAIL.COM"
+              href="mailto:zameerchattha0@gmail.com"
               className="group relative rounded-3xl p-[1.5px] transition-transform duration-300 hover:-translate-y-1.5"
               style={{ background: "linear-gradient(135deg, #fbbf24, #f59e0b)" }}
             >
@@ -1132,7 +1213,7 @@ export default function WelcomePage() {
                 </span>
                 <span className="min-w-0">
                   <span className="block text-sm font-semibold text-brand-navy">Email</span>
-                  <span className="block text-xs text-[#3d4b66] truncate">ZAMEERCHATTHA0@GMAIL.COM</span>
+                  <span className="block text-xs text-[#3d4b66] truncate">zameerchattha0@gmail.com</span>
                 </span>
               </div>
             </a>
@@ -1188,7 +1269,7 @@ export default function WelcomePage() {
               <LinkedInIcon className="w-4 h-4" />
             </a>
             <a
-              href="mailto:ZAMEERCHATTHA0@GMAIL.COM"
+              href="mailto:zameerchattha0@gmail.com"
               aria-label="Email"
               className="hover:text-amber-600 transition-colors"
             >

@@ -1,6 +1,6 @@
 "use client";
 
-/* Pricing — early-access plans */
+/* Pricing — every plan is free for all users */
 
 import Link from "next/link";
 import PageShell from "@/components/welcome/PageShell";
@@ -11,7 +11,7 @@ const PLANS = [
     name: "Starter",
     tagline: "For solo founders finding their feet",
     monthly: "Free",
-    period: "during early access",
+    period: "for every user — forever",
     features: ["1 organization", "AI transaction recording", "Journal → Ledger → Trial Balance", "Core financial statements", "Email support"],
     cta: "Start Free",
     href: "/signup",
@@ -21,10 +21,10 @@ const PLANS = [
   {
     name: "Pro",
     tagline: "For growing businesses that move fast",
-    monthly: "PKR 4,900",
-    period: "per organization / month",
+    monthly: "Free",
+    period: "for every user — forever",
     features: ["Everything in Starter", "Invoicing, quotations & receipts", "Purchases, payables & banking", "Aging & project profitability reports", "Priority support"],
-    cta: "Get Started",
+    cta: "Start Free",
     href: "/signup",
     highlight: true,
     c: "from-indigo-500 to-violet-500",
@@ -32,11 +32,11 @@ const PLANS = [
   {
     name: "Business",
     tagline: "For teams that need full control",
-    monthly: "PKR 12,900",
-    period: "per organization / month",
+    monthly: "Free",
+    period: "for every user — forever",
     features: ["Everything in Pro", "Role-based permissions & audit trails", "Confirmation gates & period management", "Multi-organization management", "Direct line to the founder"],
-    cta: "Talk to Zameer",
-    href: "https://pk.linkedin.com/in/zameerhaiderchattha",
+    cta: "Start Free",
+    href: "/signup",
     highlight: false,
     c: "from-rose-500 to-pink-500",
   },
@@ -45,11 +45,11 @@ const PLANS = [
 export default function PricingPage() {
   return (
     <PageShell
-      eyebrow="Simple, honest pricing"
+      eyebrow="Free for everyone"
       title="Pricing that grows"
       accent="with"
       titleTail="you."
-      subtitle="Start free during early access. Upgrade only when your books — not our paywall — tell you it's time."
+      subtitle="Every plan is free for all users — Starter, Pro, and Business. No trials, no credit cards, no paywalls."
     >
       <section className="py-16 sm:py-20 pb-24">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 grid md:grid-cols-3 gap-6 items-stretch">
@@ -104,7 +104,7 @@ export default function PricingPage() {
           ))}
         </div>
         <p className="mt-10 text-center text-xs text-[#64748b]">
-          Early-access pricing — locked in for lifetime when you join now. No credit card required to start.
+          All plans are completely free for every type of user. No credit card required — just sign up and start.
         </p>
       </section>
     </PageShell>

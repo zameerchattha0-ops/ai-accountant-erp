@@ -94,7 +94,7 @@ export default function ResourcesPage() {
                 <MessageCircle className="w-4 h-4" /> WhatsApp
               </a>
               <a
-                href="mailto:ZAMEERCHATTHA0@gmail.com"
+                href="mailto:zameerchattha0@gmail.com"
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white border border-white text-brand-navy text-sm font-semibold shadow-lg hover:-translate-y-0.5 transition-all"
               >
                 <Mail className="w-4 h-4 text-indigo-500" /> Email

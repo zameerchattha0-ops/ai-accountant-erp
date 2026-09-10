@@ -158,10 +158,10 @@ export default function PageShell({
               <LinkedInIcon className="w-4 h-4" /> LinkedIn
             </a>
             <a
-              href="mailto:ZAMEERCHATTHA0@gmail.com"
+              href="mailto:zameerchattha0@gmail.com"
               className="inline-flex items-center gap-2.5 px-6 py-3 rounded-full bg-white/90 border border-white text-brand-navy text-sm font-semibold shadow-lg hover:-translate-y-0.5 transition-all"
             >
-              <Mail className="w-4 h-4 text-indigo-500" /> ZAMEERCHATTHA0@gmail.com
+              <Mail className="w-4 h-4 text-indigo-500" /> zameerchattha0@gmail.com
             </a>
             <a
               href="https://wa.me/923230714288"
