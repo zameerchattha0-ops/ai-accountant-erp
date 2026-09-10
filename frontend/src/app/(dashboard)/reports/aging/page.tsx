@@ -12,13 +12,20 @@ import type { AgingRow } from "@/lib/types/entities";
 
 type Tab = "receivables" | "payables";
 
-const BUCKETS: { key: keyof AgingRow; label: string }[] = [
-  { key: "bucket_current", label: "Current" },
-  { key: "bucket_1_30", label: "1-30 days" },
-  { key: "bucket_31_60", label: "31-60 days" },
-  { key: "bucket_61_90", label: "61-90 days" },
-  { key: "bucket_90_plus", label: "90+ days" },
+const BUCKETS: { key: keyof AgingRow; short: string; tail: string }[] = [
+  { key: "bucket_current", short: "Current", tail: "" },
+  { key: "bucket_1_30", short: "1-30", tail: "days" },
+  { key: "bucket_31_60", short: "31-60", tail: "days" },
+  { key: "bucket_61_90", short: "61-90", tail: "days" },
+  { key: "bucket_90_plus", short: "90+", tail: "days" },
 ];
+
+const bucketHeader = (b: { short: string; tail: string }) => (
+  <>
+    {b.short}
+    {b.tail && <span className="hidden sm:inline"> {b.tail}</span>}
+  </>
+);
 
 export default function AgingReportPage() {
   const { org, loading: orgLoading } = useOrg();
@@ -63,11 +70,11 @@ export default function AgingReportPage() {
         }
       />
 
-      <div className="flex items-center gap-2 print:hidden">
-        <div className="flex items-center rounded-xl bg-bg-surface border border-border-subtle p-0.5">
+      <div className="flex flex-wrap items-center gap-2 print:hidden">
+        <div className="flex flex-wrap items-center rounded-xl bg-bg-surface border border-border-subtle p-0.5">
           {([
-            { id: "receivables" as Tab, label: "Receivables (customers owe you)" },
-            { id: "payables" as Tab, label: "Payables (you owe suppliers)" },
+            { id: "receivables" as Tab, a: "Receivables", b: "customers owe you" },
+            { id: "payables" as Tab, a: "Payables", b: "you owe suppliers" },
           ]).map((t) => (
             <button
               key={t.id}
@@ -77,7 +84,8 @@ export default function AgingReportPage() {
                 tab === t.id ? "bg-ai-500 text-white" : "text-text-secondary hover:text-text-primary"
               )}
             >
-              {t.label}
+              {t.a}
+              <span className="hidden sm:inline"> ({t.b})</span>
             </button>
           ))}
         </div>
@@ -101,25 +109,27 @@ export default function AgingReportPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
-                <th className="px-4 py-3 font-medium">
+                <th className="px-3 sm:px-4 py-3 font-medium">
                   {tab === "receivables" ? "Customer" : "Supplier"}
                 </th>
                 {BUCKETS.map((b) => (
-                  <th key={b.key} className="px-4 py-3 font-medium text-right">{b.label}</th>
+                  <th key={b.key} className="px-3 sm:px-4 py-3 font-medium text-right whitespace-nowrap">
+                    {bucketHeader(b)}
+                  </th>
                 ))}
-                <th className="px-4 py-3 font-medium text-right">Total</th>
+                <th className="px-3 sm:px-4 py-3 font-medium text-right">Total</th>
               </tr>
             </thead>
             <tbody>
               {(rows ?? []).map((r) => (
                 <tr key={tab === "receivables" ? r.customer_id : r.supplier_id}
                   className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
-                  <td className="px-4 py-3 text-text-primary font-medium">{partyLabel(r)}</td>
+                  <td className="px-3 sm:px-4 py-3 text-text-primary font-medium break-words max-w-[10rem] sm:max-w-none">{partyLabel(r)}</td>
                   {BUCKETS.map((b) => {
                     const v = r[b.key] as number;
                     return (
                       <td key={b.key} className={cn(
-                        "px-4 py-3 text-right tabular-nums",
+                        "px-3 sm:px-4 py-3 text-right tabular-nums whitespace-nowrap",
                         v > 0.005
                           ? b.key === "bucket_90_plus" || b.key === "bucket_61_90"
                             ? "text-error-600 font-medium"
@@ -130,7 +140,7 @@ export default function AgingReportPage() {
                       </td>
                     );
                   })}
-                  <td className="px-4 py-3 text-right text-text-primary tabular-nums font-semibold">
+                  <td className="px-3 sm:px-4 py-3 text-right text-text-primary tabular-nums font-semibold whitespace-nowrap">
                     {formatCurrency(r.total_outstanding, currency)}
                   </td>
                 </tr>
@@ -138,13 +148,13 @@ export default function AgingReportPage() {
             </tbody>
             <tfoot>
               <tr className="border-t-2 border-border-default bg-bg-muted/50">
-                <td className="px-4 py-3 font-semibold text-text-primary">Total</td>
+                <td className="px-3 sm:px-4 py-3 font-semibold text-text-primary">Total</td>
                 {BUCKETS.map((b) => (
-                  <td key={b.key} className="px-4 py-3 text-right font-semibold text-text-primary tabular-nums">
+                  <td key={b.key} className="px-3 sm:px-4 py-3 text-right font-semibold text-text-primary tabular-nums whitespace-nowrap">
                     {formatCurrency(columnTotal(b.key), currency)}
                   </td>
                 ))}
-                <td className="px-4 py-3 text-right font-semibold text-text-primary tabular-nums">
+                <td className="px-3 sm:px-4 py-3 text-right font-semibold text-text-primary tabular-nums whitespace-nowrap">
                   {formatCurrency(columnTotal("total_outstanding"), currency)}
                 </td>
               </tr>

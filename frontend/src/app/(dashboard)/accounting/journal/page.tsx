@@ -395,7 +395,7 @@ export default function JournalPage() {
         title="Journal"
         subtitle="Double-entry journal - the database rejects unbalanced postings"
         actions={
-          <div className="flex items-center gap-2 no-print">
+          <div className="flex flex-wrap items-center gap-2 no-print">
             <button
               onClick={() => window.print()}
               className="btn-3d-soft flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
@@ -412,17 +412,17 @@ export default function JournalPage() {
         }
       />
 
-      <div className="flex items-center gap-3 no-print">
+      <div className="flex flex-wrap items-center gap-3 no-print">
         <select className={`${inputCls} max-w-44`} value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}>
           {["ALL", "DRAFT", "VALIDATED", "POSTED", "REVERSED", "VOIDED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
           ))}
         </select>
-        <div className="relative">
+        <div className="relative w-full sm:w-auto">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
           <input
-            className={`${inputCls} w-64 pl-9`}
+            className={`${inputCls} w-full sm:w-64 pl-9`}
             placeholder="Search number, description, source…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -590,7 +590,7 @@ export default function JournalPage() {
       {/* New / Edit Journal Entry Modal */}
       <Modal open={modalOpen} onClose={() => { setModalOpen(false); setEditingId(null); }} title={editingId ? "Edit Journal Entry" : "New Journal Entry"} wide>
         <div className="space-y-4">
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
               <label className="text-xs font-medium text-text-secondary">Date *</label>
               <input type="date" className={`${inputCls} mt-1.5`} value={form.transaction_date}
@@ -625,21 +625,21 @@ export default function JournalPage() {
             </div>
             <div className="space-y-2">
               {form.lines.map((line, i) => (
-                <div key={i} className="grid grid-cols-12 gap-2 items-center">
-                  <select className={`${inputCls} col-span-4`} value={line.account_id}
+                <div key={i} className="grid grid-cols-2 sm:grid-cols-12 gap-2 items-center">
+                  <select className={`${inputCls} col-span-2 sm:col-span-4`} value={line.account_id}
                     onChange={(e) => setLine(i, { account_id: e.target.value })}>
                     <option value="">Account…</option>
                     {accounts.map((a) => (
                       <option key={a.id} value={a.id}>{a.code} - {a.name}</option>
                     ))}
                   </select>
-                  <input className={`${inputCls} col-span-3`} placeholder="Line note"
+                  <input className={`${inputCls} col-span-2 sm:col-span-3`} placeholder="Line note"
                     value={line.description}
                     onChange={(e) => setLine(i, { description: e.target.value })} />
-                  <input className={`${inputCls} col-span-2 text-right`} type="number" min="0" step="any"
+                  <input className={`${inputCls} col-span-1 sm:col-span-2 text-right`} type="number" min="0" step="any"
                     placeholder="Debit" value={line.debit}
                     onChange={(e) => setLine(i, { debit: e.target.value, credit: "" })} />
-                  <input className={`${inputCls} col-span-2 text-right`} type="number" min="0" step="any"
+                  <input className={`${inputCls} col-span-1 sm:col-span-2 text-right`} type="number" min="0" step="any"
                     placeholder="Credit" value={line.credit}
                     onChange={(e) => setLine(i, { credit: e.target.value, debit: "" })} />
                   <button
@@ -648,7 +648,7 @@ export default function JournalPage() {
                       lines: f.lines.filter((_, idx) => idx !== i),
                     }))}
                     disabled={form.lines.length <= 2}
-                    className="col-span-1 p-2 rounded-lg text-text-muted hover:text-error-600 hover:bg-error-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    className="col-span-2 sm:col-span-1 p-2 rounded-lg text-text-muted hover:text-error-600 hover:bg-error-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                     aria-label="Remove line"
                   >
                     <Trash2 className="w-4 h-4 mx-auto" />
@@ -684,7 +684,7 @@ export default function JournalPage() {
           </p>
           {formError && <p className="text-xs text-error-600 bg-error-50 rounded-xl px-3 py-2">{formError}</p>}
 
-          <div className="flex justify-end gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <button onClick={() => setModalOpen(false)}
               className="px-4 py-2 rounded-xl text-sm font-medium text-text-secondary hover:text-text-primary transition-colors">
               Cancel

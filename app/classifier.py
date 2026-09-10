@@ -151,6 +151,87 @@ def _matched_expense_label(text: str) -> Optional[str]:
     return None
 
 
+# CONFIGURATION-GAP RESOLVER (owner directive): every KNOWN, unambiguous
+# expense category must hit its OWN income-statement ledger.  When the
+# chart of accounts has no account for the category, the agent CREATES
+# it deterministically (never silently defaulting to the generic
+# "General Operating Expense" account, never bouncing the user with a
+# question for a category that is already certain).
+_EXPENSE_ACCOUNT_SEEDS: Dict[str, tuple[str, str]] = {
+    "utilities expense": ("Utilities Expense", "6130"),
+    "rent expense": ("Rent Expense", "6140"),
+    "salaries & wages": ("Salaries & Wages", "6010"),
+    "communication expense": ("Communication Expense", "6150"),
+    "travel & transport": ("Travel & Transport Expense", "6160"),
+    "insurance expense": ("Insurance Expense", "6170"),
+    "bank charges": ("Bank Charges", "6300"),
+    "marketing & advertising expense": (
+        "Marketing & Advertising Expense", "6180",
+    ),
+    "supplies": ("Supplies Expense", "6190"),
+}
+
+
+async def _ensure_expense_account(
+    organization_id: uuid.UUID, rule_label: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Ensure the COA has an account for the KNOWN expense *rule_label*.
+
+    Returns the matching/created account row, or None when the label is
+    unknown (caller keeps its existing clarify-or-default behaviour).
+    Creation is idempotent: an exact-name EXPENSE account short-circuits.
+    """
+    from app.repositories import account_repository as a_repo
+
+    key = (rule_label or "").strip().lower()
+    seed = _EXPENSE_ACCOUNT_SEEDS.get(key)
+    if not seed:
+        return None
+    name, base_code = seed
+
+    # Idempotency: an exact-name active EXPENSE account wins.
+    try:
+        existing = await a_repo.search_accounts(organization_id, query=name)
+    except Exception as exc:  # noqa: BLE001 — COA search is best-effort
+        log.warning("classifier.ensure_account_search_failed", error=str(exc))
+        existing = []
+    for acc in existing or []:
+        nm = (acc.get("name") or "").strip().lower()
+        if (
+            nm == name.lower()
+            and acc.get("account_type") in (None, "EXPENSE")
+            and acc.get("is_active") is not False
+        ):
+            return acc
+
+    try:
+        code = await a_repo.next_available_code(organization_id, base_code)
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name=name,
+            account_type="EXPENSE",
+            normal_balance="DEBIT",
+            description=(
+                f"Auto-created by the AI agent for '{rule_label}' entries"
+            ),
+        )
+        log.info(
+            "classifier.expense_account_created",
+            name=name,
+            code=code,
+            label=rule_label,
+        )
+        return created
+    except Exception as exc:  # noqa: BLE001 — creation must never kill a run
+        log.warning(
+            "classifier.expense_account_create_failed",
+            label=rule_label,
+            error=str(exc)[:200],
+        )
+        return None
+
+
 def _classification_text(item_description: Optional[str], entities: Dict[str, Any]) -> str:
     return " ".join(
         str(part) for part in (
@@ -511,20 +592,34 @@ async def classify_transaction(
             and rule_label
             and not _account_matches_expense_label(account, rule_label)
         ):
-            return TransactionClassification(
-                transaction_nature=nature,
-                confidence=confidence,
-                source="DETERMINISTIC_RULE",
-                entity=item or entity_name,
-                account_hint_id=None,
-                account_hint_code=None,
-                account_hint_name=None,
-                requires_clarification=True,
-                clarification_reason=(
-                    f"No '{rule_label}' account exists in the chart of "
-                    "accounts — it must be created or explicitly selected"
-                ),
-            )
+            # OWNER DIRECTIVE: a KNOWN specific expense category (rent,
+            # utilities, marketing, …) must hit its OWN income-statement
+            # ledger.  When the account doesn't exist, CREATE it right
+            # here — never silently default to the generic "General
+            # Operating Expense" account and never bounce the user with a
+            # question for a category that is already certain.
+            ensured = await _ensure_expense_account(organization_id, rule_label)
+            if ensured is not None:
+                account = ensured
+            else:
+                # Unknown label or creation failed → keep the explicit
+                # clarification fallback (never a silent wrong default).
+                return TransactionClassification(
+                    transaction_nature=nature,
+                    confidence=confidence,
+                    source="DETERMINISTIC_RULE",
+                    entity=item or entity_name,
+                    account_hint_id=None,
+                    account_hint_code=None,
+                    account_hint_name=None,
+                    requires_clarification=True,
+                    clarification_reason=(
+                        f"No '{rule_label}' account exists in the chart of "
+                        "accounts and it could not be created "
+                        "automatically — it must be created or explicitly "
+                        "selected"
+                    ),
+                )
         if account is None:
             # Nature decided but NO account hint (no category match and no
             # generic default).  OFFER relevant existing accounts + the
