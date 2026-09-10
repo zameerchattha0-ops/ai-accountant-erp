@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
+import FounderChat from "@/components/welcome/FounderChat";
 import dynamic from "next/dynamic";
 
 /* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
@@ -148,33 +149,55 @@ const ROBOT_COMMANDS = [
 ] as const;
 
 function RobotCommandDeck() {
+  /* Commands are NOT pinned on screen — a single launcher summons the
+     deck on demand, so the hero stays clean until you want to play. */
+  const [open, setOpen] = useState(false);
   return (
     <div
-      className="absolute bottom-3 right-3 md:bottom-[9%] md:right-4 z-30 flex md:flex-col flex-wrap gap-2 max-w-[calc(100%-1.5rem)]"
+      className="absolute bottom-3 right-3 md:bottom-[9%] md:right-4 z-30"
       aria-label="Ledger commands"
     >
-      <span className="hidden md:block text-[9px] font-bold uppercase tracking-[0.22em] text-brand-navy/60 pl-2">
-        Command Ledger
-      </span>
-      {ROBOT_COMMANDS.map((c) => (
-        <button
-          key={c.command}
-          type="button"
-          onClick={() =>
-            window.dispatchEvent(
-              new CustomEvent("ledger-command", { detail: { command: c.command } }),
-            )
-          }
-          className="pointer-events-auto inline-flex items-center gap-2 rounded-full bg-white/85 backdrop-blur border border-white shadow-[0_10px_26px_-12px_rgba(27,42,74,0.4)] pl-1.5 pr-3.5 py-1.5 text-[11px] font-bold text-brand-navy transition-all hover:-translate-y-0.5 hover:bg-white hover:shadow-[0_14px_30px_-12px_rgba(27,42,74,0.5)] active:scale-95"
+      {open && (
+        <div
+          className="mb-2 flex md:flex-col flex-wrap gap-2 max-w-[calc(100vw-2rem)] md:max-w-none"
+          style={{ animation: "heroRise 0.35s cubic-bezier(0.19,1,0.22,1) both" }}
         >
-          <span
-            className={`w-6 h-6 rounded-full bg-gradient-to-br ${c.chip} flex items-center justify-center shadow-sm shrink-0`}
-          >
-            <c.icon className="w-3 h-3 text-white" strokeWidth={2.5} />
+          <span className="hidden md:block text-[9px] font-bold uppercase tracking-[0.22em] text-brand-navy/60 pl-2">
+            Command Ledger
           </span>
-          {c.label}
-        </button>
-      ))}
+          {ROBOT_COMMANDS.map((c) => (
+            <button
+              key={c.command}
+              type="button"
+              onClick={() =>
+                window.dispatchEvent(
+                  new CustomEvent("ledger-command", { detail: { command: c.command } }),
+                )
+              }
+              className="pointer-events-auto inline-flex items-center gap-2 rounded-full bg-white/85 backdrop-blur border border-white shadow-[0_10px_26px_-12px_rgba(27,42,74,0.4)] pl-1.5 pr-3.5 py-1.5 text-[11px] font-bold text-brand-navy transition-all hover:-translate-y-0.5 hover:bg-white hover:shadow-[0_14px_30px_-12px_rgba(27,42,74,0.5)] active:scale-95"
+            >
+              <span
+                className={`w-6 h-6 rounded-full bg-gradient-to-br ${c.chip} flex items-center justify-center shadow-sm shrink-0`}
+              >
+                <c.icon className="w-3 h-3 text-white" strokeWidth={2.5} />
+              </span>
+              {c.label}
+            </button>
+          ))}
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-label={open ? "Hide robot commands" : "Show robot commands"}
+        className="inline-flex items-center gap-2 rounded-full bg-white/90 backdrop-blur border border-white shadow-[0_14px_30px_-12px_rgba(27,42,74,0.45)] pl-2 pr-4 py-2 text-[11px] font-bold text-brand-navy transition-all hover:-translate-y-0.5 hover:bg-white active:scale-95"
+      >
+        <span className="w-7 h-7 rounded-full bg-gradient-to-br from-teal-500 to-cyan-500 flex items-center justify-center shadow-sm shrink-0">
+          <Bot className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+        </span>
+        {open ? "Hide Commands" : "Commands"}
+      </button>
     </div>
   );
 }
@@ -787,7 +810,7 @@ export default function WelcomePage() {
                 <span className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-600 to-sky-500 flex items-center justify-center shadow-md shadow-blue-500/30">
                   <LinkedInIcon className="w-4 h-4 text-white" />
                 </span>
-                Contact Zameer Haider
+                Contact
               </a>
             </div>
 
@@ -1294,6 +1317,7 @@ export default function WelcomePage() {
           </div>
         </div>
       </footer>
+      <FounderChat />
     </div>
   );
 }

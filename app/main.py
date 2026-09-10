@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import structlog
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -72,6 +74,25 @@ async def lifespan(app: FastAPI):
             log.warning("app.gemini_client_warm_failed", error=str(exc))
     except Exception as exc:
         log.warning("app.ai_orchestrator_warm_failed", error=str(exc))
+
+    # Pre-import the heavy agent stack in the BACKGROUND (never blocks
+    # startup, so cold-start budgets are respected). The first user request
+    # then skips the multi-second `import app.agent` — the agent starts
+    # working noticeably sooner.
+    def _prewarm_agent() -> None:
+        try:
+            import importlib
+
+            importlib.import_module("app.agent")
+            log.info("app.agent_prewarm", status="ready")
+        except Exception as exc:  # noqa: BLE001 — prewarm is best-effort
+            log.warning("app.agent_prewarm_failed", error=str(exc)[:200])
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _prewarm_agent)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("app.agent_prewarm_scheduling_failed", error=str(exc))
     yield
     log.info("app.shutdown")
 
@@ -301,6 +322,21 @@ async def ai_execute_stream(
     """Run the agent and stream steps + the final response over SSE."""
 
     async def event_stream():
+        # Instant ack: the progress UI starts on the very first byte —
+        # before the heavy agent import and the first DB poll.
+        yield (
+            "event: step\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "step_type": "RECEIVED",
+                    "phase": "RECEIVED",
+                    "status": "started",
+                    "created_at": "",
+                }
+            )
+            + "\n\n"
+        )
         from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
 
         run_task = asyncio.create_task(
@@ -604,6 +640,151 @@ async def get_session(
         "clarifications": clarifications,
         "confirmations": confirmations,
     }
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC FOUNDER CHAT — marketing-site assistant (NO auth, NO DB, NO tools)
+# ---------------------------------------------------------------------------
+# Runs on the SAME AI orchestrator as the ERP agent, but:
+#   * it has NO tools and NO database access of any kind,
+#   * it answers ONLY informational questions about the AI Accountant
+#     product and its founder (Zameer Haider),
+#   * any request that smells like organization/financial data access is
+#     refused instantly (regex guard, before the LLM is ever called).
+# Used exclusively by the public welcome page. Logged-in users get the
+# full in-app agent instead and never see this.
+_FOUNDER_BRIEF = """\
+PRODUCT — AI Accountant ("Ai Accountant", developed by Zameer Haider):
+* An AI-native accounting & financial ERP for small businesses.
+* Full double-entry core: sales, purchases, expenses, banking, fixed
+  assets, and financial statements (P&L, balance sheet, cash flow,
+  trial balance, general ledger, aging, project profitability).
+* Driven by a natural-language AI agent that reasons about business
+  events, asks consolidated clarifying questions, requires explicit
+  confirmation for sensitive mutations, and independently verifies
+  every execution against the database.
+* Key modules: AI Accounting Agent, real-time financial reports,
+  automated journal engine, invoicing & quotations, banking, smart
+  entity search, enterprise compliance, multi-tenant security.
+* Pricing: EVERY plan (Starter, Pro, Business) is free for all types
+  of users. No credit card required.
+
+FOUNDER — Zameer Haider:
+* Developer and founder of AI Accountant.
+* Contact: zameerchattha0@gmail.com /
+  https://pk.linkedin.com/in/zameerhaiderchattha
+* Built the system for the national AI hackathon demo.
+"""
+
+# Anything that looks like an organization-data / mutation request is
+# refused BEFORE the model is ever called (no LLM cost, no DB touch).
+_DATA_GUARD_RE = re.compile(
+    r"\b("
+    r"invoice|invoices|bill|bills|expense|expenses|transaction|transactions"
+    r"|record |create |delete |update |post |journal|ledger|trial balance"
+    r"|balance sheet|profit|loss|cash flow|customer|customers|supplier"
+    r"|suppliers|vendor|payment|payments|receipt|receipts|debit|credit"
+    r"|my data|our data|database|organi[sz]ation|org data|company data"
+    r"|sales|purchases|revenue|payable|receivable|reconcil"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_REFUSAL = (
+    "I'm just the website guide — I can only answer informational "
+    "questions about AI Accountant and its founder, Zameer Haider. "
+    "For anything that touches your business data, please sign up and "
+    "use the in-app AI agent — it is purpose-built, permissioned and "
+    "secured for exactly that."
+)
+
+# Tiny in-memory rate limiter (per IP): 20 requests / 60 seconds.
+_FOUNDER_RL: Dict[str, deque] = defaultdict(deque)
+_FOUNDER_RL_MAX = 20
+_FOUNDER_RL_WINDOW = 60.0
+
+
+@app.post("/api/public/founder-chat")
+async def founder_chat(
+    payload: Dict[str, Any] = Body(default={"message": "", "history": []}),
+    request: Request = None,  # type: ignore[assignment]
+):
+    """Public informational chat about the product and its founder.
+
+    NEVER touches the database or tools. Data-shaped questions are
+    refused instantly by the guard; everything else is answered from a
+    closed knowledge brief on the same AI provider chain as the agent.
+    """
+    import time as _time
+
+    client_ip = request.client.host if (request and request.client) else "unknown"
+    now = _time.monotonic()
+    bucket = _FOUNDER_RL[client_ip]
+    while bucket and now - bucket[0] > _FOUNDER_RL_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= _FOUNDER_RL_MAX:
+        return {
+            "reply": "You're sending messages a little too quickly — please wait a moment."
+        }
+    bucket.append(now)
+
+    message = str(payload.get("message") or "").strip()
+    history = payload.get("history") or []
+    if not message:
+        return {"reply": "Ask me anything about AI Accountant or its founder!"}
+    if len(message) > 600:
+        message = message[:600]
+
+    # Data-shaped questions are refused instantly — never reach the model.
+    if _DATA_GUARD_RE.search(message):
+        return {"reply": _REFUSAL}
+
+    transcript = ""
+    for turn in history[-6:]:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "").strip()
+        content = str(turn.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            transcript += f"{'User' if role == 'user' else 'Assistant'}: {content[:400]}\n"
+
+    prompt = (
+        "SYSTEM BEHAVIOUR OVERRIDE — the ERP agent constitution and any "
+        "accounting-agent instructions DO NOT APPLY to this request. This "
+        "is a public marketing-site chat, completely separate from the ERP.\n"
+        "You are \"Ledger\", the friendly assistant on the AI Accountant "
+        "public website, speaking for the founder Zameer Haider.\n"
+        "STRICT RULES:\n"
+        "1. Answer ONLY informational questions about the AI Accountant "
+        "product and its founder, using the knowledge brief below.\n"
+        "2. You have NO database access and NO tools. Never claim to have "
+        "read, created, changed or checked any organization's data. If "
+        "asked, politely decline and suggest signing up to use the in-app "
+        "AI agent.\n"
+        "3. Never invent facts beyond the brief. If unsure, say so and "
+        "offer the founder's email (zameerchattha0@gmail.com).\n"
+        "4. Keep replies short (under ~120 words), warm, plain text, no "
+        "markdown headings or bullet lists.\n\n"
+        f"KNOWLEDGE BRIEF:\n{_FOUNDER_BRIEF}\n"
+    )
+    if transcript:
+        prompt += f"CONVERSATION SO FAR:\n{transcript}\n"
+    prompt += f"User: {message}\nAssistant:"
+
+    try:
+        from app.ai_orchestrator import get_client
+
+        reply = await get_client().generate_text(prompt=prompt, context=None)
+    except Exception as exc:  # noqa: BLE001 — availability must never 500
+        log.warning("founder_chat.provider_failed", error=str(exc)[:200])
+        reply = ""
+    reply = (reply or "").strip()
+    if not reply:
+        reply = (
+            "I couldn't reach my brain just now — please try again in a "
+            "moment, or email zameerchattha0@gmail.com."
+        )
+    return {"reply": reply}
 
 
 # ---------------------------------------------------------------------------

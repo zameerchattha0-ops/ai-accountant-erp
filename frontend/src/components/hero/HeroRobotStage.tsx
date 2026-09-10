@@ -219,10 +219,19 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
         window.dispatchEvent(new CustomEvent("ledger-poke", { detail: { target: targetRef.current } }));
       }
     } else if (p === "moonwalk") {
-      /* glides backwards across the stage — lean, slide, tiny toe-bounce */
-      g.position.x -= dir.current * 0.42 * d;
-      if (g.position.x > bound - 0.15) dir.current = -1;
-      else if (g.position.x < -bound + 0.15) dir.current = 1;
+      /* glides backwards across the stage — lean, slide, tiny toe-bounce.
+         Hard-clamped inside the no-crop margin: even if a command fires
+         while he stands at a hotspot edge, he glides smoothly back inside
+         instead of drifting out of the canvas. */
+      const lim = Math.max(0.3, bound - 0.25);
+      const targetX = THREE.MathUtils.clamp(
+        g.position.x - dir.current * 0.35,
+        -lim,
+        lim,
+      );
+      g.position.x = THREE.MathUtils.damp(g.position.x, targetX, 2.2, d);
+      if (g.position.x >= lim - 0.02) dir.current = -1;
+      else if (g.position.x <= -lim + 0.02) dir.current = 1;
       faceY = dir.current * 0.5;
     } else if (p === "walk") {
       g.position.x += dir.current * 0.5 * d;
