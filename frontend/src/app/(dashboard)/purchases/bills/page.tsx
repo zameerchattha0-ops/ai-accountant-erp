@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Search, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { Plus, Search, Trash2, Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
@@ -276,6 +277,13 @@ export default function PurchaseBillsPage() {
                           onError={setError}
                         />
                       )}
+                      <Link
+                        href={`/purchases/bills/${bill.id}`}
+                        aria-label={`Print bill ${bill.bill_number}`}
+                        className="inline-flex items-center gap-1 ml-3 text-xs font-medium text-text-muted hover:text-ai-600 transition-colors"
+                      >
+                        <Printer className="w-3.5 h-3.5" /> Print
+                      </Link>
                     </td>
                   </tr>
                 );
