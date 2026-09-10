@@ -745,6 +745,29 @@ body {
   50% { background-position: 100% 50%; }
 }
 
+/* Rotating hero tagline (6 palettes, swapped in JS every ~3s).
+   Each variant paints its own 600–700-tone gradient — always
+   strongly darker than the light aurora background, so the
+   headline stays prominently readable in every colour. Sits one
+   level below `.reveal-line > span` so the masked reveal and the
+   swap entrance never fight over the animation property. */
+.hero-tagline-rotate {
+  display: inline-block;
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: heroTaglineIn 0.55s cubic-bezier(0.19, 1, 0.22, 1) both,
+    heroSheen 7s ease-in-out infinite;
+}
+@keyframes heroTaglineIn {
+  from {
+    opacity: 0;
+    transform: translateY(0.35em);
+    filter: blur(6px);
+  }
+}
+
 /* Eyebrow: wide-tracked small caps that settle into place */
 .hero-eyebrow {
   animation: heroTrack 1.5s cubic-bezier(0.22, 1, 0.36, 1) both;
@@ -784,6 +807,7 @@ body {
   .hero-aurora,
   .hero-grid,
   .hero-gradient-word,
+  .hero-tagline-rotate,
   .hero-eyebrow,
   .hero-scrollcue {
     animation: none !important;

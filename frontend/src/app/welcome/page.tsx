@@ -57,6 +57,60 @@ function LinkedInIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+/* ---- Rotating hero taglines ------------------------------------
+   6 brand variants, each with its own palette. Every gradient stop
+   is a 600–700 tone — always strongly darker than the light aurora
+   background, so visibility stays prominent in every colour. Dwell
+   times vary 2.8–3.6s for an organic cadence. Rotation pauses under
+   prefers-reduced-motion (the first variant then remains). */
+const HERO_TAGLINES = [
+  { text: "Smarter with AI.", from: "#0f766e", to: "#0e7490", dur: 3000 },
+  { text: "Effortless. Intelligent.", from: "#4338ca", to: "#7c3aed", dur: 3400 },
+  { text: "Always Balanced.", from: "#047857", to: "#0d9488", dur: 2800 },
+  { text: "Precision on Autopilot.", from: "#b45309", to: "#c2410c", dur: 3600 },
+  { text: "Powered by Intelligence.", from: "#be123c", to: "#a21caf", dur: 3000 },
+  { text: "Built to Grow With You.", from: "#1d4ed8", to: "#4f46e5", dur: 3200 },
+];
+
+function HeroTagline() {
+  const [idx, setIdx] = useState(0);
+  const idxRef = useRef(0);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (mq.matches) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      if (cancelled) return;
+      const next = (idxRef.current + 1) % HERO_TAGLINES.length;
+      idxRef.current = next;
+      setIdx(next);
+      timer = setTimeout(tick, HERO_TAGLINES[next].dur);
+    };
+    /* First swap after the masked reveal lands + one full dwell */
+    timer = setTimeout(tick, HERO_TAGLINES[0].dur + 1200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, []);
+
+  const t = HERO_TAGLINES[idx];
+  return (
+    <span
+      key={idx}
+      className="hero-tagline-rotate"
+      style={{
+        backgroundImage: `linear-gradient(100deg, ${t.from} 0%, ${t.to} 100%)`,
+      }}
+    >
+      {t.text}
+    </span>
+  );
+}
+
+
 
 /* ---- Reusable animated section wrapper ---- */
 function Section({
@@ -623,18 +677,15 @@ export default function WelcomePage() {
               className="text-brand-navy text-[2.3rem] sm:text-5xl lg:text-[3.4rem] leading-[1.14] tracking-[0.03em] font-semibold"
               style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
             >
-              <span className="reveal-line">
+              <span className="sr-only">
+                Your Books, {HERO_TAGLINES[0].text}
+              </span>
+              <span className="reveal-line" aria-hidden="true">
                 <span style={{ "--d": "200ms" } as React.CSSProperties}>Your Books,</span>
               </span>
-              <span className="reveal-line">
+              <span className="reveal-line" aria-hidden="true">
                 <span style={{ "--d": "420ms" } as React.CSSProperties}>
-                  <span
-                    className="text-aurora italic font-medium text-[1.18em]"
-                    style={{ fontFamily: "var(--font-cormorant), Georgia, serif" }}
-                  >
-                    Smarter
-                  </span>{" "}
-                  with AI.
+                  <HeroTagline />
                 </span>
               </span>
             </h1>
