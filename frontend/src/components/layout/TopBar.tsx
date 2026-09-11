@@ -3,6 +3,11 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import {
+  getCachedOrgContext,
+  clearOrgCache,
+  loadOrgContext,
+} from "@/lib/hooks/useOrg";
 import { User, LogOut, Bell, Search } from "lucide-react";
 import Image from "next/image";
 
@@ -12,32 +17,45 @@ export default function TopBar() {
   const [orgLogo, setOrgLogo] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const router = useRouter();
-  const supabase = createClient();
 
   useEffect(() => {
-    async function loadUser() {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        setUserName(user.user_metadata?.full_name || user.email || "User");
+    let cancelled = false;
 
-        const { data: memberships } = await supabase
-          .from("organization_members")
-          .select("organization:organizations(name, logo_url)")
-          .eq("user_id", user.id)
-          .eq("status", "ACTIVE")
-          .limit(1);
-        const orgRow = memberships?.[0]?.organization as { name: string; logo_url: string | null } | { name: string; logo_url: string | null }[] | undefined;
-        const name = Array.isArray(orgRow) ? orgRow[0]?.name : orgRow?.name;
-        const logo = Array.isArray(orgRow) ? orgRow[0]?.logo_url : orgRow?.logo_url;
-        if (name) setOrgName(name);
-        if (logo) setOrgLogo(logo);
-      }
+    /* Org name/logo come from the SHARED session cache (useOrg's loader):
+       zero duplicate membership queries, zero auth round-trips. The cache
+       is usually already warm because every page calls useOrg. */
+    const cached = getCachedOrgContext();
+    if (cached) {
+      setOrgName(cached.org.name);
+      setOrgLogo(cached.org.logo_url);
     }
-    loadUser();
-  }, [supabase]);
+
+    (async () => {
+      const supabase = createClient();
+      const { data: { session } } = await supabase.auth.getSession();
+      const user = session?.user;
+      if (!cancelled && user) {
+        setUserName(user.user_metadata?.full_name || user.email || "User");
+      }
+      if (!cached) {
+        try {
+          const snap = await loadOrgContext();
+          if (!cancelled && snap) {
+            setOrgName(snap.org.name);
+            setOrgLogo(snap.org.logo_url);
+          }
+        } catch {
+          /* display-only context — page-level useOrg surfaces errors */
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, []);
 
   const handleLogout = async () => {
-    await supabase.auth.signOut();
+    await createClient().auth.signOut();
+    clearOrgCache();
     router.push("/login");
   };
 

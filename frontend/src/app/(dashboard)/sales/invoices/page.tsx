@@ -9,7 +9,7 @@ import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import DraftDeleteButton from "@/components/shared/DraftDeleteButton";
-import StatusBadge from "@/components/shared/StatusBadge";
+import StatusMenu from "@/components/shared/StatusMenu";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Customer, Invoice } from "@/lib/types/entities";
 
@@ -296,7 +296,19 @@ export default function InvoicesPage() {
                     <td className="px-4 py-3 text-right text-text-secondary tabular-nums">
                       {balance > 0.005 ? formatCurrency(balance, inv.currency_code) : "-"}
                     </td>
-                    <td className="px-4 py-3"><StatusBadge status={inv.status} /></td>
+                    <td className="px-4 py-3">
+                      <StatusMenu
+                        table="invoices"
+                        documentId={inv.id}
+                        status={inv.status}
+                        transitions={{
+                          DRAFT: ["ISSUED"],
+                          ISSUED: ["VOIDED"],
+                        }}
+                        onUpdated={load}
+                        onError={setError}
+                      />
+                    </td>
                     <td className="px-4 py-3 text-right">
                       {inv.status === "DRAFT" && (
                         <DraftDeleteButton

@@ -1241,3 +1241,16 @@ body {
     animation: none !important;
   }
 }
+
+/* StatusMenu dropdown — quick settle-in for the inline status changer */
+@keyframes statusMenuIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [role="menu"] {
+    animation: none !important;
+  }
+}

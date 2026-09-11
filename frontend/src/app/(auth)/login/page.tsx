@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { createClient } from "@/lib/supabase/client";
+import { clearOrgCache } from "@/lib/hooks/useOrg";
 import { getSiteUrl } from "@/lib/site-url";
 import { isGoogleProviderEnabled } from "@/lib/auth/google";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
@@ -52,6 +53,9 @@ export default function LoginPage() {
       return;
     }
 
+    // Fresh session → drop any previous user's org snapshot so the
+    // dashboard re-resolves THIS user's organization.
+    clearOrgCache();
     router.push("/");
     router.refresh();
   };

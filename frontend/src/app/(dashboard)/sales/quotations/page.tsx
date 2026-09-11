@@ -9,7 +9,7 @@ import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import DraftDeleteButton from "@/components/shared/DraftDeleteButton";
-import StatusBadge from "@/components/shared/StatusBadge";
+import StatusMenu from "@/components/shared/StatusMenu";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Customer, Quotation } from "@/lib/types/entities";
 
@@ -273,7 +273,19 @@ export default function QuotationsPage() {
                     <td className="px-4 py-3 text-right text-text-primary tabular-nums font-medium">
                       {formatCurrency(q.total, q.currency_code)}
                     </td>
-                    <td className="px-4 py-3"><StatusBadge status={q.status} /></td>
+                    <td className="px-4 py-3">
+                      <StatusMenu
+                        table="quotations"
+                        documentId={q.id}
+                        status={q.status}
+                        transitions={{
+                          DRAFT: ["SENT"],
+                          SENT: ["ACCEPTED", "REJECTED"],
+                        }}
+                        onUpdated={load}
+                        onError={setError}
+                      />
+                    </td>
                     <td className="px-4 py-3 text-right whitespace-nowrap">
                       {q.status === "DRAFT" && (
                         <div className="inline-flex items-center gap-2">
