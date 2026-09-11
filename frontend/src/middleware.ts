@@ -4,6 +4,8 @@ const PUBLIC_ROUTES = [
   "/login",
   "/signup",
   "/verify-email",
+  "/forgot-password",
+  "/reset-password",
   "/auth",
   "/welcome",
   // Marketing pages linked from the header — accessible to everyone

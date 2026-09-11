@@ -13,7 +13,7 @@
    ================================================================== */
 
 import { useEffect, useRef, useState } from "react";
-import { Bot, MessageCircle, Send, X } from "lucide-react";
+import { Bot, Send, Sparkles, X } from "lucide-react";
 
 type Msg = { role: "user" | "assistant"; text: string };
 
@@ -57,6 +57,43 @@ export default function FounderChat() {
       });
     }
   }, [msgs, open, busy]);
+
+  /* ---- Attention engine --------------------------------------------
+     The launcher must URGENT the visitor in: a teaser bubble pops up
+     ~2.5s after load, hides after ~4.5s, and repeats every ~10s with
+     rotating copy. Any click (bubble or launcher) opens the chat and
+     silences the teaser for good. */
+  const TEASERS = [
+    "Any questions? Ask me!",
+    "Curious about AI Accountant? Just ask.",
+    "Need help? I speak fluent accounting.",
+    "Zameer's AI assistant is right here 👋",
+  ];
+  const [teaser, setTeaser] = useState<string | null>(null);
+  const teaserIdxRef = useRef(0);
+
+  useEffect(() => {
+    if (open) return; // chat is open — no need to urge
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    let nextTimer: ReturnType<typeof setTimeout>;
+
+    const show = () => {
+      const t = TEASERS[teaserIdxRef.current % TEASERS.length];
+      teaserIdxRef.current += 1;
+      setTeaser(t);
+      hideTimer = setTimeout(() => setTeaser(null), 4500);
+    };
+
+    nextTimer = setTimeout(show, 2500);
+    const cycle = setInterval(show, 11000);
+
+    return () => {
+      clearTimeout(nextTimer);
+      clearTimeout(hideTimer);
+      clearInterval(cycle);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   if (authed) return null;
 
@@ -179,16 +216,59 @@ export default function FounderChat() {
         </div>
       )}
 
-      {/* launcher */}
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-label={open ? "Close assistant" : "Open assistant"}
-        aria-expanded={open}
-        className="w-14 h-14 rounded-full bg-gradient-to-br from-teal-500 to-cyan-600 text-white flex items-center justify-center shadow-xl shadow-teal-500/40 transition-all hover:-translate-y-1 hover:shadow-2xl active:scale-95"
-      >
-        {open ? <X className="w-6 h-6" /> : <MessageCircle className="w-6 h-6" />}
-      </button>
+      {/* Teaser bubble — urges the visitor in (clickable) */}
+      {teaser && !open && (
+        <button
+          type="button"
+          onClick={() => {
+            setTeaser(null);
+            setOpen(true);
+          }}
+          className="chat-teaser-bubble relative mr-1 mb-1 max-w-[15rem] rounded-2xl rounded-br-md bg-white border border-teal-200 shadow-[0_14px_34px_-12px_rgba(13,148,136,0.45)] px-3.5 py-2.5 text-left text-[13px] font-medium text-brand-navy transition-transform hover:scale-[1.03]"
+          style={{ animation: "chatTeaserIn 0.4s cubic-bezier(0.19,1,0.22,1) both" }}
+          aria-label="Open the assistant"
+        >
+          <span className="absolute -bottom-1.5 right-6 w-3 h-3 rotate-45 bg-white border-b border-r border-teal-200" />
+          {teaser}
+        </button>
+      )}
+
+      {/* Launcher — sonar rings + bobbing descriptive Bot icon */}
+      <div className="relative">
+        {/* sonar rings (visual only) */}
+        <span
+          aria-hidden="true"
+          className="chat-pulse-ring pointer-events-none absolute inset-0 rounded-full bg-teal-500/50"
+          style={{ animation: "chatPulse 2.4s cubic-bezier(0.22,1,0.36,1) infinite" }}
+        />
+        <span
+          aria-hidden="true"
+          className="chat-pulse-ring pointer-events-none absolute inset-0 rounded-full bg-cyan-400/40"
+          style={{ animation: "chatPulse 2.4s cubic-bezier(0.22,1,0.36,1) 1.2s infinite" }}
+        />
+        <button
+          type="button"
+          onClick={() => {
+            setTeaser(null);
+            setOpen((o) => !o);
+          }}
+          aria-label={open ? "Close assistant" : "Open assistant — ask any question about AI Accountant"}
+          aria-expanded={open}
+          className="chat-launcher-core relative w-14 h-14 rounded-full bg-gradient-to-br from-teal-500 to-cyan-600 text-white flex items-center justify-center shadow-xl shadow-teal-500/40 transition-all hover:-translate-y-1 hover:shadow-2xl active:scale-95"
+          style={{ animation: "chatBob 3.4s ease-in-out infinite" }}
+        >
+          {open ? (
+            <X className="w-6 h-6" />
+          ) : (
+            <>
+              <Bot className="w-7 h-7" strokeWidth={2.2} />
+              <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-white shadow-md flex items-center justify-center">
+                <Sparkles className="w-3 h-3 text-teal-600" strokeWidth={2.5} />
+              </span>
+            </>
+          )}
+        </button>
+      </div>
     </div>
   );
 }
