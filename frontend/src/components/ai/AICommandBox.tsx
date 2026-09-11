@@ -1,19 +1,20 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useSyncExternalStore } from "react";
 import { Send, Paperclip, X, Loader2, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
-import { aiClarify, aiConfirm, aiExecuteStream, aiEnqueueJob, aiGetJob, isApiErrorWithStatus, latestActiveSession, runBackgroundJob } from "@/lib/api/client";
 import type {
   AgentResponse,
   AttachmentRef,
+  UserRequest,
 } from "@/lib/types/api";
 import {
   ALLOWED_UPLOAD_MIMES,
   MAX_UPLOAD_BYTES,
 } from "@/lib/types/api";
 import { ExecutionStatus } from "@/lib/types/enums";
-import AIProgress, { type LiveStepEvent } from "./AIProgress";
+import { agentRunStore, USE_BACKGROUND_RUNS, type AgentRunState } from "@/lib/agent/agentRunStore";
+import AIProgress from "./AIProgress";
 import AIActionCard from "./AIActionCard";
 import AIClarification from "./AIClarification";
 import AIConfirmation from "./AIConfirmation";
@@ -25,27 +26,6 @@ const PLACEHOLDERS = [
   "Show me this month's profit...",
   "Upload a receipt and I'll help record it.",
 ];
-
-// Work Stream C: background runs are the DEFAULT path when a supervised
-// worker is draining ai.worker_jobs (local dev: `python scripts/ai_worker.py`).
-// A SERVERLESS host (Vercel) has no worker process, so background runs would
-// sit QUEUED forever and hit the 90s stall warning. Background mode is
-// therefore enabled only when the backend is local (NEXT_PUBLIC_API_URL
-// points at localhost) or when explicitly forced with
-// NEXT_PUBLIC_BACKGROUND_RUNS=1. On Vercel the run streams in the foreground.
-const USE_BACKGROUND_RUNS =
-  process.env.NEXT_PUBLIC_BACKGROUND_RUNS === "1" ||
-  /^(https?:)?\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(
-    process.env.NEXT_PUBLIC_API_URL ?? ""
-  );
-
-/** Fired whenever the agent FINISHES a mutation (or fails one) so every
- *  listening page reloads its data instantly - no manual browser refresh. */
-function notifyDataChanged() {
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("erp:data-changed"));
-  }
-}
 
 export default function AICommandBox() {
   // Hydration safety: the FIRST render (server and client) must be
@@ -60,81 +40,39 @@ export default function AICommandBox() {
   }, []);
   const [message, setMessage] = useState("");
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [response, setResponse] = useState<AgentResponse | null>(null);
-  const [error, setError] = useState("");
-  // Client-generated request id for the in-flight execution. The backend
-  // stores it as the session's conversation_id, so AIProgress can poll the
-  // REAL recorded reasoning state for THIS specific request.
-  const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
-  // Work Stream D: reasoning steps streamed LIVE over SSE while the run
-  // executes (rendered by AIProgress without polling).
-  const [liveSteps, setLiveSteps] = useState<LiveStepEvent[]>([]);
-  // Work Stream C: job id of a QUEUED run no worker has claimed within the
-  // stall window - the UI offers a one-click foreground fallback.
-  const [stalledJobId, setStalledJobId] = useState<string | null>(null);
-  // Work Stream C: true when the progress view was reattached to a run
-  // that was already in flight before this page loaded (browser refresh).
-  const [reattached, setReatt] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Work Stream C: resume-by-conversation. On mount, check for a still
-  // in-flight execution session (PENDING / PLANNING / EXECUTING) and
-  // reattach AIProgress to it so a browser refresh mid-run does NOT lose
-  // the live view. WAITING_FOR_USER sessions are intentionally ignored -
-  // they need an answer through the normal clarify flow, not a poller.
+  /* ---- Run state lives in the navigation-proof module store --------
+     Clicking any sidebar tab unmounts this box — the in-flight run,
+     its live steps and its result card survive in agentRunStore and
+     re-render the moment you come back. */
+  const run: AgentRunState = useSyncExternalStore(
+    agentRunStore.subscribe,
+    agentRunStore.getSnapshot,
+    agentRunStore.getSnapshot,
+  );
+  const { loading, response, error, liveSteps, activeRequestId, reattached, stalledJobId } = run;
+
+  /* Boot the reattach watcher once per session (module-level, idempotent):
+     a page refresh mid-run resumes the live progress view. */
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const info = await latestActiveSession();
-        if (cancelled || !info.found || !info.session) return;
-        const status = (info.session.status || "").toUpperCase();
-        const convId = info.session.conversation_id;
-        if (
-          (status === "EXECUTING" || status === "PLANNING" || status === "PENDING") &&
-          convId
-        ) {
-          setActiveRequestId(convId);
-          setLoading(true);
-          setReatt(true);
-        }
-      } catch {
-        /* backend offline - nothing to reattach */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    agentRunStore.ensureReattach();
   }, []);
 
-  // While reattached, watch the session until it reaches a terminal state
-  // (the endpoint stops returning it), then end the progress view. The
-  // original HTTP response is gone after a refresh, so the result card is
-  // not re-rendered - the recorded result stays available in AI Activity.
+  /* Mirror the store's terminal result onto the LOCAL input: clear the
+     message + attachments once the agent completed (or failed) a run. */
+  const lastTerminalRef = useRef<AgentResponse | null>(null);
   useEffect(() => {
-    if (!reattached) return;
-    let cancelled = false;
-    const id = setInterval(async () => {
-      try {
-        const info = await latestActiveSession();
-        if (cancelled) return;
-        if (!info.found) {
-          clearInterval(id);
-          setLoading(false);
-          setReatt(false);
-          setActiveRequestId(null);
-          notifyDataChanged();
-        }
-      } catch {
-        /* keep polling - transient network errors must not detach */
-      }
-    }, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [reattached]);
+    if (!response) return;
+    const terminal =
+      response.status === ExecutionStatus.COMPLETED ||
+      response.status === ExecutionStatus.FAILED;
+    if (terminal && lastTerminalRef.current !== response) {
+      lastTerminalRef.current = response;
+      setMessage("");
+      setAttachments([]);
+    }
+  }, [response]);
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -144,176 +82,32 @@ export default function AICommandBox() {
     }
   }, []);
 
-  const applyResponse = useCallback((res: AgentResponse) => {
-    setResponse(res);
-    if (res.status === ExecutionStatus.COMPLETED || res.status === ExecutionStatus.FAILED) {
-      setMessage("");
-      setAttachments([]);
-      notifyDataChanged();
-    }
-  }, []);
+  const buildRequest = useCallback(
+    (): UserRequest => ({
+      message: message.trim(),
+      attachments: attachments.length > 0 ? attachments : undefined,
+    }),
+    [message, attachments],
+  );
 
   const handleSend = async () => {
     if (!message.trim() && attachments.length === 0) return;
-    setError("");
-    setLoading(true);
-    setResponse(null);
-    // crypto.randomUUID() - available in all modern browsers over localhost.
-    const requestId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    setActiveRequestId(requestId);
-    setLiveSteps([]);
-
-    // Work Stream D (kept behind the constant): stream the run over SSE -
-    // each recorded reasoning step arrives live, and the result card
-    // renders ONLY when the final (verified) response arrives.
-    const runForeground = async () => {
-      const res = await aiExecuteStream(
-        {
-          message: message.trim(),
-          conversation_id: requestId,
-          attachments: attachments.length > 0 ? attachments : undefined,
-        },
-        {
-          onStep: (step) =>
-            setLiveSteps((prev) => [
-              ...prev,
-              {
-                step_type: step.step_type,
-                phase: step.phase,
-                status: step.status,
-                created_at: step.created_at,
-              },
-            ]),
-        }
-      );
-      applyResponse(res);
-    };
-
-    // Work Stream C: the run is enqueued, AIProgress polls the run's
-    // conversation_id for recorded steps, and the result card renders from
-    // the polled job result. A 404 (older backend without the jobs
-    // endpoint) falls back to the SSE path automatically.
-    const runBackground = () =>
-      runBackgroundJob({
-        enqueue: () =>
-          aiEnqueueJob({
-            message: message.trim(),
-            conversation_id: requestId,
-            attachments: attachments.length > 0 ? attachments : undefined,
-          }),
-        getJob: aiGetJob,
-        onResult: applyResponse,
-        onError: setError,
-        onStalled: setStalledJobId,
-      });
-
-    try {
-      if (USE_BACKGROUND_RUNS) {
-        try {
-          await runBackground();
-        } catch (jobErr) {
-          if (!isApiErrorWithStatus(jobErr, 404)) throw jobErr;
-          await runForeground(); // older backend: no jobs endpoint
-        }
-      } else {
-        await runForeground();
-      }
-    } catch (err) {
-      setError(err instanceof Error
-        ? /failed to fetch|networkerror|net::err/i.test(err.message)
-          ? "The AI service is offline. Start the backend server (port 8000) and try again."
-          : err.message
-        : "Something went wrong");
-    } finally {
-      setLoading(false);
-      setActiveRequestId(null);
-      setLiveSteps([]);
-    }
+    // The promise chain lives in agentRunStore — sidebar navigation
+    // during the run is safe and never orphans the work.
+    await agentRunStore.startRun(buildRequest());
   };
 
   // One-click foreground fallback when the queue is not being drained.
   const runStalledJobInForeground = async () => {
-    setStalledJobId(null);
-    if (!message.trim() && attachments.length === 0) return;
-    setError("");
-    setLoading(true);
-    const requestId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    setActiveRequestId(requestId);
-    try {
-      await aiExecuteStream(
-        {
-          message: message.trim(),
-          conversation_id: requestId,
-          attachments: attachments.length > 0 ? attachments : undefined,
-        },
-        {
-          onStep: (step) =>
-            setLiveSteps((prev) => [
-              ...prev,
-              {
-                step_type: step.step_type,
-                phase: step.phase,
-                status: step.status,
-                created_at: step.created_at,
-              },
-            ]),
-        }
-      ).then(applyResponse);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
-    } finally {
-      setLoading(false);
-      setActiveRequestId(null);
-      setLiveSteps([]);
-    }
+    await agentRunStore.runStalledInForeground(buildRequest());
   };
 
   const handleClarify = async (answer: string) => {
-    if (!response?.execution_id) return;
-    setLoading(true);
-    setError("");
-    try {
-      const res = await aiClarify({ session_id: response.execution_id, answer });
-      setResponse(res);
-      if (
-        res.status === ExecutionStatus.COMPLETED ||
-        res.status === ExecutionStatus.FAILED ||
-        res.status === ExecutionStatus.REJECTED
-      ) {
-        notifyDataChanged();
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to send answer");
-    } finally {
-      setLoading(false);
-    }
+    await agentRunStore.clarify(answer);
   };
 
   const handleConfirm = async (approved: boolean, notes?: string) => {
-    if (!response?.execution_id) return;
-    setLoading(true);
-    setError("");
-    try {
-      const res = await aiConfirm({ session_id: response.execution_id, approved, notes });
-      setResponse(res);
-      if (
-        res.status === ExecutionStatus.COMPLETED ||
-        res.status === ExecutionStatus.FAILED ||
-        res.status === ExecutionStatus.REJECTED
-      ) {
-        notifyDataChanged();
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to send decision");
-    } finally {
-      setLoading(false);
-    }
+    await agentRunStore.confirm(approved, notes);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -391,7 +185,7 @@ export default function AICommandBox() {
                     }
                     return true;
                   });
-                  if (errors.length > 0) setError(errors.join(" "));
+                  if (errors.length > 0) agentRunStore.setError(errors.join(" "));
 
                   // Read each file as base64 so the backend receives the
                   // ACTUAL document for vision extraction (blob URLs never
@@ -413,7 +207,7 @@ export default function AICommandBox() {
                       ]);
                     };
                     reader.onerror = () =>
-                      setError(`${f.name}: could not read the file.`);
+                      agentRunStore.setError(`${f.name}: could not read the file.`);
                     reader.readAsDataURL(f);
                   });
                 }}

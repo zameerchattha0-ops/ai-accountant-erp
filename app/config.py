@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +35,28 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _empty_env_means_unset(cls, data):
+        """DEPLOY FIX: treat present-but-EMPTY environment variables as unset.
+
+        Serverless platforms (Vercel) materialize optional environment
+        variables as EMPTY STRINGS. pydantic then fails numeric parsing
+        ("Input should be a valid number, unable to parse string as a
+        number [type=float_parsing, input_value='']") at function import,
+        crashing every cold start (FUNCTION_INVOCATION_FAILED) and taking
+        the whole deployment down. With this validator, an empty var is
+        REMOVED from the input so the documented default applies exactly
+        as if the variable had never been set. Required credentials that
+        are empty surface as the clear "Field required" error instead. """
+        if isinstance(data, dict):
+            return {
+                k: v
+                for k, v in data.items()
+                if not (isinstance(v, str) and not v.strip())
+            }
+        return data
 
     # ---- Supabase --------------------------------------------------------
     supabase_url: str = Field(..., description="Supabase project URL")

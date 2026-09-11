@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import Sidebar from "@/components/layout/Sidebar";
 import TopBar from "@/components/layout/TopBar";
 import AmbientAura from "@/components/shared/AmbientAura";
+import AgentRunDock from "@/components/ai/AgentRunDock";
 import { createServerSupabase } from "@/lib/supabase/server";
 
 /**
@@ -43,6 +44,9 @@ export default async function DashboardLayout({
           {children}
         </main>
       </div>
+      {/* Persistent agent status — live on EVERY sidebar tab; the run
+          itself continues in agentRunStore regardless of navigation. */}
+      <AgentRunDock />
     </div>
   );
 }
