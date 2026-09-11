@@ -143,6 +143,12 @@ def _is_plausibly_capital(
     text = str(item or "").lower()
     if any(k in text for k in _CAPITAL_ITEM_KEYWORDS):
         return True
+    # Standalone "ac"/"a/c"/"acs"/"hvac" are everyday durable abbreviations
+    # ("I buy 2 ac" is a capital candidate, NOT an assumed expense).
+    # Word-boundary regex — the substring keyword list above must never
+    # take bare "ac" (it would match "account", "trace", …).
+    if re.search(r"\ba/?c\b|\bacs\b|hvac|air.?condition", text, re.I):
+        return True
     amount = entities.get("amount")
     try:
         return amount is not None and float(amount) >= CAPITAL_AMOUNT_THRESHOLD
@@ -452,10 +458,13 @@ _LETTER_TO_PURPOSE = {
 # Durable-goods vocabulary shared with the classifier's capital rules —
 # free-text "Something else" answers containing these trigger the R3.2
 # capitalization question instead of silently expensing.
+# \ba/?c\b matches standalone "ac"/"a/c"/"acs" (the everyday abbreviation
+# for air conditioners) via WORD BOUNDARIES — a plain substring would
+# false-positive on "account", "trace", "contract", etc.
 _DURABLE_KEYWORDS_RE = re.compile(
     r"machine|equipment|furniture|fixture|vehicle|laptop|computer|printer|"
-    r"generator|air ?condition|ac unit|tool|server|capital work|building|"
-    r"renovat|overhaul",
+    r"generator|air ?condition|air.?conditioning|ac unit|\ba/?c\b|\bacs\b|"
+    r"hvac|tool|server|capital work|building|renovat|overhaul",
     re.I,
 )
 

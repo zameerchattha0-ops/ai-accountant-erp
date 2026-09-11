@@ -86,11 +86,14 @@ _INVENTORY_RULES = (r"for resale|for resell|for our shop|for the shop|"
 # Durable goods — POTENTIALLY fixed assets; materially ambiguous when the
 # ERP has no authoritative mapping.  These trigger a targeted clarification
 # instead of a default expense classification.
+# \ba/?c\b|\bacs\b cover the everyday abbreviation ("I buy 2 ac") with word
+# boundaries — safe against "account"/"trace" false positives.
 _DURABLE_GOODS = (
     "laptop|notebook|desktop|computer|printer|scanner|monitor|server|"
     "furniture|desk|chair|cabinet|machinery|machine|vehicle|car|van|"
     "motorbike|motorcycle|camera|phone|smartphone|equipment|building|"
-    "air conditioner|ac unit|generator"
+    "air conditioner|air.?conditioning|ac unit|\\ba/?c\\b|\\bacs\\b|hvac|"
+    "generator"
 )
 
 # Account-name search terms per nature (used against the live COA).
