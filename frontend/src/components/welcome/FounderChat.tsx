@@ -75,7 +75,6 @@ export default function FounderChat() {
   useEffect(() => {
     if (open) return; // chat is open — no need to urge
     let hideTimer: ReturnType<typeof setTimeout> | undefined;
-    let nextTimer: ReturnType<typeof setTimeout>;
 
     const show = () => {
       const t = TEASERS[teaserIdxRef.current % TEASERS.length];
@@ -84,7 +83,7 @@ export default function FounderChat() {
       hideTimer = setTimeout(() => setTeaser(null), 4500);
     };
 
-    nextTimer = setTimeout(show, 2500);
+    const nextTimer = setTimeout(show, 2500);
     const cycle = setInterval(show, 11000);
 
     return () => {
