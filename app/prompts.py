@@ -198,6 +198,21 @@ def build_user_content(message: str, context: AgentContext) -> str:
                 f"{classification.account_hint_name} (id: {classification.account_hint_id})"
             )
             parts.append("    → Pass this account id as the 'account_id' argument when recording this transaction. The accounting engine will validate it.")
+        elif getattr(classification, "create_account_confirmed", False):
+            proposed = getattr(classification, "proposed_account_name", None)
+            code = getattr(classification, "proposed_account_code", None)
+            parts.append(
+                f"    → The user CONFIRMED creating the new account '{proposed or 'the proposed account'}'"
+                + (
+                    f" (base code {code} — a free code in that series is "
+                    "resolved automatically)"
+                    if code else ""
+                )
+                + ". Run create_account for it FIRST, then record the "
+                "transaction against the newly created account. The "
+                "account-creation guard blocks default-account recording "
+                "until the account exists."
+            )
         elif classification.transaction_nature:
             parts.append(
                 "    → No dedicated account exists for this nature. Use the most "

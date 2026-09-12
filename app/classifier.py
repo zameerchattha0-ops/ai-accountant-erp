@@ -178,14 +178,18 @@ _EXPENSE_ACCOUNT_SEEDS: Dict[str, tuple[str, str]] = {
 }
 
 
-async def _ensure_expense_account(
+async def _propose_expense_account(
     organization_id: uuid.UUID, rule_label: Optional[str]
-) -> Optional[Dict[str, Any]]:
-    """Ensure the COA has an account for the KNOWN expense *rule_label*.
+) -> Optional[tuple[str, str]]:
+    """PROPOSE (never silently create) the COA account for a KNOWN expense
+    *rule_label*.
 
-    Returns the matching/created account row, or None when the label is
-    unknown (caller keeps its existing clarify-or-default behaviour).
-    Creation is idempotent: an exact-name EXPENSE account short-circuits.
+    Returns ``(name, next_free_code)`` for the canonical seed account, or
+    None when the label is unknown.  Idempotency: an exact-name active
+    EXPENSE account short-circuits to itself — the caller treats it as the
+    hint.  CREATION IS NEVER DONE HERE: the missing account is surfaced as
+    a configuration-gap clarification and the user confirms creation (or
+    names an existing account) — the account-creation confirmation policy.
     """
     from app.repositories import account_repository as a_repo
 
@@ -199,7 +203,7 @@ async def _ensure_expense_account(
     try:
         existing = await a_repo.search_accounts(organization_id, query=name)
     except Exception as exc:  # noqa: BLE001 — COA search is best-effort
-        log.warning("classifier.ensure_account_search_failed", error=str(exc))
+        log.warning("classifier.propose_account_search_failed", error=str(exc))
         existing = []
     for acc in existing or []:
         nm = (acc.get("name") or "").strip().lower()
@@ -208,34 +212,14 @@ async def _ensure_expense_account(
             and acc.get("account_type") in (None, "EXPENSE")
             and acc.get("is_active") is not False
         ):
-            return acc
+            return (name, str(acc.get("code") or base_code))
 
     try:
         code = await a_repo.next_available_code(organization_id, base_code)
-        created = await a_repo.create_account(
-            organization_id=organization_id,
-            code=code,
-            name=name,
-            account_type="EXPENSE",
-            normal_balance="DEBIT",
-            description=(
-                f"Auto-created by the AI agent for '{rule_label}' entries"
-            ),
-        )
-        log.info(
-            "classifier.expense_account_created",
-            name=name,
-            code=code,
-            label=rule_label,
-        )
-        return created
-    except Exception as exc:  # noqa: BLE001 — creation must never kill a run
-        log.warning(
-            "classifier.expense_account_create_failed",
-            label=rule_label,
-            error=str(exc)[:200],
-        )
+    except Exception as exc:  # noqa: BLE001 — code resolution is best-effort
+        log.warning("classifier.propose_account_code_failed", label=rule_label, error=str(exc)[:200])
         return None
+    return (name, str(code))
 
 
 def _classification_text(item_description: Optional[str], entities: Dict[str, Any]) -> str:
@@ -641,34 +625,50 @@ async def classify_transaction(
             and rule_label
             and not _account_matches_expense_label(account, rule_label)
         ):
-            # OWNER DIRECTIVE: a KNOWN specific expense category (rent,
-            # utilities, marketing, …) must hit its OWN income-statement
-            # ledger.  When the account doesn't exist, CREATE it right
-            # here — never silently default to the generic "General
-            # Operating Expense" account and never bounce the user with a
-            # question for a category that is already certain.
-            ensured = await _ensure_expense_account(organization_id, rule_label)
-            if ensured is not None:
-                account = ensured
-            else:
-                # Unknown label or creation failed → keep the explicit
-                # clarification fallback (never a silent wrong default).
+            # OWNER POLICY (account-creation confirmation): a KNOWN specific
+            # expense category (rent, utilities, marketing, …) must hit its
+            # OWN income-statement ledger — never the generic "General
+            # Operating Expense" account, and never a SILENTLY created one.
+            # The classifier PROPOSES the canonical account (name + free
+            # code); the user confirms creation (or names an existing
+            # account) in the clarification round.  When the proposal was
+            # already confirmed, it is an explicit USER_ANSWER: execution
+            # runs create_account FIRST, then records (tool-order guard).
+            proposal = await _propose_expense_account(organization_id, rule_label)
+            confirmed_name = (entities.get("create_account") or "").strip()
+            if confirmed_name and proposal is not None:
                 return TransactionClassification(
                     transaction_nature=nature,
-                    confidence=confidence,
-                    source="DETERMINISTIC_RULE",
+                    confidence="HIGH",
+                    source="USER_ANSWER",
                     entity=item or entity_name,
-                    account_hint_id=None,
-                    account_hint_code=None,
-                    account_hint_name=None,
-                    requires_clarification=True,
-                    clarification_reason=(
-                        f"No '{rule_label}' account exists in the chart of "
-                        "accounts and it could not be created "
-                        "automatically — it must be created or explicitly "
-                        "selected"
-                    ),
+                    proposed_account_name=proposal[0],
+                    proposed_account_code=proposal[1],
+                    create_account_confirmed=True,
+                    requires_clarification=False,
                 )
+            candidates = await _candidate_expense_accounts(organization_id)
+            return TransactionClassification(
+                transaction_nature=nature,
+                confidence=confidence,
+                source="DETERMINISTIC_RULE",
+                entity=item or entity_name,
+                candidate_accounts=candidates or None,
+                proposed_account_name=proposal[0] if proposal else None,
+                proposed_account_code=proposal[1] if proposal else None,
+                requires_clarification=True,
+                clarification_reason=(
+                    f"No '{rule_label}' account exists in your chart of "
+                    + (
+                        f"accounts. Create '{proposal[0]}' (code {proposal[1]})? "
+                        "Reply YES to create it, or name an existing account "
+                        "to use instead."
+                        if proposal
+                        else "accounts — a dedicated account must be created "
+                        "(with your confirmation) or an existing one selected."
+                    )
+                ),
+            )
         if account is None:
             # Nature decided but NO account hint (no category match and no
             # generic default).  OFFER relevant existing accounts + the

@@ -747,6 +747,14 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
     renders these as chips (label shown, value sent); its hardcoded
     field-name switch remains the offline fallback."""
     q = (question or "").lower()
+    # CONFIGURATION GAP — account-creation confirmation: one-tap YES
+    # creates the proposed account, NO keeps the entry open for the user
+    # to name (or tap) an existing account.
+    if "should i create" in q:
+        return [
+            {"value": "YES", "label": "Create the account"},
+            {"value": "NO", "label": "Use an existing account"},
+        ]
     if _PURPOSE_MARKER in q:
         return [
             {"value": letter, "label": opt.label}
@@ -1197,17 +1205,34 @@ def analyze_requirements(
             ))
         elif nature and needs_clarification:
             # The nature is decided but no configured account captures it —
-            # a configuration gap.  Never invent an account.
-            nodes.append(DependencyNode(
-                key="account_mapping", dimension="Account mapping",
-                state=FieldResolutionState.BLOCKED_BY_CONFIGURATION,
-                detail=reason,
-                question=(
+            # a configuration gap.  Never invent an account.  When the
+            # classifier PROPOSED the canonical account, name it (and its
+            # free code) so the user can confirm creation with one tap.
+            proposal_name = getattr(classification, "proposed_account_name", None)
+            proposal_code = getattr(classification, "proposed_account_code", None)
+            if proposal_name:
+                gap_question = (
+                    f"There is no '{proposal_name}' account in your chart of "
+                    f"accounts for this entry"
+                    + (
+                        f" (suggested code {proposal_code})"
+                        if proposal_code else ""
+                    )
+                    + ". Should I create it, or do you want to use a specific "
+                    "existing account?"
+                )
+            else:
+                gap_question = (
                     f"There is no {str(nature).replace('_', ' ').lower()} "
                     "account in your chart of accounts for this entry. "
                     "Should I create one, or do you want to use a specific "
                     "existing account?"
-                ),
+                )
+            nodes.append(DependencyNode(
+                key="account_mapping", dimension="Account mapping",
+                state=FieldResolutionState.BLOCKED_BY_CONFIGURATION,
+                detail=reason,
+                question=gap_question,
                 kind="CONFIGURATION_GAP",
             ))
         elif needs_clarification:

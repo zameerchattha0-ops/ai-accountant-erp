@@ -402,6 +402,16 @@ class TransactionClassification(BaseModel):
     account_hint_id: Optional[str] = None  # COA account resolved for the nature (validated by the engine)
     account_hint_code: Optional[str] = None
     account_hint_name: Optional[str] = None
+    # Account-creation PROPOSAL (never silent): when the category's ledger
+    # is missing, the classifier proposes the canonical account and the
+    # user confirms creation (or names an existing account) in the
+    # clarification round.  Never auto-created without that confirmation.
+    proposed_account_name: Optional[str] = None
+    proposed_account_code: Optional[str] = None
+    # True when the user ALREADY confirmed creating the proposed account in
+    # a prior clarification round — execution must run create_account
+    # BEFORE the recording mutation (tool-order guard enforces this).
+    create_account_confirmed: bool = False
     requires_clarification: bool = False
     clarification_reason: Optional[str] = None
 

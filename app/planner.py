@@ -1245,6 +1245,28 @@ def _merge_clarification_answers(
                 merged["payment_method"] = "BANK_TRANSFER"
                 continue
 
+        # OWNER POLICY — ACCOUNT-CREATION CONFIRMATION ("Should I create
+        # it, or do you want to use a specific existing account?"): the
+        # answer is authoritative.  YES confirms the classifier's proposed
+        # account (extracted from the question text) — execution runs
+        # create_account first (free code resolved automatically) and the
+        # tool-order guard blocks any default-account recording until it
+        # succeeds.  NO keeps the entry open: any extra wording names the
+        # existing account to use instead.
+        if "should i create" in question:
+            low = answer.lower().strip(" .)'\"")
+            if low.startswith(("yes", "y", "create", "ok")):
+                m = re.search(r"no '(.+?)' account", question)
+                if m:
+                    merged["create_account"] = m.group(1)
+            else:
+                named = re.sub(
+                    r"^(no|n|use|pick|existing)\b[,.:;! ]*", "", low
+                ).strip()
+                if named and "existing account" not in named:
+                    merged["account_name"] = named
+            continue
+
         # Work Stream R: the nature/purpose decision tree is resolved
         # FIRST and FAMILY-AWARE ("b" means SERVICE in a sale round but
         # INVENTORY in a purchase round; a credit-note question contains
