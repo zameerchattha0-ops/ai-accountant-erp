@@ -131,7 +131,9 @@ export default function FounderChat() {
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col items-end gap-2.5">
+    /* Raised a level off the extreme bottom edge so it reads as part of
+       the page's floating UI instead of hugging the viewport border. */
+    <div className="fixed bottom-10 right-4 z-50 flex flex-col items-end gap-2.5">
       {open && (
         <div
           className="w-[calc(100vw-2rem)] max-w-sm rounded-3xl bg-white/95 backdrop-blur-2xl border border-white shadow-[0_30px_70px_-24px_rgba(27,42,74,0.5)] overflow-hidden flex flex-col h-[min(480px,70vh)]"

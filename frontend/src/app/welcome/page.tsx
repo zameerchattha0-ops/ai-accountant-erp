@@ -97,8 +97,15 @@ const HERO_TAGLINES = [
   { text: "Built to Grow With You.", dur: 3200 },
 ] as const;
 
+/* Brand gradient shared by every tagline variant */
+const TAGLINE_GRADIENT =
+  "linear-gradient(100deg, #0f766e 0%, #0891b2 55%, #06b6d4 100%)";
+
 function HeroTagline() {
   const [idx, setIdx] = useState(0);
+  /* The outgoing line lingers behind the incoming one for the crossfade,
+     then unmounts once its exit animation has fully played. */
+  const [prevIdx, setPrevIdx] = useState<number | null>(null);
   const idxRef = useRef(0);
 
   useEffect(() => {
@@ -109,6 +116,7 @@ function HeroTagline() {
     const tick = () => {
       if (cancelled) return;
       const next = (idxRef.current + 1) % HERO_TAGLINES.length;
+      setPrevIdx(idxRef.current);
       idxRef.current = next;
       setIdx(next);
       timer = setTimeout(tick, HERO_TAGLINES[next].dur);
@@ -121,20 +129,39 @@ function HeroTagline() {
     };
   }, []);
 
+  /* Retire the outgoing line after its 0.8s exit finishes */
+  useEffect(() => {
+    if (prevIdx === null) return;
+    const id = setTimeout(() => setPrevIdx(null), 850);
+    return () => clearTimeout(id);
+  }, [prevIdx]);
+
   const t = HERO_TAGLINES[idx];
   return (
     <span
-      key={idx}
-      className="hero-tagline-rotate"
+      className="hero-tagline-stack"
       style={{
         fontFamily: "var(--font-bodoni), Georgia, serif",
         fontStyle: "italic",
         fontWeight: 700,
-        backgroundImage:
-          "linear-gradient(100deg, #0f766e 0%, #0891b2 55%, #06b6d4 100%)",
       }}
     >
-      {t.text}
+      {prevIdx !== null && prevIdx !== idx && (
+        <span
+          key={`out-${prevIdx}`}
+          className="hero-tagline-rotate hero-tagline-out"
+          style={{ backgroundImage: TAGLINE_GRADIENT }}
+        >
+          {HERO_TAGLINES[prevIdx].text}
+        </span>
+      )}
+      <span
+        key={idx}
+        className="hero-tagline-rotate"
+        style={{ backgroundImage: TAGLINE_GRADIENT }}
+      >
+        {t.text}
+      </span>
     </span>
   );
 }
@@ -155,11 +182,13 @@ const ROBOT_COMMANDS = [
 
 function RobotCommandDeck() {
   /* Commands are NOT pinned on screen — a single launcher summons the
-     deck on demand, so the hero stays clean until you want to play. */
+     deck on demand, so the hero stays clean until you want to play.
+     DESKTOP ONLY: on mobile the deck is fully removed — the launcher
+     button and the command chips never render below the md breakpoint. */
   const [open, setOpen] = useState(false);
   return (
     <div
-      className="absolute bottom-3 right-3 md:bottom-[9%] md:right-4 z-30"
+      className="hidden md:block absolute bottom-[9%] right-4 z-30"
       aria-label="Ledger commands"
     >
       {open && (
@@ -840,10 +869,11 @@ export default function WelcomePage() {
                 hero-section height (top edge to bottom edge), so his canvas
                 bottom sits exactly on the backdrop image's bottom border —
                 a much bigger stage, and he can never be cropped by its
-                edges (camera + roam bounds guarantee it). */}
+                edges (camera + roam bounds guarantee it). DELIBERATELY no
+                entrance animation: Ledger is a native part of the hero —
+                he is simply there from the first frame, on every load. */}
             <div
               className="relative h-[420px] sm:h-[500px] md:h-[540px] -mx-3 sm:mx-0 lg:absolute lg:z-20 lg:inset-y-0 lg:mx-0 lg:h-auto lg:left-1/2 lg:w-[50vw]"
-              style={{ animation: "heroRise 1.2s cubic-bezier(0.19,1,0.22,1) 300ms both" }}
               onPointerDown={(e) => {
                 /* Mouse control: click Ledger directly (the canvas) and he
                    responds with an engaging routine. Clicks on cards/deck

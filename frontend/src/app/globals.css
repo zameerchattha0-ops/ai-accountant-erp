@@ -750,21 +750,49 @@ body {
    strongly darker than the light aurora background, so the
    headline stays prominently readable in every colour. Sits one
    level below `.reveal-line > span` so the masked reveal and the
-   swap entrance never fight over the animation property. */
+   swap never fight over the animation property.
+
+   The swap itself is a TRUE crossfade — never an instant cut:
+   both lines share one inline-grid cell; the outgoing line blurs
+   upward and dissolves while the incoming line settles from a
+   soft blur-rise. Long easing curves + gentle distances keep it
+   smooth, sophisticated and creamy. */
+.hero-tagline-stack {
+  display: inline-grid;
+  justify-items: start;
+}
+.hero-tagline-stack > .hero-tagline-rotate {
+  grid-area: 1 / 1;
+}
 .hero-tagline-rotate {
   display: inline-block;
   background-size: 220% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: heroTaglineIn 0.55s cubic-bezier(0.19, 1, 0.22, 1) both,
+  animation: heroTaglineIn 1.05s cubic-bezier(0.22, 1, 0.36, 1) both,
     heroSheen 7s ease-in-out infinite;
 }
 @keyframes heroTaglineIn {
   from {
     opacity: 0;
-    transform: translateY(0.35em);
-    filter: blur(6px);
+    transform: translateY(0.22em) scale(0.99);
+    filter: blur(9px);
+  }
+  60% {
+    filter: blur(2.5px);
+  }
+}
+.hero-tagline-out {
+  animation: heroTaglineOut 0.8s cubic-bezier(0.4, 0, 0.2, 1) both,
+    heroSheen 7s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes heroTaglineOut {
+  to {
+    opacity: 0;
+    transform: translateY(-0.18em) scale(1.01);
+    filter: blur(8px);
   }
 }
 
@@ -808,6 +836,7 @@ body {
   .hero-grid,
   .hero-gradient-word,
   .hero-tagline-rotate,
+  .hero-tagline-out,
   .hero-eyebrow,
   .hero-scrollcue {
     animation: none !important;

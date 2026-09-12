@@ -102,7 +102,11 @@ function RobotActor({ variant, reduced }: { variant: Variant; reduced: boolean }
   const face = useRef<FaceMode>("happy");
 
   /* --- behaviour state (refs on purpose: 60fps, no re-renders) --- */
-  const phase = useRef<Phase>("wave");
+  /* Starts on a calm idle — NO greet/wave entrance performance. Ledger
+     is a native part of the hero: present and still from the first
+     frame, on every load/reload; the ambient activity loop simply
+     resumes from there. */
+  const phase = useRef<Phase>("idle");
   const t = useRef(0);
   const dur = useRef(reduced ? Infinity : 2.4);
   const dir = useRef<1 | -1>(1);
