@@ -28,6 +28,9 @@ import structlog
 
 from app.models.schemas import TransactionClassification
 
+# Built-in capitalization threshold (mirrors reasoning.CAPITAL_AMOUNT_
+# THRESHOLD; lazy import at use site keeps the module graph acyclic).
+
 log = structlog.get_logger(__name__)
 
 # Canonical natures
@@ -292,9 +295,31 @@ def rule_based_nature(
             pass
         return None, "LOW"  # durable ambiguity → COA mapping or clarify
 
-    # 7. Unknown items default to the conservative operating-expense
-    #    treatment (matching the accounting engine's default) — the user is
-    #    NOT quizzed about everyday unmapped items.
+    # 7. Unknown items: the conservative default is operating-expense ONLY
+    #    for immaterial amounts (everyday unmapped items are never quizzed).
+    #    A MATERIAL amount on an item no rule recognises is exactly where
+    #    auto-expense fails at scale — a multi-national business deals in
+    #    thousands of item types across hundreds of trades, and a keyword
+    #    vocabulary can never be exhaustive.  The AMOUNT decides skepticism:
+    #    at or above the org's capitalization threshold the nature decision
+    #    must be ASKED (fixed asset / inventory / expense / prepaid),
+    #    never guessed.
+    from app.reasoning import CAPITAL_AMOUNT_THRESHOLD
+
+    try:
+        threshold = float(
+            entities.get("capitalization_threshold")
+            or CAPITAL_AMOUNT_THRESHOLD
+        )
+    except (TypeError, ValueError):
+        threshold = CAPITAL_AMOUNT_THRESHOLD
+    amount = entities.get("amount")
+    try:
+        material = amount is not None and float(amount) >= threshold
+    except (TypeError, ValueError):
+        material = False
+    if material:
+        return None, "MEDIUM"  # material-unknown → ASK (skips loose COA mapping)
     return OPERATING_EXPENSE, "MEDIUM"
 
 
@@ -578,6 +603,27 @@ async def classify_transaction(
     nature, confidence = rule_based_nature(
         " ".join(x for x in (item, message) if x), entities
     )
+    # Material-unknown (rule 7 with a material amount): an item the ERP
+    # cannot authoritatively classify at a material amount must be ASKED.
+    # The loose first-match COA shortcut (4b) must NEVER decide it — that
+    # is how "2 industrial pumps" ended up capitalised to "Computer
+    # Equipment" and "2 ac" silently expensed.  Durable items keep their
+    # (None, LOW) path and remain 4b-eligible.
+    material_unknown = nature is None and confidence == "MEDIUM"
+    if material_unknown:
+        return TransactionClassification(
+            transaction_nature=None,
+            confidence="MEDIUM",
+            source="INFERENCE",
+            entity=item or entity_name,
+            requires_clarification=True,
+            clarification_reason=(
+                f"'{item or entity_name or 'this entry'}' is a material "
+                "amount the ERP cannot authoritatively classify — the "
+                "purpose/treatment decision must be explicit (fixed asset, "
+                "resale inventory, expense, or prepaid), never assumed"
+            ),
+        )
     if nature:
         classification_text = " ".join(x for x in (item, message) if x)
         rule_label = (

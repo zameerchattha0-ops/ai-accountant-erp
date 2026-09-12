@@ -656,26 +656,34 @@ def purpose_requires_capitalization_question(
     amount: Optional[float] = None,
     threshold: float = 50_000.0,
 ) -> bool:
-    """R3.2 + user decision: the capitalization question fires ONLY when
+    """R3.2 + SCALE-SAFE policy: the capitalization question is decided by
+    the AMOUNT and the option's ambiguity class — never by a keyword list.
 
-    * the purpose is genuinely ambiguous (repairs, software, or a durable
-      free-text answer) — rent/salaries/etc. never see it, and
-    * the amount is at or above the org's capitalization threshold —
-      small amounts auto-expense without asking (never below).
-    Equipment purchases are unambiguous CAPITAL and skip the question.
+    * Known unambiguous treatments NEVER see it: rent/salaries/utilities
+      (EXPENSE), resale purchase (INVENTORY), equipment (CAPITAL — the
+      class derives the fixed-asset treatment directly).
+    * Ambiguous/generic treatments (repairs, software, "something else",
+      durable free text) at a MATERIAL amount (>= the org's threshold)
+      ALWAYS see it.  A multi-national business deals in thousands of
+      item types across hundreds of trades — a keyword vocabulary can
+      never be exhaustive, so the AMOUNT decides when to be skeptical.
+      Below the threshold the conservative auto-expense applies without
+      asking (small items are never quizzed).
     """
     opt = purpose_option(purpose_value)
     if not opt:
         return False
     if opt.capital_class in ("EXPENSE", "INVENTORY", "CAPITAL"):
         return False
-    if opt.capital_class == "DURABLE_ELSE":
-        # Only when the free-text answer itself is durable-flavoured.
-        combined = f"{purpose_value} {context_text}"
-        if not _DURABLE_KEYWORDS_RE.search(combined):
+    # AMBIGUOUS (repairs/software/other-durable) and DURABLE_ELSE (generic
+    # "something else") are materially ambiguous by definition — the
+    # amount gate alone decides.  (_DURABLE_KEYWORDS_RE remains in the
+    # vocabulary as a descriptive hint, not as a gate.)
+    try:
+        if amount is not None and float(amount) < float(threshold):
             return False
-    if amount is not None and float(amount) < float(threshold):
-        return False
+    except (TypeError, ValueError):
+        pass
     return True
 
 
