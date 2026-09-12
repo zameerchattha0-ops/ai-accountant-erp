@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { Cinzel, Cormorant_Garamond, Fraunces, DM_Serif_Display, Antic_Didone } from "next/font/google";
+import { Cinzel, Cormorant_Garamond, Fraunces, DM_Serif_Display, Antic_Didone, Bodoni_Moda } from "next/font/google";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
@@ -64,6 +64,14 @@ const antic = Antic_Didone({
   variable: "--font-antic",
   display: "swap",
 });
+/* Bodoni Moda — the hero headline face (high-contrast didone, variable
+   weight incl. bold 700 + italic for the power words). */
+const bodoni = Bodoni_Moda({
+  subsets: ["latin"],
+  style: ["normal", "italic"],
+  variable: "--font-bodoni",
+  display: "swap",
+});
 
 /* Brand glyph — lucide-react no longer ships brand icons (Linkedin was
    removed from the library), so the LinkedIn mark is inlined here. */
@@ -74,19 +82,19 @@ function LinkedInIcon({ className }: { className?: string }) {
     </svg>
   );
 }
-/* ---- Rotating hero taglines ------------------------------------
-   6 brand variants, each with its own palette. Every gradient stop
-   is a 600–700 tone — always strongly darker than the light aurora
-   background, so visibility stays prominent in every colour. Dwell
+/* ---- Rotating hero taglines (the POWER WORDS) --------------------
+   Rendered in Bodoni Moda ITALIC with the BRAND colour (teal→cyan —
+   the same brand ramp as every CTA and the text-aurora accent), so
+   the power words read unmistakably as the brand's voice. Dwell
    times vary 2.8–3.6s for an organic cadence. Rotation pauses under
    prefers-reduced-motion (the first variant then remains). */
 const HERO_TAGLINES = [
-  { text: "Smarter with AI.", from: "#0f766e", to: "#0e7490", dur: 3000, font: "dm-italic" },
-  { text: "Effortless. Intelligent.", from: "#4338ca", to: "#7c3aed", dur: 3400, font: "antic-bold" },
-  { text: "Always Balanced.", from: "#047857", to: "#0d9488", dur: 2800, font: "dm" },
-  { text: "Precision on Autopilot.", from: "#b45309", to: "#c2410c", dur: 3600, font: "antic-bold" },
-  { text: "Powered by Intelligence.", from: "#be123c", to: "#a21caf", dur: 3000, font: "dm-italic" },
-  { text: "Built to Grow With You.", from: "#1d4ed8", to: "#4f46e5", dur: 3200, font: "antic-bold" },
+  { text: "Smarter with AI.", dur: 3000 },
+  { text: "Effortless. Intelligent.", dur: 3400 },
+  { text: "Always Balanced.", dur: 2800 },
+  { text: "Precision on Autopilot.", dur: 3600 },
+  { text: "Powered by Intelligence.", dur: 3000 },
+  { text: "Built to Grow With You.", dur: 3200 },
 ] as const;
 
 function HeroTagline() {
@@ -114,19 +122,16 @@ function HeroTagline() {
   }, []);
 
   const t = HERO_TAGLINES[idx];
-  const fontCss: React.CSSProperties =
-    t.font === "antic-bold"
-      ? { fontFamily: "var(--font-antic), Georgia, serif", fontWeight: 700, letterSpacing: "0.01em" }
-      : t.font === "dm-italic"
-        ? { fontFamily: "var(--font-dm-serif), Georgia, serif", fontStyle: "italic" }
-        : { fontFamily: "var(--font-dm-serif), Georgia, serif" };
   return (
     <span
       key={idx}
       className="hero-tagline-rotate"
       style={{
-        ...fontCss,
-        backgroundImage: `linear-gradient(100deg, ${t.from} 0%, ${t.to} 100%)`,
+        fontFamily: "var(--font-bodoni), Georgia, serif",
+        fontStyle: "italic",
+        fontWeight: 700,
+        backgroundImage:
+          "linear-gradient(100deg, #0f766e 0%, #0891b2 55%, #06b6d4 100%)",
       }}
     >
       {t.text}
@@ -617,7 +622,7 @@ export default function WelcomePage() {
   const FLOW_DOTS = ["bg-teal-500", "bg-indigo-500", "bg-amber-500", "bg-rose-500", "bg-sky-500", "bg-violet-500", "bg-emerald-500", "bg-pink-500", "bg-teal-500"];
 
   return (
-    <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, dmSerif.variable, antic.variable, "min-h-screen bg-bg-primary")}>
+    <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, dmSerif.variable, antic.variable, bodoni.variable, "min-h-screen bg-bg-primary")}>
       {/* ============================================================ */}
       {/* NAVBAR — light floating glass                                 */}
       {/* ============================================================ */}
@@ -766,8 +771,8 @@ export default function WelcomePage() {
             </p>
 
             <h1
-              className="text-brand-navy text-[2.3rem] sm:text-5xl lg:text-[3.4rem] leading-[1.14] tracking-[0.03em] font-semibold"
-              style={{ fontFamily: "var(--font-cinzel), Georgia, serif" }}
+              className="text-brand-navy text-[2.3rem] sm:text-5xl lg:text-[3.4rem] leading-[1.14] tracking-[0.01em] font-bold"
+              style={{ fontFamily: "var(--font-bodoni), Georgia, serif" }}
             >
               <span className="sr-only">
                 Your Books, {HERO_TAGLINES[0].text}
@@ -1038,7 +1043,7 @@ export default function WelcomePage() {
               Features
             </span>
             <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-              Everything your <span className="text-aurora">accountant</span> needs
+              Everything your <span className="text-aurora italic">accountant</span> needs
             </h2>
             <p className="text-[#3d4b66] text-lg max-w-2xl mx-auto">
               A complete ERP built for small businesses that want accurate
@@ -1070,7 +1075,7 @@ export default function WelcomePage() {
               The Core Workflow
             </span>
             <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-              From <span className="text-aurora">words</span> to financial statements
+              From <span className="text-aurora italic">words</span> to financial statements
             </h2>
             <p className="text-[#3d4b66] text-lg max-w-2xl mx-auto">
               One connected pipeline — describe what happened, and the AI
@@ -1167,7 +1172,7 @@ export default function WelcomePage() {
 
                 <div className="relative z-10">
                   <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-                    Ready to <span className="text-aurora">automate</span> your accounting?
+                    Ready to <span className="text-aurora italic">automate</span> your accounting?
                   </h2>
                   <p className="text-[#3d4b66] text-lg max-w-xl mx-auto mb-8">
                     Join businesses that trust AI Accountant to keep their
@@ -1196,7 +1201,7 @@ export default function WelcomePage() {
               Contact
             </span>
             <h2 className="text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-              Built by <span className="text-aurora">Zameer Haider</span>
+              Built by <span className="text-aurora italic">Zameer Haider</span>
             </h2>
             <p className="text-[#3d4b66] text-lg max-w-xl mx-auto">
               Questions, feedback, or a live demo for your business — reach
