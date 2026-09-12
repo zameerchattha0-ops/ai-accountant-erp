@@ -45,6 +45,7 @@ from app.reasoning import (
     nature_for_purpose,
     nature_question_for_intent,
     purpose_label,
+    purpose_option,
     purpose_question,
     purpose_requires_capitalization_question,
     resolve_capitalization_answer,
@@ -626,6 +627,27 @@ def plan(
         "capitalization_threshold",
         capitalization_threshold_from_prefs(prefs),
     )
+
+    # CA-GRADE REASONING (expense path): when the message itself names a
+    # KNOWN expense category ("record electricity bill of 20,000"), the
+    # agent derives the purpose ITSELF — IFRS presentation gives every
+    # expense category its own line item and its own ledger — and never
+    # wastes a clarification round re-asking what the request already
+    # answered.  Only keyword-matched categories qualify; free text that
+    # matches no category still asks the purpose question.
+    if intent == "record_expense" and not entities.get("transaction_purpose"):
+        _cat_text = " ".join(
+            str(x) for x in (
+                entities.get("item_description"),
+                entities.get("description"),
+            ) if x
+        )
+        if _cat_text:
+            _derived = resolve_purpose_answer(purpose_question(), _cat_text)
+            _derived_opt = purpose_option(str(_derived)) if _derived else None
+            if _derived_opt is not None and _derived_opt.keywords:
+                entities["transaction_purpose"] = _derived
+
     purpose_now = entities.get("transaction_purpose")
     if (
         isinstance(purpose_now, str)
@@ -1217,16 +1239,29 @@ def _merge_clarification_answers(
                 merged["capitalization_decision"] = resolved_cap
                 continue
 
-        # Work Stream R3.3 — settlement position: paid now (cash/bank),
-        # outstanding (-> credit treatment, party payable) or prepaid.
-        # Plain payables, accruals and prepaids stay distinguishable.
-        if "paid, or is it outstanding" in question:
+        # Work Stream R3.3 — settlement position: the CA-grade expense
+        # treatments (paid now cash/bank · payable now · SETTLEMENT of an
+        # expense already recorded as payable · prepaid) and the legacy
+        # wording, so history answers always resolve.  Plain payables,
+        # accruals, prepaids and payable-settlements stay distinguishable.
+        if (
+            "paid, or is it outstanding" in question
+            or "expense debit, cash credit" in question
+        ):
             resolved_settle = resolve_settlement_answer(question, answer)
             if resolved_settle:
                 if resolved_settle == "ACCRUAL_PREPAID":
                     merged["settlement_position"] = "ACCRUAL_PREPAID"
                     merged["transaction_nature"] = "PREPAID_EXPENSE"
                     merged["payment_method"] = "CASH"
+                elif resolved_settle == "SETTLE_EXISTING_PAYABLE":
+                    # Treatment 3 — the SETTLEMENT of a previously
+                    # recorded payable.  payment_method stays EMPTY so
+                    # no paid tool ever fires; the reasoning path
+                    # locates the outstanding payable, confirms it with
+                    # the user, then settles it (Dr payables / Cr
+                    # cash-bank) — never a second expense.
+                    merged["settlement_position"] = "SETTLE_EXISTING_PAYABLE"
                 else:
                     merged["payment_method"] = resolved_settle
                     if resolved_settle == "CREDIT":

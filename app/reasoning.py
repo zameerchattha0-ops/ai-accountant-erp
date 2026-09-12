@@ -693,11 +693,23 @@ def purpose_requires_capitalization_question(
 
 _SETTLEMENT_MARKER = "paid, or is it outstanding"
 
+# CA-GRADE EXPENSE SETTLEMENT (accrual accounting): one question carrying
+# the three journal treatments a chartered accountant enumerates for
+# "record the electricity bill" — paid now (which ledger), incurred-now-
+# payable (accrual), or the SETTLEMENT of an expense already recorded as
+# payable (trade payables debit / cash-bank credit — NO new expense) —
+# plus prepaid.  The old "(c) invoice or bill received" framing belonged
+# to purchases/sales, not the expense path.
+_EXPENSE_SETTLEMENT_MARKER = "expense debit, cash credit"
 SETTLEMENT_POSITION_QUESTION = (
-    "Has this expense been paid, or is it outstanding? Reply with a, b, "
-    "c or d: (a) Paid now — cash; (b) Paid now — bank / online; "
-    "(c) Outstanding — invoice or bill received, payable to the party; "
-    "(d) Prepaid / advance — paid ahead of the expense."
+    "How should this be recorded — paid now, payable, or settling an "
+    "expense already recorded as payable? Reply a, b, c, d or e: "
+    "(a) Paid now — expense debit, cash credit; "
+    "(b) Paid now — expense debit, bank credit; "
+    "(c) Payable — expense debit, trade payables credit (pay later); "
+    "(d) Settling an earlier payable — trade payables debit, cash/bank "
+    "credit (no new expense); "
+    "(e) Prepaid — paid ahead of consumption (prepayment asset)."
 )
 
 # The expense path's date question asks about the UNDERLYING EVENT (the
@@ -714,22 +726,40 @@ EXPENSE_EVENT_DATE_QUESTION = (
 
 def resolve_settlement_answer(question: str, answer: str) -> Optional[str]:
     """Map a settlement answer to CASH / BANK_TRANSFER / CREDIT /
-    ACCRUAL_PREPAID (None = re-ask; never guessed)."""
-    if _SETTLEMENT_MARKER not in (question or "").lower():
+    SETTLE_EXISTING_PAYABLE / ACCRUAL_PREPAID (None = re-ask; never
+    guessed).  Both the CA-grade expense wording and the legacy wording
+    resolve — history answers never break across wording upgrades."""
+    q = (question or "").lower()
+    if _EXPENSE_SETTLEMENT_MARKER not in q and _SETTLEMENT_MARKER not in q:
         return None
     text = (answer or "").strip().lower().strip(" .)'\"")
-    if text in ("a", "1"):
-        return "CASH"
-    if text in ("b", "2"):
-        return "BANK_TRANSFER"
-    if text in ("c", "3"):
-        return "CREDIT"
-    if text in ("d", "4"):
-        return "ACCRUAL_PREPAID"
-    if re.search(r"outstanding|invoice|bill|payable|credit|owe|later", text):
-        return "CREDIT"
+    if _EXPENSE_SETTLEMENT_MARKER in q:
+        if text in ("a", "1"):
+            return "CASH"
+        if text in ("b", "2"):
+            return "BANK_TRANSFER"
+        if text in ("c", "3"):
+            return "CREDIT"
+        if text in ("d", "4"):
+            return "SETTLE_EXISTING_PAYABLE"
+        if text in ("e", "5"):
+            return "ACCRUAL_PREPAID"
+    else:
+        # Legacy wording (kept for clarification history continuity).
+        if text in ("a", "1"):
+            return "CASH"
+        if text in ("b", "2"):
+            return "BANK_TRANSFER"
+        if text in ("c", "3"):
+            return "CREDIT"
+        if text in ("d", "4"):
+            return "ACCRUAL_PREPAID"
+    if re.search(r"settl|already recorded|earlier payable|against the payable", text):
+        return "SETTLE_EXISTING_PAYABLE"
     if re.search(r"prepaid|advance|ahead", text):
         return "ACCRUAL_PREPAID"
+    if re.search(r"outstanding|payable|credit|owe|later", text):
+        return "CREDIT"
     if re.search(r"bank|online|transfer|neft|card", text):
         return "BANK_TRANSFER"
     if re.search(r"cash", text):
@@ -770,6 +800,14 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
         return [
             {"value": "A", "label": "Ordinary expense"},
             {"value": "B", "label": "Capitalize to fixed asset"},
+        ]
+    if _EXPENSE_SETTLEMENT_MARKER in q:
+        return [
+            {"value": "a", "label": "Paid now — cash (Dr expense / Cr cash)"},
+            {"value": "b", "label": "Paid now — bank (Dr expense / Cr bank)"},
+            {"value": "c", "label": "Payable — pay later (Cr trade payables)"},
+            {"value": "d", "label": "Settle an earlier payable (no new expense)"},
+            {"value": "e", "label": "Prepaid — paid ahead (prepayment)"},
         ]
     if _SETTLEMENT_MARKER in q:
         return [

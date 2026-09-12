@@ -134,6 +134,18 @@ def build_system_instructions(constitution: str = "") -> str:
         "       instead of silently picking an account.",
         "    d. Plain text only — no markdown (**bold**, backticks, headings) in",
         "       questions or summaries.",
+        "22. EXPENSE SETTLEMENT TREATMENTS (accrual accounting — CA-grade): an",
+        "    expense request has exactly THREE candidate journal treatments —",
+        "    (1) Dr expense / Cr cash-bank (paid now), (2) Dr expense / Cr trade",
+        "    payables (incurred now, unpaid — accrual), (3) Dr trade payables /",
+        "    Cr cash-bank (the SETTLEMENT of an expense already recorded as",
+        "    payable — NEVER re-record the expense).  Ask which applies when not",
+        "    stated; for (3) search the previously recorded unpaid expense of the",
+        "    same category (description/payee match), confirm it with the user,",
+        "    then settle it.  Every expense category keeps its OWN ledger account",
+        "    (IFRS: separate line items on the financial statements) — utilities",
+        "    (electricity, gas, water, internet-type bills) post to the Utilities",
+        "    account, never to a generic operating-expense account.",
         "",
     ]
     if constitution:

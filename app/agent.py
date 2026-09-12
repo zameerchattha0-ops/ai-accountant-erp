@@ -188,6 +188,13 @@ def _expense_fast_path_call(
     payment = str(entities.get("payment_method") or "").upper()
     if payment not in ("CASH", "BANK_TRANSFER"):
         return None
+    if str(entities.get("settlement_position") or "").upper() == "SETTLE_EXISTING_PAYABLE":
+        # CA treatment 3 — the settlement of an expense ALREADY recorded
+        # as payable is NOT a new expense: never fast-path create_expense
+        # for it.  The reasoning path locates the outstanding payable
+        # (same category), confirms it with the user, then settles it
+        # (Dr trade payables / Cr cash-bank).
+        return None
     payee = str(entities.get("supplier_name") or "").strip() or "Local Vendor"
     params: Dict[str, Any] = {
         "expense_date": str(txn_date),
