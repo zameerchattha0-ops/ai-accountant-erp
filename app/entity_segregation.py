@@ -1,5 +1,5 @@
 ﻿"""
-AI-first perception stage (Work Stream S2) â€” grounded LLM fact extraction.
+AI-first perception stage â€” grounded LLM fact extraction.
 
 ARCHITECTURE CHANGE (S1 -> S2)
 ------------------------------

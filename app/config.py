@@ -226,7 +226,7 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=10)
     database_max_overflow: int = Field(default=20)
 
-    # ---- Semantic understanding layer (Work Stream S2) --------------------
+    # ---- Semantic understanding layer --------------------
     # This is the PRIMARY semantic interpretation stage of the ERP: the user's
     # natural-language request goes to the LLM FIRST, together with the
     # reasoning rulebook and a bounded, organization-scoped ERP context
@@ -263,7 +263,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ---- LLM-primary accounting reasoning loop (Work Stream S3) ------------
+    # ---- LLM-primary accounting reasoning loop ------------
     # The LLM is the PRIMARY accounting reasoning layer: it inspects the live
     # books (through the closed, permission-checked evidence catalog in
     # app/books_evidence.py), reassesses the request against what the records
@@ -318,10 +318,29 @@ class Settings(BaseSettings):
         ),
     )
     accounting_reasoning_max_rounds: int = Field(
-        default=3,
+        default=4,
         description=(
             "Maximum reasoning rounds (evidence request → reassessment "
-            "→ decision). Bounded so a confused model can never loop."
+            "→ decision). Bounded so a confused model can never loop. "
+            "4 (was 3): round-1 evidence + round-2 proposal rejected on a "
+            "tool-contract violation needs one more round to fold the "
+            "violation feedback and re-propose; at 3 the loop exhausted "
+            "instead of re-proposing and the run degraded to the keyword "
+            "pipeline, discarding a correct proposal (production session "
+            "3ea794a0, 2026-09-23). The stage stays bounded by "
+            "accounting_reasoning_total_timeout regardless."
+        ),
+    )
+    accounting_reasoning_prefetch: bool = Field(
+        default=True,
+        description=(
+            "P1-⑩ (forensic latency report §5): speculatively start the "
+            "read-only evidence loaders hinted by preliminary "
+            "candidate_subject_areas IN PARALLEL with the round-1 model "
+            "call. When the model asks for them they are served instantly "
+            "(common settlement flow becomes a 1-round decision); when it "
+            "does not, only cheap read-only queries were spent. Set False "
+            "to restore strictly sequential fetching."
         ),
     )
     # ---------------------------------------------------------------------

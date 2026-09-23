@@ -1,5 +1,5 @@
 """
-AI-Native ERP — Semantic Intent Contract (Work Stream S2)
+AI-Native ERP — Semantic Intent Contract
 =========================================================
 
 The formal representation of *business meaning* produced by the LLM semantic

@@ -1,7 +1,7 @@
 -- ============================================================
 -- 050: EDIT/DELETE ROLLOUT TO DOCUMENT MODULES (journal pattern)
 -- ============================================================
--- Work Stream F: applies the verified journal-entry permission model
+-- applies the verified journal-entry permission model
 -- (migration 048) to Quotations, Purchase Bills, Invoices, Expenses,
 -- Payments and Receipts.
 --

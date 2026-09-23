@@ -1,5 +1,5 @@
 """
-AI-Native ERP — LIVE BOOKS EVIDENCE layer (Work Stream S3)
+AI-Native ERP — LIVE BOOKS EVIDENCE layer
 ==========================================================
 
 Python's job here is *retrieval and enforcement*, never interpretation.
@@ -80,6 +80,10 @@ class EvidenceResult:
     error: Optional[str] = None
     truncated: bool = False
     rejected: bool = False
+    #: The request arguments this result answered (P1-⑤). Needed to key the
+    #: cross-turn memo with the SAME (kind, args) rule as the in-loop cache.
+    #: Never rendered into prompts and not part of ``as_dict()``.
+    args: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -1039,7 +1043,22 @@ def render_evidence(results: Sequence[EvidenceResult]) -> str:
     if not results:
         return ""
     blocks: List[str] = []
+    seen: set = set()
     for result in results:
+        # P2-⑫: an identical snapshot (same kind + same rows) renders ONCE
+        # even if seed/prefetch/cache hands it over twice — DIFFERENT args
+        # are different reads and are never dropped.
+        key = (
+            result.kind,
+            result.title,
+            result.error,
+            bool(result.rejected),
+            bool(result.truncated),
+            json.dumps(result.records, sort_keys=True, default=str),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
         header = f"  [{result.kind}] {result.title}"
         if result.why:
             header += f" — requested because: {result.why}"
@@ -1067,6 +1086,7 @@ def render_evidence(results: Sequence[EvidenceResult]) -> str:
 def render_evidence_compact(results: Sequence[EvidenceResult]) -> str:
     """One-line-per-kind summary for audit steps and logs."""
     parts: List[str] = []
+    seen: set = set()
     for result in results:
         if result.rejected:
             state = "refused"
@@ -1076,5 +1096,9 @@ def render_evidence_compact(results: Sequence[EvidenceResult]) -> str:
             state = "empty"
         else:
             state = f"{len(result.records)} row(s)"
-        parts.append(f"{result.kind}={state}")
+        line = f"{result.kind}={state}"
+        if line in seen:  # P2-⑫: identical line once
+            continue
+        seen.add(line)
+        parts.append(line)
     return "; ".join(parts)

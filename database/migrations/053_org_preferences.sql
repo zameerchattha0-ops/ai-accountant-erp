@@ -1,5 +1,5 @@
 -- =====================================================================
--- 053 - ORG PREFERENCES (Work Stream F: clarification memory + defaults)
+-- 053 - ORG PREFERENCES
 -- =====================================================================
 -- The agent learns durable per-organization defaults from clarification
 -- answers (payment mode, tax category, nature decision for a recurring

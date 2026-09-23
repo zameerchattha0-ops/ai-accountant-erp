@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "./useOrg";
 
 /**
- * Work Stream F: fetch the current user's ACTIVE membership role for the
+ * fetch the current user's ACTIVE membership role for the
  * selected organisation so module pages can gate edit/delete buttons the
  * same way the database does (RLS has_org_role(org, 2) for deletes).
  *

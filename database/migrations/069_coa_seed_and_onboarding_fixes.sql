@@ -1,7 +1,7 @@
 -- =====================================================================
 -- Migration 069: chart-of-accounts seeding fixes
 -- =====================================================================
--- Two defects were found while verifying the end-to-end onboarding flow
+-- Two problems were found while verifying the end-to-end onboarding flow
 -- introduced by 067.  Both are corrected here (the live database recorded
 -- them as the migrations "fix_seed_org_chart_of_accounts_parent_link" and
 -- "apply_organization_onboarding_rank_cast").
@@ -93,7 +93,7 @@ BEGIN
 
   -- Parent/child hierarchy.  The parent is matched from a comma-joined
   -- FROM list because a JOIN's ON clause may not reference the UPDATE
-  -- target (the defect this migration fixes).
+  -- target (the problem this migration fixes).
   UPDATE public.accounts a
   SET parent_account_id = p.id,
       updated_at = now()

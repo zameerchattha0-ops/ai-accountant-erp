@@ -33,14 +33,14 @@ from app.validator import validate_operation
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tool-definition cache (Work Stream A4).  ai.tools + ai.tool_parameters are
+# Tool-definition cache.  ai.tools + ai.tool_parameters are
 # read-only metadata: cache the built declarations in-process for 5 minutes.
 # ---------------------------------------------------------------------------
 _TOOL_DEFS_TTL_SECONDS = 300.0
 _TOOL_DEFS_CACHE = None  # (loaded_at: float, tools: list[dict]) | None
 
 # ---------------------------------------------------------------------------
-# Work Stream A - transaction-date protocol.  Mutation tools whose native
+# transaction-date protocol.  Mutation tools whose native
 # date parameter the model must supply.  When the model omits it, the
 # router maps a supplied ``transaction_date`` through the deterministic
 # parser onto the native parameter, or defaults to TODAY and flags the
@@ -83,12 +83,10 @@ async def _terminalise_claim(
 ) -> None:
     """Release a financial-mutation claim on a FAILED path.
 
-    Production incident 2026-09-20 (session 6a48a432, create_invoice): the
-    generic ``except Exception`` returned a ToolResult WITHOUT releasing the
-    claim, so ``public.financial_operations`` row
-    59777966-aef6-4672-adfd-ba86971e60ff stayed ``IN_PROGRESS`` with
-    ``error = NULL`` — a zombie claim that both hid the cause and blocked the
-    legitimate retry until the stale window expired.
+    If the generic ``except Exception`` returns a ToolResult WITHOUT
+    releasing the claim, the ``public.financial_operations`` row stays
+    ``IN_PROGRESS`` with ``error = NULL`` — a claim that both hides the cause
+    and blocks the legitimate retry until the stale window expires.
 
     The RAW exception type and message are stored, not the sanitised
     model-facing sentence: the user-facing text is deliberately generic
@@ -267,7 +265,7 @@ async def route_tool_call(
                     "tool_router.idempotency_claim_failed", error=str(exc)[:200]
                 )
 
-    # 3b. Work Stream A - transaction-date protocol: map a resolved
+    # 3b. map a resolved
     #     transaction_date onto the tool's native date parameter; when the
     #     model supplied none, default to TODAY and flag the result so the
     #     response states the assumed date honestly (never a silent guess).
@@ -277,9 +275,8 @@ async def route_tool_call(
     # 4. Execute.  The attempt is guarded from the DATE MAPPING onwards (not
     #    only from the handler call) so that EVERY failure after the claim
     #    lands in one of the two handlers below — the only places that can
-    #    release the claim.  Anything that escaped this block would leave the
-    #    claim IN_PROGRESS forever (production row 59777966, see
-    #    ``_terminalise_claim``).
+    #    release the claim.  Anything that escapes this block would leave the
+    #    claim IN_PROGRESS forever (see ``_terminalise_claim``).
     try:
         if date_param:
             arguments = dict(arguments)
@@ -373,7 +370,7 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
     Gemini receives accurate JSON-Schema parameter contracts instead of
     a bare ``organization_id`` placeholder.
 
-    Work Stream A4: definitions are READ-ONLY metadata, so they are cached
+    definitions are READ-ONLY metadata, so they are cached
     in-process with a 5-minute TTL and refreshed explicitly via
     :func:`invalidate_tool_definition_cache` (the DB is hit once across
     requests instead of once per request).

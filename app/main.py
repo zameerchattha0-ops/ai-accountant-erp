@@ -163,6 +163,65 @@ async def health_check():
     return {"status": "ok", "version": "1.0.0", "config_ok": _config_ok}
 
 
+@app.get("/api/ai/warm")
+async def ai_warm():
+    """P2-⑭ (forensic report ⑭): cold-start mitigation hook.
+
+    Forces the lazy heavy agent stack to import NOW so a platform warm-up
+    ping (cron/monitor) pays the import cost instead of the user's first
+    request. No DB, no auth (like /api/health): importing modules is
+    side-effect-bounded and exposes no data. Import-graph trimming and
+    provisioned concurrency stay infra follow-ups, scored once P2-⑪
+    CLIENT_TTFB percentiles are queryable from SQL.
+    """
+    import importlib
+
+    modules = (
+        "app.agent",
+        "app.accounting_reasoning",
+        "app.books_evidence",
+        "app.classifier",
+        "app.context_manager",
+        "app.plan_materialization",
+        "app.reasoning",
+    )
+    try:
+        started = time.perf_counter()
+        warmed = [importlib.import_module(m) for m in modules]
+        return {
+            "status": "ok",
+            "warmed": [m.__name__ for m in warmed],
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+    except Exception as exc:  # noqa: BLE001 — warm ping must never 500
+        return {"status": "error", "detail": str(exc)[:200]}
+
+
+@app.post("/api/ai/client-timing")
+async def ai_client_timing(
+    timing: Dict[str, Any] = Body(...),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """P2-⑪: client-side TTFB (cold start happens BEFORE started_at and is
+    invisible to server-side step timings). Stored as a CLIENT_TTFB step
+    for SQL percentiles; best-effort — failures never surface to the UI.
+    """
+    from app.agent import _attach_client_ttfb  # lazy: heavy agent stack
+
+    try:
+        session_id = uuid.UUID(str(timing.get("execution_id") or ""))
+        ttfb_ms = float(timing.get("ttfb_ms") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return {"ok": False, "detail": "invalid payload"}
+    ok = await _attach_client_ttfb(
+        session_id=session_id,
+        ttfb_ms=ttfb_ms,
+        transport=str(timing.get("transport") or "unknown")[:16],
+        organization_id=auth.organization_id,
+    )
+    return {"ok": ok}
+
+
 @app.get("/api/ai/providers")
 async def ai_providers(
     force: bool = False,
@@ -256,7 +315,7 @@ async def ai_confirm(
 
 
 # ---------------------------------------------------------------------------
-# Work Stream C: BACKGROUND AI RUNS (DB claim/lease queue + worker process)
+# BACKGROUND AI RUNS (DB claim/lease queue + worker process)
 # ---------------------------------------------------------------------------
 # POST /api/ai/jobs queues the run and returns IMMEDIATELY; a supervised
 # worker process (scripts/ai_worker.py) claims and executes it via the same
@@ -321,7 +380,7 @@ async def get_ai_job(
 
 
 # ---------------------------------------------------------------------------
-# Work Stream D: STREAMING EXECUTION (SSE)
+# STREAMING EXECUTION (SSE)
 # ---------------------------------------------------------------------------
 # Same trusted execute() pipeline as POST /api/ai/execute, but the response
 # streams progress: an `event: step` message for every reasoning step as it
@@ -408,6 +467,9 @@ async def ai_execute_stream(
                                 "phase": step.get("description") or step.get("step_type"),
                                 "status": step.get("status"),
                                 "created_at": str(step.get("created_at")),
+                                # P2-⑪: lets the client attach its TTFB
+                                # measurement to THIS session's steps.
+                                "execution_id": str(session_row["id"]),
                             }
                         )
                         + "\n\n"
@@ -416,9 +478,10 @@ async def ai_execute_stream(
             heartbeat += 1
             if heartbeat % 15 == 0:
                 yield ": keepalive\n\n"
-            # 150ms poll: stage updates land in the same tick the DB step
-            # is written — the run feels instant instead of chunky.
-            await asyncio.sleep(0.15)
+            # P2-⑬ (forensic report ⑬): 250ms poll — halves the per-run DB
+            # polling load (server-side only; user-perceived step latency
+            # stays well under a quarter second, invisible).
+            await asyncio.sleep(0.25)
 
         response = await run_task
         yield (
@@ -653,7 +716,7 @@ async def _stamp_stranded_run(row: Dict[str, Any], age: float) -> None:
 async def latest_active_session(
     auth: AuthContext = Depends(get_current_user),
 ):
-    """Work Stream C: resume-by-conversation.
+    """resume-by-conversation.
 
     Returns the latest LIVE execution session for this user+org — PENDING /
     PLANNING / EXECUTING, or WAITING_FOR_USER parked on a question — so the
@@ -679,8 +742,8 @@ async def latest_active_session(
         if status not in _ACTIVE_RUN_STATUSES and status != "WAITING_FOR_USER":
             # TERMINAL — and that is a hard boundary, not just "skip this row".
             # A newer run has SETTLED, so nothing older can still be pending.
-            # Falling through to an older parked session was the defect: after
-            # a run COMPLETED, reattach walked past it and reported a
+            # Falling through to an older parked session is wrong: after a
+            # run COMPLETED, reattach must not walk past it and report a
             # superseded WAITING_FOR_USER row, showing "your last request is
             # still waiting for your answer" about a request already abandoned.
             break

@@ -1,8 +1,7 @@
 -- ============================================================
 -- 051: FIX reverse_journal_entry PERMISSIONS FOR THE JOURNAL PAGE
 -- ============================================================
--- Live defect (Owner, Journal page): clicking "Reverse" on a POSTED
--- entry failed with
+-- Clicking "Reverse" on a POSTED entry from the Journal page failed with
 --   "permission denied for function reverse_journal_entry" (403).
 --
 -- Root cause: the security-hardening migrations (023/037/045) revoked

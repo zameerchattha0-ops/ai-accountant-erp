@@ -1,5 +1,5 @@
 """
-ERP AI Agent - Semantic Tool Shortlister (Work Stream E)
+ERP AI Agent - Semantic Tool Shortlister
 =========================================================
 Deterministic intent -> tool-subset mapping.  A mutation intent only
 needs ITS mutation tools plus the lookups for the entity types it can

@@ -122,7 +122,7 @@ NATURE_DECISION_QUESTION = (
 )
 
 
-# Work Stream R4.2 — receipts/payments ask WHICH BUSINESS OPERATION the
+# receipts/payments ask WHICH BUSINESS OPERATION the
 # money belongs to (the CA question: what is this settlement really
 # settling?).  Same wire values as before, so routing and preference
 # learning are unchanged.
@@ -156,7 +156,7 @@ def _is_plausibly_capital(
         return False
 
 # ---------------------------------------------------------------------------
-# Work Stream R - CA-GRADE NATURE/PURPOSE MATRIX (purpose -> nature -> info)
+# CA-GRADE NATURE/PURPOSE MATRIX (purpose -> nature -> info)
 # ---------------------------------------------------------------------------
 # A chartered accountant establishes the PURPOSE of a transaction FIRST,
 # because the nature (fixed asset vs inventory vs consumable vs expense vs
@@ -340,7 +340,7 @@ def resolve_nature_answer(question: str, answer: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R3.1 — PURPOSE-FIRST taxonomy for the generic expense path
+# PURPOSE-FIRST taxonomy for the generic expense path
 # ---------------------------------------------------------------------------
 # An "expense" utterance ("record an expense of 25000") is the user's
 # DESCRIPTION of an event, NOT an accounting classification.  Before any
@@ -566,7 +566,7 @@ def nature_for_purpose(purpose_value: str, capitalized: Optional[bool] = None) -
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R3.2 — capitalization disambiguation (IAS 16 / IAS 38)
+# capitalization disambiguation (IAS 16 / IAS 38)
 # ---------------------------------------------------------------------------
 
 _CAPITALIZATION_MARKER = "ordinary expense or capitalized"
@@ -688,7 +688,7 @@ def purpose_requires_capitalization_question(
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R3.3 — settlement position + underlying-event date
+# settlement position + underlying-event date
 # ---------------------------------------------------------------------------
 
 _SETTLEMENT_MARKER = "paid, or is it outstanding"
@@ -768,7 +768,7 @@ def resolve_settlement_answer(question: str, answer: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R3.4 — backend-emitted tap-to-answer options per question
+# backend-emitted tap-to-answer options per question
 # ---------------------------------------------------------------------------
 
 def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
@@ -816,7 +816,7 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
             {"value": "c", "label": "Outstanding"},
             {"value": "d", "label": "Prepaid / advance"},
         ]
-    # Work Stream R4.2 — the business-operation question for receipts
+    # the business-operation question for receipts
     # and payments (invoice settlement / advance / loan-or-other).
     if "which business operation is this for" in q:
         return [
@@ -824,7 +824,7 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
             {"value": "b", "label": "Advance"},
             {"value": "c", "label": "Loan / drawing / other"},
         ]
-    # Work Stream R4.4 — the settlement channel (cash vs bank) decides
+    # the settlement channel (cash vs bank) decides
     # which ledger the money hits.
     if "in cash, or through the bank" in q:
         return [
@@ -1083,7 +1083,7 @@ _CREDIT_PARTY_INTENTS = {
     "create_purchase_return": "supplier_name",
 }
 
-# Work Stream A - MANDATORY TRANSACTION-DATE PROTOCOL: every mutation
+# every mutation
 # intent must resolve an explicit accounting date before any tool call.
 # Canonical set (imported by app/planner.py); quotations, asset disposal
 # and depreciation are included even though they create non-journal-first
@@ -1139,7 +1139,7 @@ def analyze_requirements(
             state=FieldResolutionState.NOT_QUERIED,
         ))
 
-    # --- 1b. Transaction date (Work Stream A) --------------------------------
+    # --- 1b. Transaction date --------------------------------
     # The mandatory date protocol: a mutation without a resolved date is a
     # MISSING_AND_REQUIRED user decision (never silently defaulted).
     if intent in DATE_REQUIRED_INTENTS:
@@ -1381,7 +1381,7 @@ def analyze_requirements(
                 question=question,
             ))
 
-    # --- 4d. TRANSACTION NATURE (Work Stream R - purpose-first) --------------
+    # --- 4d. TRANSACTION NATURE --------------
     # Fires for EVERY intent that creates, moves or classifies value,
     # regardless of amount/date/party state.  A missing amount NEVER
     # suppresses the nature node.  When a nature question already exists

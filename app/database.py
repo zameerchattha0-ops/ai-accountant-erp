@@ -13,10 +13,13 @@ Thin async wrapper around the Supabase Python client.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
+
 import json
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 from supabase import Client, create_client
@@ -24,6 +27,15 @@ from supabase import Client, create_client
 from app.config import get_settings
 
 log = structlog.get_logger(__name__)
+
+#: P2-⑪ (forensic latency report ⑪): per-request phase timings recorded by
+#: the agent (set on execute()'s own task context — request-scoped and
+#: concurrency-safe) and merged into every execution result, so p50/p95
+#: stage latency stays queryable from SQL even where structlog output is
+#: lost (Vercel runtime-logs 404, DEFECT3 §…).
+REQUEST_TIMINGS: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "REQUEST_TIMINGS", default=None
+)
 
 
 # ---------------------------------------------------------------------------
@@ -302,23 +314,52 @@ async def get_tools_for_capability(
     return tools
 
 
+#: P1-⑦ (forensic latency report §7): ``ai_context_rules`` / sources are
+#: STATIC configuration rows (no tenant data; changes are rare) — cached per
+#: process with a TTL so build_context can collapse its two waves into one
+#: and stop paying the 1+N rule/source lookups on every turn.
+_CONTEXT_RULES_TTL_S = 300.0
+_context_rules_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def peek_context_rules_cache(intent: str) -> Optional[Dict[str, Any]]:
+    """Sync warm-cache lookup for ``intent``; None on miss/expiry. No I/O."""
+    hit = _context_rules_cache.get(intent)
+    if not hit:
+        return None
+    expires_at, value = hit
+    if time.monotonic() > expires_at:
+        _context_rules_cache.pop(intent, None)
+        return None
+    return value
+
+
+def clear_context_rules_cache() -> None:
+    """Test/admin hook — drop every cached context rule."""
+    _context_rules_cache.clear()
+
+
 async def get_context_sources_for_intent(intent: str) -> Dict[str, Any]:
     """Return the context rule + resolved sources for a given intent."""
+    cached = peek_context_rules_cache(intent)
+    if cached is not None:
+        return cached
     rule = await fetch_one("ai_context_rules", filters={"intent": intent, "status": "ACTIVE"})
     if not rule:
-        return {"rule": None, "sources": []}
+        result: Dict[str, Any] = {"rule": None, "sources": []}
+    else:
+        required = rule.get("required_sources") or []
+        optional = rule.get("optional_sources") or []
+        all_slugs = required + optional
 
-    required = rule.get("required_sources") or []
-    optional = rule.get("optional_sources") or []
-    all_slugs = required + optional
-
-    sources = []
-    for slug in all_slugs:
-        src = await fetch_one("ai_context_sources", filters={"slug": slug, "status": "ACTIVE"})
-        if src:
-            sources.append(src)
-
-    return {"rule": rule, "sources": sources}
+        sources = []
+        for slug in all_slugs:
+            src = await fetch_one("ai_context_sources", filters={"slug": slug, "status": "ACTIVE"})
+            if src:
+                sources.append(src)
+        result = {"rule": rule, "sources": sources}
+    _context_rules_cache[intent] = (time.monotonic() + _CONTEXT_RULES_TTL_S, result)
+    return result
 
 
 async def create_execution_session(
@@ -412,7 +453,17 @@ async def create_execution_step(
         select="id",
         limit=1000,
     )
-    summary = json.dumps(step_data, default=str)[:2000] if step_data else None
+    # P1-⑤: the cross-turn evidence memo rides this payload and must arrive
+    # as VALID JSON — the default 2000-char cap would shear it mid-record.
+    # ONLY payloads that actually carry the memo get the raised cap (120KB,
+    # and the serializer bounds itself well under that); every other step
+    # keeps the original 2000-char behaviour untouched.
+    cap = (
+        120_000
+        if isinstance(step_data, dict) and "evidence_full" in step_data
+        else 2000
+    )
+    summary = json.dumps(step_data, default=str)[:cap] if step_data else None
     return await insert_one(
         "ai_execution_steps",
         data={
@@ -441,11 +492,9 @@ async def create_tool_call(
     ``tool_id`` is a FK to ``ai.tools`` resolved from the slug (cached);
     ``call_order`` is computed per session.
 
-    ``error_details`` carries WHY a call failed.  This column existed but no
-    caller could ever populate it, so every FAILED row in production held
-    NULL — including the create_invoice failure of 2026-09-20 (session
-    6a48a432), which is what made the incident's real cause unrecoverable
-    from the database.  A failed call now always stores its reason.
+    ``error_details`` carries WHY a call failed.  Without it every FAILED row
+    would hold NULL and the cause of a failure would be unrecoverable from
+    the database.  A failed call therefore always stores its reason.
     """
     tool_id = await _resolve_tool_id(tool_name)
     if not tool_id:
@@ -561,19 +610,25 @@ async def seed_clarification_history(
     """
     if not history:
         return
-    for qa in history:
-        await insert_one(
-            "ai_clarifications",
-            data={
+    # P0-④ (forensic report ④): ONE bulk insert for the whole history —
+    # one insert_one per Q&A was O(N) sequential round-trips on every
+    # resumed turn (O(N²) per conversation). Identical row shape as before.
+    answered_at = datetime.now(timezone.utc).isoformat()
+    await insert_many(
+        "ai_clarifications",
+        data=[
+            {
                 "execution_session_id": str(session_id),
                 "question": str(qa.get("question") or ""),
                 "user_response": str(qa.get("answer") or ""),
                 "required_information": [],
                 "options": [],
                 "status": "COMPLETED",
-                "answered_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+                "answered_at": answered_at,
+            }
+            for qa in history
+        ],
+    )
 
 
 async def create_confirmation(
@@ -646,6 +701,12 @@ async def create_execution_result(
     status: str = "COMPLETED",
 ) -> Dict[str, Any]:
     """Record the final execution result for a session."""
+    # P2-⑪: attach this request's phase-timing mirror (structlog timing
+    # data is lost on Vercel — these land in result_payload.timings so the
+    # forensic baseline can be scored from SQL after every change).
+    timings = REQUEST_TIMINGS.get()
+    if timings and isinstance(result_data, dict):
+        result_data = {**result_data, "timings": dict(timings)}
     return await insert_one(
         "ai_execution_results",
         data={

@@ -110,7 +110,7 @@ class GeminiClient:
 
         # Generation config (includes system_instruction + tools).
         # ``max_output_tokens`` overrides the client default for THIS
-        # request (Work Stream B tiered routing: lighter budget for simple
+        # request (lighter budget for simple
         # lookups that still need the model).
         config = types.GenerateContentConfig(
             system_instruction=self._system_instructions,
@@ -165,7 +165,7 @@ class GeminiClient:
                         text_parts.append(part.text)
 
                 # Execute tools and feed results back to Gemini.
-                # Work Stream A1: independent read-only calls run
+                # independent read-only calls run
                 # CONCURRENTLY; mutations stay strictly sequential in plan
                 # order (see app/tool_execution.py).
                 if has_function_call and executor:

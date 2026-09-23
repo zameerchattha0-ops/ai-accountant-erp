@@ -32,7 +32,7 @@ log = structlog.get_logger(__name__)
 CONSTITUTION_PATH = constitution_path()
 
 # ---------------------------------------------------------------------------
-# Constitution cache (Work Stream A4).
+# Constitution cache.
 #
 # The constitution file is static system-instruction material: it is read
 # ONCE and served from memory. An mtime check keeps the cache honest - an
@@ -206,7 +206,7 @@ def build_user_content(message: str, context: AgentContext) -> str:
         p = context.accounting_period
         parts.append(f"Current period: {p.get('name', 'N/A')} ({p.get('start_date', '')} to {p.get('end_date', '')})")
 
-    # Work Stream F: learned organization defaults - authoritative unless
+    # learned organization defaults - authoritative unless
     # the user explicitly overrides them in the current request.
     if context.org_preferences:
         parts.append("")
@@ -307,7 +307,7 @@ def build_user_content(message: str, context: AgentContext) -> str:
             "If it is only 'usually created', do NOT create it."
         )
 
-    # Work Stream S3 — LIVE BOOKS EVIDENCE retrieved by the LLM reasoning
+    # LIVE BOOKS EVIDENCE retrieved by the LLM reasoning
     # layer.  Labelled as evidence (not as truth): the model must reassess the
     # request against it and may reclassify.
     if getattr(context, "live_evidence", None):
@@ -330,7 +330,7 @@ def build_user_content(message: str, context: AgentContext) -> str:
             rendered = str(item.get("records"))[:1200]
             parts.append(f"  - {kind} ({len(item.get('records') or [])} row(s)): {rendered}")
 
-    # Work Stream S3 — the model's own prior accounting reasoning for this
+    # the model's own prior accounting reasoning for this
     # request (interpretation + proposed treatment), so the planning stage
     # reassesses instead of silently replacing it with a keyword route.
     reasoning = getattr(context, "accounting_reasoning", None)
@@ -366,7 +366,7 @@ def build_user_content(message: str, context: AgentContext) -> str:
         if reasoning.get("evidence_summary"):
             parts.append(f"  - evidence inspected: {reasoning['evidence_summary']}")
 
-    # Work Stream S3 — the deterministic extraction, labelled as PRELIMINARY so
+    # the deterministic extraction, labelled as PRELIMINARY so
     # it can never be mistaken for a decided accounting treatment.
     preliminary = getattr(context, "preliminary_extraction", None)
     if preliminary:

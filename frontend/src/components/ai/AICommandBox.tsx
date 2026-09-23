@@ -272,7 +272,7 @@ export default function AICommandBox() {
         </div>
       )}
 
-      {/* Work Stream C: queued but not picked up by any worker - offer the
+      {/* queued but not picked up by any worker - offer the
           one-click foreground fallback instead of an endless wait. */}
       {stalledJobId && !loading && (
         <div className="p-3 rounded-xl bg-warning-50 border border-warning-100 text-sm text-text-secondary flex items-center justify-between gap-3">

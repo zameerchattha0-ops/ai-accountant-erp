@@ -1,5 +1,5 @@
 """
-AI-native semantic understanding layer (Work Stream S2).
+AI-native semantic understanding layer.
 
 This is the PRIMARY interpretation stage of the ERP. The user's request — in
 whatever natural wording — is understood here as structured business meaning,
@@ -473,7 +473,7 @@ def normalize_to_erp(facts: dict) -> dict:
 
 
 # ===========================================================================
-# PRIMARY API (Work Stream S2) — the semantic understanding layer proper
+# PRIMARY API — the semantic understanding layer proper
 # ===========================================================================
 #
 # Everything above (``ground_facts`` / ``normalize_to_erp``) is the S1-era

@@ -61,8 +61,8 @@ _EXPENSE_RULES = [
     ("bank charge|bank fee|service charge", "Bank charges"),
     # "advertising" is deliberately covered: a named advertising/marketing
     # classification must NEVER silently fall through to the first/default
-    # expense account (live defect: "Facebook advertising campaign" was
-    # debited to 6140 Utilities Expense).
+    # expense account (an "advertising campaign" must never be debited to
+    # an unrelated account such as Utilities).
     ("marketing|advertis|advertisment|ad spend|ad campaign",
      "Marketing & advertising expense"),
 ]
@@ -127,7 +127,7 @@ def _account_matches_expense_label(
 
     "Marketing & advertising expense" matches an account named
     "Advertising & Marketing" (first significant words overlap) but NOT
-    "Utilities Expense" — the silent-default defect this prevents.
+    "Utilities Expense" — the silent mis-classification this prevents.
     """
     if not account or not label:
         return False
@@ -402,9 +402,9 @@ async def _search_account_by_nature(
 
     # Fallback for expense-type natures: ONLY a genuinely GENERIC expense
     # account (name contains general/other/miscellaneous/sundry/operating).
-    # NEVER "whichever EXPENSE account sorts first" — live defect: a chair
-    # purchase was debited to 6010 Salaries because it happened to sort
-    # first.  When no generic account exists the caller must clarify or
+    # NEVER "whichever EXPENSE account sorts first" — an unrelated purchase
+    # must never land in e.g. 6010 Salaries just because it sorts first.
+    # When no generic account exists the caller must clarify or
     # create one — a silent wrong-category default is worse than a question.
     if nature in (OPERATING_EXPENSE, SERVICE, CONSUMABLE):
         accounts = await a_repo.get_chart_of_accounts(
@@ -429,12 +429,27 @@ async def classify_transaction(
     intent: str,
     entities: Dict[str, Any],
     message: Optional[str] = None,
+    # P1-⑧ (forensic latency report ⑧): account-hint / config-gap resolution
+    # is the classifier's DB-heavy part (up to ~6 round-trips). Its consumers
+    # — the deterministic fast path, the Phase-4 account-hint prompt and the
+    # config-gap question — do NOT run when a validated reasoning proposal or
+    # an approved plan owns the plan. NATURE-AFFECTING lookups (products
+    # mapping, 4b COA item mapping) always run: build_event_profile consumes
+    # transaction_nature for the executor's prohibited-tools guard.
+    resolve_account_hints: bool = True,
 ) -> TransactionClassification:
     """Classify the transaction using the authority hierarchy (see module doc).
 
     Purely deterministic — no LLM involvement.  Returns a structured
     ``TransactionClassification``; ``requires_clarification=True`` means the
     ambiguity is MATERIAL and the agent must ask instead of guessing.
+
+    With ``resolve_account_hints=False`` (P1-⑧, proposal/approved paths)
+    every ACCOUNT-HINT lookup and its configuration-gap branches are
+    skipped; the NATURE decision itself is unchanged (explicit answer,
+    asset-lifecycle rule, products mapping, deterministic rules and 4b COA
+    item mapping all still run) — so ``build_event_profile`` keeps the
+    nature it needs for the executor's prohibited-set guard.
 
     Payment/transfer intents (record_expense_payment, record_payment,
     record_receipt, record_bank_transfer) are never held for classification:
@@ -472,7 +487,11 @@ async def classify_transaction(
         "record_asset_depreciation",
     )
     if intent in _ASSET_LIFECYCLE_INTENTS:
-        account = await _search_account_by_nature(organization_id, FIXED_ASSET, item)
+        account = (
+            await _search_account_by_nature(organization_id, FIXED_ASSET, item)
+            if resolve_account_hints
+            else None
+        )
         return TransactionClassification(
             transaction_nature=FIXED_ASSET,
             confidence="HIGH",
@@ -501,8 +520,16 @@ async def classify_transaction(
         nature = str(explicit).upper()
         if nature not in NATURES:
             nature = FIXED_ASSET if "ASSET" in nature else OPERATING_EXPENSE
-        account = await _search_account_by_nature(organization_id, nature, item)
-        if not account and nature in (FIXED_ASSET, INTANGIBLE_ASSET):
+        account = (
+            await _search_account_by_nature(organization_id, nature, item)
+            if resolve_account_hints
+            else None
+        )
+        if (
+            resolve_account_hints
+            and not account
+            and nature in (FIXED_ASSET, INTANGIBLE_ASSET)
+        ):
             # NO arbitrary asset-account fallback: picking "the first
             # non-cash ASSET account" could route a laptop to Warehouse or
             # any unrelated asset.  A missing fixed-asset account is a
@@ -614,14 +641,19 @@ async def classify_transaction(
             _matched_expense_label(classification_text)
             if nature == OPERATING_EXPENSE else None
         )
-        account = await _search_account_by_nature(organization_id, nature, item)
+        account = (
+            await _search_account_by_nature(organization_id, nature, item)
+            if resolve_account_hints
+            else None
+        )
         # CONFIGURATION GAP (P4): a SPECIFIC expense category was identified
         # (e.g. Marketing & advertising, Rent) but the chart of accounts has
         # no account matching that category.  The first/default expense
         # account (e.g. Utilities) must NEVER silently capture it — surface
         # the gap and let the account be created or explicitly selected.
         if (
-            nature == OPERATING_EXPENSE
+            resolve_account_hints
+            and nature == OPERATING_EXPENSE
             and rule_label
             and not _account_matches_expense_label(account, rule_label)
         ):
@@ -669,11 +701,11 @@ async def classify_transaction(
                     )
                 ),
             )
-        if account is None:
+        if resolve_account_hints and account is None:
             # Nature decided but NO account hint (no category match and no
             # generic default).  OFFER relevant existing accounts + the
             # option to create a dedicated one — never post to a guessed
-            # account (live defect: 'bonus' would have landed in Salaries).
+            # account (e.g. a 'bonus' must not land in Salaries).
             candidates = await _candidate_expense_accounts(organization_id)
             suggestion = ", ".join(f"'{c}'" for c in candidates[:4])
             return TransactionClassification(

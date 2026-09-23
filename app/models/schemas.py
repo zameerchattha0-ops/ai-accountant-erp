@@ -186,7 +186,7 @@ class AccountingImpactLine(BaseModel):
 
 
 class QuestionOption(BaseModel):
-    """Work Stream R3.4 — one tap-to-answer option for a clarification
+    """one tap-to-answer option for a clarification
     question.  ``label`` is displayed; ``value`` is what gets sent back."""
 
     value: str
@@ -209,7 +209,7 @@ class AgentResponse(BaseModel):
     # Quick-answer buttons for clarification rounds (e.g. suggested existing
     # accounts + "Create new account" when no matching account exists).
     options: Optional[List[str]] = None
-    # Work Stream R3.4 — structured per-question options (data-driven
+    # structured per-question options (data-driven
     # tap-to-answer chips).  Each inner list is aligned with the
     # corresponding numbered sub-question; an inner ``None`` (or empty
     # list) means "free-text question — no chips".
@@ -320,7 +320,7 @@ class AgentContext(BaseModel):
     extracted_entities: Dict[str, Any] = Field(default_factory=dict)
     # Prior clarification Q&A (already answered — never re-ask)
     clarification_history: List[Dict[str, str]] = Field(default_factory=list)
-    # Work Stream F: learned organization-level defaults.  Rendered into the
+    # learned organization-level defaults.  Rendered into the
     # model prompt as authoritative defaults the user set previously; the
     # planner already treats them as answered-for entities.
     org_preferences: Dict[str, str] = Field(default_factory=dict)
@@ -335,7 +335,7 @@ class AgentContext(BaseModel):
     economic_event: Optional[str] = None
     impact_map: Dict[str, Any] = Field(default_factory=dict)
     prohibited_actions: List[Dict[str, str]] = Field(default_factory=list)
-    # Work Stream S3 — LLM-PRIMARY ACCOUNTING REASONING.
+    # LLM-PRIMARY ACCOUNTING REASONING.
     # ``preliminary_extraction`` is the deterministic LITERAL-only extraction,
     # explicitly labelled as provisional in the prompt.  ``live_evidence``
     # carries the LIVE BOOKS EVIDENCE blocks the reasoning layer retrieved
@@ -383,7 +383,7 @@ class ExecutionPlan(BaseModel):
     economic_event: Optional[str] = None
     impact_map: Dict[str, bool] = Field(default_factory=dict)
     prohibited_actions: List[Dict[str, str]] = Field(default_factory=list)
-    # Work Stream B - BATCH TRANSACTIONS: when the request enumerates
+    # when the request enumerates
     # multiple transactions ("record these 3 expenses: 1) ... 2) ..."),
     # the planner produces one sub-intent per document and merges them
     # into THIS plan. Each entry: {position, segment, intent,
@@ -392,7 +392,7 @@ class ExecutionPlan(BaseModel):
     # sub-document is independent: one failing document never rolls back
     # its successful siblings.
     batch_items: Optional[List[Dict[str, Any]]] = None
-    # Work Stream R - the RESOLVED transaction nature + WHY it was chosen
+    # the RESOLVED transaction nature + WHY it was chosen
     # (audit trail / explainability): USER_ANSWER (explicit clarification
     # answer), PREFERENCE (learned org default) or DETERMINISTIC_RULE
     # (intent-inherent, e.g. asset lifecycle).  Never an LLM guess.

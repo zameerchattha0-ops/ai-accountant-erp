@@ -20,7 +20,7 @@ import re
 import uuid
 from collections import deque
 from datetime import date
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import structlog
 import time
@@ -30,6 +30,7 @@ from app.context_manager import build_context
 from app.books_evidence import render_evidence_compact
 from app.idempotency import FINANCIAL_WRITE_TOOLS
 from app.database import (
+    REQUEST_TIMINGS,
     create_clarification,
     create_confirmation,
     create_execution_result,
@@ -51,7 +52,7 @@ from app.reasoning import options_for_question, purpose_label, purpose_option, s
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R2 - DETERMINISTIC MUTATION FAST PATH (instant mode)
+# DETERMINISTIC MUTATION FAST PATH (instant mode)
 # ---------------------------------------------------------------------------
 # Provider evidence (live): ONE Qwen tool-planning round-trip costs 30-85s.
 # When the planner + classifier have already resolved EVERYTHING (intent,
@@ -61,7 +62,7 @@ from app.reasoning import options_for_question, purpose_label, purpose_option, s
 # confirmation gate (Phase 5), the tool router/validator and the date
 # protocol are unchanged - this only removes the model round-trip.
 
-# Work Stream R3.5/R4.5: the DETERMINISTIC fast path family — when the
+# the DETERMINISTIC fast path family — when the
 # reasoning ladder has fully resolved a transaction (nature/purpose,
 # settlement channel, party, amount, date), the tool call is built here
 # and the LLM is bypassed entirely.  Ambiguous or unconfirmed plans are
@@ -79,16 +80,45 @@ _FAST_PATH_INTENTS = {
 
 
 # R4.8: sale-side intents whose deterministic fast path gates on a CUSTOMER
-# ledger (everything else keeps the original supplier gate).
+# ledger.  R4.12 extends it to the money-IN settlement intents: a receipt /
+# cash sale settles a CUSTOMER's obligation, so its party gate must search
+# the CUSTOMER registry (every other intent keeps the supplier gate).
+# Production (session 3ea794a0): "I received 60000 from FDS Labs Pvt" hit
+# the supplier gate while FDS Labs was a customer with open Invoice 5.
 _CUSTOMER_PARTY_INTENTS = {
     "create_invoice",
     "record_credit_sale",
     "create_quotation",
+    "record_receipt",
+    "record_cash_sale",
+}
+
+
+# R4.11: the party gate ONLY fires inside a transaction-recording intent.
+# The keyword fallback's "unknown" and read-only report intents must never
+# ask party questions — there is no recording workflow behind them to
+# resolve a ledger for.  This is exactly how the degraded run of
+# "I received 60000 from FDS Labs Pvt" (intent=unknown after the LLM
+# proposal was contract-rejected) produced "create a new supplier ledger?"
+# instead of falling through to the model path that had already read the
+# party's receivables.
+_PARTY_GATE_INTENTS = _FAST_PATH_INTENTS | {
+    "create_quotation",
+    "convert_quotation",
+    "create_credit_note",
+    "create_purchase_return",
+    "record_expense_payment",
+    "record_cash_purchase",
+    "record_purchase",
+    "record_sale",
+    "register_fixed_asset",
+    "dispose_fixed_asset",
+    "record_asset_depreciation",
 }
 
 
 # ---------------------------------------------------------------------------
-# SERVERLESS PROVIDER BUDGET (live defect: FUNCTION_INVOCATION_TIMEOUT)
+# SERVERLESS PROVIDER BUDGET (host FUNCTION_INVOCATION_TIMEOUT limit)
 # ---------------------------------------------------------------------------
 # A provider round-trip retries internally (Qwen: 3 attempts, each bounded by
 # qwen_timeout_seconds) and then falls back to the next model / Gemini.  With
@@ -131,7 +161,7 @@ async def _party_resolution_question(
     organization_id: uuid.UUID,
     execution_plan,
 ) -> Optional[Dict[str, Any]]:
-    """Party resolution for the deterministic fast path (Work Stream R2).
+    """Party resolution for the deterministic fast path.
 
     * EXACT party match            -> None (proceed to the tool call).
     * SIMILAR matches (no exact)   -> a "Party check" question listing the
@@ -148,6 +178,11 @@ async def _party_resolution_question(
     exist yet, instead of falling to a 70-80s LLM planning round.
     """
     entities = execution_plan.extracted_entities or {}
+    if execution_plan.intent not in _PARTY_GATE_INTENTS:
+        # No recording workflow (unknown/report intent): a party question
+        # would be asked with nothing to record behind it — return None so
+        # the model path interprets the request instead.
+        return None
     kind = (
         "customer"
         if execution_plan.intent in _CUSTOMER_PARTY_INTENTS
@@ -597,7 +632,7 @@ def _invoice_fast_path_call(
     customer_name = (entities.get("customer_name") or "").strip()
     if not customer_name:
         return None  # the party gate question handles this
-    # Work Stream R4.10 — MULTI-LINE items: when DISTINCT lines were
+    # when DISTINCT lines were
     # parsed (or multi-item answer given) each becomes its own invoice
     # line.  The stated amount MUST equal Σ(qty × price) — any mismatch
     # is never guessed away; the plan falls back to clarification/model.
@@ -625,7 +660,7 @@ def _invoice_fast_path_call(
         if abs(derived - float(amount)) > 0.01:
             return None  # stated total ≠ Σ lines — never reconcile by guess
         return {"invoice_date": str(txn_date), "items": items}
-    # Work Stream R4.9 — the ladder now ASKS for the line description and
+    # the ladder now ASKS for the line description and
     # quantity (parity with the manual form's mandatory line item).  The
     # header total is divided across the units so the derived unit price
     # reconciles with the amount the user actually stated.
@@ -878,7 +913,7 @@ async def _deterministic_mutation_calls(
         # Configuration/nature gap - asking is the safe behaviour.
         return None
 
-    # Party resolution (Work Stream R2): EXACT match -> reuse.  Otherwise
+    # Party resolution: EXACT match -> reuse.  Otherwise
     # a new party is created ONLY when the user explicitly confirmed it
     # (supplier_create_confirmed from the "Party check" round) - never
     # silently invented.  Anything unresolved goes back to the question.
@@ -1061,10 +1096,9 @@ def _tool_audit_error_text(tr: Optional[ToolResult]) -> Optional[str]:
     are persisted, so the next failure of this kind is root-causable straight
     from the database instead of from server logs.
 
-    The production incident of 2026-09-20 (session 6a48a432, create_invoice)
-    wrote a FAILED row with a NULL reason, so the true cause had to be
-    reconstructed by hand from the plan snapshot.  A FAILED call is now never
-    written without a reason.
+    A FAILED row must never hold a NULL reason — otherwise the cause has to
+    be reconstructed by hand from the plan snapshot.  A FAILED call is
+    therefore never written without a reason.
     """
     if tr is None or tr.success:
         return None
@@ -1101,10 +1135,10 @@ async def _close_superseded_sessions(
     """Close non-terminal sessions for this user+org that a NEW request has
     superseded.
 
-    LIVE DEFECT: when a run parked on a clarification question and the user
+    Guard: when a run parks on a clarification question and the user
     simply re-sent the request instead of answering, the parked session was
     left WAITING_FOR_USER for ever (`completed_at` NULL).  Multiple such
-    orphans accumulated (three sessions for one sale request) and then
+    orphans can accumulate, and then
     /api/ai/sessions/latest-active — which walks newest-first and SKIPS
     terminal rows — returned an OLD parked session, so the dashboard showed
 
@@ -1483,7 +1517,7 @@ def _confirmation_summary(plan) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Work Stream B - deterministic report fast-path.  Standard reports and
+# deterministic report fast-path.  Standard reports and
 # simple lookups skip the LLM entirely: the planner's intent is enough to
 # call the read-only reporting tools directly and format the rows with
 # deterministic code.  Step data records BYPASS_LLM so the audit trail
@@ -1503,7 +1537,7 @@ _PARTY_LEDGER_FAST = {
     "customer_balance": ("search_customer", "get_customer_ledger", "customer_name", "customer_id"),
     "supplier_balance": ("search_supplier", "get_supplier_ledger", "supplier_name", "supplier_id"),
 }
-# Tiered routing (Work Stream B): these intents are simple lookups.  When
+# Tiered routing: these intents are simple lookups.  When
 # they reach the model at all (fast-path did not apply), they get a light
 # output budget instead of the full mutation-sized one.
 _LIGHT_BUDGET_INTENTS = set(_REPORT_FAST_TOOLS) | set(_PARTY_LEDGER_FAST)
@@ -1574,7 +1608,7 @@ def _party_exact_matches(data: Any, name: str) -> List[Dict[str, Any]]:
 
 
 async def _load_org_preferences(organization_id: uuid.UUID) -> Dict[str, str]:
-    """Load learned org preferences (Work Stream F); best-effort, {} on failure."""
+    """Load learned org preferences; best-effort, {} on failure."""
     try:
         from app.services import preference_service
 
@@ -1584,11 +1618,60 @@ async def _load_org_preferences(organization_id: uuid.UUID) -> Dict[str, str]:
         return {}
 
 
+async def _preamble_side_effects(
+    *,
+    session_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    prior_qa: List[Dict[str, str]],
+) -> Dict[str, str]:
+    """P0-④ (forensic report ④): preamble side-effects as ONE gather.
+
+    (1) SUPERSEDE — a new request closes this user's earlier non-terminal
+        runs; without it the abandoned row stays WAITING_FOR_USER for ever
+        and reattach reports a live "waiting for your answer" banner right
+        after a COMPLETED run. Best-effort: never blocks the run.
+    (2) HISTORY SEED — carry this conversation's answered Q&A into the new
+        session (BULK — one round-trip, P0-④) so nothing is re-asked.
+    (3) PREFERENCE CAPTURE — remember the last preference-shaped answer
+        (best-effort, never blocks the run).
+    (4) ORG DEFAULTS — learned preferences for reasoning/planner/context.
+
+    All four are independent once session_id exists: 4 sequential RTs → 1
+    (measured preamble ~4.2s; report target ~1.5s). Ordering that depends
+    on session_id is preserved (the session row is created before this is
+    awaited); AWAITING_*/FAILED durable writes happen LATER and stay
+    awaited inline in _log_step. Returns (4)'s dict for every consumer.
+    """
+    coros: List[Any] = [
+        _close_superseded_sessions(
+            organization_id, user_id, keep_session_id=session_id
+        ),
+        seed_clarification_history(session_id, prior_qa),
+        _load_org_preferences(organization_id),
+    ]
+    if prior_qa:
+        last_qa = prior_qa[-1] or {}
+        from app.services import preference_service
+
+        coros.append(
+            preference_service.record_answer_preference(
+                organization_id,
+                last_qa.get("question") or "",
+                last_qa.get("answer") or "",
+            )
+        )
+    results = await asyncio.gather(*coros)
+    # Positional: org-preferences is always the third coroutine.
+    org_prefs = results[2]
+    return org_prefs if isinstance(org_prefs, dict) else {}
+
+
 def _preference_memory_hint(
     org_prefs: Dict[str, str],
     questions: List[str],
 ) -> str:
-    """Clarification-memory hint (Work Stream F).
+    """Clarification-memory hint.
 
     When a pending question is preference-shaped AND the org already has a
     learned value, offer it inside the question text ("previously: cash -
@@ -1756,6 +1839,269 @@ async def _try_report_fast_path(
     )
 
 
+def _reasoning_produced_interpretation(reasoning: Any) -> bool:
+    """P1-⑥ (forensic latency report ⑥): has THIS request's reasoning stage
+    already produced a usable interpretation of the user's sentence?
+
+    True only when the loop RAN (a real outcome exists), did not fail at
+    the provider, and returned a non-empty ``understanding`` dict — i.e.
+    re-asking the semantic layer for a fresh interpretation would be the
+    report's "full interpretation 2x" waste (measured 1-8s on degraded
+    turns).
+    """
+    return bool(
+        reasoning is not None
+        and not getattr(reasoning, "provider_failed", False)
+        and getattr(reasoning, "understanding", None)
+    )
+
+
+def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
+    """P1-⑥: planner prefill derived from the reasoning outcome + the SAME
+    deterministic literals both stages saw (preliminary extraction).
+
+    Only literal, traceable values are passed — never facts invented from
+    prose. ``semantic_intent`` is deliberately absent: its sole consumers
+    are the AI_PERCEPTION log and planner.py's whitelist (which then falls
+    back to its regex intent exactly as the existing reasoning-skip paths
+    do today — traced before switching, per the report).
+    """
+    literals = (preliminary or {}).get("literals") or {}
+    prefill: Dict[str, Any] = {}
+    for key in ("amount", "transaction_date", "item_description"):
+        value = literals.get(key)
+        if value is not None and value != "":
+            prefill[key] = value
+    return prefill
+
+
+async def _resolve_gate_questions(
+    *,
+    organization_id: uuid.UUID,
+    execution_plan: ExecutionPlan,
+) -> tuple:
+    """P1-⑨ (forensic latency report §5): the four clarification gates
+    (party / settlement / catalog / revenue-ledger) are pure read-only
+    lookups — run them CONCURRENTLY, then ask in the original deterministic
+    order (party → settlement → catalog → revenue) so observable behaviour
+    is unchanged while ~3 sequential RTs collapse to ~1 (−0.1-0.3s).
+    """
+    return tuple(
+        await asyncio.gather(
+            _party_resolution_question(
+                organization_id=organization_id, execution_plan=execution_plan
+            ),
+            _settlement_check_question(
+                organization_id=organization_id, execution_plan=execution_plan
+            ),
+            _catalog_check_question(
+                organization_id=organization_id, execution_plan=execution_plan
+            ),
+            _revenue_ledger_review_gate(
+                organization_id=organization_id, execution_plan=execution_plan
+            ),
+        )
+    )
+
+
+def _record_phase_timing(
+    store: Dict[str, Any], t0: float, marker: str, extra: Dict[str, Any]
+) -> None:
+    """P2-⑪: mirror one phase marker into the request timings dict.
+
+    Values are SQL-friendly scalars (bounded strings) so
+    ``result_payload.timings`` stays a flat JSON object per request —
+    p50/p95 per stage = percentile over these after every change ships.
+    """
+    snapshot: Dict[str, Any] = {"elapsed_ms": int((time.monotonic() - t0) * 1000)}
+    for key, value in (extra or {}).items():
+        snapshot[key] = (
+            value
+            if isinstance(value, (int, float, bool, type(None)))
+            else str(value)[:120]
+        )
+    store[marker] = snapshot
+
+
+# P2-⑫: whitelists for the reasoning prompt's ORGANIZATION PROFILE /
+# ACCOUNTING PERIOD blocks (full rows still flow to build_context — only
+# the prompt projection is slimmed).
+_ORG_PROFILE_FIELDS = (
+    "name", "legal_name", "currency", "base_currency", "country",
+    "tax_number", "email", "phone", "address",
+)
+_FY_FIELDS = ("label", "name", "code", "start_date", "end_date", "is_current")
+_PERIOD_FIELDS = ("label", "name", "start_date", "end_date", "status", "is_open")
+
+
+def _slim_row(
+    row: Optional[Dict[str, Any]], fields: Sequence[str]
+) -> Dict[str, Any]:
+    """Whitelist projection for prompt rendering (never raw timestamps)."""
+    if not row:
+        return {}
+    return {k: row[k] for k in fields if row.get(k) is not None}
+
+
+def _flatten_period(
+    fy: Optional[Dict[str, Any]], period: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Flat, prompt-friendly {fy_*, period_*} dict (empty when unknown)."""
+    out: Dict[str, Any] = {}
+    for key, value in (fy or {}).items():
+        out[f"fy_{key}"] = value
+    for key, value in (period or {}).items():
+        out[f"period_{key}"] = value
+    return out
+
+
+async def _load_org_facts(
+    organization_id: uuid.UUID,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """P2-⑫: organization + financial year + open accounting period.
+
+    The reasoning prompt rendered ORGANIZATION PROFILE / ACCOUNTING PERIOD
+    as "(none provided)" — risking a wasted evidence round on org/period
+    kinds the pipeline could have supplied. Started as a BACKGROUND task at
+    execute() entry so it runs concurrently with the preamble (zero added
+    serial round-trips); build_context receives the same rows (moved, not
+    added — total query count unchanged). Any failure degrades to
+    ``(None, None, None)`` and every consumer falls back to fetching (or
+    rendering empty) exactly as before.
+    """
+    from app.repositories import organization_repository
+
+    try:
+        org, fy, period = await asyncio.gather(
+            organization_repository.get_organization(
+                organization_id=organization_id
+            ),
+            organization_repository.get_current_financial_year(organization_id),
+            organization_repository.get_open_accounting_period(organization_id),
+        )
+        return org, fy, period
+    except Exception as exc:  # noqa: BLE001 — facts are best-effort
+        log.warning("agent.org_facts_load_failed", error=str(exc)[:200])
+        return None, None, None
+
+
+def _flush_cap_for(close_marker: Optional[str]) -> Optional[float]:
+    """P2-⑮ flush policy: ~250ms ONLY for PARKING responses.
+
+    Audit-loss review (report ⑮): the durable AWAITING_*/FAILED rows are
+    awaited inline in _log_step and can never be lost; a capped flush only
+    risks NON-durable progress rows beyond the cap on a hard serverless
+    freeze — observability, never correctness (and the P1-⑤ memo load
+    fails soft to a plain refetch). Terminal (COMPLETED/FAILED/REJECTED/
+    CANCELLED) and unknown markers keep the report's leave-as-is default:
+    the FULL drain.
+    """
+    if close_marker in ("AWAITING_CLARIFICATION", "AWAITING_CONFIRMATION"):
+        return 0.25
+    return None
+
+
+async def _attach_client_ttfb(
+    *,
+    session_id: uuid.UUID,
+    ttfb_ms: float,
+    transport: str,
+    organization_id: uuid.UUID,
+) -> bool:
+    """P2-⑪: persist the browser's TTFB as a CLIENT_TTFB step.
+
+    Cold start happens BEFORE the server's ``started_at`` — the browser is
+    the only place it is visible. Org-scoped (the session must belong to
+    the caller's organisation) and best-effort: returns False instead of
+    raising, so observability can never break a client. CLIENT_TTFB is
+    unknown to _STEP_TYPE_MAP — ``description`` keeps the marker for SQL
+    and the phase defaults to REASON.
+    """
+    try:
+        session = await fetch_one(
+            "ai_execution_sessions",
+            filters={
+                "id": str(session_id),
+                "organization_id": str(organization_id),
+            },
+        )
+        if not session:
+            return False
+        await create_execution_step(
+            session_id=session_id,
+            step_type="CLIENT_TTFB",
+            step_data={
+                "ttfb_ms": max(0, int(ttfb_ms)),
+                "transport": str(transport)[:16],
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — observability never fails
+        log.warning("agent.client_ttfb_failed", error=str(exc)[:200])
+        return False
+
+
+def _resolve_declared_aliases_from_evidence(
+    calls: List[Any],
+    evidence_results: List[Any],
+) -> List[Dict[str, Any]]:
+    """P1-⑤: replace DECLARED party name-aliases in the frozen plan with
+    canonical ids already present in THIS request's own evidence.
+
+    Zero extra queries — the reasoning layer's ``parties`` rows (role, id,
+    name) were fetched during this turn. Exact single match per declared
+    alias AND role only; otherwise the argument is untouched and the
+    approval turn's materialization resolves it exactly as before
+    (fail-toward-existing-behaviour). The substitution is recorded as a
+    durable step for audit.
+    """
+    from app.plan_materialization import DECLARED_REFERENCES
+
+    rows: List[Dict[str, Any]] = []
+    for res in evidence_results or ():
+        if (
+            getattr(res, "error", None) is None
+            and getattr(res, "kind", "") == "parties"
+        ):
+            rows.extend(r for r in (res.records or []) if isinstance(r, dict))
+    if not rows:
+        return []
+    replacements: List[Dict[str, Any]] = []
+    for call in calls or ():
+        tool = getattr(call, "tool_name", None)
+        args = getattr(call, "arguments", None)
+        if not tool or not isinstance(args, dict):
+            continue
+        for param, spec in (DECLARED_REFERENCES.get(tool) or {}).items():
+            if spec.role not in ("customer", "supplier") or args.get(param):
+                continue
+            alias = next((a for a in spec.aliases if args.get(a)), None)
+            if alias is None:
+                continue
+            name = str(args.get(alias) or "").strip()
+            matches = [
+                r
+                for r in rows
+                if str(r.get("name") or "").strip().lower() == name.lower()
+                and str(r.get("role") or "").strip().lower() == spec.role
+                and r.get("id")
+            ]
+            if len(matches) != 1:
+                continue  # 0 or ambiguous -> materialization handles it
+            args[param] = str(matches[0]["id"])
+            args.pop(alias, None)
+            replacements.append(
+                {
+                    "tool": tool,
+                    "parameter": param,
+                    "alias": alias,
+                    "requested": name,
+                    "resolved_id": str(matches[0]["id"]),
+                }
+            )
+    return replacements
+
+
 async def execute(
     *,
     user_message: str,
@@ -1767,6 +2113,7 @@ async def execute(
     confirmation_granted: bool = False,
     attachments: Optional[List[AttachmentRef]] = None,
     approved_tool_calls: Optional[List[ToolCall]] = None,
+    confirmed_intent: Optional[str] = None,
 ) -> AgentResponse:
     """Main entry point — process a user message through the full agent lifecycle.
 
@@ -1782,13 +2129,27 @@ async def execute(
     079).  When present the tool selection is NOT re-derived — neither the
     deterministic fast path nor the LLM planning call runs — so the executed
     plan is exactly what the user reviewed.
+
+    ``confirmed_intent`` is the confirmation's ``action_type`` — the intent
+    the ORIGINAL turn planned and the user approved.  It is re-applied over
+    the keyword planner on approved turns (the semantic prefill those turns
+    deliberately skip may be what gave the request its intent), so Phase 7/8
+    verification keys on the APPROVED economic event, never on a keyword
+    guess.
     """
 
     session_id: Optional[uuid.UUID] = None
     prior_qa: List[Dict[str, str]] = clarification_history or []
     _t0 = time.monotonic()
+    # P2-⑪ (forensic report ⑪): structlog phase timings are LOST on Vercel
+    # (runtime-logs 404, DEFECT3) — mirror every marker into a per-request
+    # dict carried on this task's context; create_execution_result persists
+    # it as result_payload.timings (spawned/zero critical-path cost).
+    _timings: Dict[str, Any] = {}
+    REQUEST_TIMINGS.set(_timings)
 
     def _phase_elapsed(marker: str, **extra) -> None:
+        _record_phase_timing(_timings, _t0, marker, extra)
         log.info(
             "agent.phase_timing",
             phase=marker,
@@ -1797,6 +2158,10 @@ async def execute(
         )
 
     try:
+        # P2-⑫: org/period facts load CONCURRENTLY with the whole preamble
+        # (normally finished before the reasoning loop starts — zero added
+        # serial round-trips; failure degrades to None below).
+        _org_facts_task = asyncio.create_task(_load_org_facts(organization_id))
         # ---- PHASE 1: RECEIVED -------------------------------------------
         session = await create_execution_session(
             organization_id=organization_id,
@@ -1805,36 +2170,28 @@ async def execute(
             conversation_id=conversation_id,
         )
         session_id = uuid.UUID(session["id"])
+        # P2-⑪: wall-clock start for this session → every step row gets
+        # elapsed_ms (stamped synchronously in _log_step, before any spawn).
+        if len(_STEP_START) > 512:
+            _STEP_START.clear()
+        _STEP_START[str(session_id)] = time.monotonic()
         await _log_step(session_id, "RECEIVED", {"message": user_message})
 
-        # A new request SUPERSEDES any earlier run of this user that is still
-        # non-terminal (e.g. parked on a question the user chose not to answer
-        # and simply re-sent instead).  Without this the abandoned row stays
-        # WAITING_FOR_USER for ever and reattach later reports it as a live
-        # pending question — the "still waiting for your answer" banner that
-        # appeared immediately after a run that had COMPLETED.  Best-effort:
-        # it can never block or fail this run.
-        await _close_superseded_sessions(
-            organization_id, user_id, keep_session_id=session_id
+        # P0-④ (forensic report ④): preamble side-effects as ONE gather —
+        # supersede abandoned runs + BULK-seed this conversation's Q&A +
+        # capture the last preference-shaped answer + load org defaults
+        # were 4 sequential round-trips before thinking (measured preamble
+        # ~4.2s; report target ~1.5s). Ordering only depends on session_id
+        # (created above); AWAITING_*/FAILED durable writes happen later
+        # and stay awaited inline in _log_step. Returns org_prefs for the
+        # reasoning/planner/build_context consumers — the old sequential
+        # load after document extraction is gone.
+        org_prefs = await _preamble_side_effects(
+            session_id=session_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            prior_qa=prior_qa,
         )
-
-        # Carry Q&A answered in earlier rounds of this conversation into the
-        # resumed session, so its clarification history stays complete and
-        # nothing already answered can ever be re-asked.
-        await seed_clarification_history(session_id, prior_qa)
-
-        # Work Stream F: capture preference-shaped answers so future runs
-        # start with the user's established defaults (best-effort, never
-        # blocks the run).
-        if prior_qa:
-            last_qa = prior_qa[-1] or {}
-            from app.services import preference_service
-
-            await preference_service.record_answer_preference(
-                organization_id,
-                last_qa.get("question") or "",
-                last_qa.get("answer") or "",
-            )
 
         # ---- PHASE 1b: DOCUMENT / VISION EXTRACTION ------------------------
         # Attachments are processed in-memory by the vision-capable Qwen
@@ -1882,10 +2239,10 @@ async def execute(
 
         # ---- PHASE 2: INTERPRETING / PLANNING ----------------------------
         await _update_status(session_id, ExecutionStatus.INTERPRETING)
-        # Work Stream F: learned org defaults feed the planner as
-        # answered-for entities (an explicit user value always wins).
-        org_prefs = await _load_org_preferences(organization_id)
-        # ---- PHASE 2a: AI-FIRST SEMANTIC UNDERSTANDING (Work Stream S2) ---
+        # learned org defaults feed the planner as answered-for entities
+        # (an explicit user value always wins). P0-④: loaded concurrently
+        # in the preamble gather above — no sequential wait here.
+        # ---- PHASE 2a: AI-FIRST SEMANTIC UNDERSTANDING ---
         # The user's request goes to the LLM FIRST. The semantic layer
         # (app/semantic_layer.py) understands the BUSINESS MEANING in any
         # natural wording, grounds every fact against the user's own words
@@ -1900,7 +2257,7 @@ async def execute(
         # balancing, idempotency, confirmation) are NOT AI. Batch
         # (enumerated) requests keep their per-item deterministic protocol.
         # ---- PHASE 2a0: PRELIMINARY EXTRACTION + LLM ACCOUNTING REASONING --
-        # Work Stream S3.  Python extracts ONLY the literal values from the
+        #   Python extracts ONLY the literal values from the
         # user's own words and labels them PRELIMINARY.  The LLM is then given
         # the request + that preliminary extraction + a closed catalog of
         # read-only evidence lookups, and it decides what to inspect, what to
@@ -1930,16 +2287,43 @@ async def execute(
         await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
         _reasoning = None
+        # P2-⑫: harvest the background org/period facts (started at entry;
+        # normally already finished during the preamble — no added serial
+        # round-trip; None rows fall back downstream exactly as before).
+        _org_row, _fy_row, _period_row = await _org_facts_task
         _reasoning_calls: Optional[List[ToolCall]] = None
         from app.planner import split_batch_request as _split_batch_now
 
-        if getattr(_settings, "accounting_reasoning_enabled", False) and not _split_batch_now(user_message):
+        # P0-① (forensic latency report): an APPROVED turn re-enters with a
+        # FROZEN plan — nothing downstream of the approved-reuse branch
+        # consults a fresh reasoning outcome, so running the loop here was
+        # 10-30s of pure discarded work per approval, and its NEEDS_INPUT /
+        # REFUSAL early-returns could park or REJECT a run the user had
+        # already confirmed.  Skipped entirely on approved turns.
+        if (
+            getattr(_settings, "accounting_reasoning_enabled", False)
+            and not _split_batch_now(user_message)
+            and approved_tool_calls is None
+        ):
             # The model may only propose names from the TRUSTED registry, so it
             # is given exactly that vocabulary — Python decides which tools
             # exist, the model decides which one the event needs.
             from app.tools import list_tools as _list_registered_tools
             from app.tools import tool_contracts as _tool_argument_contracts
 
+            # P1-⑤: seed the loop with this conversation's validated prior
+            # evidence (the DATABASE is the memo carrier — serverless-safe:
+            # any instance, any turn). Freshness/invalidation is enforced in
+            # _load_prior_evidence; zero cost when no fresh snapshot exists.
+            _prior_evidence = (
+                await _load_prior_evidence(
+                    conversation_id=conversation_id,
+                    organization_id=organization_id,
+                    current_session_id=session_id,
+                )
+                if conversation_id
+                else []
+            )
             _reasoning = await _run_reasoning_loop(
                 _ReasoningFacts(
                     user_request=user_message,
@@ -1947,6 +2331,12 @@ async def execute(
                     preliminary=_preliminary,
                     org_policies=dict(org_prefs or {}),
                     today=_preliminary.get("today", ""),
+                    # P2-⑫: real org/period instead of "(none provided)" —
+                    # those blocks risked a wasted evidence round on
+                    # org/period kinds (report §2). Rows were loaded in the
+                    # background at entry; slimmed for the prompt only.
+                    organization=_slim_row(_org_row, _ORG_PROFILE_FIELDS),
+                    accounting_period=_flatten_period(_fy_row, _period_row),
                 ),
                 organization_id=organization_id,
                 auth=auth,
@@ -1965,12 +2355,19 @@ async def execute(
                 step_logger=lambda event, payload: _spawn_step_write(
                     _log_step(session_id, event, payload)
                 ),
+                # P1-⑤: prior_evidence seeds the in-loop cache (P0-③ keying)
+                # so a re-requested kind is served with zero database reads.
+                prior_evidence=_prior_evidence,
+                # P1-⑩: speculative evidence prefetch ∥ round-1 model call
+                # (report §5) — flag-controlled, default from settings.
+                prefetch_enabled=bool(
+                    getattr(_settings, "accounting_reasoning_prefetch", True)
+                ),
             )
             # Defense in depth: run_reasoning_loop() contractually returns a
             # populated ReasoningOutcome on every reachable terminal path.
-            # If an internal defect ever violates that contract, fail
-            # CONTROLLED here — never crash on ``as_dict()`` (the production
-            # incident a59b889c), never continue to planning, a confirmation
+            # If the contract is ever violated, fail CONTROLLED here — never
+            # crash on ``as_dict()``, never continue to planning, a confirmation
             # snapshot or execution from a missing reasoning result, and
             # never let the generic handler mask a programming error.
             if _reasoning is None:
@@ -1994,7 +2391,17 @@ async def execute(
                         "in this conversation."
                     ),
                 )
-            await _log_step(session_id, "ACCOUNTING_REASONING", _reasoning.as_dict())
+            _reasoning_step = _reasoning.as_dict()
+            # P1-⑤: carry the full (bounded, cacheable) evidence rows on the
+            # durable step — this is the memo the NEXT turn of this
+            # conversation seeds from (freshness is checked at load; the
+            # step writer raises its cap ONLY for payloads with this key).
+            from app.accounting_reasoning import serialize_evidence_memo
+
+            _reasoning_step["evidence_full"] = serialize_evidence_memo(
+                _reasoning.evidence_results
+            )
+            await _log_step(session_id, "ACCOUNTING_REASONING", _reasoning_step)
             _phase_elapsed(
                 "accounting_reasoning.done",
                 status=_reasoning.status,
@@ -2101,16 +2508,37 @@ async def execute(
         from app.planner import split_batch_request as _split_batch
 
         _ai_prefill: Dict[str, Any] = {}
-        if (
+        # P1-⑥ (forensic latency report ⑥): the semantic layer and the
+        # reasoning stage BOTH interpret the same sentence. When reasoning
+        # already produced an understanding, a fresh semantic LLM call is
+        # the report's "full interpretation 2x" waste (1-8s on degraded
+        # turns). _would_interpret is byte-for-byte the pre-P1-⑥ condition —
+        # the change below only reroutes its TRUE branch; semantic stays for
+        # provider-down / reasoning-skipped / understanding-less paths.
+        _would_interpret = (
             not _split_batch(user_message)
             and _reasoning_calls is None
+            # P0-①: approved turns already carry a validated plan; a second
+            # LLM interpretation of the original sentence is pure waste.
+            and approved_tool_calls is None
             and not _provider_down
             and not (
                 _reasoning is not None
                 and _reasoning.usable
                 and _reasoning.status in (_R_NEEDS_INPUT, _R_COMPLETE, _R_REFUSAL)
             )
-        ):
+        )
+        if _would_interpret and _reasoning_produced_interpretation(_reasoning):
+            # P1-⑥: planner prefill derived from the reasoning outcome
+            # instead of a fresh semantic LLM call.
+            _ai_prefill = _prefill_from_reasoning(_reasoning, _preliminary)
+            await _log_step(session_id, "AI_PERCEPTION", {
+                "facts": sorted(_ai_prefill.keys()),
+                "intent": None,
+                "ambiguous": False,
+                "source": "accounting_reasoning_prefill",
+            })
+        elif _would_interpret:
             _semantic = await extract_semantic_facts(
                 user_message, orchestrator=get_client()
             )
@@ -2128,9 +2556,16 @@ async def execute(
             org_preferences=org_prefs,
             prefill_entities=_ai_prefill or None,
         )
+        if confirmed_intent:
+            # P0-①: the approval is keyed to the confirmation's action_type —
+            # the intent the user actually approved.  Re-apply it over the
+            # keyword planner (which runs WITHOUT the semantic prefill this
+            # path skips) so tool shortlisting, guards and Phase 7/8
+            # verification all operate on the APPROVED event.
+            execution_plan.intent = str(confirmed_intent)
         _phase_elapsed("planner.done", intent=execution_plan.intent)
 
-        # Work Stream E: deterministic semantic tool shortlist.  Seeds the
+        # deterministic semantic tool shortlist.  Seeds the
         # exclusion set so the model only SEES the tools relevant to this
         # economic event plus its entity-type lookups (<= 15 tools).
         # NEVER excludes a planner-listed tool; batch plans keep the full
@@ -2145,7 +2580,7 @@ async def execute(
                 execution_plan.potential_tools,
                 _list_all_tools(),
             )
-        # Work Stream R: the audit trail records WHY the treatment was
+        # the audit trail records WHY the treatment was
         # chosen - the resolved nature and its source (USER_ANSWER /
         # PREFERENCE / DETERMINISTIC_RULE).
         planning_details: Dict[str, Any] = {
@@ -2189,6 +2624,9 @@ async def execute(
             execution_plan.requires_clarification
             and len(prior_qa) < MAX_CLARIFICATION_ROUNDS
             and _reasoning_calls is None
+            # P0-①: an approved plan is frozen — a questionnaire gap can
+            # never park a turn whose plan the user already confirmed.
+            and approved_tool_calls is None
         ):
             from app.reasoning import plan_clarification_text
 
@@ -2199,7 +2637,7 @@ async def execute(
                 )
                 or "Please provide more details."
             )
-            # Work Stream F: offer the learned default inside the question
+            # offer the learned default inside the question
             # ("previously: cash - reply SAME to reuse").
             memory_hint = _preference_memory_hint(
                 org_prefs, execution_plan.clarification_questions
@@ -2242,7 +2680,7 @@ async def execute(
                 proceeding_with_partial_info=True,
             )
 
-        # ---- PHASE 2c: DETERMINISTIC REPORT FAST-PATH (Work Stream B) ----
+        # ---- PHASE 2c: DETERMINISTIC REPORT FAST-PATH ----
         # Plain reports/lookups with no open questions skip the LLM: the
         # planner's intent directly drives the read-only tools and the
         # rows are formatted deterministically.  Returns None for anything
@@ -2311,14 +2749,43 @@ async def execute(
                 f"{execution_plan.entity_type}_name", execution_plan.entity_name
             )
 
-        context = await build_context(
-            organization_id=organization_id,
-            user_id=user_id,
-            intent=execution_plan.intent,
-            entity_hints=entity_hints,
-            clarification_history=prior_qa,
-        )
-        # Work Stream S3 — the model's own reasoning products travel WITH the
+        if approved_tool_calls is not None:
+            # P0-①: the frozen approved plan has NO consumer for the domain
+            # context — Phase 4 (its only heavy reader) is skipped, and
+            # verification reads tool results, not context rows.  Build the
+            # STRUCTURE from the planner's entities + already-loaded org
+            # preferences: zero DB round-trips (kills the 12-query build AND
+            # the duplicate org-preferences fetch on this path).
+            context = AgentContext(
+                organization={},
+                user={"user_id": str(user_id)},
+                extracted_entities=entity_hints,
+                clarification_history=list(prior_qa),
+                org_preferences=dict(org_prefs or {}),
+            )
+        else:
+            context = await build_context(
+                organization_id=organization_id,
+                user_id=user_id,
+                intent=execution_plan.intent,
+                entity_hints=entity_hints,
+                clarification_history=prior_qa,
+                # P1-⑦ (forensic latency report ⑦): org preferences were
+                # already loaded this turn — pass them through (kills the
+                # duplicate query) — and skip the seven domain fetches when a
+                # validated reasoning proposal owns the plan (Phase 4, their
+                # only heavy consumer, does not run; traced: open_questions
+                # feeds logs only, gates look up their own rows, prompts.py
+                # renders relevant_* only for the Phase-4 prompt).
+                org_preferences=dict(org_prefs or {}),
+                domain_fetches=_reasoning_calls is None,
+                # P2-⑫: rows already loaded at entry (moved, not added —
+                # the same queries build_context used to run itself).
+                organization=_org_row,
+                financial_year=_fy_row,
+                accounting_period=_period_row,
+            )
+        # the model's own reasoning products travel WITH the
         # context so every later LLM call reassesses them instead of silently
         # replacing them with a keyword route.
         context.preliminary_extraction = dict(_preliminary or {})
@@ -2354,6 +2821,15 @@ async def execute(
             intent=execution_plan.intent,
             entities=context.extracted_entities,
             message=user_message,
+            # P1-⑧ (forensic latency report ⑧): skip ONLY the account-hint /
+            # config-gap DB work on proposal/approved paths (its consumers —
+            # fastpath, Phase-4 prompt, config-gap question — do not run
+            # there). Nature-affecting lookups still run: build_event_profile
+            # consumes transaction_nature for the executor's prohibited-set
+            # guard (traced; P0-① kept classification running for this).
+            resolve_account_hints=(
+                _reasoning_calls is None and approved_tool_calls is None
+            ),
         )
         execution_plan.classification = classification
         context.classification = classification
@@ -2414,6 +2890,12 @@ async def execute(
             classification.requires_clarification
             and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
             and _reasoning_calls is None
+            # P0-①: the classification still RUNS on approved turns (its
+            # nature refines the event profile that powers the executor's
+            # prohibited-tools guard) but its question must never park a
+            # confirmed plan — any configuration gap was resolved during the
+            # original turn.
+            and approved_tool_calls is None
         ):
             if classification.transaction_nature:
                 # Configuration gap: the nature is decided (user answer /
@@ -2503,28 +2985,48 @@ async def execute(
         # SKIPPED entirely (see _deterministic_mutation_calls).  Returns
         # None whenever anything is unresolved - the model path below then
         # handles it exactly as before.
-        # Work Stream R2: BEFORE the tool call, the named party is
+        # BEFORE the tool call, the named party is
         # RESOLVED like a chartered accountant would - exact match → use
         # it; similar matches → the user picks the real party; nothing
         # found → the user confirms the new party ledger.  Never silently
         # invented.
         _phase_elapsed("party_question.start")
-        party_question = None
-        if _reasoning_calls is None:
-            party_question = await _party_resolution_question(
+        # P1-⑨ (forensic latency report §5): all four gate LOOKUPS run once,
+        # concurrently, up front — then each ask-check below runs in the
+        # original deterministic order (party → settlement → catalog →
+        # revenue), so which question the user sees is unchanged.
+        party_question = settlement_question = catalog_question = review = None
+        if _reasoning_calls is None and approved_tool_calls is None:
+            (
+                party_question,
+                settlement_question,
+                catalog_question,
+                review,
+            ) = await _resolve_gate_questions(
                 organization_id=organization_id,
                 execution_plan=execution_plan,
             )
         else:
+            _gate_skip_reason = (
+                "approved plan reuse — plan frozen by confirmation"
+                if approved_tool_calls is not None
+                else "validated LLM accounting proposal is in force"
+            )
             # A validated LLM accounting proposal already inspected the books
             # and declared which records are — and are NOT — affected. Python
             # does not re-invent a party requirement on top of that; it still
             # enforces registry, permissions, constraints and the confirmation
             # gate at execution time.
-            await _log_step(session_id, "GATE_SKIPPED", {
-                "gate": "party_resolution",
-                "reason": "validated LLM accounting proposal is in force",
-            })
+            for _skipped_gate in (
+                "party_resolution",
+                "settlement_check",
+                "catalog_check",
+                "revenue_ledger_review",
+            ):
+                await _log_step(session_id, "GATE_SKIPPED", {
+                    "gate": _skipped_gate,
+                    "reason": _gate_skip_reason,
+                })
         if party_question:
             party_required = party_question.get("required_fields") or [
                 "supplier_name"
@@ -2553,17 +3055,7 @@ async def execute(
         # never a second expense).  No unpaid payable → the fallback
         # re-picks the treatment.
         _phase_elapsed("settlement_question.start")
-        settlement_question = None
-        if _reasoning_calls is None:
-            settlement_question = await _settlement_check_question(
-                organization_id=organization_id,
-                execution_plan=execution_plan,
-            )
-        else:
-            await _log_step(session_id, "GATE_SKIPPED", {
-                "gate": "settlement_check",
-                "reason": "validated LLM accounting proposal is in force",
-            })
+        # P1-⑨: lookup already resolved concurrently above.
         if settlement_question:
             settle_required = settlement_question.get("required_fields") or [
                 "settlement_check"
@@ -2588,22 +3080,12 @@ async def execute(
                 requires_user_input=True,
             )
         _phase_elapsed("settlement_question.done", asked=bool(settlement_question))
-        # Work Stream R4.10 — CATALOG CHECK: invoice lines naming items
+        # invoice lines naming items
         # that are not in the product/service catalog are resolved the
         # same way the party gate works — the user decides ONCE whether
         # the catalog grows; nothing is silently invented.
         _phase_elapsed("catalog_question.start")
-        catalog_question = None
-        if _reasoning_calls is None:
-            catalog_question = await _catalog_check_question(
-                organization_id=organization_id,
-                execution_plan=execution_plan,
-            )
-        else:
-            await _log_step(session_id, "GATE_SKIPPED", {
-                "gate": "catalog_check",
-                "reason": "validated LLM accounting proposal is in force",
-            })
+        # P1-⑨: lookup already resolved concurrently above.
         if catalog_question:
             clarification = await create_clarification(
                 session_id=session_id,
@@ -2630,17 +3112,8 @@ async def execute(
         # A sale must never be booked to an arbitrary revenue account.  When the
         # item sold names a stream with no dedicated ledger, ASK — and create the
         # ledger on approval — BEFORE any execution.  Never assumes.
-        if _reasoning_calls is not None:
-            review = None
-            await _log_step(session_id, "GATE_SKIPPED", {
-                "gate": "revenue_ledger_review",
-                "reason": "validated LLM accounting proposal is in force",
-            })
-        else:
-            review = await _revenue_ledger_review_gate(
-                organization_id=organization_id,
-                execution_plan=execution_plan,
-            )
+        # P1-⑨: lookup already resolved concurrently above (None on the
+        # proposal/approved path — the GATE_SKIPPED logs moved up front).
         if review is not None:
             # PERSIST the question — the answer round must find a pending
             # clarification row.  (Without this row the answer was silently
@@ -2734,7 +3207,7 @@ async def execute(
                     ),
                 )
             client = get_client()
-            # Work Stream B tiered routing: simple lookup intents that reached
+            # simple lookup intents that reached
             # the model (the deterministic fast-path did not apply - ambiguous
             # phrasing) get a lighter output budget.
             light_budget = execution_plan.intent in _LIGHT_BUDGET_INTENTS
@@ -2877,6 +3350,21 @@ async def execute(
             # records, impact, what will NOT change, uncertainty and the exact
             # confirmation sentence) — not a keyword-intent summary.
             _disclosure = _reasoning_disclosure(_reasoning)
+            # P1-⑤: carry THIS request's already-fetched evidence into the
+            # frozen plan — declared party name-aliases become canonical ids
+            # HERE, so the approval turn's materialization skips its party
+            # search (zero new queries; exact single match only; recorded).
+            _alias_fixes = _resolve_declared_aliases_from_evidence(
+                planned_tool_calls,
+                (_reasoning.evidence_results if _reasoning is not None else None)
+                or [],
+            )
+            if _alias_fixes:
+                await _log_step(
+                    session_id,
+                    "REFERENCE_RESOLVED_FROM_EVIDENCE",
+                    {"replacements": _alias_fixes},
+                )
             confirmation = await create_confirmation(
                 session_id=session_id,
                 action_type=execution_plan.intent,
@@ -3079,11 +3567,10 @@ async def execute(
                             "results": result.data,
                             "directive": directive,
                         }
-            # ROOT-CAUSE FIX (S4/S7/S2/S6 live failures): search tools return
-            # LISTS (supplier_service.search etc.) — the old dict-only branch
-            # DROPPED them, so the model received {"success": true} with no
-            # rows and kept re-searching / created records blindly. All
-            # result shapes are now fed back.
+            # Search tools return LISTS (supplier_service.search etc.) — a
+            # dict-only branch would DROPPED them, so the model would receive
+            # {"success": true} with no rows and keep re-searching or create
+            # records blindly. All result shapes are fed back.
             if result.data is not None:
                 if isinstance(result.data, dict):
                     return {"success": result.success, **result.data}
@@ -3100,14 +3587,13 @@ async def execute(
         # The model receives real parameters, executes tools, gets results
         # fed back, and can make follow-up calls until done.
         #
-        # CRASH FIX (live defect, session 3662feeb): this call used to run
-        # UNCONDITIONALLY, but `client` and `light_budget` are only bound on
-        # the LLM planning path (the `else` above).  On the deterministic
-        # fast path every confirmed mutation therefore died with
-        # ``UnboundLocalError: cannot access local variable 'client'``
-        # the moment it resumed after user approval.  The fast path now
-        # executes its pre-built tool calls DIRECTLY — no LLM round-trip,
-        # exactly what "bypass_llm" always promised.
+        # This call may only run on the LLM planning path: `client` and
+        # `light_budget` are bound there (the `else` above).  On the
+        # deterministic fast path they do not exist, so running it would
+        # raise ``UnboundLocalError: cannot access local variable 'client'``
+        # the moment a confirmed mutation resumed after user approval.  The
+        # fast path executes its pre-built tool calls DIRECTLY — no LLM
+        # round-trip, exactly what "bypass_llm" promises.
         if deterministic_calls is not None:
             # PROGRESS VISIBILITY: mirror the LLM path so the pipeline lights
             # the same EXECUTING stage on the fast path too.
@@ -3275,7 +3761,7 @@ async def execute(
         tool_calls: List[ToolCall] = final_result.get("tool_calls", [])
         tool_results: List[ToolResult] = final_result.get("tool_results", [])
 
-        # ---- Work Stream B: BATCH per-document result breakdown -----------
+        # ---- BATCH per-document result breakdown -----------
         # Every sub-document is an INDEPENDENT mutation: a failed one never
         # rolls back its successful siblings. The result card must state
         # EXACTLY which documents succeeded and which failed - honestly,
@@ -3291,11 +3777,10 @@ async def execute(
                 })
                 llm_text = (llm_text + "\n\n" + breakdown).strip()
 
-        # Log every tool call for the audit trail (fire-and-forget -
-        # Work Stream A3; drained by flush_step_logs before return).  A
-        # FAILED call also records WHY it failed (error_details) — the
-        # column existed but nothing ever wrote it, which is how the
-        # create_invoice incident lost its real cause.
+        # Log every tool call for the audit trail (fire-and-forget; drained
+        # by flush_step_logs before return).  A FAILED call also records WHY
+        # it failed (error_details) — without it the cause of a failure
+        # cannot be recovered from the database.
         for i, tc in enumerate(tool_calls):
             tr = tool_results[i] if i < len(tool_results) else None
             _spawn_step_write(
@@ -3630,11 +4115,11 @@ async def execute(
             resolve_account_name=_make_account_label_resolver(organization_id),
         )
 
-        # Work Stream A: surface the recorded transaction date so the result
+        # surface the recorded transaction date so the result
         # card can state "Dated: YYYY-MM-DD" honestly (including a defaulted
         # today-assumption flagged by the tool router).
         recorded_date, date_defaulted = _extract_recorded_date(tool_results)
-        # Work Stream R: surface the resolved nature (and its source) so
+        # surface the resolved nature (and its source) so
         # the result card can state "Nature: Fixed Asset - you confirmed"
         # honestly, next to the Dated badge.
         nature_data: Dict[str, Any] = (
@@ -3746,10 +4231,22 @@ async def execute(
             summary="An unexpected error occurred. Please try again.",
         )
     finally:
-        # Work Stream A3: all fire-and-forget audit writes are drained
+        # all fire-and-forget audit writes are drained
         # before the request returns - the user never waited on them,
         # but every one of them has landed by now.
-        await flush_step_logs()
+        # P2-⑪/⑮: compute this session's flush policy BEFORE releasing its
+        # bookkeeping, then drain the step queue (250ms cap only when the
+        # run PARKED; terminal keeps the full drain — audit-loss review in
+        # flush_step_logs / _flush_cap_for).
+        _flush_cap = (
+            _flush_cap_for(_CLOSE_MARKERS.get(str(session_id)))
+            if session_id is not None
+            else None
+        )
+        if session_id is not None:
+            _STEP_START.pop(str(session_id), None)
+            _CLOSE_MARKERS.pop(str(session_id), None)
+        await flush_step_logs(cap_seconds=_flush_cap)
 
 
 def _session_is_owned(session: Optional[Dict[str, Any]], organization_id: uuid.UUID,
@@ -3991,6 +4488,11 @@ async def resume_with_confirmation(
         # execution proceeds instead of re-raising a new confirmation.
         confirmation_granted=True,
         approved_tool_calls=approved_calls,
+        # P0-①: carry the APPROVED intent (the confirmation's action_type)
+        # so verification keys on what the user confirmed — the keyword
+        # planner on this turn runs without the semantic prefill and may not
+        # re-derive the original intent on its own.
+        confirmed_intent=str((pending_row or {}).get("action_type") or "") or None,
     )
 
 
@@ -4005,7 +4507,7 @@ async def _update_status(session_id: uuid.UUID, phase: ExecutionStatus) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fire-and-forget step logging (Work Stream A3).
+# Fire-and-forget step logging.
 #
 # Step/control-plane writes (RECEIVED, CLASSIFICATION, ... plus the
 # per-tool-call audit rows) must NEVER sit in the user's critical path:
@@ -4016,6 +4518,11 @@ async def _update_status(session_id: uuid.UUID, phase: ExecutionStatus) -> None:
 # ---------------------------------------------------------------------------
 _STEP_TASK_MAX_PENDING = 64
 _pending_step_tasks: "deque[asyncio.Task]" = deque()
+
+# P2-⑪/⑮: per-session bookkeeping — wall-clock start (elapsed_ms on every
+# step row) and the last parking/terminal marker (flush policy + SQL joins).
+_STEP_START: Dict[str, float] = {}
+_CLOSE_MARKERS: Dict[str, str] = {}
 
 
 def _spawn_step_write(coro) -> None:
@@ -4042,17 +4549,58 @@ async def _await_and_swallow(task: asyncio.Task) -> None:
         log.warning("agent.step_log_failed", error=str(exc))
 
 
-async def flush_step_logs() -> None:
+async def flush_step_logs(cap_seconds: Optional[float] = None) -> None:
     """Drain the background step-write queue before the response returns.
 
-    Called in execute()'s finally block: every scheduled audit write has
-    landed (or been individually swallowed with a warning) by the time the
-    caller regains control.
+    P2-⑮ (forensic report ⑮, AFTER the audit-loss review):
+
+    * ``cap_seconds=None`` — terminal states and anything unknown — keeps
+      the ORIGINAL full drain: every scheduled audit write lands;
+    * a cap (0.25s, parking responses) bounds user-visible wait. Writes
+      past the cap are DETACHED with a reaping callback (they still run in
+      the background; no 'Task exception was never retrieved'). The
+      durable AWAITING_*/FAILED rows are awaited inline in _log_step and
+      can never be lost — only non-durable progress rows beyond the cap
+      are at risk on a hard serverless freeze: observability, never
+      correctness (the P1-⑤ memo load fails soft to a plain refetch).
     """
+    deadline = None if cap_seconds is None else time.monotonic() + float(cap_seconds)
+
+    def _detach_and_log(remaining_tasks) -> None:
+        for pending in remaining_tasks:
+            pending.add_done_callback(_swallow_later)
+        log.warning(
+            "agent.step_flush_bounded",
+            cap_s=cap_seconds,
+            detached=len(remaining_tasks),
+        )
+
     while _pending_step_tasks:
         task = _pending_step_tasks.popleft()
         if task.done():
             # Surface (and swallow) any background exception now.
+            exc = task.exception() if not task.cancelled() else None
+            if exc is not None:
+                log.warning("agent.step_log_failed", error=str(exc))
+            continue
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _detach_and_log([task, *_pending_step_tasks])
+                _pending_step_tasks.clear()
+                return
+            try:
+                # asyncio.wait, NEVER wait_for: wait_for CANCELS the task
+                # on timeout — a detached write must keep RUNNING in the
+                # background, not be killed at the cap.
+                done_set, _ = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                task.add_done_callback(_swallow_later)
+                continue
+            if not done_set:
+                _detach_and_log([task, *_pending_step_tasks])
+                _pending_step_tasks.clear()
+                return
             exc = task.exception() if not task.cancelled() else None
             if exc is not None:
                 log.warning("agent.step_log_failed", error=str(exc))
@@ -4064,6 +4612,16 @@ async def flush_step_logs() -> None:
             continue
         except Exception as exc:  # noqa: BLE001 - audit write failure is logged
             log.warning("agent.step_log_failed", error=str(exc))
+
+
+def _swallow_later(task: asyncio.Task) -> None:
+    """Detach-callback for capped flushes (P2-⑮): reap late errors."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:  # noqa: BLE001 — reaping must never raise
+        pass
 
 
 # Step types that PARK a run or close it.  These are written DURABLY (awaited)
@@ -4089,6 +4647,20 @@ async def _log_step(session_id: uuid.UUID, step_type: str, data: Dict[str, Any])
     Steps that park or close the run are the exception — see
     _DURABLE_STEP_TYPES — and are awaited here.
     """
+    _sid = str(session_id)
+    # P2-⑮: remember the last parking/terminal marker for the flush policy.
+    if step_type in (
+        "AWAITING_CLARIFICATION", "AWAITING_CONFIRMATION",
+        "COMPLETED", "FAILED", "REJECTED", "CANCELLED",
+    ):
+        if len(_CLOSE_MARKERS) > 512:
+            _CLOSE_MARKERS.clear()
+        _CLOSE_MARKERS[_sid] = step_type
+    # P2-⑪: elapsed_ms since this session's start — stamped SYNCHRONOUSLY
+    # here, before any spawn, so the value can never go stale.
+    t0 = _STEP_START.get(_sid)
+    if t0 is not None:
+        data = {**data, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
     coro = create_execution_step(
         session_id=session_id,
         step_type=step_type,
@@ -4101,6 +4673,93 @@ async def _log_step(session_id: uuid.UUID, step_type: str, data: Dict[str, Any])
             log.warning("agent.step_log_failed", step=step_type, error=str(exc))
         return
     _spawn_step_write(coro)
+
+
+# P1-⑤: step markers that PROVE the books may have changed. A memo snapshot
+# is reused ONLY from the latest prior session of the conversation when it
+# PARKED at a clarification (parking happens BEFORE Phase 6 — no tool ever
+# ran) AND none of these markers appear. COMPLETED / FAILED are deliberately
+# included: a terminal run may have mutated (FAILED can leave partial
+# writes), so the memo fails TOWARD re-fetching — a miss is always safe,
+# only a wrong hit would be a correctness bug.
+_MUTATION_STEP_MARKERS = frozenset(
+    {
+        "DETERMINISTIC_EXECUTION",
+        "EXECUTING",
+        "EXECUTING_TOOLS",
+        "REASONING_PLAN_EXECUTION",
+        "APPROVED_PLAN_REUSED",
+        "TOOL_FAILURE",
+        "COMPLETED",
+        "FAILED",
+    }
+)
+
+
+async def _load_prior_evidence(
+    *,
+    conversation_id: str,
+    organization_id: uuid.UUID,
+    current_session_id: uuid.UUID,
+) -> List[Any]:
+    """P1-⑤: load the conversation's reusable evidence memo, or ``[]``.
+
+    The carrier is the DATABASE (serverless-safe: any instance, any turn —
+    an in-process cache would die between invocations). Freshness =
+    the latest PRIOR session of this conversation parked at a
+    clarification, carried no mutation marker, and holds a serialized
+    ``evidence_full`` payload. Anything unexpected -> ``[]`` (a plain
+    refetch: a miss is safe, only a wrong hit would be a correctness bug).
+    """
+    from app.accounting_reasoning import deserialize_evidence_memo
+
+    try:
+        sessions = await fetch_many(
+            "ai_execution_sessions",
+            filters={
+                "conversation_id": str(conversation_id),
+                "organization_id": str(organization_id),
+            },
+            select="id",
+            order="started_at.desc",
+            limit=5,
+        )
+        prior = next(
+            (
+                s
+                for s in sessions or []
+                if str(s.get("id")) != str(current_session_id)
+            ),
+            None,
+        )
+        if not prior:
+            return []
+        steps = await fetch_many(
+            "ai_execution_steps",
+            filters={"execution_session_id": str(prior["id"])},
+            select="description,input_summary",
+            order="created_at",
+            limit=300,
+        ) or []
+        descs = [str(s.get("description") or "") for s in steps]
+        if "AWAITING_CLARIFICATION" not in descs:
+            return []
+        if any(d in _MUTATION_STEP_MARKERS for d in descs):
+            return []
+        payload = next(
+            (
+                s.get("input_summary")
+                for s in reversed(steps)
+                if str(s.get("description") or "") == "ACCOUNTING_REASONING"
+            ),
+            None,
+        )
+        if not payload:
+            return []
+        return deserialize_evidence_memo(payload)
+    except Exception as exc:  # noqa: BLE001 — the memo is best-effort only
+        log.warning("agent.prior_evidence_load_failed", error=str(exc)[:200])
+        return []
 
 
 def _intent_tool_names(intent: str) -> frozenset:
@@ -4223,7 +4882,7 @@ def _execution_failure_summary(
 def _mutation_date(
     tc: ToolCall, tr: Optional[ToolResult]
 ) -> Optional[str]:
-    """Best-effort recorded date of a mutation (Work Stream A result cards)."""
+    """Best-effort recorded date of a mutation."""
     from app.tool_router import _TXN_DATE_PARAM
 
     param = _TXN_DATE_PARAM.get(tc.tool_name)
@@ -4237,7 +4896,7 @@ def _mutation_date(
     return None
 
 
-# Work Stream A: every key a mutation tool may use for its accounting date.
+# every key a mutation tool may use for its accounting date.
 _RECORDED_DATE_KEYS = (
     "transaction_date", "invoice_date", "bill_date", "expense_date",
     "quotation_date", "credit_note_date", "return_date", "receipt_date",
@@ -4273,11 +4932,11 @@ def _build_batch_breakdown(
     tool_calls: List[ToolCall],
     tool_results: List[ToolResult],
 ) -> str:
-    """Per-document result summary for a BATCH plan (Work Stream B).
+    """Per-document result summary for a BATCH plan.
 
     Mutations are collected in execution order and reported one per line.
     The report is honest: fewer mutations executed than documents planned,
-    or any failure, is stated explicitly.  Work Stream A: each created
+    or any failure, is stated explicitly.  each created
     document also states its recorded transaction date.
     """
     from app.tools import get_handler as _registry_entry

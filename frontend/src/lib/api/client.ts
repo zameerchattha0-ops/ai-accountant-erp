@@ -99,7 +99,7 @@ export async function aiGetSession(sessionId: string) {
 }
 
 /**
- * Work Stream C: resume-by-conversation. Returns the latest NON-TERMINAL
+ * resume-by-conversation. Returns the latest NON-TERMINAL
  * execution session (status PENDING / PLANNING / EXECUTING) for this
  * user+org so a browser refresh mid-run can reattach the progress view.
  */
@@ -224,7 +224,7 @@ export async function catalogueDelete(
   });
 }
 
-/* ---- Work Stream C: background runs ---- */
+/* ---- background runs ---- */
 
 export interface EnqueueJobResult {
   queued: boolean;
@@ -277,7 +277,7 @@ export interface BackgroundJobHandlers {
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
- * Work Stream C: enqueue an AI run and poll it to a terminal state.
+ * enqueue an AI run and poll it to a terminal state.
  * SUCCEEDED renders the result card, FAILED surfaces the error, and a
  * QUEUED job no worker claims within the stall window triggers the
  * one-click "run in foreground instead" offer. The jobs endpoint is
@@ -309,7 +309,7 @@ export async function runBackgroundJob(
   }
 }
 
-/* ---- Work Stream D: SSE streaming execution ---- */
+/* ---- SSE streaming execution ---- */
 
 export interface StreamEvents {
   onStep?: (step: {
@@ -317,7 +317,35 @@ export interface StreamEvents {
     phase?: string | null;
     status?: string | null;
     created_at?: string | null;
+    execution_id?: string | null;
   }) => void;
+}
+
+/* P2-⑪: serverless cold start happens BEFORE the server's started_at —
+ * the browser is the only place TTFB can see it. Fire-and-forget report;
+ * observability only, never blocks or fails the request. */
+async function reportClientTtfb(args: {
+  executionId: string;
+  ttfbMs: number;
+  transport: string;
+  token?: string;
+}): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/api/ai/client-timing`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(args.token ? { Authorization: `Bearer ${args.token}` } : {}),
+      },
+      body: JSON.stringify({
+        execution_id: args.executionId,
+        ttfb_ms: Math.max(0, Math.round(args.ttfbMs)),
+        transport: args.transport,
+      }),
+    });
+  } catch {
+    /* observability only */
+  }
 }
 
 /**
@@ -334,6 +362,7 @@ export async function aiExecuteStream(
   const supabase = createClient();
   const { data: { session } } = await supabase.auth.getSession();
   const token = session?.access_token;
+  const startedAt = performance.now();
 
   const res = await fetch(`${API_BASE}/api/ai/execute-stream`, {
     method: "POST",
@@ -346,7 +375,14 @@ export async function aiExecuteStream(
 
   if (!res.ok || !res.body) {
     // Older backend without the SSE route - fall back to the plain call.
-    return aiExecute(request);
+    const fallback = await aiExecute(request);
+    void reportClientTtfb({
+      executionId: fallback.execution_id,
+      ttfbMs: performance.now() - startedAt,
+      transport: "inline",
+      token,
+    });
+    return fallback;
   }
 
   const reader = res.body.getReader();
@@ -354,7 +390,22 @@ export async function aiExecuteStream(
   let buffer = "";
   // Wrapped in an object so TypeScript's closure analysis cannot narrow
   // `final` to `null` (it is assigned inside handleEvent).
-  const state = { final: null as AgentResponse | null };
+  const state = {
+    final: null as AgentResponse | null,
+    firstByteAt: null as number | null,
+    ttfbReported: false,
+  };
+
+  const maybeReportTtfb = (executionId?: string | null) => {
+    if (state.ttfbReported || state.firstByteAt === null || !executionId) return;
+    state.ttfbReported = true;
+    void reportClientTtfb({
+      executionId,
+      ttfbMs: state.firstByteAt - startedAt,
+      transport: "sse",
+      token,
+    });
+  };
 
   const handleEvent = (raw: string) => {
     const lines = raw.split("\n");
@@ -367,13 +418,19 @@ export async function aiExecuteStream(
     if (!data) return;
     if (event === "step") {
       try {
-        events?.onStep?.(JSON.parse(data));
+        const parsed = JSON.parse(data);
+        events?.onStep?.(parsed);
+        // P2-⑪: the FIRST-BYTE instant is frozen above; report TTFB once a
+        // DB-backed step event carries the execution_id (the instant-ack
+        // RECEIVED event predates session creation).
+        maybeReportTtfb(parsed?.execution_id);
       } catch {
         /* malformed step - ignore */
       }
     } else if (event === "final") {
       try {
         state.final = JSON.parse(data) as AgentResponse;
+        maybeReportTtfb(state.final?.execution_id);
       } catch {
         /* malformed final - handled by null check below */
       }
@@ -383,6 +440,7 @@ export async function aiExecuteStream(
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (state.firstByteAt === null) state.firstByteAt = performance.now();
     buffer += decoder.decode(value, { stream: true });
     let idx: number;
     // SSE messages are separated by a blank line.

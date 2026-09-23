@@ -1,10 +1,9 @@
 -- ============================================================================
 -- 036 — Seed the trusted cash-sale domain tool in the AI control plane
 -- ============================================================================
--- P1 fix (final verification pass): cash sales must flow through a trusted
--- domain operation (record_cash_sale) instead of the model manually
--- assembling prepare/validate/post journal calls (live defects S4/S7: the
--- model looped on search_account and produced no journal).
+-- Cash sales must flow through a trusted domain operation (record_cash_sale)
+-- instead of the model manually assembling prepare/validate/post journal
+-- calls (the model could loop on search_account and produce no journal).
 --
 -- 1. ai.tools row (FK target for ai.tool_calls + tool_parameters source)
 -- 2. ai.tool_parameters (the model's parameter contract)

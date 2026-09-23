@@ -139,7 +139,7 @@ function stepSummaryLabel(step: ProgressStep): string {
 }
 
 /**
- * A step event pushed LIVE over SSE (Work Stream D). Shape mirrors the
+ * A step event pushed LIVE over SSE. Shape mirrors the
  * polled ProgressStep so the render path is identical.
  */
 export interface LiveStepEvent {

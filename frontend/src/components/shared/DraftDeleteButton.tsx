@@ -7,7 +7,7 @@ import { useOrgRole } from "@/lib/hooks/useOrgRole";
 import { cn } from "@/lib/utils/cn";
 
 /**
- * Work Stream F: role-gated DRAFT delete for document modules.
+ * role-gated DRAFT delete for document modules.
  *
  * The database is the enforcement layer (RLS delete = Owner/Admin only,
  * status-guard trigger = DRAFT-only + linked-journal refusal). This button

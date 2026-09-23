@@ -10,7 +10,7 @@ interface Props {
   summary: string;
   riskLevel?: RiskLevel;
   accountingImpact?: AccountingEntry[];
-  /** Work Stream A: the resolved transaction date shown for review. */
+  /** the resolved transaction date shown for review. */
   transactionDate?: string;
   dateDefaulted?: boolean;
   onDecision: (approved: boolean, notes?: string) => void;
@@ -58,7 +58,7 @@ export default function AIConfirmation({
       <div className="p-5 space-y-4">
         <p className="text-sm text-text-secondary">{summary}</p>
 
-        {/* Work Stream A: the transaction date under review is prominent -
+        {/* the transaction date under review is prominent -
             a defaulted today-assumption is labelled honestly. */}
         {transactionDate && (
           <div className="flex items-center gap-2 text-sm">

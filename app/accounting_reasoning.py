@@ -1,5 +1,5 @@
 """
-AI-Native ERP — LLM ACCOUNTING REASONING LOOP (Work Stream S3)
+AI-Native ERP — LLM ACCOUNTING REASONING LOOP
 ==============================================================
 
 This module implements the architectural correction: the LLM is the PRIMARY
@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import structlog
 
 from app.books_evidence import (
+    EVIDENCE_KINDS,
     EVIDENCE_LABEL,
     EvidenceRequest,
     EvidenceResult,
@@ -340,12 +341,87 @@ def _render_dict_block(data: Dict[str, Any], limit: int = 40) -> str:
     return "\n".join(lines)
 
 
+def _contract_line(
+    tool_name: str,
+    contract: Dict[str, Any],
+    alias_pairs: Sequence[str],
+) -> str:
+    """One compact line per tool: accepted names, required subset, aliases."""
+    accepted = ", ".join(contract.get("accepted") or ())
+    required = ", ".join(contract.get("required") or ())
+    parts = [f"  {tool_name}: {accepted or '(no arguments)'}"]
+    if required:
+        parts.append(f" [required: {required}]")
+    if alias_pairs:
+        parts.append(f" [reference aliases accepted: {', '.join(alias_pairs)}]")
+    return "".join(parts)
+
+
+def _render_tool_contracts_block(
+    offered_tools: Sequence[str],
+    tool_contracts: Optional[Dict[str, Dict[str, Any]]],
+) -> List[str]:
+    """Real executable signatures for OFFERED MUTATION tools only.
+
+    Why this exists (forensic latency report, P0-②): the prompt used to list
+    tool SLUGS ONLY, so the model composed argument keys from whatever
+    vocabulary it could see (evidence rows, entity field names) and Python
+    rejected the proposal AFTER a full generation round — production session
+    3ea794a0 burned ~10.7s on exactly that rejection before its rounds were
+    exhausted.  Rendering the signature-derived contract up front raises
+    first-pass success WITHOUT weakening validation: the deterministic gate
+    (``validate_outcome`` → ``tool_contract.validate_calls``) still runs
+    unchanged afterwards.
+
+    Deliberate size rules (report §6, prompt latency budget):
+    * mutation tools only — read-only mis-namings are rare and the rejection
+      message names them precisely; never the whole 49-tool registry;
+    * names come from ``tool_contracts()`` (inspect()-derived at import time,
+      never hand-maintained) and only alias keys the GATE accepts
+      (``declared_reference_inputs``) are advertised, so every name shown is
+      actually executable.
+    """
+    if not tool_contracts:
+        return []
+    try:
+        from app.plan_materialization import declared_reference_inputs
+        from app.tool_execution import is_read_only_tool
+
+        ref_inputs = declared_reference_inputs()
+    except Exception:  # noqa: BLE001 — prompt assembly must never break
+        log.warning("accounting_reasoning.contracts_block_unavailable")
+        return []
+    lines: List[str] = []
+    for slug in sorted(set(offered_tools or ())):
+        contract = tool_contracts.get(slug)
+        if not contract or is_read_only_tool(slug):
+            continue
+        pairs = [
+            f"{alias}->{param}"
+            for param, aliases in (ref_inputs.get(slug) or {}).items()
+            for alias in (aliases or ())
+        ]
+        lines.append(_contract_line(slug, contract, pairs))
+    if not lines:
+        return []
+    return [
+        "TOOL ARGUMENT CONTRACTS — the REAL executable signatures. Compose "
+        "arguments with EXACTLY these parameter names: Python rejects any "
+        "other name BEFORE anything executes. 'alias->param' names a "
+        "reference input the gate accepts; Python resolves it to the "
+        "canonical id before execution:",
+        *lines,
+        "",
+    ]
+
+
 def build_reasoning_prompt(
     facts: ReasoningFacts,
     *,
     evidence_block: str = "",
     violations: Sequence[str] = (),
     offered_tools: Sequence[str] = (),
+    tool_contracts: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
     """Assemble the labelled reasoning prompt.
 
@@ -407,7 +483,22 @@ def build_reasoning_prompt(
         parts.append("  " + ", ".join(sorted(offered_tools)))
         parts.append("")
 
+    # P0-②: first-pass success — the model sees each offered mutation tool's
+    # REAL argument contract before generating, so proposals bind on attempt 1
+    # instead of paying a ~6-11s reject-and-retry round.  Validation itself is
+    # untouched and still runs after every generation.
+    parts.extend(_render_tool_contracts_block(offered_tools, tool_contracts))
+
     parts.append(evidence_catalog_text())
+    parts.append("")
+
+    # P2-⑫ (forensic report ⑫): STATIC PREFIX contract — everything above
+    # (and TODAY here) is byte-stable across rounds; the first dynamic byte
+    # is the LIVE BOOKS evidence block below. Prefix/KV-caching providers
+    # reuse the static head (≈10-14KB) on rounds 2+. _RESPONSE_SHAPE stays
+    # deliberately LAST (recency aids format compliance; re-sent per call
+    # by design — documented, not accidental).
+    parts.append(f"TODAY: {facts.today or '(unset)'}")
     parts.append("")
 
     if evidence_block:
@@ -442,8 +533,9 @@ def build_reasoning_prompt(
             parts.append(f"  · {item}")
         parts.append("")
 
-    parts.append(f"TODAY: {facts.today or '(unset)'}")
-    parts.append("")
+    # P2-⑫: TODAY is a STATIC value — it now renders BEFORE the dynamic
+    # evidence/violations tail (moved up in build_reasoning_prompt); this
+    # tail-only duplicate is removed so the static prefix stays intact.
     parts.append(_RESPONSE_SHAPE)
     return "\n".join(parts)
 
@@ -633,10 +725,10 @@ def validate_outcome(
         # The proposed ARGUMENTS must bind against the Python contract of the
         # tool that will receive them.  The model is offered tool NAMES only,
         # so it composes argument keys from the vocabulary it can see (entity
-        # fields, org preferences): the production incident of 2026-09-20
-        # proposed create_invoice with 'line_items' / 'customer_name' /
-        # 'tax_category', the user approved that plan, and the call then died at
-        # CALL-BINDING time with no database work at all.  Python therefore
+        # fields, org preferences): a plan may propose create_invoice with
+        # 'line_items' / 'customer_name' / 'tax_category', the user approves it,
+        # and the call then dies at CALL-BINDING time with no database work at
+        # all.  Python therefore
         # rejects the un-bindable call HERE — before any confirmation snapshot
         # exists — and feeds the precise message back to the model.
         from app.plan_materialization import (
@@ -757,6 +849,158 @@ def refusal_text(refusal: Optional[Dict[str, Any]]) -> str:
     ).strip()
 
 
+def _evidence_cache_key(request: EvidenceRequest) -> tuple:
+    """Loop-local evidence cache key: (kind, canonical argument JSON).
+
+    Why this needs NO invalidation machinery (forensic latency report,
+    P0-③): the reasoning loop runs BEFORE any execution, so no mutation can
+    change the books while it lives — identical (kind, args) reads against
+    the same organization always return the same rows.  The dict is local to
+    one ``run_reasoning_loop`` call and the org is fixed by the caller, so
+    scope, freshness and tenant isolation hold by construction.  Args are
+    canonicalized with ``sort_keys``; anything un-keyable falls back to
+    ``repr`` — an exotic value may MISS the cache, and a miss is always
+    safe; only a wrong HIT would be a correctness bug, so keying fails
+    toward re-fetching.
+    """
+    kind = (request.kind or "").strip().lower()
+    try:
+        args_key = json.dumps(request.args or {}, sort_keys=True, default=str)
+    except Exception:  # noqa: BLE001 — never break the loop on keying
+        args_key = repr(request.args or {})
+    return (kind, args_key)
+
+
+#: P1-⑩ (forensic latency report §5): preliminary subject-area HINTS → the
+#: evidence kinds they most often imply. Hints only — nothing here decides a
+#: treatment; a miss just costs a cheap read-only query that runs in
+#: parallel with the round-1 model call anyway.
+_PREFETCH_KIND_MAP: Dict[str, str] = {
+    "receivables": "open_receivables",
+    "payables": "open_payables",
+    "fixed_assets": "fixed_assets",
+    "bank": "bank_accounts",
+    "cash": "bank_accounts",
+}
+_PREFETCH_MAX_KINDS = 3
+
+
+def _prefetch_requests(
+    facts: Any,
+    evidence_cache: Dict[tuple, EvidenceResult],
+) -> List[EvidenceRequest]:
+    """Speculative round-1 prefetch requests (default args only).
+
+    Registered kinds only, at most ``_PREFETCH_MAX_KINDS``, and never a kind
+    already served by the P1-⑤ seed (same cache keys — a seeded kind would
+    be a pointless duplicate fetch).
+    """
+    preliminary = getattr(facts, "preliminary", None) or {}
+    areas = [str(a or "") for a in (preliminary.get("candidate_subject_areas") or [])]
+    requests: List[EvidenceRequest] = []
+    seen: set = set()
+    for area in areas:
+        kind = _PREFETCH_KIND_MAP.get(area)
+        if not kind or kind in seen or kind not in EVIDENCE_KINDS:
+            continue
+        request = EvidenceRequest(
+            kind=kind, why="speculative prefetch (preliminary subject-area hint)"
+        )
+        if _evidence_cache_key(request) in evidence_cache:
+            continue
+        seen.add(kind)
+        requests.append(request)
+        if len(requests) >= _PREFETCH_MAX_KINDS:
+            break
+    return requests
+
+
+def _reap_prefetch(task: "asyncio.Task") -> None:
+    """Reap a never-consumed prefetch task (fire-and-forget hygiene).
+
+    The read-only task completes on its own; only its exception, if any,
+    must not surface later as 'Task exception was never retrieved'.
+    """
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:  # noqa: BLE001 — reaping must never raise
+        pass
+
+
+def serialize_evidence_memo(
+    results: Sequence[EvidenceResult],
+) -> List[Dict[str, Any]]:
+    """P1-⑤: durable form of this turn's cacheable evidence for the NEXT
+    turn of the same conversation (freshness is checked at LOAD time).
+
+    Bounded by construction: at most 12 entries and the whole payload kept
+    under ~90KB, so the step writer's raised cap never shears it into
+    invalid JSON (a truncated memo fails soft at load = plain refetch).
+    """
+    entries: List[Dict[str, Any]] = []
+    for res in list(results or []):
+        if res is None or res.error is not None:
+            continue
+        entries.append(
+            {
+                "kind": res.kind,
+                "args": dict(getattr(res, "args", None) or {}),
+                "result": {
+                    "kind": res.kind,
+                    "title": res.title,
+                    "why": res.why,
+                    "records": res.records,
+                    "source": res.source,
+                    "truncated": bool(res.truncated),
+                    "rejected": bool(res.rejected),
+                },
+            }
+        )
+    out = entries[:12]
+    while out and len(json.dumps({"evidence_full": out}, default=str)) > 90_000:
+        out.pop()
+    return out
+
+
+def deserialize_evidence_memo(payload: Any) -> List[EvidenceResult]:
+    """Inverse of ``serialize_evidence_memo``.
+
+    FAIL SOFT: any malformed / sheared payload returns ``[]`` — the caller
+    simply re-fetches (a miss is always safe; only a wrong HIT would be a
+    correctness bug, so loading fails toward re-fetching).
+    """
+    try:
+        data = json.loads(payload) if isinstance(payload, str) else (payload or {})
+        raw_entries = data.get("evidence_full") if isinstance(data, dict) else None
+        if not isinstance(raw_entries, list):
+            return []
+        out: List[EvidenceResult] = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("result") or {}
+            res = EvidenceResult(
+                kind=str(raw.get("kind") or entry.get("kind") or ""),
+                title=str(raw.get("title") or ""),
+                why=str(raw.get("why") or ""),
+                records=[r for r in (raw.get("records") or []) if isinstance(r, dict)],
+                source=str(raw.get("source") or ""),
+                error=raw.get("error"),
+                truncated=bool(raw.get("truncated")),
+                rejected=bool(raw.get("rejected")),
+            )
+            if res.error is not None:
+                continue
+            res.args = dict(entry.get("args") or {})
+            out.append(res)
+        return out
+    except Exception:  # noqa: BLE001 — a memo load must never break a turn
+        log.warning("accounting_reasoning.evidence_memo_unreadable")
+        return []
+
+
 async def run_reasoning_loop(
     facts: ReasoningFacts,
     *,
@@ -770,6 +1014,8 @@ async def run_reasoning_loop(
     timeout_seconds: Optional[float] = None,
     step_logger: Any = None,
     tool_contracts: Optional[Dict[str, Dict[str, Any]]] = None,
+    prior_evidence: Sequence[EvidenceResult] = (),
+    prefetch_enabled: bool = False,
 ) -> ReasoningOutcome:
     """Run the LLM accounting reasoning loop against the live books.
 
@@ -824,6 +1070,49 @@ async def run_reasoning_loop(
 
     evidence_block = ""
     gathered: List[EvidenceResult] = []
+    # P0-③: cross-round evidence cache — see _evidence_cache_key.
+    evidence_cache: Dict[tuple, EvidenceResult] = {}
+    # P1-⑤: seed from this conversation's earlier PARKED turn (the caller
+    # has already proved it mutation-free). Same keying as P0-③, so a
+    # re-request this turn is a cache hit with ZERO database reads.
+    for _res in prior_evidence or ():
+        if _res is None or _res.error is not None:
+            continue
+        _key = _evidence_cache_key(
+            EvidenceRequest(
+                kind=_res.kind, why=_res.why,
+                args=getattr(_res, "args", None) or {},
+            )
+        )
+        if _key not in evidence_cache:
+            evidence_cache[_key] = _res
+            gathered.append(_res)
+    if gathered:
+        _notify("EVIDENCE_SEEDED", {"kinds": [r.kind for r in gathered]})
+    # P1-⑩ (forensic report §5): start hinted read-only loaders NOW, in
+    # parallel with the round-1 model call (6-11s). If the model asks for
+    # them they are served instantly — the common settlement flow becomes a
+    # 1-round decision; if not, only cheap read-only queries were spent and
+    # the task is reaped. Flag: accounting_reasoning_prefetch.
+    prefetch_task: Optional["asyncio.Task"] = None
+    prefetch_requests: List[EvidenceRequest] = []
+    prefetch_pool: Dict[tuple, EvidenceResult] = {}
+    if prefetch_enabled:
+        prefetch_requests = _prefetch_requests(facts, evidence_cache)
+        if prefetch_requests:
+            prefetch_task = asyncio.create_task(
+                gather_evidence(
+                    prefetch_requests,
+                    organization_id=organization_id,
+                    auth=auth,
+                    session_id=session_id,
+                )
+            )
+            prefetch_task.add_done_callback(_reap_prefetch)
+            _notify(
+                "EVIDENCE_PREFETCH",
+                {"kinds": [r.kind for r in prefetch_requests]},
+            )
     rejected: List[str] = []
     violations: List[str] = []
     outcome = ReasoningOutcome(status=UNSUPPORTED)
@@ -854,6 +1143,9 @@ async def run_reasoning_loop(
             evidence_block=evidence_block,
             violations=violations,
             offered_tools=offered_tools,
+            # P0-②: pass the SAME inspect()-derived contracts the validation
+            # gate enforces — the model proposes against the real signature.
+            tool_contracts=tool_contracts,
         )
         try:
             call_kwargs: Dict[str, Any] = {"prompt": prompt}
@@ -926,20 +1218,94 @@ async def run_reasoning_loop(
                 "EVIDENCE_REQUESTED",
                 {"round": rounds_used, "kinds": [r.kind for r in valid]},
             )
-            new_results = await gather_evidence(
-                valid,
-                organization_id=organization_id,
-                auth=auth,
-                session_id=session_id,
-            )
-            gathered.extend(new_results)
+            # P0-③ (forensic report): cross-round dedupe.  No mutation can
+            # run INSIDE this loop, so (kind, args) names one immutable
+            # snapshot of the books for the whole request — a repeat request
+            # is served from this request's own fetch: no duplicate database
+            # read and no duplicate rows re-rendered into later prompts
+            # (production 3ea794a0 re-fetched bank_accounts in round 3).
+            # Results carrying an error are NOT cached, so a transient loader
+            # failure or a permission denial can be retried next round.
+            misses: List[EvidenceRequest] = []
+            cached_kinds: List[str] = []
+            staged: set = set()
+            for request in valid:
+                key = _evidence_cache_key(request)
+                if key in evidence_cache or key in staged:
+                    cached_kinds.append(request.kind)
+                else:
+                    staged.add(key)
+                    misses.append(request)
+            fetched: List[EvidenceResult] = []
+            prefetched_kinds: List[str] = []
+            # P1-⑩: harvest the speculative pool FIRST (started before the
+            # round-1 model call), then fetch only what is still missing.
+            if prefetch_task is not None:
+                try:
+                    prefetch_results = await prefetch_task
+                except Exception:  # noqa: BLE001 — prefetch is best-effort
+                    prefetch_results = []
+                prefetch_task = None
+                for req0, res0 in zip(prefetch_requests, prefetch_results or []):
+                    # P1-⑤ keying: prefetch uses default args ({}).
+                    res0.args = dict(req0.args or {})
+                    if res0.error is None:
+                        prefetch_pool[_evidence_cache_key(req0)] = res0
+            if prefetch_pool and misses:
+                still_missing: List[EvidenceRequest] = []
+                for request in misses:
+                    hit = prefetch_pool.pop(_evidence_cache_key(request), None)
+                    if hit is not None:
+                        evidence_cache[_evidence_cache_key(request)] = hit
+                        fetched.append(hit)
+                        prefetched_kinds.append(request.kind)
+                    else:
+                        still_missing.append(request)
+                misses = still_missing
+            if misses:
+                fresh = await gather_evidence(
+                    misses,
+                    organization_id=organization_id,
+                    auth=auth,
+                    session_id=session_id,
+                )
+                for req, res in zip(misses, fresh):
+                    # P1-⑤: remember WHICH args this snapshot answered so
+                    # the cross-turn memo reuses the same (kind, args) key.
+                    res.args = dict(req.args or {})
+                    if res.error is None:
+                        evidence_cache[_evidence_cache_key(req)] = res
+                fetched.extend(fresh)
+            gathered.extend(fetched)
             evidence_block = render_evidence(gathered)
+            if cached_kinds:
+                evidence_block += (
+                    "\n  · NOTE: "
+                    + ", ".join(sorted(set(cached_kinds)))
+                    + " served from THIS request's own fetch — no new "
+                    "database read (the books cannot change while reasoning "
+                    "is in progress)."
+                )
+            if prefetched_kinds:
+                evidence_block += (
+                    "\n  · NOTE: "
+                    + ", ".join(sorted(set(prefetched_kinds)))
+                    + " prefetched in parallel with this round's model call "
+                    "(speculative read-only lookup)."
+                )
             _notify(
                 "EVIDENCE_RETURNED",
                 {
                     "round": rounds_used,
-                    "summary": render_evidence_compact(new_results),
+                    "summary": render_evidence_compact(fetched),
                     "label": EVIDENCE_LABEL,
+                    # P0-③ observability: loader invocations vs requested
+                    # kinds — the report's dedupe metric, durable per run.
+                    "requested_kinds": [r.kind for r in valid],
+                    "fetched_kinds": [r.kind for r in misses],
+                    "cached_kinds": cached_kinds,
+                    # P1-⑩ observability: served from the speculative pool.
+                    "prefetched_kinds": prefetched_kinds,
                 },
             )
             violations = []
@@ -983,10 +1349,9 @@ async def run_reasoning_loop(
 
     # Round budget exhausted without an accepted decision.  This is a
     # TERMINAL outcome: there are no rounds left to satisfy a dangling
-    # NEEDS_EVIDENCE, and — production incident a59b889c-dc26-4ba6-a90a-
-    # e0cb6085dacf — falling off the end of the function implicitly returned
-    # None, which crashed the caller with AttributeError: 'NoneType' object
-    # has no attribute 'as_dict'.  Every reachable terminal path must return
+    # NEEDS_EVIDENCE, and falling off the end of the function would implicitly
+    # return None, which crashes the caller with AttributeError: 'NoneType'
+    # object has no attribute 'as_dict'.  Every reachable terminal path must return
     # a populated ReasoningOutcome.
     outcome.evidence_results = list(gathered)
     outcome.rounds = rounds_used

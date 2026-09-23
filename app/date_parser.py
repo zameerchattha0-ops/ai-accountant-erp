@@ -1,5 +1,5 @@
 """
-ERP AI Agent - Deterministic Transaction-Date Parser (Work Stream A)
+ERP AI Agent - Deterministic Transaction-Date Parser
 =====================================================================
 Pure, deterministic date parsing for the mandatory transaction-date
 protocol.  The LLM NEVER parses dates (house rule): every date the agent
@@ -16,7 +16,7 @@ Accepted inputs (case-insensitive, trimmed):
 Everything else is rejected with an error that names both accepted
 formats so the agent can re-ask once, with guidance.
 
-Also provides ``resolve_date_range`` for report intents (Work Stream G):
+Also provides ``resolve_date_range`` for report intents:
 deterministic resolution of "last month", "this month", "last week",
 "this quarter", "last quarter" into ``date_from`` / ``date_to``.
 """
@@ -134,7 +134,7 @@ def parse_transaction_date(
 
 
 # ---------------------------------------------------------------------------
-# Work Stream G1 - relative-range resolution for REPORT intents.
+# relative-range resolution for REPORT intents.
 # Deterministic; returns inclusive (date_from, date_to) ISO strings.
 # ---------------------------------------------------------------------------
 _WEEK_START_MONDAY = 0  # weeks run Monday-Sunday

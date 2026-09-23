@@ -1,7 +1,7 @@
 """
 ERP AI Agent - Parallel Tool Execution
 =======================================
-Work Stream A1: executes planned tool calls with READ-ONLY parallelism.
+executes planned tool calls with READ-ONLY parallelism.
 
 Contract (mirrors the tool registry in app/tools/__init__.py):
 * Registered tools expose ``read_only`` in the registry.

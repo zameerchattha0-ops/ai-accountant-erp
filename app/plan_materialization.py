@@ -1,7 +1,7 @@
 """Plan materialization — human-level references become canonical ids.
 
-Production incident 2026-09-20 (session 6a48a432-d9d9-480c-8e47-e6799305bc6f)
-===========================================================================
+Why this exists
+===============
 
 The approved plan was expressed in the user's own terms::
 
@@ -99,6 +99,19 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
     "record_customer_receipt": {
         "customer_id": ReferenceSpec(
             "customer_id", "customer", ("customer_name", "party_name")
+        ),
+        # The model (and the user) naturally reference an open invoice by
+        # its NUMBER — that is the key LIVE BOOKS EVIDENCE shows and the
+        # only form a human ever speaks. The service binds ``invoice_id``
+        # only, so the gate rejected the natural phrasing in production
+        # (session 3ea794a0: "invoice_number is not a parameter") and the
+        # correct receipt proposal died on rounds exhaustion. Declared
+        # here the number resolves read-only, org-scoped, exact-match —
+        # an unresolvable number BLOCKS, never invents, never silently
+        # unallocates (required=True: IF given, it must resolve; absent,
+        # no resolution is attempted and the receipt stays unallocated).
+        "invoice_id": ReferenceSpec(
+            "invoice_id", "invoice", ("invoice_number",), required=True
         ),
     },
     "record_supplier_payment": {
@@ -213,6 +226,19 @@ async def _search(role: str, organization_id: uuid.UUID, query: str, limit: int)
         from app.services import service_service
 
         return await service_service.search(organization_id, query=query, limit=limit)
+    if role == "invoice":
+        # Document references resolve against the tenant's own numbering,
+        # not a name search: exact invoice_number, org-scoped. The match
+        # layer compares ``name``, so the invoice's human key (its number)
+        # is exposed under that field; anything else is a different row.
+        from app.repositories import invoice_repository
+
+        row = await invoice_repository.get_invoice_by_number(
+            organization_id, invoice_number=str(query).strip()
+        )
+        if not row:
+            return []
+        return [{"id": row.get("id"), "name": row.get("invoice_number")}]
     return []
 
 

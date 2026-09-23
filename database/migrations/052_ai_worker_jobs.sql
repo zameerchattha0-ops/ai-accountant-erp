@@ -1,5 +1,5 @@
 -- ============================================================
--- 052: AI WORKER JOBS (Work Stream C - background runs)
+-- 052: AI WORKER JOBS
 -- ============================================================
 -- A DB-backed claim/lease queue so an HTTP request can return EARLY and a
 -- supervised worker process executes the AI run.

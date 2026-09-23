@@ -7,10 +7,9 @@ and nothing checked those names against the Python callable that would receive
 them.  A plan could therefore be shown to the user, approved, executed — and
 die at CALL-BINDING time:
 
-    production incident 2026-09-20 (session 6a48a432, create_invoice)
     TypeError: create_invoice() got an unexpected keyword argument 'line_items'
 
-The model had invented ``line_items`` / ``customer_name`` / ``tax_category``
+The model may invent ``line_items`` / ``customer_name`` / ``tax_category``
 because the reasoning prompt offers tool *slugs only* — no parameter contract is
 ever shown.  Python must therefore reject the un-bindable call BEFORE the user is
 asked to approve it, and say precisely which name is wrong.

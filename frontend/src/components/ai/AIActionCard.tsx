@@ -10,7 +10,7 @@ interface Props {
   response: AgentResponse;
 }
 
-// Work Stream R: canonical nature values are rendered as readable labels
+// canonical nature values are rendered as readable labels
 // (plain hyphens only - never em/en dashes).
 const NATURE_LABELS: Record<string, string> = {
   FIXED_ASSET: "Fixed Asset",
@@ -134,7 +134,7 @@ export default function AIActionCard({ response }: Props) {
                 {verification}
               </span>
             )}
-            {/* Work Stream A: the recorded transaction date is always shown
+            {/* the recorded transaction date is always shown
                 prominently; an assumed-today default is labelled honestly. */}
             {typeof response.data?.transaction_date === "string" && (
               <span className="text-[11px] font-medium px-2 py-0.5 rounded-full border bg-bg-muted text-text-secondary border-border-subtle">
@@ -142,7 +142,7 @@ export default function AIActionCard({ response }: Props) {
                 {response.data.date_defaulted ? " (assumed today)" : ""}
               </span>
             )}
-            {/* Work Stream R: the resolved transaction nature is always
+            {/* the resolved transaction nature is always
                 shown next to the date so the accounting treatment is
                 auditable ("you confirmed" = explicit user answer). */}
             {typeof response.data?.transaction_nature === "string" && (

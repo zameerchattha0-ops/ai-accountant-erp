@@ -105,7 +105,7 @@ async def get_default_bank_account(
     )
 
 
-# ---- Cash Accounts (Work Stream R4.1 — cash ledger is SEPARATE from the
+# ---- Cash Accounts (cash ledger is SEPARATE from the
 # bank ledger: a CASH receipt/payment must debit/credit the CASH GL, never
 # the bank GL) ---------------------------------------------------------------
 

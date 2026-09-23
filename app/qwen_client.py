@@ -126,7 +126,7 @@ class QwenClient:
         attempt what it is not offered.
 
         ``max_output_tokens`` overrides the client default for THIS request
-        (Work Stream B tiered routing: simple lookups get a lighter budget).
+.
 
         Returns ``{"text": str, "tool_calls": [ToolCall, ...],
         "tool_results": [ToolResult, ...], "iteration_count": int}``.
@@ -202,7 +202,7 @@ class QwenClient:
                     "tool_calls": tool_calls_raw,
                 }
             )
-            # Work Stream A1: independent read-only calls run
+            # independent read-only calls run
             # CONCURRENTLY; mutations stay strictly sequential in plan
             # order (see app/tool_execution.py).
             result_data_list = await execute_planned_tool_calls(

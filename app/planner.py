@@ -75,7 +75,7 @@ _EXPENSE_NATURE_INTENTS = frozenset({
     "register_fixed_asset",
 })
 
-# Work Stream B: hard ceiling on batch size - beyond this the request is
+# hard ceiling on batch size - beyond this the request is
 # treated as a single (possibly itemised) transaction instead of N
 # documents, preventing pathological N-document explosions.
 _BATCH_MAX_ITEMS = 10
@@ -98,7 +98,7 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     # Expense LOOKUPS must win over record_expense: the bare "expense"
     # keyword in record_expense used to swallow query phrasings like
     # "provide details of current month expenses" and drag them into the
-    # recording clarification ladder (live defect).  Query-shaped
+    # recording clarification ladder.  Query-shaped
     # phrasings are matched FIRST and routed to the read-only listing.
     ("list_expenses", [
         r"(?:show|list|give|provide|tell|view|display|details?|summary|"
@@ -131,7 +131,20 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"expense\s+(?:of|for)\s+(?:rs\.?|pkr)?\s*[\d,]",
         r"spent",
     ]),
-    ("record_receipt", [r"receipt", r"received.*from.*customer", r"customer.*paid", r"payment.*received"]),
+    (
+        "record_receipt",
+        [
+            r"receipt",
+            r"received.*from.*customer",
+            r"customer.*paid",
+            r"payment.*received",
+            # "I received 60000 from FDS Labs Pvt" — money-in stated as a
+            # bare figure directly after "received" + "from <party>".  The
+            # digits must sit IMMEDIATELY after "received ... from" so
+            # goods receipts ("received 3 boxes from supplier") never match.
+            r"\breceived\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?\s+from\b",
+        ],
+    ),
     ("record_payment", [r"paid.*supplier", r"supplier.*payment", r"payment.*to.*supplier"]),
     ("record_bank_transfer", [r"transfer.*bank", r"bank.*transfer", r"transfer.*from.*to.*account", r"move.*money.*from", r"transfer.*hbl\b", r"transfer.*meezan\b"]),
     ("create_bank_account", [r"add.*bank.*account", r"create.*bank.*account", r"new.*bank.*account", r"open.*bank.*account"]),
@@ -157,7 +170,7 @@ _TRANSACTION_INTENTS = {
     "register_fixed_asset",
 }
 
-# Work Stream S2 — planner intents the SEMANTIC layer may set. This is the
+# planner intents the SEMANTIC layer may set. This is the
 # deterministic whitelist: a semantic intent outside it is ignored and the
 # keyword extractor decides (the LLM cannot invent an intent).
 _SEMANTIC_INTENTS = frozenset({
@@ -168,7 +181,7 @@ _SEMANTIC_INTENTS = frozenset({
     "create_purchase_return",
 })
 
-# Work Stream A - MANDATORY TRANSACTION-DATE PROTOCOL: every mutation
+# every mutation
 # intent must resolve an explicit accounting date before any tool call.
 # Canonical set lives in app.reasoning (DATE_REQUIRED_INTENTS) so the
 # dependency graph and the planner can never drift apart.
@@ -338,7 +351,7 @@ _PAYMENT_METHOD_PATTERNS = [
 def split_batch_request(user_message: str) -> List[str]:
     """Detect a MULTI-TRANSACTION request and split it into sub-requests.
 
-    Work Stream B. Conservative by design - only confident enumeration
+     Conservative by design - only confident enumeration
     patterns are split:
       * numbered lists on separate lines ("1) ... 2) ..."),
       * inline enumerators between transactional clauses
@@ -523,11 +536,11 @@ def plan(
     answered value is merged into the extracted entities so it is never
     asked for again.
 
-    ``org_preferences`` (Work Stream F) carries learned organization-level
+    ``org_preferences`` carries learned organization-level
     defaults; they are treated as answered-for entities UNLESS the user
     explicitly said something different in the message or history.
 
-    ``prefill_entities`` (Work Stream S1) carries grounded values produced by
+    ``prefill_entities`` carries grounded values produced by
     the LLM entity-segregation stage. They are inserted with ``setdefault``
     semantics — a value captured by regex from the message, answered in a
     clarification round, or learned as an org preference always wins.
@@ -535,7 +548,7 @@ def plan(
     msg = user_message.strip()
     msg_lower = msg.lower()
 
-    # 0. BATCH DETECTION (Work Stream B): an enumerated multi-transaction
+    # 0. BATCH DETECTION: an enumerated multi-transaction
     #    request is planned per sub-document and merged into ONE plan, so
     #    the existing consolidated-clarification (one round for ALL gaps)
     #    and ONE-confirmation machinery handle the batch unchanged.
@@ -545,7 +558,7 @@ def plan(
             segments, clarification_history, user_message, org_preferences
         )
 
-    # 1. Identify intent — SEMANTIC FIRST (Work Stream S2).
+    # 1. Identify intent — SEMANTIC FIRST.
     #    The LLM semantic layer expresses the business act in ERP vocabulary
     #    ("supplied X with chairs, payment later" -> record_credit_sale).
     #    A whitelist makes any unknown/out-of-vocabulary value fall back to
@@ -590,7 +603,7 @@ def plan(
         if stated_qty is not None:
             entities.setdefault("item_quantity", stated_qty)
             entities.setdefault("quantity", stated_qty)
-    # Work Stream R4.10 — MULTI-LINE ITEMS: several items stated in ONE
+    # several items stated in ONE
     # request ("2 laptops at 5000 each and 3 mice at 500") are parsed into
     # DISTINCT lines; the invoice total is DERIVED from them (Σ qty ×
     # price) so the header can never disagree with its own lines.
@@ -634,7 +647,7 @@ def plan(
 
     # 3. Merge answers from prior clarification rounds (never re-ask)
     nature_source: Optional[str] = None
-    # Work Stream R4 — settlement-party hygiene + extraction.  The loose
+    # settlement-party hygiene + extraction.  The loose
     # entity extractor can fill supplier_name/customer_name with noise
     # ("payment", "Rs.12"); a garbage name must never reach the party
     # gate — it is dropped BEFORE the clarification merge so a real
@@ -679,7 +692,7 @@ def plan(
             if candidate.lower() not in _PARTY_NOISE:
                 entities["customer_name"] = candidate
 
-    # Work Stream R4.5 — bank-transfer parties: the "from X to Y" bank
+    # the "from X to Y" bank
     # names are material for the deterministic transfer path (the trusted
     # tool resolves names to ids and refuses unknown banks — accounts are
     # never invented).  Extraction is best-effort; unresolved names keep
@@ -701,7 +714,7 @@ def plan(
     if clarification_history:
         entities = _merge_clarification_answers(entities, clarification_history)
         if not nature_before_merge and entities.get("transaction_nature"):
-            # Work Stream R: the nature came from an explicit user answer
+            # the nature came from an explicit user answer
             # to the consolidated decision tree - logged for the audit trail.
             nature_source = "USER_ANSWER"
         # A clarification answer may have resolved the payment treatment —
@@ -710,7 +723,7 @@ def plan(
         if intent in ("record_purchase", "record_sale") and entities.get("payment_method"):
             intent = _refine_intent(intent, entities.get("payment_method"))
 
-    # 2b. GROUNDED LLM PREFILL (Work Stream S2 — AI-first perception).
+    # 2b. GROUNDED LLM PREFILL.
     #     Facts segregated from the user's OWN sentence by app/semantic_layer.py
     #     + app/entity_segregation.py (verbatim-grounded in Python) fill the
     #     gaps BEFORE any questionnaire is computed, so fields the user
@@ -725,7 +738,7 @@ def plan(
         if _pv is None or _pv == "" or _pk == "semantic_intent":
             continue
         if _pk in ("supplier_name", "customer_name"):
-            # Work Stream R4.4 stays true whichever stage produced the name:
+            # 
             # table furniture ("payment") and amount shapes ("Rs.12") must
             # never reach the party gate.
             _prefill_name = str(_pv).strip()
@@ -750,38 +763,37 @@ def plan(
         if not entities.get(_pk):
             entities[_pk] = _pv
 
-    # 3a. ORG PREFERENCES (Work Stream F) - learned defaults are treated as
+    # 3a. ORG PREFERENCES - learned defaults are treated as
     #     answered-for entities; an explicit user value ALWAYS wins (the
     #     extraction above already captured it).  The transaction date is
     #     NEVER defaulted - it is governed by the mandatory date protocol.
     prefs = org_preferences or {}
     if prefs:
-        # Work Stream R2 (product decision): the payment TREATMENT is a
+        # the payment TREATMENT is a
         # per-transaction question, NEVER an assumed default.  The user
         # explicitly chooses cash/bank/credit in the first round, and only
         # a CREDIT answer pulls the party question into the next round.
         # A learned payment_method preference is deliberately NOT
         # auto-applied (it stays recorded for reporting only).
         #
-        # LIVE DEFECT (fixed): the learned nature default was applied to ANY
-        # intent, including SALES.  Its vocabulary is the EXPENSE decision
-        # tree (FIXED_ASSET / INVENTORY / CONSUMABLE / OPERATING_EXPENSE /
-        # SERVICE), so a sale inherited an expense nature — which is how
-        # "Record Sale of Mobile PHONE" was recorded with
-        # transaction_nature=OPERATING_EXPENSE and the UI badge read
-        # "Nature: Operating Expense" on a SALE.  It also suppressed the
-        # sale-type question, so the revenue account was resolved silently.
-        # A learned nature may only answer where that taxonomy applies.
+        # The learned nature default must NOT be applied to ANY intent,
+        # including SALES.  Its vocabulary is the EXPENSE decision tree
+        # (FIXED_ASSET / INVENTORY / CONSUMABLE / OPERATING_EXPENSE /
+        # SERVICE), so applying it to a sale would record
+        # transaction_nature=OPERATING_EXPENSE on a SALE and show the wrong
+        # badge in the UI.  It would also suppress the sale-type question,
+        # so the revenue account would be resolved silently.  A learned
+        # nature may only answer where that taxonomy applies.
         if (
             not entities.get("transaction_nature")
             and prefs.get("transaction_nature")
             and intent in _EXPENSE_NATURE_INTENTS
         ):
             entities["transaction_nature"] = prefs["transaction_nature"]
-            # Work Stream R: a learned org default answered the nature.
+            # a learned org default answered the nature.
             nature_source = "PREFERENCE"
 
-    # Work Stream R3 — capitalization threshold + learned decisions:
+    # 
     # the org-set capitalization threshold governs when the R3.2
     # question fires (small amounts auto-expense), and a learned
     # capitalization decision for THIS purpose (preference key
@@ -790,6 +802,26 @@ def plan(
         "capitalization_threshold",
         capitalization_threshold_from_prefs(prefs),
     )
+
+    # R4.12 RECEIPT PARTY HYGIENE — money-IN: the counterparty of a
+    # receipt is the CUSTOMER who paid, never a payee. The loose "from X"
+    # regex is a SUPPLIER pattern, and a supplier-kind "Party check"
+    # answer folded from earlier history can also land in supplier_name;
+    # either one reaching a supplier-side gate made "I received 60000 from
+    # FDS Labs Pvt" ask to create a SUPPLIER ledger while FDS Labs existed
+    # as a customer with an open receivable (Invoice 5). Move a genuine
+    # captured name across, then drop the supplier key entirely.
+    if intent == "record_receipt":
+        _payer = str(entities.get("supplier_name") or "").strip()
+        if (
+            _payer
+            and _payer.lower() not in _PARTY_NOISE
+            and not re.fullmatch(
+                r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", _payer, re.IGNORECASE
+            )
+        ):
+            entities.setdefault("customer_name", _payer)
+        entities.pop("supplier_name", None)
 
     # CA-GRADE REASONING (expense path): when the message itself names a
     # KNOWN expense category ("record electricity bill of 20,000"), the
@@ -822,7 +854,7 @@ def plan(
             f"capitalization:{purpose_now.upper()}"
         ]
 
-    # Work Stream R3.1 — the purpose answer DERIVES the transaction
+    # the purpose answer DERIVES the transaction
     # nature (before routing): ambiguous purposes follow the R3.2
     # decision (CAPITALIZE -> FIXED_ASSET), everything else keeps its
     # deterministic nature.  A purpose-derived nature is an explicit
@@ -905,7 +937,7 @@ def plan(
     ):
         intent = "record_expense"
 
-    # Work Stream R: a sale answered FIXED ASSET DISPOSAL is never a
+    # a sale answered FIXED ASSET DISPOSAL is never a
     # revenue sale - it re-routes to the asset-disposal lifecycle (gain/
     # loss journal), with the named item becoming the asset reference.
     if entities.get("transaction_nature") == "ASSET_DISPOSAL" and intent in (
@@ -1029,7 +1061,7 @@ _FIELD_QUESTION = {
         "exist yet)."
     ),
     "customer_name": "Who is the customer?",
-    # Work Stream R4.9 — invoice LINE-DETAIL.  The manual invoice form
+    # invoice LINE-DETAIL.  The manual invoice form
     # mandates a line item (description + quantity); the AI path must ask
     # for both in the SAME consolidated round instead of silently
     # defaulting "Goods" x1.  Quantity is asked against the KNOWN total so
@@ -1044,7 +1076,7 @@ _FIELD_QUESTION = {
     ),
     "payment_type": "Was this paid in cash or on credit?",
     "asset_name": "Which asset is this about (asset name or code)?",
-    # Work Stream A - the standardized date question (exact shape per the
+    # the standardized date question (exact shape per the
     # protocol): joined to the consolidated questionnaire, never a
     # standalone round.
     "transaction_date": (
@@ -1061,10 +1093,10 @@ def _questions_for_fields(
 ) -> List[str]:
     """Per-field question text for the consolidated questionnaire.
 
-    The nature/purpose question is FAMILY-SPECIFIC (Work Stream R): the
+    The nature/purpose question is FAMILY-SPECIFIC: the
     question for a purchase (fixed asset vs inventory vs consumable vs
     service) differs from a sale, expense, settlement, return or
-    quotation.  Work Stream R3: the generic expense path asks the
+    quotation.  the generic expense path asks the
     PURPOSE question (what is it actually for?), the CONDITIONAL
     capitalization question and the settlement question instead of the
     4-way nature tree.  Every other field uses its standard
@@ -1092,7 +1124,7 @@ def _questions_for_fields(
             and str(ents.get("settlement_position") or "").upper()
             == "SETTLE_EXISTING_PAYABLE"
         ):
-            # Work Stream R4.4 — the settlement CHANNEL decides which
+            # the settlement CHANNEL decides which
             # ledger the money hits (cash vs bank), so it is asked.
             if intent == "record_receipt":
                 questions.append(
@@ -1116,7 +1148,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     """Return the material fields genuinely missing for *intent*.
 
     Rules (single source of truth for clarification):
-    * Nature/purpose comes FIRST (Work Stream R): for EVERY intent that
+    * Nature/purpose comes FIRST: for EVERY intent that
       creates, moves or classifies value the nature (fixed asset vs
       inventory vs consumable vs expense vs settlement) is a user decision
       - never guessed, never suppressed by other missing fields.  A learned
@@ -1130,13 +1162,13 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     * Cash-vs-credit treatment changes the accounting entries (payable vs
       immediate payment), so when NO payment keyword was found anywhere it
       is material and MUST be asked — never guessed.
-    * Ordering is dependency-first (Work Stream R): nature/purpose ->
+    * Ordering is dependency-first: nature/purpose ->
       cash-vs-credit -> party/asset reference -> amount -> transaction
-      date (Work Stream A text unchanged, always last).
+      date.
     """
     missing: List[str] = []
 
-    # Work Stream R3 — the generic expense ladder (dependency-first):
+    # 
     #   1. PURPOSE (what is it actually for?) replaces the 4-way nature
     #      tree for record_expense — the purpose answer DERIVES the nature.
     #   2. CAPITALIZE-OR-EXPENSE — only when the purpose is ambiguous
@@ -1171,7 +1203,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
             else:
                 missing.append("settlement_position")
 
-    # Work Stream R - the nature/purpose decision comes FIRST: it
+    # it
     # re-routes the intent (fixed asset -> registration, consumable ->
     # expense, disposal -> asset disposal) and the treatment.  The
     # generic expense path is covered by the R3 ladder above (purpose
@@ -1188,7 +1220,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
         # the cash/credit treatment is genuinely unknown.
         missing.append("payment_type")
 
-    # Work Stream R4.4/R4.6 — receipts/payments: the settlement CHANNEL
+    # the settlement CHANNEL
     # (cash vs bank) is ASKED, never defaulted — it decides which ledger
     # the money hits (R4.1: cash ledger is separate from the bank
     # ledger).  The PARTY is a NEXT-STAGE question: it is only material
@@ -1216,7 +1248,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     if intent in ("record_credit_sale", "create_invoice") and not entities.get("customer_name"):
         missing.append("customer_name")
 
-    # Work Stream R4.9/R4.10 — invoice LINE-DETAIL (dependency-first):
+    # 
     # the description and quantity are MATERIAL for invoices (parity law:
     # the manual form mandates a line item), so both are asked in the
     # same consolidated round — after the party, before amount/date —
@@ -1250,7 +1282,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
         missing.append("amount")
 
-    # Work Stream A: the transaction date is material for EVERY mutation -
+    # the transaction date is material for EVERY mutation -
     # an absent or unparseable date is asked (never silently defaulted).
     if intent in DATE_REQUIRED_INTENTS and not entities.get("transaction_date"):
         missing.append("transaction_date")
@@ -1262,7 +1294,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 # Multi-question answer splitting — the consolidated questionnaire may be
 # answered in ONE message ("1) cash 2) 150,000" or "cash, 150000").  Each
 # part must be routed to ITS OWN question, or the second answer is lost and
-# the same question is asked again (live defect).
+# the same question would be asked again.
 # ---------------------------------------------------------------------------
 
 _NUMBERED_Q_LINE = re.compile(r"^\s*\d+[.)]\s*(.+)$", re.MULTILINE)
@@ -1328,7 +1360,7 @@ def _explode_multi_answers(
             and len(parts) == len(sub_questions) + 1
             and re.match(r"supplier\s*:", parts[-1], re.IGNORECASE)
         ):
-            # Work Stream R2 - the UI's CONDITIONAL inline party answer:
+            # 
             # choosing CREDIT on the payment question reveals an extra
             # "N) supplier: X" part.  Pair the base parts with their
             # questions and route the trailing part to the supplier field.
@@ -1353,7 +1385,7 @@ def _resolve_same_answers(
     """Resolve "SAME" answers to the prior answer for the same question.
 
     The clarification-memory hint offers "reply SAME to reuse" for
-    preference-shaped questions (Work Stream F).  The question text may
+    preference-shaped questions.  The question text may
     carry the "(previously: ...)" hint suffix, so matching normalises it
     away.  A SAME with no resolvable prior is dropped (never guessed).
     """
@@ -1381,6 +1413,36 @@ def _resolve_same_answers(
     return resolved
 
 
+def _party_name_candidate(answer: str) -> Optional[str]:
+    """A party NAME extracted from a party-check answer, or ``None``.
+
+    A pick ("ABC Traders"), a declined-then-renamed reply ("No, use FDS
+    Labs") and similar are stored verbatim so the next search finds the
+    EXACT match.  A sentence-shaped reply ("I am Receiving amount, not
+    paying") is FEEDBACK about the question itself — folding it into the
+    party-name entity used to create a ledger literally named after the
+    user's complaint, so it is rejected and the previously extracted name
+    is kept (the gate simply re-asks instead of adopting the reply).
+    """
+    candidate = re.sub(
+        r"^(?:(?:yes|y|no|n|ok|create|use|pick|existing)\b[,.:;! \t]*)+",
+        "",
+        answer.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    if len(candidate) < 2 or len(candidate.split()) > 8:
+        return None
+    if re.match(
+        r"^(?:i|i'm|im|we|it|this|that|not|there|am|the)\b",
+        candidate,
+        re.IGNORECASE,
+    ):
+        return None
+    if not _is_plausible_party(candidate):
+        return None
+    return candidate
+
+
 def _merge_clarification_answers(
     entities: Dict[str, Any],
     qa_history: List[Dict[str, str]],
@@ -1401,7 +1463,7 @@ def _merge_clarification_answers(
         if not answer:
             continue
 
-        # Work Stream R3 — PURPOSE ("What is this expense for?"): the
+        # the
         # purpose answer is authoritative and DERIVES the transaction
         # nature (equipment -> FIXED_ASSET, resale goods -> INVENTORY,
         # everything else -> operating expense; ambiguous purposes wait
@@ -1416,7 +1478,7 @@ def _merge_clarification_answers(
                     merged["item_description"] = purpose_label(resolved_purpose)
                 continue
 
-        # Work Stream R3.2 — capitalization decision: authoritative for
+        # authoritative for
         # the ambiguous purposes (repairs / software / durable free text).
         if "ordinary expense or capitalized" in question:
             resolved_cap = resolve_capitalization_answer(question, answer)
@@ -1424,7 +1486,7 @@ def _merge_clarification_answers(
                 merged["capitalization_decision"] = resolved_cap
                 continue
 
-        # Work Stream R3.3 — settlement position: the CA-grade expense
+        # the CA-grade expense
         # treatments (paid now cash/bank · payable now · SETTLEMENT of an
         # expense already recorded as payable · prepaid) and the legacy
         # wording, so history answers always resolve.  Plain payables,
@@ -1484,7 +1546,7 @@ def _merge_clarification_answers(
                 merged["settlement_position"] = "OUTSTANDING"
             continue
 
-        # Work Stream R4.4 — settlement channel for receipts/payments:
+        # 
         # cash hits the CASH ledger, bank hits the BANK ledger (R4.1) —
         # the answer is authoritative and letter-tappable.
         if "in cash, or through the bank" in question:
@@ -1518,7 +1580,7 @@ def _merge_clarification_answers(
                     merged["account_name"] = named
             continue
 
-        # Work Stream R: the nature/purpose decision tree is resolved
+        # the nature/purpose decision tree is resolved
         # FIRST and FAMILY-AWARE ("b" means SERVICE in a sale round but
         # INVENTORY in a purchase round; a credit-note question contains
         # the word "credit" and must never be mistaken for the cash-vs-
@@ -1530,7 +1592,7 @@ def _merge_clarification_answers(
                 merged["transaction_nature"] = resolved_nature
                 continue
 
-        # Work Stream R2 - PARTY-RESOLUTION round ("Party check: ..."):
+        # ..."):
         # the answer either PICKS an existing party (kept verbatim so the
         # next search finds the EXACT match) or CONFIRMS creation of a new
         # party ledger.  Authoritative - it overrides any earlier value.
@@ -1543,13 +1605,19 @@ def _merge_clarification_answers(
                 merged["supplier_create_confirmed"] = True
                 if is_customer:
                     merged["customer_create_confirmed"] = True
-            elif is_customer:
-                merged["customer_name"] = answer
             else:
-                merged["supplier_name"] = answer
+                named = _party_name_candidate(answer)
+                if named:
+                    if is_customer:
+                        merged["customer_name"] = named
+                    else:
+                        merged["supplier_name"] = named
+                # else: sentence-shaped feedback — keep the extracted name
+                # and let the gate re-ask; a reply like "I am Receiving
+                # amount, not paying" must never become a ledger name.
             continue
 
-        # Work Stream R4.10 - CATALOG-CHECK round ("Catalog check: ..."):
+        # ..."):
         # one or more invoice lines are not in the product/service
         # catalog.  YES adds them (with the stated unit prices), NO keeps
         # them as one-off free-text lines.  Either way the invoice line
@@ -1567,7 +1635,7 @@ def _merge_clarification_answers(
         # dedicated child ledger under the revenue parent; any other answer names
         # the existing revenue account to use instead.  Either way the decision is
         # the user's — a sale is never silently booked to an arbitrary revenue
-        # account (the defect that credited a mobile-phone sale to "Software
+        # account (a mobile-phone sale must not be credited to e.g. "Software
         # Development Revenue").
         if "revenue ledger check:" in question:
             low = answer.lower()
@@ -1580,7 +1648,7 @@ def _merge_clarification_answers(
                     merged["revenue_account_name"] = named
             continue
 
-        # Work Stream R4.9/R4.10 — invoice LINE-DETAIL answers: the
+        # the
         # description and quantity are asked in the consolidated round
         # and routed here.  A multi-item answer ("2 laptops at 5000 and
         # 3 mice at 500") parses into DISTINCT lines instead of one
@@ -1611,7 +1679,7 @@ def _merge_clarification_answers(
         elif "supplier" in question and not merged.get("supplier_name"):
             low = answer.lower().strip()
             if "local vendor" in low or low in ("local", "no party", "none"):
-                # Work Stream R2 - one-off local vendor: fold into the
+                # fold into the
                 # standing 'Local Vendor' account (searched and created
                 # on first use by the deterministic executor).
                 merged["supplier_name"] = "Local Vendor"
@@ -1620,7 +1688,7 @@ def _merge_clarification_answers(
         elif "customer" in question and not merged.get("customer_name"):
             merged["customer_name"] = answer
         elif "date" in question and not merged.get("transaction_date"):
-            # Work Stream A: route the answer through the deterministic
+            # route the answer through the deterministic
             # parser.  On failure keep the raw answer so the validation
             # in plan() drops it and the date is re-asked (never guessed).
             parsed = parse_transaction_date(answer)
@@ -1708,7 +1776,7 @@ def _identify_intent(msg_lower: str) -> str:
         for pat in patterns:
             if re.search(pat, msg_lower):
                 return intent
-    # Work Stream R3.1 — LOOSE expense phrasings.  A typo'd or unusual
+    # LOOSE expense phrasings.  A typo'd or unusual
     # expense wording ("record an explanation of 25000" — the observed
     # failure) contains no "expense" substring, so the strict patterns
     # miss it and the request used to fall to the generic model path,
@@ -1728,7 +1796,7 @@ def _identify_intent(msg_lower: str) -> str:
         ):
             return "list_expenses"
         return "record_expense"
-    # Work Stream R4.4 — "received payment" WITHOUT a sale/purchase verb
+    # "received payment" WITHOUT a sale/purchase verb
     # is a customer receipt ("received payment of Rs.20,000"); a sale
     # phrasing ("sold ... and received payment") belongs to the sale
     # family and is handled by its own patterns above.
@@ -1825,7 +1893,7 @@ def _extract_item_quantity(msg: str, item: str) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Work Stream R4.10 — MULTI-LINE ITEM parsing
+# MULTI-LINE ITEM parsing
 # ---------------------------------------------------------------------------
 # Users state several line items in ONE request ("2 laptops at 5000 each
 # and 3 mice at 500", "1 laptop for 50,000, 2 keyboards for 2,000 each").

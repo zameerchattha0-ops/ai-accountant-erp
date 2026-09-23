@@ -1,5 +1,5 @@
 """
-AI Worker - DB-backed background job processor (Work Stream C)
+AI Worker - DB-backed background job processor
 ===============================================================
 A SUPERVISED process (not a FastAPI background task) that claims queued
 AI runs from ``ai.worker_jobs`` (FOR UPDATE SKIP LOCKED via

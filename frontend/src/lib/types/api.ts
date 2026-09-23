@@ -146,7 +146,7 @@ export interface AgentResponse {
   /** Quick-answer buttons (e.g. suggested accounts + "Create new account"). */
   options?: string[];
   /**
-   * Work Stream R3.4 — structured per-question tap-to-answer options
+   * structured per-question tap-to-answer options
    * (data-driven chips).  Each inner list is aligned with the
    * corresponding numbered sub-question of the questionnaire.
    */

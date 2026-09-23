@@ -133,7 +133,7 @@ async def find_stream_ledger(
       * the account name equals the proposed ledger name ("Chairs Sales"), or
       * the account name equals the stream itself ("Chairs").
 
-    A fuzzy hit is never accepted — guessing here is the very defect this
+    A fuzzy hit is never accepted — guessing here is the very failure this
     module exists to remove.
     """
     wanted = {_norm(label), _norm(suggest_ledger_name(label))}

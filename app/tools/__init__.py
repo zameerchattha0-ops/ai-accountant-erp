@@ -61,8 +61,7 @@ def register(
     ``contract`` is the tool's ARGUMENT contract, derived from the Python
     callable that consumes the arguments (``contract_from_callable``).  It is
     what lets Python reject an un-bindable call BEFORE the user is asked to
-    approve it — the missing check behind the 2026-09-20 create_invoice
-    incident.  A tool that declares no contract is simply not validated.
+    approve it.  A tool that declares no contract is simply not validated.
     """
     _TOOL_REGISTRY[slug] = {
         "handler": handler,
@@ -150,9 +149,9 @@ async def _get_chart_of_accounts(organization_id: uuid.UUID, **kw) -> ToolResult
 
 async def _create_account(organization_id: uuid.UUID, **kw) -> ToolResult:
     # Explicit account-creation requests MUST NOT fail on a colliding code
-    # (live defect: the model suggested 6150 which already exists, the
-    # unique constraint fired, and the operation silently degraded to the
-    # default expense account).  Resolve a free code in the same numbering
+    # (a suggested code such as 6150 may already exist; the unique constraint
+    # would fire and the operation would silently degrade to the default
+    # expense account).  Resolve a free code in the same numbering
     # series BEFORE the insert; the DB unique constraint remains the
     # last line of defence.
     requested_code = str(kw.get("code") or "")
@@ -406,9 +405,9 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
         # Auto-validate + auto-post the invoice journal — same convention as
         # create_purchase_bill / payment_service / create_expense: a recorded
         # invoice is a real receivable event; the ledger must reflect it
-        # immediately instead of leaving a DRAFT journal. Live-verified
-        # defect (S5/S6 suite): invoice journals stayed DRAFT. Deterministic
-        # backend calls — never an LLM decision.
+        # immediately instead of leaving a DRAFT journal behind (a recorded
+        # invoice must never leave a DRAFT journal). Deterministic backend
+        # calls — never an LLM decision.
         prepared = journal_result.get("journal_entry") or {}
         entry = prepared.get("entry") or {}
         if entry.get("id"):
@@ -421,10 +420,9 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
                 # posted invoice journal is a real receivable event: the
                 # invoice must carry journal_entry_id and sit in ISSUED so
                 # v_open_receivables / v_customer_aging reflect it (they
-                # filter out DRAFT). Live-verified defect (INV-000001):
-                # journal POSTED but invoice stayed DRAFT with a NULL
-                # journal_entry_id, so the ledger showed a receivable the
-                # aging views hid.
+                # filter out DRAFT): a POSTED journal with the invoice left
+                # DRAFT and a NULL journal_entry_id would show a receivable
+                # in the ledger that the aging views hide.
                 from app.repositories import invoice_repository as inv_repo
                 await inv_repo.link_journal_to_invoice(
                     invoice_id=uuid.UUID(str(data["id"])),

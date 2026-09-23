@@ -47,8 +47,8 @@ export default function JournalPage() {
   const [myRole, setMyRole] = useState<string | null>(null);
   const isAdmin = myRole === "OWNER" || myRole === "ADMIN";
   // Action errors (post/delete/reverse) are shown as an INLINE banner so a
-  // failed action never replaces the whole list (live-defect fix: a reverse
-  // permission error used to blank the page with an ErrorState).
+  // failed action never replaces the whole list (a reverse permission error
+  // must not blank the page with an ErrorState).
   const [actionError, setActionError] = useState<string | null>(null);
 
   const [expanded, setExpanded] = useState<string | null>(null);

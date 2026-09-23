@@ -19,7 +19,7 @@
 --    to GENERAL_SERVICE (verified live: an E_COMMERCE and a
 --    MANUFACTURING organization both received the identical service
 --    chart).
--- 4. A LATENT DEFECT. `create_organization` never created the
+-- 4. A LATENT GAP. `create_organization` never created the
 --    organization's `chart_of_accounts` row, so every seeded account had
 --    `chart_of_accounts_id = NULL`.  The banking screen resolves that row
 --    before it will create a bank GL account and therefore refused to

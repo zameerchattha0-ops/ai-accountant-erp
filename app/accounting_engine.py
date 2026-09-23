@@ -424,7 +424,7 @@ async def _resolve_default_account(
     """Resolve a default account of the given type — deterministically.
 
     EXPENSE accounts are special: an arbitrary "first expense account"
-    default debited a chair purchase to 6010 Salaries (live defect).  For
+    default can post to an unrelated category (e.g. Salaries).  For
     EXPENSE the default MUST be a genuinely GENERIC account (general /
     other / miscellaneous / sundry / operating in its name); when none
     exists we return None so the caller surfaces an honest warning instead
@@ -542,8 +542,8 @@ async def auto_journal(
             if not receivable:
                 # Resolve the RECEIVABLE account precisely — the first ASSET
                 # account is usually Cash (1000), which would debit Cash for a
-                # CREDIT sale. Live-verified defect (S5/S6 suite): JE-000041
-                # debited 1000 Cash instead of 1100 Accounts Receivable.
+                # CREDIT sale - it must never debit 1000 Cash instead of
+                # 1100 Accounts Receivable.
                 receivable = await accounting_service.resolve_account(
                     organization_id, account_name="Accounts Receivable"
                 )

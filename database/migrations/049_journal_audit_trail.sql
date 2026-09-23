@@ -1,7 +1,7 @@
 -- ============================================================
 -- 049: AUDIT TRAIL FOR JOURNAL EDIT / DELETE / REVERSE
 -- ============================================================
--- Work Stream E: the audit_logs table now receives a row for EVERY
+-- the audit_logs table now receives a row for EVERY
 -- journal-entry edit (before/after summary), DRAFT delete, and POSTED
 -- reversal - for ALL paths (UI, service, AI) because it is enforced by
 -- a DATABASE TRIGGER, not by application code.

@@ -8,7 +8,7 @@ import type { QuestionOption } from "@/lib/types/api";
 interface Props {
   question: string;
   options?: string[];
-  /** Work Stream R3.4 — backend-emitted options per numbered
+  /** backend-emitted options per numbered
    *  sub-question (aligned by index; the hardcoded quickOptions
    *  switch below remains the offline fallback). */
   questionOptions?: QuestionOption[][];
@@ -32,7 +32,7 @@ function splitQuestions(question: string): string[] {
   return [];
 }
 
-/** Work Stream R2: the intro is the questionnaire text MINUS the numbered
+/** the intro is the questionnaire text MINUS the numbered
  *  questions (those render as their own interactive fields - repeating
  *  them verbatim made the card duplicated and cluttered). */
 function introText(question: string): string {
@@ -43,7 +43,7 @@ function introText(question: string): string {
     .join("\n");
 }
 
-/** Work Stream R3.4a — strip model markdown (**bold**, backticks,
+/** strip model markdown (**bold**, backticks,
  *  headings, bullets) before rendering; the backend sanitizes too,
  *  this is the belt-and-braces fallback. */
 function sanitizeMarkdown(text: string): string {
@@ -55,7 +55,7 @@ function sanitizeMarkdown(text: string): string {
     .replace(/^\s{0,3}[-*]\s+/gm, "");
 }
 
-/** Work Stream R2: tap-to-select answers for known question types
+/** tap-to-select answers for known question types
  *  (no typing needed). */
 function quickOptions(q: string): string[] | null {
   if (/fixed asset/i.test(q) && /inventory/i.test(q)) {
@@ -67,7 +67,7 @@ function quickOptions(q: string): string[] | null {
   return null;
 }
 
-/** Work Stream R3.4 — the option list for ONE sub-question: the
+/** the
  *  backend payload wins (data-driven), the hardcoded switch is the
  *  fallback.  Dates offer Today/Yesterday chips when the backend did
  *  not send a payload. */
@@ -112,7 +112,7 @@ export default function AIClarification({
   const [answers, setAnswers] = useState<string[]>(
     multi ? subQuestions.map(() => "") : []
   );
-  // Work Stream R2: the CONDITIONAL party box appears only when CREDIT is
+  // the CONDITIONAL party box appears only when CREDIT is
   // selected on the payment question.  Ticking the Local Vendor toggle
   // disables the text box; the typed text is then NOT sent - the standing
   // "Local Vendor" account is used instead.
@@ -153,7 +153,7 @@ export default function AIClarification({
   const sendMulti = () => {
     if (!allAnswered || disabled) return;
     // Numbered so the backend routes every part to its own question.
-    // Work Stream R2: when CREDIT is selected, the conditional party box
+    // when CREDIT is selected, the conditional party box
     // is appended as a trailing "N) supplier: X" part (the backend pairs
     // it with the supplier field); the Local Vendor toggle sends the
     // standing "Local Vendor" answer instead of any typed text.
@@ -275,7 +275,7 @@ export default function AIClarification({
                 placeholder="Type your answer here..."
                 className="w-full px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-500/30 focus:border-ai-500 transition disabled:bg-bg-muted disabled:text-text-muted disabled:cursor-not-allowed"
               />
-              {/* Work Stream R2: the CONDITIONAL party box - only visible
+              {/* the CONDITIONAL party box - only visible
                   once CREDIT is selected on the payment question (or
                   "Outstanding" on the R3.3 settlement question). */}
               {(i === paymentIdx || i === settlementIdx) && creditSelected && (

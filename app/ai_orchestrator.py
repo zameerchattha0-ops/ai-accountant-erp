@@ -47,7 +47,7 @@ from app.models.schemas import AgentContext
 
 log = structlog.get_logger(__name__)
 
-# Work Stream B - tiered routing: reduced output budget for simple lookup
+# reduced output budget for simple lookup
 # intents that still need the model (the deterministic fast-path handles
 # the unambiguous ones without any LLM at all).
 _LIGHT_OUTPUT_BUDGET_TOKENS = 600
@@ -184,7 +184,7 @@ class AIOrchestrator:
         the session FAILED instead of risking a duplicate mutation on
         replay.
 
-        ``light_budget`` (Work Stream B tiered routing): when True the
+        ``light_budget``: when True the
         request gets a reduced max_output_tokens — used for simple lookup
         intents that still need the model (e.g. ambiguous phrasing) after
         the deterministic fast-path did not apply.

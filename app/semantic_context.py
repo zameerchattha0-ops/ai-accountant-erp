@@ -1,5 +1,5 @@
 """
-AI-Native ERP — Semantic Context Package (Work Stream S2)
+AI-Native ERP — Semantic Context Package
 ========================================================
 
 Builds the *relevant* context the semantic understanding layer is allowed to
@@ -267,7 +267,7 @@ H. AMBIGUOUS IS NOT MISSING
 I. NEVER ASK WHAT IS ALREADY KNOWN
    If a fact is EXPLICIT or SAFELY_INFERRED or already in ALREADY ESTABLISHED
    FACTS / PREVIOUS USER ANSWERS, it must NOT appear in missing or in any
-   question. Asking again for information the user already gave is the defect
+   question. Asking again for information the user already gave is the failure
    this architecture exists to prevent.
 
 J. QUESTIONS ARE GENERATED, NOT TEMPLATED

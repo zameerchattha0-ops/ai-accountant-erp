@@ -1,5 +1,5 @@
 """
-ERP AI Agent - Organization Preference Service (Work Stream F)
+ERP AI Agent - Organization Preference Service
 ===============================================================
 Learns durable per-organization defaults from clarification answers and
 serves them back as authoritative context.  Writers are the trusted
@@ -35,7 +35,7 @@ _NATURE_RE = re.compile(
     r"fixed asset|consumable|operating expense|inventory", re.I
 )
 _TAX_RE = re.compile(r"tax category|tax rate|inclusive|exclusive", re.I)
-# Work Stream R3.2 — the capitalization decision question ("ORDINARY
+# the capitalization decision question ("ORDINARY
 # EXPENSE or CAPITALIZED ...") is preference-shaped PER PURPOSE: the
 # purpose label appears inside the question text, so recurring purposes
 # (e.g. repairs) stop re-asking once answered.
@@ -69,7 +69,7 @@ def capture_preference_from_answer(
             return {"key": KEY_PAYMENT_METHOD, "value": "CASH"}
         return None
 
-    # Work Stream R3.2 — capitalization decision, learned PER PURPOSE.
+    # capitalization decision, learned PER PURPOSE.
     # Checked BEFORE the nature detector: the capitalization question
     # text itself contains "fixed asset", which would otherwise be
     # mistaken for a nature answer.

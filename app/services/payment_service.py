@@ -53,7 +53,7 @@ async def _resolve_cash_gl_account(
     organization_id: uuid.UUID,
     cash_account_id: Optional[uuid.UUID],
 ) -> uuid.UUID:
-    """Resolve the GL account id for a cash_accounts row (Work Stream R4.1).
+    """Resolve the GL account id for a cash_accounts row.
 
     The CASH ledger is separate from the bank ledger: an explicit
     cash_account_id wins, else the org's default (first active) cash
@@ -82,7 +82,7 @@ async def _resolve_settlement_gl(
     bank_account_id: Optional[uuid.UUID] = None,
     cash_account_id: Optional[uuid.UUID] = None,
 ) -> uuid.UUID:
-    """The MONEY side of a settlement journal (Work Stream R4.1).
+    """The MONEY side of a settlement journal.
 
     CASH  -> the cash ledger (cash_accounts GL).
     BANK* -> the bank ledger (bank_accounts GL).
@@ -122,7 +122,7 @@ async def _resolve_receipt_credit_account(
     customer_id: uuid.UUID,
     transaction_nature: Optional[str],
 ) -> tuple:
-    """The CREDIT side of a customer receipt (Work Stream R4.3).
+    """The CREDIT side of a customer receipt.
 
     * ALLOCATION (or unknown)  -> the customer's receivable (settlement).
     * ADVANCE                  -> a customer-advances LIABILITY account
@@ -172,7 +172,7 @@ async def _resolve_payment_debit_account(
     supplier_id: uuid.UUID,
     transaction_nature: Optional[str],
 ) -> tuple:
-    """The DEBIT side of a supplier payment (Work Stream R4.3).
+    """The DEBIT side of a supplier payment.
 
     * ALLOCATION (or unknown)  -> the supplier's payable (settlement).
     * ADVANCE                  -> a supplier-advances ASSET account
@@ -330,7 +330,7 @@ async def record_customer_receipt(
 ) -> Dict[str, Any]:
     """Record a customer receipt with auto-journal and optional invoice allocation.
 
-    Work Stream R4: the MONEY side follows the settlement channel — a CASH
+    the MONEY side follows the settlement channel — a CASH
     receipt debits the CASH ledger, a bank receipt debits the BANK ledger
     (never crossed).  The CREDIT side follows the business operation
     (``transaction_nature``): invoice settlement credits the receivable,
@@ -445,7 +445,7 @@ async def record_supplier_payment(
 ) -> Dict[str, Any]:
     """Record a supplier payment with auto-journal and optional bill allocation.
 
-    Work Stream R4: the MONEY side follows the settlement channel — a CASH
+    the MONEY side follows the settlement channel — a CASH
     payment credits the CASH ledger, a bank payment credits the BANK ledger.
     The DEBIT side follows the business operation (``transaction_nature``):
     bill settlement debits the payable, an advance debits a supplier-advances
