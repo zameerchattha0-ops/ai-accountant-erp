@@ -376,12 +376,16 @@ export async function aiExecuteStream(
   if (!res.ok || !res.body) {
     // Older backend without the SSE route - fall back to the plain call.
     const fallback = await aiExecute(request);
-    void reportClientTtfb({
-      executionId: fallback.execution_id,
-      ttfbMs: performance.now() - startedAt,
-      transport: "inline",
-      token,
-    });
+    // Guard: AgentResponse.execution_id is optional (string | undefined);
+    // only report TTFB when the id actually came back.
+    if (fallback.execution_id) {
+      void reportClientTtfb({
+        executionId: fallback.execution_id,
+        ttfbMs: performance.now() - startedAt,
+        transport: "inline",
+        token,
+      });
+    }
     return fallback;
   }
 
