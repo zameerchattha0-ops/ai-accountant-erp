@@ -1073,6 +1073,72 @@ def _usable_question(text: str) -> Optional[str]:
     return None
 
 
+# ---- CASH-CONFIG GATE (P5 pattern for the cash ledger) --------------------
+# A cash settlement with no drawer configured is a CONFIGURATION state, not
+# an execution failure: it must park with a guided question (asked once per
+# conversation) instead of dead-ending in "Something went wrong", and the
+# drawer may be created only AFTER an explicit YES (never invented).
+_AFFIRMATIVE_ANSWER_RE = re.compile(
+    r"(?i)^\s*(?:y|yes|yep|yeah|yup|sure|ok|okay|fine|confirm\w*|create\w*"
+    r"|create\s+it|do\s+it|go\s+ahead|proceed|please\s+(?:do|create|proceed))"
+    r"\s*[.!?,]?\s*$"
+)
+
+
+def _is_affirmative_answer(text: Optional[str]) -> bool:
+    """True only for a tight set of clear YES replies (never guessing)."""
+    return bool(text) and _AFFIRMATIVE_ANSWER_RE.match(str(text).strip()) is not None
+
+
+def _is_cash_config_error(error: Optional[str]) -> bool:
+    """True when a tool failed solely because no cash drawer is configured."""
+    return "No cash account specified" in (error or "")
+
+
+def _cash_configuration_question(cash_gl: Optional[Dict[str, Any]]) -> str:
+    """Ask-once guided question replacing the dead-end cash failure.
+
+    Both variants carry "cash ledger" (the creation trigger) and "cash
+    account" (the ask-once marker), so a second miss falls through to the
+    genuine FAILED path instead of re-parking forever.
+    """
+    if cash_gl:
+        name = str(cash_gl.get("name") or "Cash")
+        code = str(cash_gl.get("code") or "")
+        return (
+            f"No cash account is configured as the cash ledger for this "
+            f"organization, so this cash payment or receipt cannot be "
+            f"recorded yet — the money side must hit the cash ledger, never "
+            f"the bank. Reply YES to create a default '{name}' cash account "
+            f"linked to your existing '{name}' ({code}) GL account, then "
+            f"I'll retry; or set it up another way and ask me again."
+        )
+    return (
+        "No cash account is configured as the cash ledger for this "
+        "organization, so this cash payment or receipt cannot be recorded "
+        "yet — and the chart of accounts has no Cash asset account either. "
+        "Add a Cash (ASSET) account under Accounting → Chart of Accounts, "
+        "then ask me again — I won't invent a GL account myself."
+    )
+
+
+def _cash_drawer_creation_pending(prior_qa: List[Dict[str, str]]) -> bool:
+    """True when the cash-ledger question was asked AND the user said YES."""
+    for qa in prior_qa or []:
+        question = (qa.get("question") or "").lower()
+        if "cash ledger" in question and _is_affirmative_answer(qa.get("answer")):
+            return True
+    return False
+
+
+def _cash_config_already_asked(prior_qa: List[Dict[str, str]]) -> bool:
+    """Ask-once: any prior cash-account question counts (P5 bank mirror)."""
+    return any(
+        "cash account" in (qa.get("question") or "").lower()
+        for qa in prior_qa or []
+    )
+
+
 def _mutation_executed(tool_calls: List[ToolCall]) -> bool:
     """True if any executed tool MUTATES ERP state (not read-only).
 
@@ -2737,6 +2803,32 @@ async def execute(
                     requires_user_input=True,
                 )
 
+        # ---- CASH-CONFIG GATE: a user-sanctioned YES on the parked
+        # cash-ledger question creates the default drawer before any
+        # execution path (model, fast path, or approval re-run) can settle
+        # in cash.  P5 pattern: creation ONLY after an explicit YES — never
+        # on the agent's own initiative; links the EXISTING cash GL account
+        # (never invents a GL, never falls back to the bank ledger).
+        if _cash_drawer_creation_pending(prior_qa):
+            from app.services import bank_service
+
+            drawer_before = await bank_service.repo.get_default_cash_account(
+                organization_id
+            )
+            created_drawer = await bank_service.ensure_default_cash_account(
+                organization_id
+            )
+            if created_drawer and not drawer_before:
+                # Durable observability marker (structlog is lost on Vercel
+                # — DEFECT3) — written only on the turn that actually
+                # created the drawer, never on later idempotent passes.
+                await _log_step(session_id, "CASH_DRAWER_CREATED", {
+                    "cash_account_id": str(created_drawer.get("id")),
+                    "name": created_drawer.get("name"),
+                    "gl_account_id": str(created_drawer.get("gl_account_id")),
+                    "source": "cash_accounts_configuration",
+                })
+
         _phase_elapsed("context.start")
         # ---- PHASE 3: CONTEXT LOADING ------------------------------------
         await _update_status(session_id, ExecutionStatus.CONTEXT_LOADING)
@@ -3926,6 +4018,42 @@ async def execute(
             if not successful_results:
                 # Nothing succeeded — the operation genuinely failed.
                 first_error = failed_results[0].error or "unknown error"
+                # ---- CASH-CONFIG GATE (P5 mirror): no configured cash
+                # drawer is a configuration state, not an execution failure —
+                # park with a guided question ONCE instead of dead-ending in
+                # "Something went wrong".  A second miss (already asked)
+                # falls through to the genuine FAILED path below.
+                if _is_cash_config_error(
+                    first_error
+                ) and not _cash_config_already_asked(prior_qa):
+                    from app.services import bank_service
+
+                    question = _cash_configuration_question(
+                        await bank_service.find_cash_gl_account(organization_id)
+                    )
+                    await create_clarification(
+                        session_id=session_id,
+                        question=question,
+                        required_fields=["cash_accounts_configuration"],
+                    )
+                    await _update_status(
+                        session_id, ExecutionStatus.AWAITING_CLARIFICATION
+                    )
+                    await _log_step(
+                        session_id,
+                        "AWAITING_CLARIFICATION",
+                        {
+                            "source": "cash_accounts_configuration",
+                            "question": question[:500],
+                        },
+                    )
+                    return AgentResponse(
+                        status=ExecutionStatus.AWAITING_CLARIFICATION,
+                        execution_id=session_id,
+                        question=question,
+                        required_information=["cash_accounts_configuration"],
+                        requires_user_input=True,
+                    )
                 await _update_status(session_id, ExecutionStatus.FAILED)
                 await create_execution_result(
                     session_id=session_id,

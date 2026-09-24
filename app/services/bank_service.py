@@ -183,3 +183,72 @@ async def resolve_bank_account(
 
     # Ambiguous — return None so the agent can ask for clarification
     return None
+
+# ---------------------------------------------------------------------------
+# Cash drawers (cash_accounts) — the CASH ledger's configuration rows
+# ---------------------------------------------------------------------------
+
+
+def pick_cash_gl_account(accounts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Choose the org's CASH GL account from its chart (pure, testable).
+
+    Preference: exact ``Cash in Hand`` → exact ``Cash`` → any active row
+    whose name contains ``cash``.  Returns None when the chart has no cash
+    GL account — a missing GL is a configuration state the user resolves
+    (never invented here).
+    """
+    active = [a for a in (accounts or []) if a.get("is_active", True)]
+    named = [(a, (a.get("name") or "").strip().lower()) for a in active]
+    for wanted in ("cash in hand", "cash"):
+        for row, name in named:
+            if name == wanted:
+                return row
+    for row, name in named:
+        if "cash" in name:
+            return row
+    return None
+
+
+async def find_cash_gl_account(organization_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """The chart-of-accounts cash GL row (drives the configuration question)."""
+    assets = await acct_repo.get_chart_of_accounts(
+        organization_id, account_type="ASSET", limit=500,
+    )
+    return pick_cash_gl_account(assets)
+
+
+async def ensure_default_cash_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """Return the default cash drawer, creating it ONLY on user sanction.
+
+    Callers must have an explicit YES to the cash-configuration question
+    (P5 pattern: configuration is never invented on the agent's own
+    initiative — same rule as bank accounts).  The drawer links to the
+    org's EXISTING cash GL account; no cash GL → None (chart creation
+    stays its own guided flow).  Idempotent: an existing active drawer
+    (the first active row is the default) is returned untouched.
+    """
+    existing = await repo.get_default_cash_account(organization_id)
+    if existing:
+        return existing
+    cash_gl = await find_cash_gl_account(organization_id)
+    if not cash_gl:
+        return None
+    drawer = await insert_one(
+        "cash_accounts",
+        data={
+            "organization_id": str(organization_id),
+            "name": str(cash_gl.get("name") or "Cash"),
+            "gl_account_id": str(cash_gl["id"]),
+            "is_active": True,
+        },
+    )
+    log.info(
+        "cash.drawer_created",
+        organization_id=str(organization_id),
+        cash_account_id=drawer.get("id"),
+        gl_account_id=str(cash_gl["id"]),
+    )
+    return drawer
+
