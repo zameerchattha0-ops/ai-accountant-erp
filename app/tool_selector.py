@@ -159,3 +159,52 @@ def excluded_for_intent(
         return set()
     allowed = tools_for_intent(intent, planner_tools)
     return {t for t in (all_tools or ()) if t not in allowed}
+
+
+# Every lookup slug plus the journal helpers are universally permitted for
+# any intent — they never trigger reconciliation or a confirmation conflict.
+_LOOKUP_UNIVERSE = (
+    _CUSTOMER_LOOKUPS | _SUPPLIER_LOOKUPS | _ACCOUNT_LOOKUPS
+    | _PRODUCT_LOOKUPS | _ASSET_LOOKUPS | _BANK_LOOKUPS
+)
+_JOURNAL_HELPERS = {"prepare_journal", "validate_journal", "post_journal"}
+
+
+def reconcile_intent_with_tools(
+    intent: str,
+    tool_names: Iterable[str],
+    potential_tools: Iterable[str] = (),
+) -> tuple[str, set[str]]:
+    """FIX-5: align the INTENT with the mutation tools a plan actually runs.
+
+    Returns ``(reconciled_intent, still_unpermitted_tools)``.
+
+    Generic — derived only from the intent→tool table above, NEVER from an
+    event-specific template (the "3 computers" incident: reasoning proposed
+    ``register_fixed_asset`` while the plan/confirmation intent said
+    ``record_expense``; the mismatch made the shortlist refuse the plan's
+    own tool at execution).
+
+    * every planned tool already belongs to *intent* (planner-listed tools,
+      lookups and journal helpers included) → nothing changes;
+    * the tools point at exactly ONE other intent → that intent wins (the
+      plan IS the economic event; the intent string must not contradict it);
+    * ambiguous / multi-intent / unknown tools are RETURNED as unpermitted —
+      the caller decides (never silently executed, never silently dropped).
+    """
+    tools = set(tool_names or ())
+    if not tools:
+        return intent, set()
+    always = _LOOKUP_UNIVERSE | _JOURNAL_HELPERS
+    allowed = tools_for_intent(intent, potential_tools) | always
+    extra = tools - allowed
+    if not extra:
+        return intent, set()
+    candidates = [
+        i for i, core in _INTENT_TOOLS.items() if extra <= core
+    ]
+    if len(candidates) == 1 and candidates[0] != intent:
+        final = candidates[0]
+        allowed_final = tools_for_intent(final, potential_tools) | always
+        return final, tools - allowed_final
+    return intent, extra

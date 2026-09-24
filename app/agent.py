@@ -1444,6 +1444,78 @@ def event_prohibited_tools(
     return prohibited_tool_names(profile)
 
 
+# Party-creation slugs: the ONLY tools the shortlist guard may refuse with
+# the historical duplicate-party wording (the case that guard was written
+# for — a search already resolved the party).
+_PARTY_CREATE_TOOLS = frozenset({"create_supplier", "create_customer"})
+
+
+def excluded_tool_refusal(tool_name: str, intent: str) -> Dict[str, str]:
+    """FIX-2: accurate refusal for a shortlist-disabled tool.
+
+    RC-2 (production 2026-09-24, "3 computers" incident): a single guard
+    refused EVERY excluded tool with the party-duplicate message —
+    ``register_fixed_asset`` failed with "an existing record was already
+    found for this party" for a party that never existed in the request.
+    Party creation keeps its historical wording (byte-identical); every
+    other excluded tool gets an honest not-permitted-for-this-intent
+    refusal.  Pure — unit tested directly.
+    """
+    if tool_name in _PARTY_CREATE_TOOLS:
+        return {
+            "success": False,
+            "error": (
+                "BUSINESS_RULE_VIOLATION: an existing record was "
+                "already found for this party — reuse it. Creating "
+                "a duplicate is forbidden."
+            ),
+            "error_category": "BUSINESS_RULE_VIOLATION",
+        }
+    return {
+        "success": False,
+        "error": (
+            f"BUSINESS_RULE_VIOLATION: {tool_name} is not part of the "
+            f"'{intent}' transaction's permitted toolset — it was "
+            "excluded from this plan. Record the event with the tools "
+            "that match its accounting intent, or ask the user to "
+            "confirm a different treatment."
+        ),
+        "error_category": "BUSINESS_RULE_VIOLATION",
+    }
+
+
+def plan_conflict_tools(
+    *,
+    planned_names: Sequence[str],
+    prohibited_actions: Optional[List[Dict[str, str]]],
+    unpermitted: Any = (),
+    batch: bool = False,
+) -> set:
+    """FIX-6 decision: which planned tools can NEVER execute, when NOTHING
+    in the plan remains executable.
+
+    Fail-closed BEFORE the user is asked to approve a plan that execution
+    would refuse (production 2026-09-24: a plan whose ONLY tool was
+    prohibited for its own event profile was frozen into a confirmation
+    and detonated on the approval turn).  Partial tolerance is preserved:
+    when at least one planned tool can still execute the set is empty and
+    the executor gates refuse individual tools exactly as before.  Batch
+    plans keep their existing sub-intent handling (never flagged here).
+    Pure — unit tested directly.
+    """
+    if batch:
+        return set()
+    names = {str(n) for n in (planned_names or [])}
+    if not names:
+        return set()
+    blocked = names & (
+        event_prohibited_tools(prohibited_actions) | set(unpermitted or ())
+    )
+    if blocked and not (names - blocked):
+        return blocked
+    return set()
+
+
 
 def party_resolved_in_search(
     result_data: Any, entity_name: Optional[str]
@@ -2922,6 +2994,9 @@ async def execute(
             resolve_account_hints=(
                 _reasoning_calls is None and approved_tool_calls is None
             ),
+            # RC-4a: honest provenance — a learned org preference must not
+            # be reported as USER_ANSWER ("the user said so").
+            explicit_nature_source=execution_plan.transaction_nature_source,
         )
         execution_plan.classification = classification
         context.classification = classification
@@ -3376,6 +3451,56 @@ async def execute(
             )
 
 
+        # ---- FIX-5 / FIX-1: reconcile the INTENT with the planned tools,
+        # then never let the shortlist guard refuse the plan itself.
+        # RC-1/RC-5 (production 2026-09-24, "3 computers" incident): the
+        # reasoning layer proposed register_fixed_asset while the plan/
+        # confirmation intent said record_expense; the approved turn then
+        # re-seeded the shortlist from the MISMATCHED intent, the plan's own
+        # tool landed in excluded_tools, and the executor refused the only
+        # planned call with the party-duplicate story -> FAILED.  The
+        # reconciliation is GENERIC — derived from the intent->tool table,
+        # never an event template.  Batch plans keep full toolsets (the
+        # shortlist seed skips them too).
+        _unpermitted: set = set()
+        if planned_tool_calls and not execution_plan.batch_items:
+            from app.planner import intent_requires_confirmation
+            from app.tool_selector import reconcile_intent_with_tools
+
+            _planned_names = [tc.tool_name for tc in planned_tool_calls]
+            _intent_before = execution_plan.intent
+            _recon_intent, _unpermitted = reconcile_intent_with_tools(
+                _intent_before,
+                _planned_names,
+                execution_plan.potential_tools,
+            )
+            if _recon_intent != _intent_before:
+                execution_plan.intent = _recon_intent
+                # Re-seed the shortlist from the RECONCILED intent so the
+                # offering, the guards and Phase 7/8 verification all agree
+                # with the economic event the plan actually performs.
+                excluded_tools = excluded_for_intent(
+                    _recon_intent,
+                    execution_plan.potential_tools,
+                    _list_all_tools(),
+                )
+                if intent_requires_confirmation(_recon_intent):
+                    # The reconciled event class needs user authorization —
+                    # never silently execute it merely because the old
+                    # intent (e.g. record_expense) did not.
+                    execution_plan.requires_confirmation = True
+                await _log_step(session_id, "PLANNING", {
+                    "intent_before": _intent_before,
+                    "intent_after": _recon_intent,
+                    "planned_tools": _planned_names,
+                    "source": "intent_tool_reconcile",
+                })
+            # FIX-1: tools the plan is ALLOWED to run are never refused by
+            # the shortlist guard — the (frozen) plan is the authority at
+            # this point.  Tools OUTSIDE the reconciled intent stay
+            # excluded and are refused honestly by excluded_tool_refusal.
+            excluded_tools -= set(_planned_names) - _unpermitted
+
         # ---- PHASE 5: CONFIRMATION GATE (BEFORE execution) ---------------
         # Skipped when resuming an already-approved session
         # (confirmation_granted=True from resume_with_confirmation).
@@ -3434,6 +3559,65 @@ async def execute(
                         list(execution_plan.missing_fields or [])
                         or ["missing_details"]
                     ),
+                    requires_user_input=True,
+                )
+
+            # ---- FIX-6: FAIL CLOSED before the user approves a plan that
+            # execution would refuse (RC-1/RC-3: the computers incident
+            # froze a plan whose only tool contradicted its own event
+            # profile and detonated it on the approval turn).  When NOTHING
+            # executable remains, ask for the accounting treatment instead
+            # of creating a doomed confirmation.  Partial plans keep
+            # today's tolerance — the executor gates refuse individual
+            # tools with accurate messages.
+            _conflict = plan_conflict_tools(
+                planned_names=[tc.tool_name for tc in planned_tool_calls],
+                prohibited_actions=execution_plan.prohibited_actions,
+                unpermitted=_unpermitted,
+                batch=bool(execution_plan.batch_items),
+            )
+            if _conflict:
+                _c_reason = next(
+                    (
+                        str((a or {}).get("reason") or "")
+                        for a in (execution_plan.prohibited_actions or [])
+                        if event_prohibited_tools([a]) & _conflict
+                    ),
+                    "the planned step is not permitted for this "
+                    "transaction's intent",
+                )
+                _c_question = (
+                    f"Nothing has been recorded yet. I cannot prepare an "
+                    f"executable plan: {', '.join(sorted(_conflict))} "
+                    f"cannot be recorded for this transaction as it is "
+                    f"classified ({_c_reason}). How should this transaction "
+                    f"be treated? Confirm the accounting treatment and I "
+                    f"will propose a valid plan."
+                )
+                try:
+                    _c_clar = await create_clarification(
+                        session_id=session_id,
+                        question=_c_question,
+                        required_fields=["accounting_treatment"],
+                    )
+                    _c_question = _c_clar.get("question", _c_question)
+                except Exception as exc:  # noqa: BLE001 — asking is not optional
+                    log.warning(
+                        "agent.treatment_conflict_clarification_failed",
+                        session_id=str(session_id),
+                        error=str(exc)[:200],
+                    )
+                await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                    "source": "intent_tool_conflict",
+                    "intent": execution_plan.intent,
+                    "blocked_tools": sorted(_conflict),
+                    "question": _c_question[:300],
+                })
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=_c_question,
+                    required_information=["accounting_treatment"],
                     requires_user_input=True,
                 )
 
@@ -3566,17 +3750,19 @@ async def execute(
                 }
             # Reasoning-level guard: once a party has been resolved by
             # search, its creation tool is disabled — refuse any attempt so
-            # the model reuses the resolved record instead.
+            # the model reuses the resolved record instead.  FIX-2 (RC-2):
+            # the refusal TEXT is tool-specific — party tools keep the
+            # duplicate-party wording; anything else is honestly reported
+            # as not-permitted-for-this-intent, never a fabricated party
+            # story ("3 computers" incident).
             if tool_name in excluded_tools:
-                return {
-                    "success": False,
-                    "error": (
-                        "BUSINESS_RULE_VIOLATION: an existing record was "
-                        "already found for this party — reuse it. Creating "
-                        "a duplicate is forbidden."
-                    ),
-                    "error_category": "BUSINESS_RULE_VIOLATION",
-                }
+                log.warning(
+                    "agent.excluded_tool_refused",
+                    session_id=str(session_id),
+                    intent=execution_plan.intent,
+                    tool=tool_name,
+                )
+                return excluded_tool_refusal(tool_name, execution_plan.intent)
             # Reasoning-level guard: the user explicitly requested a new
             # account; until that account is successfully created, default-
             # account mutations are forbidden (no silent degradation).

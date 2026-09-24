@@ -75,6 +75,30 @@ _EXPENSE_NATURE_INTENTS = frozenset({
     "register_fixed_asset",
 })
 
+# Intents that require explicit user authorization BEFORE any mutation
+# (the PHASE 5 confirmation gate).  Exported through
+# intent_requires_confirmation() so the agent can RE-EVALUATE the
+# requirement after FIX-5 reconciliation (when the planned tools reveal a
+# confirmation-class event under a non-confirmation intent, e.g. a
+# register_fixed_asset plan living under record_expense).
+_CONFIRMATION_INTENTS = frozenset({
+    "record_credit_purchase", "record_credit_sale", "create_invoice",
+    "record_receipt", "record_payment",
+    "create_credit_note", "create_purchase_return", "record_expense_payment",
+    "record_bank_transfer", "create_bank_account",
+    "register_fixed_asset", "dispose_fixed_asset",
+    "record_asset_depreciation",
+    # Quotation → invoice conversion posts a receivable journal, so the
+    # user confirms before the accounting mutation (same as create_invoice).
+    "convert_quotation",
+})
+
+
+def intent_requires_confirmation(intent: str) -> bool:
+    """Does *intent* require user authorization before mutating?"""
+    return intent in _CONFIRMATION_INTENTS
+
+
 # hard ceiling on batch size - beyond this the request is
 # treated as a single (possibly itemised) transaction instead of N
 # documents, preventing pathological N-document explosions.
@@ -789,9 +813,31 @@ def plan(
             and prefs.get("transaction_nature")
             and intent in _EXPENSE_NATURE_INTENTS
         ):
-            entities["transaction_nature"] = prefs["transaction_nature"]
-            # a learned org default answered the nature.
-            nature_source = "PREFERENCE"
+            # RC-4b (production 2026-09-24, "3 computers" incident): a
+            # LEARNED default may only answer the nature BELOW the
+            # capitalization threshold.  At/above it the expense-vs-asset
+            # distinction is exactly what must be asked (or derived from the
+            # item) — injecting "OPERATING_EXPENSE" here suppressed the
+            # nature question and made the plan promise an expense while
+            # the reasoning layer proposed capitalisation.  Amount unknown
+            # keeps the legacy injection (the threshold/ladder questions
+            # still fire through their own paths).
+            _pref_amt = entities.get("amount")
+            try:
+                _pref_amt_f = float(_pref_amt) if _pref_amt is not None else None
+            except (TypeError, ValueError):
+                _pref_amt_f = None
+            _pref_thr = capitalization_threshold_from_prefs(prefs)
+            if _pref_amt_f is not None and _pref_amt_f >= _pref_thr:
+                log.info(
+                    "planner.nature_preference_skipped_at_or_above_threshold",
+                    amount=_pref_amt_f,
+                    threshold=_pref_thr,
+                )
+            else:
+                entities["transaction_nature"] = prefs["transaction_nature"]
+                # a learned org default answered the nature.
+                nature_source = "PREFERENCE"
 
     # 
     # the org-set capitalization threshold governs when the R3.2
@@ -974,17 +1020,7 @@ def plan(
         "generate_supplier_ledger",
     )
     requires_accounting = intent in _TRANSACTION_INTENTS
-    requires_confirmation = intent in (
-        "record_credit_purchase", "record_credit_sale", "create_invoice",
-        "record_receipt", "record_payment",
-        "create_credit_note", "create_purchase_return", "record_expense_payment",
-        "record_bank_transfer", "create_bank_account",
-        "register_fixed_asset", "dispose_fixed_asset",
-        "record_asset_depreciation",
-        # Quotation → invoice conversion posts a receivable journal, so the
-        # user confirms before the accounting mutation (same as create_invoice).
-        "convert_quotation",
-    )
+    requires_confirmation = intent in _CONFIRMATION_INTENTS
 
     # 5. ECONOMIC EVENT CLASSIFICATION — BEFORE tool selection.
     #    Determine what real-world event this request represents and which

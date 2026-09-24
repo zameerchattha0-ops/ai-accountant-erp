@@ -1668,7 +1668,13 @@ class EventProfile:
 _ACTION_TOOLS: Dict[str, set] = {
     "party_ledger_creation": {"create_supplier", "create_customer"},
     "inventory_movement": set(),   # no inventory tools registered yet
-    "fixed_asset_capitalization": set(),
+    # RC-3 (production 2026-09-24, "3 computers" incident): this prohibited
+    # ACTION used to map to NO tool, so the executor's generic negative-
+    # reasoning gate could never fire for it — the capitalisation of an
+    # operating expense slipped through to an unrelated guard with a
+    # fabricated party-duplicate message.  The asset-lifecycle tool IS the
+    # prohibited act; the enforcement mechanism stays generic.
+    "fixed_asset_capitalization": {"register_fixed_asset"},
     "mutation": set(),             # filled dynamically for REPORTING events
 }
 

@@ -437,6 +437,7 @@ async def classify_transaction(
     # mapping, 4b COA item mapping) always run: build_event_profile consumes
     # transaction_nature for the executor's prohibited-tools guard.
     resolve_account_hints: bool = True,
+    explicit_nature_source: Optional[str] = None,
 ) -> TransactionClassification:
     """Classify the transaction using the authority hierarchy (see module doc).
 
@@ -520,6 +521,20 @@ async def classify_transaction(
         nature = str(explicit).upper()
         if nature not in NATURES:
             nature = FIXED_ASSET if "ASSET" in nature else OPERATING_EXPENSE
+        # RC-4a (production 2026-09-24, "3 computers" incident): the plan
+        # carries the TRUE provenance of the nature (planner:
+        # USER_ANSWER vs PREFERENCE vs DETERMINISTIC_RULE).  Reporting a
+        # learned org preference as USER_ANSWER upgraded a default into
+        # "the user said so" (the CLASSIFICATION step showed source:
+        # USER_ANSWER for a nature the user never answered).  Honest
+        # provenance only — the nature DECISION itself is unchanged.
+        # Legacy callers without the param keep the historical label.
+        _raw_src = str(explicit_nature_source or "").strip().upper()
+        explicit_source = (
+            _raw_src
+            if _raw_src in ("USER_ANSWER", "PREFERENCE", "DETERMINISTIC_RULE")
+            else "USER_ANSWER"
+        )
         account = (
             await _search_account_by_nature(organization_id, nature, item)
             if resolve_account_hints
@@ -537,7 +552,7 @@ async def classify_transaction(
             return TransactionClassification(
                 transaction_nature=nature,
                 confidence="HIGH",
-                source="USER_ANSWER",
+                source=explicit_source,
                 entity=item or entity_name,
                 account_hint_id=None,
                 account_hint_code=None,
@@ -552,7 +567,7 @@ async def classify_transaction(
         return TransactionClassification(
             transaction_nature=nature,
             confidence="HIGH",
-            source="USER_ANSWER",
+            source=explicit_source,
             entity=item or entity_name,
             account_hint_id=account.get("id") if account else None,
             account_hint_code=account.get("code") if account else None,
