@@ -184,10 +184,52 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- Token Harbor (th) — PRIMARY gateway: DeepSeek V4.1 + Mimo 2.6 ------
+    # OpenAI-compatible gateway (https://tokenharbor.ai/v1) reached with a
+    # Universal Key (thk_live_…).  Key resolution: env TH_API_KEY first, then
+    # Supabase Vault 'TH_API_KEY' (service-role only — same pattern as the
+    # Gemini key; migration 083).  Model ids ending in ':free' are billed $0
+    # (verified LIVE 2026-09-25: chat 200 / usage 0):
+    #   deepseek-v4.1-flash:free  1M ctx — PRIMARY for every TEXT/TOOL turn
+    #   mimo-v2.6-flash:free      1M ctx — PRIMARY for every IMAGE/VISION turn
+    # The Qwen chain and Gemini remain ordered fallbacks behind both; an
+    # unconfigured key degrades to today's chain with one cheap cached miss.
+    th_api_key: str = Field(
+        default="",
+        description="Token Harbor Universal Key (thk_live_…) — env TH_API_KEY, else Vault",
+    )
+    th_base_url: str = Field(
+        default="https://tokenharbor.ai/v1",
+        description="Token Harbor OpenAI-compatible base URL",
+    )
+    th_text_model: str = Field(
+        default="deepseek-v4.1-flash:free",
+        description="PRIMARY text/tool model — DeepSeek V4.1 flash (free tier)",
+    )
+    th_vision_model_chain: str = Field(
+        default="mimo-v2.5:free,deepseek-v4.1-flash:free",
+        description=(
+            "Ordered Token Harbor VISION chain. Mimo 2.5 (free) leads image "
+            "turns (proven 16.3s end-to-end 2026-09-25); DeepSeek V4.1 flash "
+            "(native multimodal, proven 2.7s) follows, then the qwen-vl chain. "
+            "NOTE: mimo-v2.6-flash:free chat/tools work, but its IMAGE route "
+            "hung 2x at 240s and 502'd on a hosted URL (verified 2026-09-25) "
+            "so it is deliberately absent from this chain."
+        ),
+    )
+    th_timeout_seconds: float = Field(
+        default=60.0,
+        description=(
+            "Per-ATTEMPT HTTP timeout for Harbor calls. Free-tier routing can "
+            "take longer than the Qwen workspace round-trip (esp. first "
+            "vision tokens), so this is above qwen_timeout_seconds."
+        ),
+    )
+
     # ---- Provider orchestration ------------------------------------------
     ai_primary_provider: str = Field(
         default="qwen",
-        description="PRIMARY runtime AI provider (qwen)",
+        description="PRIMARY runtime AI provider when Token Harbor is unconfigured (qwen)",
     )
     ai_fallback_provider: str = Field(
         default="gemini",
@@ -459,6 +501,16 @@ class Settings(BaseSettings):
         for m in self.qwen_vision_model_chain.split(","):
             m = m.strip()
             if m and m not in banned and m not in seen:
+                seen.append(m)
+        return seen
+
+    @property
+    def th_vision_chain_list(self) -> List[str]:
+        """Ordered, de-duplicated Token Harbor vision chain (Mimo → DeepSeek)."""
+        seen: List[str] = []
+        for m in (self.th_vision_model_chain or "").split(","):
+            m = m.strip()
+            if m and m not in seen:
                 seen.append(m)
         return seen
 

@@ -4,9 +4,12 @@ ERP AI Agent — AI Provider Orchestrator
 Routes runtime LLM traffic for the ERP Agent:
 
     User → ERP Agent (app/agent.py) → AI Orchestrator (this module)
-         → Qwen chain  (PRIMARY — Alibaba Model Studio, verified models)
+         → Token Harbor  (PRIMARY — DeepSeek V4.1 text/tools, Mimo 2.6 vision;
+                          OpenAI-compatible gateway, ':free' models, $0)
+              deepseek-v4.1-flash:free / mimo-v2.6-flash:free
+         → Qwen chain    (SECONDARY — Alibaba Model Studio, verified models)
               qwen3.6-plus → qwen3.5-plus → qwen-max → qwen-plus
-         → Gemini      (FALLBACK — used only after the Qwen chain exhausts)
+         → Gemini        (FALLBACK — used only after both chains exhaust)
 
 Capability-aware routing:
 * Text/tool ERP requests  → the text/tool chain (models verified live for
@@ -58,10 +61,12 @@ _orchestrator: Optional["AIOrchestrator"] = None
 
 class AIOrchestrator:
     """Dispatches agent LLM calls across an ordered, capability-aware
-    provider chain: Qwen models (primary) → Gemini (final fallback)."""
+    provider chain: Token Harbor (DeepSeek/Mimo, primary) → Qwen → Gemini."""
 
     def __init__(self) -> None:
         self._qwen_clients: Dict[str, Any] = {}  # model -> QwenClient
+        self._harbor_clients: Dict[str, Any] = {}  # model -> QwenClient (Token Harbor)
+        self._harbor_unavailable: Dict[str, str] = {}  # model -> cached reason
         self._gemini: Optional[Any] = None
         self._health_cache: Dict[str, Any] = {}
         self._health_cached_at: float = 0.0
@@ -69,6 +74,52 @@ class AIOrchestrator:
     # -------------------------------------------------------------------
     # Provider construction (lazy, graceful)
     # -------------------------------------------------------------------
+
+    def _get_harbor(self, model: str) -> Any:
+        """Build (once) an OpenAI-compatible client for Token Harbor *model*.
+
+        The gateway speaks the OpenAI chat protocol, so the proven
+        ``QwenClient`` transport is reused verbatim with the Harbor base URL
+        and key.  Key resolution: env ``TH_API_KEY`` first, Supabase Vault
+        second (migration 083 — same service-role-only pattern as Gemini).
+        When neither is configured a ProviderError is raised AND CACHED, so
+        an unconfigured environment falls through to the Qwen chain with one
+        cheap miss instead of re-probing the Vault on every request.
+        """
+        settings = get_settings()
+        if model in self._harbor_clients:
+            return self._harbor_clients[model]
+        if model in self._harbor_unavailable:
+            from app.qwen_client import ProviderError
+
+            raise ProviderError(self._harbor_unavailable[model])
+
+        from app.qwen_client import ProviderError, QwenClient
+
+        api_key = settings.th_api_key
+        if not api_key:
+            try:
+                from app.database import get_th_api_key
+
+                api_key = get_th_api_key()
+            except Exception as exc:  # noqa: BLE001 — vault missing/unreachable
+                reason = f"Token Harbor key unavailable (env TH_API_KEY / Vault): {str(exc)[:160]}"
+                self._harbor_unavailable[model] = reason
+                raise ProviderError(reason) from exc
+        if not api_key:
+            reason = "Token Harbor key is empty (set TH_API_KEY or Vault TH_API_KEY)"
+            self._harbor_unavailable[model] = reason
+            raise ProviderError(reason)
+
+        self._harbor_clients[model] = QwenClient(
+            api_key=api_key,
+            base_url=settings.th_base_url,
+            model=model,
+            temperature=settings.qwen_temperature,
+            max_output_tokens=settings.qwen_max_output_tokens,
+            timeout_seconds=settings.th_timeout_seconds,
+        )
+        return self._harbor_clients[model]
 
     def _get_qwen(self, model: Optional[str] = None) -> Any:
         """Build (once) a QwenClient for *model*. Raises ProviderError
@@ -126,6 +177,19 @@ class AIOrchestrator:
         candidates: List[Dict[str, Any]] = []
 
         if requires_vision:
+            # Token Harbor vision chain — Mimo leads image turns (the user's
+            # image mandate), DeepSeek V4.1's native-multimodal flash follows.
+            # Appended unconditionally: an unconfigured key raises a cached
+            # ProviderError at construction and the chain continues below.
+            for model in settings.th_vision_chain_list:
+                candidates.append(
+                    {
+                        "provider": "token-harbor",
+                        "model": model,
+                        "capability": "vision",
+                        "factory": (lambda m=model: self._get_harbor(m)),
+                    }
+                )
             for model in settings.qwen_vision_chain_list:
                 candidates.append(
                     {
@@ -137,8 +201,19 @@ class AIOrchestrator:
                 )
             # Gemini is NOT a vision candidate: GeminiClient.generate_with_tools
             # does not accept image parts. Document requests must be handled
-            # by the verified vision-capable Qwen chain.
+            # by the verified vision-capable chain.
         else:
+            # Token Harbor / DeepSeek V4.1 — PRIMARY for every text/tool turn
+            # (all model tiers: the tier chains below become the ordered
+            # fallback behind it).
+            candidates.append(
+                {
+                    "provider": "token-harbor",
+                    "model": settings.th_text_model,
+                    "capability": "text_tools",
+                    "factory": (lambda m=settings.th_text_model: self._get_harbor(m)),
+                }
+            )
             chain = [m for m in (text_chain or []) if m] or settings.qwen_chain_list
             for model in chain:
                 candidates.append(
@@ -387,6 +462,42 @@ class AIOrchestrator:
             "banned_models": sorted(settings.qwen_banned_set),
             "providers": {},
         }
+
+        # Token Harbor (DeepSeek text + Mimo vision) — PRIMARY when the key
+        # resolves (env TH_API_KEY, else Supabase Vault).  Both models probed
+        # independently, mirroring the Qwen block below.
+        harbor_models = list(dict.fromkeys(
+            [settings.th_text_model, *settings.th_vision_chain_list]
+        ))
+        harbor_providers = []
+        for model in harbor_models:
+            try:
+                harbor = self._get_harbor(model)
+                harbor_health = await harbor.health_check()
+                harbor_providers.append(
+                    {
+                        "role": "primary",
+                        "configured": True,
+                        "available": harbor_health["ok"],
+                        "model": model,
+                        "endpoint": harbor.base_url,
+                        "detail": harbor_health["detail"],
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                harbor_providers.append(
+                    {
+                        "role": "primary",
+                        "configured": False,
+                        "available": False,
+                        "model": model,
+                        "detail": str(exc)[:200],
+                    }
+                )
+        status["providers"]["token-harbor"] = harbor_providers
+        if any(e["configured"] for e in harbor_providers):
+            status["primary"] = "token-harbor"
+            status["primary_models"] = harbor_models
 
         # Qwen text chain — each member probed independently.
         qwen_providers = []

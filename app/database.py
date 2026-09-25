@@ -78,6 +78,30 @@ def get_gemini_api_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Token Harbor API key (from Vault)
+# ---------------------------------------------------------------------------
+def get_th_api_key() -> str:
+    """Retrieve the Token Harbor Universal Key from Supabase Vault.
+
+    Calls ``public.get_th_api_key()`` which is a SECURITY DEFINER function
+    granting access only to the service_role (migration 083 — the same
+    pattern as ``get_gemini_api_key``).  The backend prefers the TH_API_KEY
+    environment variable and only reaches for the Vault when it is absent,
+    so the deployed project needs no Vercel env change.
+    """
+    client = get_service_client()
+    result = client.rpc("get_th_api_key").execute()
+    if not result.data:
+        raise RuntimeError("Token Harbor key not found in Supabase Vault")
+    key = result.data
+    if isinstance(key, list):
+        key = key[0] if key else None
+    if not key:
+        raise RuntimeError("Token Harbor key is empty in Supabase Vault")
+    return str(key)
+
+
+# ---------------------------------------------------------------------------
 # Generic helpers — thin wrappers used by repositories
 # ---------------------------------------------------------------------------
 
