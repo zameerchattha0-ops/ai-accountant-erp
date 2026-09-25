@@ -92,7 +92,7 @@ def _approved_world(
         {
             "tool_name": "create_invoice",
             "arguments": {
-                "customer_id": "cust-abc-furnitures",
+                "customer_id": "11111111-1111-4111-8111-111111111111",
                 "invoice_date": "2026-09-20",
                 "due_date": "2026-10-20",
                 "items": [

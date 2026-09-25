@@ -953,14 +953,19 @@ class PartyMatchState(str, Enum):
     UNNAMED = "UNNAMED"
 
 
-_WS = re.compile(r"[\s\-_,.;:()'\"\[\]]+")
-
-
 def normalize_entity_name(name: Optional[str]) -> str:
-    """Normalise a name for comparison (case/punctuation/space-insensitive)."""
-    if not name:
-        return ""
-    return _WS.sub(" ", str(name)).strip().lower()
+    """Normalise a name for comparison — separator-insensitive.
+
+    Delegates to ``app.name_matching.name_key`` (single source of truth):
+    case, spacing, hyphens and punctuation never hide a match.  Since
+    2026-09-24 "Al-Areesh Engineering" and "Alareesh Engineering" normalise
+    IDENTICALLY — the old space-preserving normaliser still treated the
+    hyphen as a wall and classified an existing party as NONE (session
+    8b2f14dd).
+    """
+    from app.name_matching import name_key
+
+    return name_key(name)
 
 
 def _row_name(row: Any) -> str:

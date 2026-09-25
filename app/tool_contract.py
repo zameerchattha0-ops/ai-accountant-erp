@@ -42,6 +42,7 @@ that cannot be derived is simply absent.
 from __future__ import annotations
 
 import inspect
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Arguments the ROUTER itself owns and consumes before dispatch, so they are
@@ -53,6 +54,22 @@ PROTOCOL_ARGUMENTS = frozenset({"idempotency_key", "transaction_date"})
 
 # Injected by the router on every call; never expected from the model.
 ROUTER_ARGUMENTS = frozenset({"organization_id"})
+
+
+def _is_uuid_annotation(annotation: Any) -> bool:
+    """True when the parameter is declared ``uuid.UUID`` (or Optional/union).
+
+    With ``from __future__ import annotations`` the annotation is the SOURCE
+    TEXT (``'Optional[uuid.UUID]'``); otherwise it is the class itself.
+    Either way the bound value must be a database id, and a non-uuid value
+    dies at the uuid cast AFTER approval — exactly the ``created_by: "user"``
+    production crash (session 66d1dbb6: ``22P02 invalid input syntax for
+    type uuid: "user"``).  The value domain therefore derives from the SAME
+    source of truth as the name check: the signature.
+    """
+    if annotation is inspect.Parameter.empty:
+        return False
+    return "uuid.uuid" in str(annotation).lower().replace(" ", "")
 
 
 def contract_from_callable(
@@ -68,6 +85,11 @@ def contract_from_callable(
                         cannot bind.
     ``accepts_extra`` — the callable has ``**kwargs``, so unknown names are
                         silently tolerated and must NOT be rejected.
+    ``uuid_params``   — parameters declared ``uuid.UUID`` (incl.
+                        ``Optional[uuid.UUID]`` / unions): their VALUE must
+                        parse as a uuid too — checked by
+                        ``validate_arguments`` BEFORE approval, because such
+                        a value can only die at the database cast after it.
 
     ``extra_arguments`` — arguments the HANDLER consumes but *fn*'s signature
     does not describe.  The tool handler is what receives the model's arguments
@@ -98,6 +120,7 @@ def contract_from_callable(
     signature = inspect.signature(fn)
     accepted: List[str] = []
     required: List[str] = []
+    uuid_params: List[str] = []
     accepts_extra = False
     for name, parameter in signature.parameters.items():
         if parameter.kind is inspect.Parameter.VAR_KEYWORD:
@@ -108,6 +131,8 @@ def contract_from_callable(
         if name in ROUTER_ARGUMENTS:
             continue
         accepted.append(name)
+        if _is_uuid_annotation(parameter.annotation):
+            uuid_params.append(name)
         if parameter.default is inspect.Parameter.empty:
             required.append(name)
     for name in extra_arguments or ():
@@ -117,6 +142,7 @@ def contract_from_callable(
         "accepted": tuple(accepted),
         "required": tuple(required),
         "accepts_extra": accepts_extra,
+        "uuid_params": tuple(uuid_params),
     }
 
 
@@ -183,6 +209,41 @@ def validate_arguments(
             "cannot run without it. Resolve it from the live books (a record "
             "that already exists supplies its id) or ask the user; never "
             "invent an id."
+        )
+
+    # Value domain: a uuid-typed parameter that is not a uuid can never bind
+    # — it dies at the database cast AFTER approval, hiding the real cause
+    # behind the generic banner (session 66d1dbb6: ``created_by: "user"``
+    # -> 22P02 invalid input syntax for type uuid).  Derived from the
+    # signature (``uuid_params``), the same source of truth as the name check.
+    for name in contract.get("uuid_params") or ():
+        if name == "created_by" or name not in arguments:
+            continue
+        value = arguments[name]
+        if value in (None, ""):
+            continue
+        try:
+            uuid.UUID(str(value))
+        except (ValueError, TypeError):
+            aliases = tuple((reference_inputs or {}).get(name) or ())
+            alias_hint = (
+                f" A declared reference input may be used instead: "
+                f"{', '.join(aliases)}." if aliases else ""
+            )
+            violations.append(
+                f"{tool_name}: {name} must be a record id (uuid), got "
+                f"{value!r} — resolve it from the live books or omit it; "
+                f"never invent an id.{alias_hint}"
+            )
+
+    # Attribution is the EXECUTOR's, never the model's: created_by is bound
+    # by the router to the authenticated user (same class as
+    # organization_id).  A model value can only be wrong, so reject it HERE
+    # — before a confirmation freezes the junk into an approved plan.
+    if "created_by" in arguments:
+        violations.append(
+            f"{tool_name}: created_by is bound automatically to the user "
+            "running the operation — omit it from the plan."
         )
 
     return violations

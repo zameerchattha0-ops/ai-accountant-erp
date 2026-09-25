@@ -148,6 +148,25 @@ async def route_tool_call(
     handler = entry["handler"]
     read_only = entry["read_only"]
 
+    # 1x. ATTRIBUTION IS ROUTER-OWNED (same class as organization_id): the
+    # model has no way to know the executing user's id, and a model-authored
+    # value dies at the uuid cast — production 2026-09-24 16:30 (session
+    # 66d1dbb6): ``created_by: "user"`` -> 22P02 invalid input syntax for
+    # type uuid, bannered as "Something went wrong".  A SUPPLIED value is
+    # rebound to the REAL actor (or dropped when the tool cannot carry it);
+    # an ABSENT value stays absent — no silent injection.  Runs before
+    # validation and the idempotency claim so the stored request hash sees
+    # exactly what will execute.
+    if "created_by" in arguments:
+        contract = entry.get("contract") or {}
+        accepted = set(contract.get("accepted") or ())
+        arguments = {k: v for k, v in arguments.items() if k != "created_by"}
+        if not contract or "created_by" in accepted or contract.get("accepts_extra"):
+            arguments["created_by"] = str(user_id)
+            log.info("tool_router.created_by_rebound", tool=slug, user=str(user_id))
+        else:
+            log.warning("tool_router.created_by_dropped", tool=slug)
+
     # 2. Permission check (via ai.permissions)
     if auth is None:
         # SECURITY: a MUTATION must never execute without an authorization

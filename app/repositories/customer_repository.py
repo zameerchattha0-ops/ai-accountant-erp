@@ -13,8 +13,18 @@ from app.database import fetch_many, fetch_one, insert_one, search_ilike, update
 async def search_customers(
     organization_id: uuid.UUID, *, query: str, limit: int = 25
 ) -> List[Dict[str, Any]]:
-    """Search customers by name or code using trigram similarity."""
-    return await search_ilike(
+    """Search customers by name or code using trigram similarity.
+
+    FALLBACK (production incident 2026-09-24, session 8b2f14dd): strict
+    ILIKE treats every separator as a wall, so the evidence layer's query
+    "Alareesh Engineering" never matched the existing customer
+    "Al-Areesh Engineering" and ``parties=empty`` sent the model into a
+    clarification the books could already answer.  When ILIKE finds
+    nothing, re-read a bounded candidate set and rank it with
+    ``name_key`` (separator-insensitive).  The strict path — and its cost —
+    is untouched: the fallback only runs on a miss.
+    """
+    rows = await search_ilike(
         "customers",
         column="name",
         value=query,
@@ -22,6 +32,18 @@ async def search_customers(
         select="id,name,customer_code,email,phone,is_active",
         limit=limit,
     )
+    if rows or not str(query or "").strip():
+        return rows
+    from app.name_matching import normalized_matches
+
+    candidates = await fetch_many(
+        "customers",
+        filters={"organization_id": str(organization_id)},
+        select="id,name,customer_code,email,phone,is_active",
+        order="name.asc",
+        limit=500,
+    )
+    return normalized_matches(candidates, query, limit=limit)
 
 
 async def get_customer(

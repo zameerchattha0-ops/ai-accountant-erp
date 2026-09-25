@@ -100,7 +100,17 @@ class TestContractPrimedPrompt:
     def test_gate_still_rejects_invented_names_after_priming(self):
         """Priming raises first-pass odds; it NEVER weakens the gate."""
         contract = tool_contracts()["record_customer_receipt"]
-        base_args = {name: name for name in (contract.get("required") or ())}
+        # Bindable base: uuid-typed required parameters need a real uuid —
+        # the gate's value domain (tool_contract.uuid_params) rejects any
+        # non-uuid id exactly as it rejects an invented name.
+        base_args = {
+            name: (
+                str(uuid.uuid4())
+                if name in (contract.get("uuid_params") or ())
+                else name
+            )
+            for name in (contract.get("required") or ())
+        }
 
         # The natural phrasing passes: required keys + the DECLARED alias.
         ok = validate_outcome(

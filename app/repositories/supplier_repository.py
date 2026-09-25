@@ -13,8 +13,15 @@ from app.database import fetch_many, fetch_one, insert_one, search_ilike, update
 async def search_suppliers(
     organization_id: uuid.UUID, *, query: str, limit: int = 25
 ) -> List[Dict[str, Any]]:
-    """Search suppliers by name or code."""
-    return await search_ilike(
+    """Search suppliers by name or code.
+
+    FALLBACK: mirrors ``customer_repository.search_customers`` — when the
+    strict ILIKE search misses because separators hide the name (hyphenated
+    "Al-Areesh"-style names vs a query without them), rank a bounded
+    candidate set with the separator-insensitive ``name_key`` instead of
+    returning a false EMPTY.
+    """
+    rows = await search_ilike(
         "suppliers",
         column="name",
         value=query,
@@ -22,6 +29,18 @@ async def search_suppliers(
         select="id,name,supplier_code,email,phone,is_active",
         limit=limit,
     )
+    if rows or not str(query or "").strip():
+        return rows
+    from app.name_matching import normalized_matches
+
+    candidates = await fetch_many(
+        "suppliers",
+        filters={"organization_id": str(organization_id)},
+        select="id,name,supplier_code,email,phone,is_active",
+        order="name.asc",
+        limit=500,
+    )
+    return normalized_matches(candidates, query, limit=limit)
 
 
 async def get_supplier(

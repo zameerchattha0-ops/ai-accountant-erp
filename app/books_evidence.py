@@ -40,6 +40,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import structlog
 
+from app.name_matching import name_key
+
 log = structlog.get_logger(__name__)
 
 #: The label every evidence block carries into the prompt.  Deterministic
@@ -180,13 +182,22 @@ def _limit(args: Dict[str, Any]) -> int:
 
 
 def _matches(record: Dict[str, Any], terms: Sequence[str]) -> bool:
-    """True when any term appears in any string field of *record*."""
+    """True when any term appears in any string field of *record*.
+
+    Compared via ``name_key`` (separator/case-insensitive) so a term like
+    "alareesh" can still find "Al-Areesh Engineering" — the raw substring
+    comparison was the evidence-layer blind spot behind session 8b2f14dd.
+    """
     if not terms:
         return True
-    haystack = " ".join(
-        str(v).lower() for v in record.values() if isinstance(v, (str, int, float))
+    haystack = name_key(
+        " ".join(str(v) for v in record.values() if isinstance(v, (str, int, float)))
     )
-    return any(term.lower() in haystack for term in terms)
+    for term in terms:
+        key = name_key(term)
+        if key and key in haystack:
+            return True
+    return False
 
 
 def _trim(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -625,7 +636,8 @@ async def _load_prior_transactions(
     out.extend(
         _trim({"kind": "receipt", **row})
         for row in receipts
-        if _matches(row, terms) or (party and party.lower() in str(row).lower())
+        if _matches(row, terms)
+        or (party and name_key(party) in name_key(str(row)))
     )
     payments = await payment_repository.list_payments(
         organization_id, limit=_limit(args)
@@ -633,7 +645,8 @@ async def _load_prior_transactions(
     out.extend(
         _trim({"kind": "supplier_payment", **row})
         for row in payments
-        if _matches(row, terms) or (party and party.lower() in str(row).lower())
+        if _matches(row, terms)
+        or (party and name_key(party) in name_key(str(row)))
     )
     expenses = await expense_repository.list_expenses(
         organization_id, limit=_limit(args)
@@ -641,7 +654,8 @@ async def _load_prior_transactions(
     out.extend(
         _trim({"kind": "expense", **row})
         for row in expenses
-        if _matches(row, terms) or (party and party.lower() in str(row).lower())
+        if _matches(row, terms)
+        or (party and name_key(party) in name_key(str(row)))
     )
     return out
 
