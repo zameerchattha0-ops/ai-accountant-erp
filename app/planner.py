@@ -1032,6 +1032,12 @@ def plan(
 
     # 6. Determine tools + context sources
     tools = _tools_for_intent(intent)
+    # EXECUTION-AGENT LOOP: a USER-CONFIRMED account creation must be
+    # offerable/plannable for EVERY intent — the shortlist may never narrow
+    # below a planner-listed tool (create_account then executes FIRST via
+    # the executor's tool-order guard).
+    if entities.get("create_account") and "create_account" not in tools:
+        tools = [*tools, "create_account"]
     context = _context_for_intent(intent)
 
     # 6. Clarification — DYNAMIC, MINIMAL and CONSOLIDATED:
@@ -1605,9 +1611,12 @@ def _merge_clarification_answers(
         if "should i create" in question:
             low = answer.lower().strip(" .)'\"")
             if low.startswith(("yes", "y", "create", "ok")):
-                m = re.search(r"no '(.+?)' account", question)
+                # Match on the RAW question — `question` is lowercased, and
+                # the extracted account name must keep the proposal's
+                # casing ("Office Chairs", never "office chairs").
+                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
                 if m:
-                    merged["create_account"] = m.group(1)
+                    merged["create_account"] = m.group(1).strip()
             else:
                 named = re.sub(
                     r"^(no|n|use|pick|existing)\b[,.:;! ]*", "", low

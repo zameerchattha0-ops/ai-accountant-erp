@@ -1654,6 +1654,84 @@ def _confirmation_summary(plan) -> str:
     return "Pending confirmation — " + "; ".join(bits) + "."
 
 
+async def _account_rescue_question(
+    *,
+    session_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    execution_plan,
+    failures,
+    prior_qa,
+    require_no_successful_writes: bool = True,
+) -> Optional[AgentResponse]:
+    """EXECUTION-AGENT LOOP (rescue): account-DETERMINATION failures become
+    the account-creation clarification instead of a dead-end FAILED run.
+
+    Fires only when: every failure is an account-gap error; no creation is
+    confirmed yet; the merge-contract question was not asked this
+    conversation; clarification rounds remain; and (optionally) no WRITE
+    has succeeded — a posted mutation is never re-run behind the user's
+    back.  Returns None → the normal FAILED path continues unchanged.
+    """
+    from app.account_resolution import (
+        gap_already_asked,
+        gap_from_execution_failure,
+        is_account_resolution_error,
+        options_for_gap,
+        question_for_gap,
+    )
+
+    if not failures or not require_no_successful_writes:
+        return None
+    if not all(
+        is_account_resolution_error(getattr(tr, "error", "") or "")
+        for tr in failures
+    ):
+        return None
+    entities = getattr(execution_plan, "extracted_entities", None) or {}
+    if str(entities.get("create_account") or "").strip():
+        return None
+    if gap_already_asked(prior_qa) or len(prior_qa) >= MODEL_MAX_CLARIFICATION_ROUNDS:
+        return None
+    gap = gap_from_execution_failure(
+        [getattr(tr, "error", "") or "" for tr in failures],
+        entities=entities,
+        intent=getattr(execution_plan, "intent", "") or "",
+    )
+    if gap is None:
+        return None
+    question = question_for_gap(gap)
+    try:
+        clarification = await create_clarification(
+            session_id=session_id,
+            question=question,
+            required_fields=["account_configuration"],
+        )
+        question = clarification.get("question", question)
+    except Exception as exc:  # noqa: BLE001 — asking is not optional
+        log.warning(
+            "agent.account_rescue_clarification_failed",
+            session_id=str(session_id),
+            error=str(exc)[:200],
+        )
+    options = options_for_gap(gap)
+    await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+    await _log_step(session_id, "AWAITING_CLARIFICATION", {
+        "source": "account_creation_rescue",
+        "gap": {"name": gap.name, "account_type": gap.account_type,
+                "source": gap.source},
+        "question": question[:300],
+    })
+    return AgentResponse(
+        status=ExecutionStatus.AWAITING_CLARIFICATION,
+        execution_id=session_id,
+        question=question,
+        options=options,
+        question_options=[[{"value": o, "label": o} for o in options]],
+        required_information=["account_configuration"],
+        requires_user_input=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # deterministic report fast-path.  Standard reports and
 # simple lookups skip the LLM entirely: the planner's intent is enough to
@@ -3501,6 +3579,126 @@ async def execute(
             # excluded and are refused honestly by excluded_tool_refusal.
             excluded_tools -= set(_planned_names) - _unpermitted
 
+        # ---- PHASE 4c: EXECUTION-AGENT LOOP — ACCOUNT PRE-FLIGHT ----------
+        # Every account the planned calls REQUIRE (register_fixed_asset
+        # needs a PPE ledger; a known expense category needs its own ledger)
+        # or NAME (explicit args, journal lines) is resolved against the live
+        # chart BEFORE the user approves anything.  A missing ledger spawns
+        # the IFRS-aware account-creation clarification — never a deep
+        # execution failure ("No fixed-asset account could be determined…").
+        # A user-confirmed creation is injected as the FIRST planned call so
+        # the approval snapshot covers it and the tool-order guard unblocks
+        # the recording mutation — any intent, any activity.
+        if planned_tool_calls and not execution_plan.batch_items:
+            from app.account_resolution import (
+                account_exists,
+                account_shape,
+                ensure_create_account_first,
+                gap_already_asked,
+                options_for_gap,
+                preflight_account_gaps,
+                question_for_gap,
+            )
+
+            _ents = execution_plan.extracted_entities or {}
+            _confirmed_acct = str(_ents.get("create_account") or "").strip()
+            try:
+                _gaps = await preflight_account_gaps(
+                    organization_id,
+                    tool_calls=planned_tool_calls,
+                    entities=_ents,
+                    intent=execution_plan.intent,
+                    message=user_message,
+                    # P1-⑧ parity: nature probes are the classifier's
+                    # account-hint DB work — proposal/approved paths skip
+                    # them (the execution-time rescue covers those).
+                    include_nature_probes=(
+                        _reasoning_calls is None and approved_tool_calls is None
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — never break a run
+                log.warning("agent.account_preflight_failed",
+                            session_id=str(session_id), error=str(exc)[:200])
+                _gaps = []
+            if _confirmed_acct:
+                _gaps = [g for g in _gaps
+                         if (g.name or "").strip().lower() != _confirmed_acct.lower()]
+            # Gate ORDER is contractual: a confirmation-pending plan must
+            # reach PHASE 5 first (reconcile/approval tests pin it).  The ask
+            # is deferred there — explicit-ref gaps are asked on the approved
+            # turn (refs are checked on every path), nature gaps by the
+            # execution-time rescue.  Never a dead end.
+            _confirmation_pending = bool(
+                execution_plan.requires_confirmation
+                and planned_tool_calls
+                and not confirmation_granted
+            )
+            if (_gaps and not _confirmation_pending
+                    and not gap_already_asked(prior_qa)
+                    and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS):
+                _gap = _gaps[0]
+                _q = question_for_gap(_gap)
+                try:
+                    _clar = await create_clarification(
+                        session_id=session_id, question=_q,
+                        required_fields=["account_configuration"],
+                    )
+                    _q = _clar.get("question", _q)
+                except Exception as exc:  # noqa: BLE001 — asking is not optional
+                    log.warning("agent.account_gap_clarification_failed",
+                                session_id=str(session_id), error=str(exc)[:200])
+                _opts = options_for_gap(_gap)
+                await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                    "source": "account_creation_gap",
+                    "gap": {"name": _gap.name, "account_type": _gap.account_type,
+                            "source": _gap.source},
+                    "question": _q[:300],
+                })
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=_q,
+                    options=_opts,
+                    question_options=[[{"value": o, "label": o} for o in _opts]],
+                    required_information=["account_configuration"],
+                    requires_user_input=True,
+                )
+            # User-confirmed creation → create_account FIRST (injected before
+            # the confirmation snapshot, so the approval covers it).
+            if _confirmed_acct:
+                try:
+                    _acct_now = await account_exists(organization_id, _confirmed_acct)
+                except Exception:  # noqa: BLE001
+                    _acct_now = None
+                if _acct_now is None and not any(
+                    tc.tool_name == "create_account" for tc in planned_tool_calls
+                ):
+                    _cls = classification or execution_plan.classification
+                    _shape = account_shape(
+                        getattr(_cls, "transaction_nature", None) or "OPERATING_EXPENSE"
+                    )
+                    planned_tool_calls = ensure_create_account_first(
+                        planned_tool_calls,
+                        arguments={
+                            "name": _confirmed_acct,
+                            "code": getattr(_cls, "proposed_account_code", None)
+                                    or _shape[2],
+                            "account_type": _shape[0],
+                            "normal_balance": _shape[1],
+                            "description": "Created via the account-creation confirmation loop.",
+                        },
+                    )
+                    if "create_account" not in (execution_plan.potential_tools or []):
+                        execution_plan.potential_tools = [
+                            *(execution_plan.potential_tools or []), "create_account",
+                        ]
+                    excluded_tools.discard("create_account")
+                    await _log_step(session_id, "PLANNING", {
+                        "source": "account_creation_injected",
+                        "account": _confirmed_acct,
+                        "tools": [tc.tool_name for tc in planned_tool_calls],
+                    })
+
         # ---- PHASE 5: CONFIRMATION GATE (BEFORE execution) ---------------
         # Skipped when resuming an already-approved session
         # (confirmation_granted=True from resume_with_confirmation).
@@ -4240,6 +4438,19 @@ async def execute(
                         required_information=["cash_accounts_configuration"],
                         requires_user_input=True,
                     )
+                # ---- EXECUTION-AGENT LOOP (RESCUE A): an account-
+                # DETERMINATION failure with NOTHING recorded yet becomes the
+                # account-creation clarification instead of a dead-end FAILED
+                # run (mirrors the cash-config gate above; one-shot).
+                _rescue = await _account_rescue_question(
+                    session_id=session_id,
+                    organization_id=organization_id,
+                    execution_plan=execution_plan,
+                    failures=failed_results,
+                    prior_qa=prior_qa,
+                )
+                if _rescue is not None:
+                    return _rescue
                 await _update_status(session_id, ExecutionStatus.FAILED)
                 await create_execution_result(
                     session_id=session_id,
@@ -4299,6 +4510,28 @@ async def execute(
                         )
                     )
             if required_failures:
+                # ---- EXECUTION-AGENT LOOP (RESCUE B): the primary mutation
+                # failed on an account-DETERMINATION error while no WRITE has
+                # succeeded (read-only lookups may have) and no creation is
+                # confirmed yet → ask the same account-creation question
+                # instead of parking FAILED.  Account resolution is
+                # dependency-first in the services, so nothing financial was
+                # posted when this error fires.
+                from app.tool_execution import is_read_only_tool
+
+                _rescue = await _account_rescue_question(
+                    session_id=session_id,
+                    organization_id=organization_id,
+                    execution_plan=execution_plan,
+                    failures=required_failures,
+                    prior_qa=prior_qa,
+                    require_no_successful_writes=all(
+                        not tr.success or is_read_only_tool(tr.tool_name)
+                        for tr in tool_results
+                    ),
+                )
+                if _rescue is not None:
+                    return _rescue
                 failed_ops = [tr.tool_name for tr in required_failures]
                 failed_detail = "; ".join(
                     f"{tr.tool_name}: {(tr.error or 'failed')[:160]}"

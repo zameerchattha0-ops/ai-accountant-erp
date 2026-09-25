@@ -222,6 +222,34 @@ async def _propose_expense_account(
     return (name, str(code))
 
 
+async def _confirmed_account_code(
+    organization_id: uuid.UUID, nature: str, name: str
+) -> str:
+    """Free code in the nature's numbering series for a CONFIRMED creation.
+
+    Seed accounts (utilities, rent, …) keep their canonical code series; the
+    rest take the nature's base series probed for the next free code —
+    ``create_account`` re-resolves collisions again at execution time.
+    """
+    from app.account_resolution import account_shape
+    from app.repositories import account_repository as a_repo
+
+    seed = next(
+        (
+            (seed_name, seed_code)
+            for seed_name, seed_code in _EXPENSE_ACCOUNT_SEEDS.values()
+            if seed_name.lower() == str(name or "").strip().lower()
+        ),
+        None,
+    )
+    base = seed[1] if seed else account_shape(nature)[2]
+    try:
+        return str(await a_repo.next_available_code(organization_id, base))
+    except Exception as exc:  # noqa: BLE001 — best-effort; the tool re-resolves
+        log.warning("classifier.confirmed_code_failed", error=str(exc)[:200])
+        return str(base)
+
+
 def _classification_text(item_description: Optional[str], entities: Dict[str, Any]) -> str:
     return " ".join(
         str(part) for part in (
@@ -477,6 +505,60 @@ async def classify_transaction(
             confidence="LOW",
             source="INFERENCE",
             entity=item or entity_name,
+            requires_clarification=False,
+        )
+
+    # ---- EXECUTION-AGENT LOOP (user-confirmed account creation) ----------
+    # The account-creation clarification was answered YES — the answer-merge
+    # folded the confirmed name into entities["create_account"].  EVERY
+    # intent family routes through here (fixed asset, invoice, purchase,
+    # expense, journal, any new activity): the classification marks the
+    # creation as a USER_ANSWER so the prompt orders create_account FIRST
+    # and the executor's tool-order guard blocks the recording mutation
+    # until the ledger exists.  A name that already exists degrades to a
+    # plain account hint (create_account reuses it — never a duplicate).
+    confirmed_account = str(entities.get("create_account") or "").strip()
+    if confirmed_account:
+        if intent in (
+            "register_fixed_asset", "dispose_fixed_asset",
+            "record_asset_depreciation",
+        ):
+            nature = FIXED_ASSET
+        else:
+            nature = str(entities.get("transaction_nature") or "").upper()
+            if nature not in NATURES:
+                nature = None
+        if nature is None:
+            nature, _confirmed_conf = rule_based_nature(
+                " ".join(x for x in (item, message) if x), entities
+            )
+        if nature is None:
+            nature = OPERATING_EXPENSE
+        from app.account_resolution import account_exists
+
+        existing = await account_exists(organization_id, confirmed_account)
+        if existing:
+            return TransactionClassification(
+                transaction_nature=nature,
+                confidence="HIGH",
+                source="USER_ANSWER",
+                entity=item or entity_name,
+                account_hint_id=str(existing.get("id") or "") or None,
+                account_hint_code=str(existing.get("code") or "") or None,
+                account_hint_name=str(existing.get("name") or "") or None,
+                requires_clarification=False,
+            )
+        code = await _confirmed_account_code(
+            organization_id, nature, confirmed_account
+        )
+        return TransactionClassification(
+            transaction_nature=nature,
+            confidence="HIGH",
+            source="USER_ANSWER",
+            entity=item or entity_name,
+            proposed_account_name=confirmed_account,
+            proposed_account_code=code,
+            create_account_confirmed=True,
             requires_clarification=False,
         )
 
