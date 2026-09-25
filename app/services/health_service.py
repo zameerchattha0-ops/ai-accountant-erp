@@ -54,12 +54,24 @@ async def calculate_health(organization_id: uuid.UUID) -> Dict[str, Any]:
 
 
 async def _sum_accounts(org_id: uuid.UUID, acc_type: str) -> float:
-    result = await fetch_one(
-        "journal_lines",
-        columns="SUM(CASE WHEN a.account_type = %(t)s THEN l.debit - l.credit ELSE 0 END) as total",
-        filters={"l.organization_id": str(org_id)},
+    """Net (debit - credit) balance summed over accounts of *acc_type*.
+
+    FIXED: the previous implementation passed PostgREST-invalid arguments
+    (``columns=`` / an SQL aggregate expression / an ``l.``-aliased filter)
+    to ``fetch_one`` — every call raised TypeError, so calculate_health and
+    get_health could never run.  ``v_trial_balance`` (migration 017) already
+    computes exactly ``sum(debit) - sum(credit)`` per account WITH its
+    ``account_type`` — ask the view, sum the rows here.
+    """
+    from app.database import fetch_many
+
+    rows = await fetch_many(
+        "v_trial_balance",
+        filters={"organization_id": str(org_id), "account_type": acc_type},
+        select="balance",
+        limit=500,
     )
-    return float(result.get("total", 0)) if result and result.get("total") else 0
+    return float(sum(float(r.get("balance") or 0) for r in rows))
 
 
 async def _store_snapshot(org_id, overall, liquidity, profitability, efficiency, metrics, alerts) -> None:
@@ -72,13 +84,29 @@ async def _store_snapshot(org_id, overall, liquidity, profitability, efficiency,
 
 
 async def get_latest_snapshot(organization_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    return await fetch_one("financial_health_snapshots",
-                           filters={"organization_id": str(organization_id)},
-                           order="snapshot_date DESC")
+    """Most recent financial-health snapshot for the organization.
+
+    FIXED: passed ``order=`` to ``fetch_one``, which only accepts
+    ``filters``/``select`` — get_health raised TypeError ("unexpected
+    keyword argument 'order'") on every production call.  ``fetch_many``
+    owns ordering; take the newest row.
+    """
+    from app.database import fetch_many
+
+    rows = await fetch_many(
+        "financial_health_snapshots",
+        filters={"organization_id": str(organization_id)},
+        order="snapshot_date.desc",
+        limit=1,
+    )
+    return rows[0] if rows else None
 
 
 async def get_history(organization_id: uuid.UUID, limit: int = 12) -> List[Dict[str, Any]]:
     from app.database import fetch_many
     return await fetch_many("financial_health_snapshots",
                            filters={"organization_id": str(organization_id)},
-                           order="snapshot_date DESC", limit=limit)
+                           # 081-class fix: fetch_many parses "column.direction";
+                           # the old SQL-style "snapshot_date DESC" became ONE
+                           # column identifier and 42703'd every get_health call.
+                           order="snapshot_date.desc", limit=limit)
