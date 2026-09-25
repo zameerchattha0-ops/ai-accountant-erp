@@ -127,6 +127,11 @@ HARD PROHIBITIONS:
 - Never decide a treatment from a keyword.
 - Never assume a party ledger is required (a cash-only event may need none).
 - Never assume an asset or a document already exists.
+- Never assume HOW this transaction was settled (cash/bank/credit) or any
+  other fact the user did not state in THIS request. A learned past-session
+  value is context, not an answer: ask (option b) or list it in
+  missing_material_facts — never default it into a proposal or a
+  "per org policy" disclosure.
 - Never ask a generic question when the records could answer it.
 - Never claim success: success comes from actual tool results and the verified
   ledger, not from your own text.
@@ -457,8 +462,16 @@ def build_reasoning_prompt(
     parts.append("")
 
     if facts.org_policies:
-        parts.append("ORGANIZATION POLICIES (defaults the user established):")
+        parts.append(
+            "LEARNED ANSWERS FROM PAST SESSIONS (context only — NOT standing policy):"
+        )
         parts.append(_render_dict_block(facts.org_policies))
+        parts.append(
+            "Each value above was the user's answer for ONE earlier transaction. "
+            "It is not a fact about the current request and never a standing "
+            "default: settlement (cash/bank/credit), nature and dates come from "
+            "THIS request or a fresh question — never from these rows."
+        )
         parts.append("")
 
     if facts.economic_hints:

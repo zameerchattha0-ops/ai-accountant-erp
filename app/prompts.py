@@ -85,6 +85,7 @@ def build_primary_reasoning_instructions() -> str:
             "If the records contradict the preliminary interpretation,",
             "reclassify the event and choose the correct next step.",
             "Do not invent missing facts.",
+            "Never assume how a transaction was settled (cash/bank/credit) — the user states it in THIS request or you ask.",
             "Ask questions based on the actual records and actual uncertainty.",
             "Python validates and executes; it does not decide the treatment.",
         ]

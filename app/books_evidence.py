@@ -594,7 +594,8 @@ async def _load_periods(
 async def _load_policies(
     organization_id: uuid.UUID, **args: Any
 ) -> List[Dict[str, Any]]:
-    """Organization profile and learned accounting policies/preferences."""
+    """Organization profile and learned answers from past sessions (context
+    only — never standing policy; one-off clarification answers)."""
     from app.repositories import organization_repository
     from app.services import preference_service
 
@@ -615,7 +616,7 @@ async def _load_policies(
         )
     prefs = await preference_service.get_all_preferences(organization_id)
     for key, value in (prefs or {}).items():
-        out.append(_trim({"kind": "policy_preference", "key": key, "value": value}))
+        out.append(_trim({"kind": "learned_answer", "key": key, "value": value}))
     return out
 
 
@@ -820,8 +821,11 @@ EVIDENCE_KINDS.update(
         ),
         "policies": EvidenceKind(
             kind="policies",
-            title="Organization profile and accounting policies",
-            description="Organization identity plus learned accounting policies.",
+            title="Organization profile and past-session learned answers",
+            description=(
+                "Organization identity plus learned past answers (context "
+                "only — never standing policy for a new transaction)."
+            ),
             args={},
             permission_slug="search_account",
             loader=_load_policies,
