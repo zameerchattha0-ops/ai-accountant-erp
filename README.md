@@ -22,8 +22,10 @@ FastAPI backend (port 8000)  —  app/main.py
         │     → accounting engine → independent verification
         │
         ├── AI Orchestrator (app/ai_orchestrator.py)
-        │     Qwen (Alibaba Model Studio, primary, capability-aware chain)
-        │     → Gemini (fallback, key from Supabase Vault)
+        │     Token Harbor gateway (DeepSeek V4.1 text/tools, Mimo vision,
+        │     OpenAI-compatible, free-tier models)
+        │     → Qwen chain (Alibaba Model Studio, capability-aware)
+        │     → Gemini (final fallback, key from Supabase Vault)
         │     provider fallback ONLY for provider-level failures; never
         │     replays a request after any tool has executed
         │
@@ -39,7 +41,8 @@ FastAPI backend (port 8000)  —  app/main.py
 - **Backend:** Python 3.12, FastAPI, pydantic-settings, supabase-py, structlog
 - **Frontend:** Next.js 15 (App Router), TypeScript, Tailwind CSS 4, Supabase SSR
 - **Database:** Supabase-hosted PostgreSQL (RLS on all tables)
-- **AI:** Alibaba Cloud Model Studio / Qwen (primary), Google Gemini (fallback)
+- **AI:** Token Harbor gateway (DeepSeek V4.1 / Mimo, primary) · Alibaba
+  Cloud Model Studio / Qwen (secondary) · Google Gemini (final fallback)
 
 ## Capabilities
 
@@ -51,8 +54,13 @@ FastAPI backend (port 8000)  —  app/main.py
 - **Party sub-ledgers**: every customer gets its own receivable account and
   every supplier its own payable account, as a child of the control account,
   so receivables/payables stay segregated per party for reporting.
-- Quotations (with conversion to invoices), sales invoices, credit notes
-- Purchase bills, purchase returns, expenses
+- Quotations (with conversion to invoices), sales invoices
+- Credit notes (customer returns): branded printable documents, mandatory
+  reason, status flow DRAFT → ISSUED → VOIDED, and a deterministic reversal
+  journal (Dr revenue / Cr receivable) auto-validated, auto-posted and
+  source-tied on creation
+- Purchase bills, debit notes / purchase returns (same journal discipline
+  on the payable side), expenses
 - Receipts and payments with full/partial allocation and settlement
 - Banking: accounts, transfers, transactions
 - Fixed assets: registration, depreciation schedules, disposal
@@ -77,14 +85,16 @@ FastAPI backend (port 8000)  —  app/main.py
 - Python 3.12+
 - Node.js 20+
 - A Supabase project (database URL + keys)
-- Alibaba Model Studio API key (Qwen) — optional for UI-only use; the app
-  starts and serves the dashboard even without any AI provider configured
-  (provider initialisation is lazy and never blocks startup)
+- An AI provider key — optional for UI-only use; supported providers are a
+  Token Harbor universal key (primary), an Alibaba Model Studio key (Qwen)
+  and Google Gemini. The app starts and serves the dashboard even with no
+  AI provider configured (provider initialisation is lazy and never blocks
+  startup)
 
 ### Setup
 
 1. **Database:** apply the SQL migrations in `database/migrations/` in
-   filename order (`001…080`) to a fresh Supabase project.
+   filename order (`001…083`) to a fresh Supabase project.
 2. **Backend config:** copy `.env.example` to `.env` and fill in your values.
    Never commit `.env`. The Gemini key lives in Supabase Vault and is read
    via the `get_gemini_api_key()` RPC (service_role only).
@@ -130,7 +140,8 @@ See `.env.example` for the full annotated list. Key variables:
 | Variable | Purpose |
 |---|---|
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Database access (service role: backend only, never the browser) |
-| `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL_CHAIN`, `QWEN_VISION_MODEL_CHAIN`, `QWEN_BANNED_MODELS` | Primary AI provider and capability-aware chains |
+| `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL_CHAIN`, `QWEN_VISION_MODEL_CHAIN`, `QWEN_BANNED_MODELS` | Secondary AI provider and capability-aware chains |
+| `TH_API_KEY`, `TH_BASE_URL`, `TH_TEXT_MODEL`, `TH_VISION_MODEL_CHAIN`, `TH_TIMEOUT_SECONDS` | Primary AI gateway (Token Harbor) — the key may be resolved from Supabase Vault instead of the environment |
 | `GEMINI_MODEL` | Fallback provider model (key stays in Supabase Vault) |
 | `AI_PRIMARY_PROVIDER`, `AI_FALLBACK_PROVIDER` | Provider routing |
 | `APP_HOST`, `APP_PORT`, `APP_ENV`, `CORS_ORIGINS` | Server configuration |
