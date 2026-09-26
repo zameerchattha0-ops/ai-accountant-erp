@@ -205,6 +205,92 @@ async def record_cash_sale(
     )
 
 
+async def record_credit_note(
+    *,
+    organization_id: uuid.UUID,
+    customer_id: uuid.UUID,
+    receivable_account_id: uuid.UUID,
+    revenue_account_id: uuid.UUID,
+    amount: float,
+    transaction_date: str,
+    description: str,
+    source_id: Optional[uuid.UUID] = None,
+    project_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Record a credit note journal (customer return / allowance).
+
+    Debit:  Revenue account — the sale is reversed (contra to the invoice)
+    Credit: Accounts Receivable (customer) — the receivable shrinks
+    """
+    lines = [
+        {
+            "account_id": str(revenue_account_id),
+            "description": f"Sales reversal — {description}",
+            "debit": amount,
+            "credit": 0,
+            "customer_id": str(customer_id),
+            "project_id": str(project_id) if project_id else None,
+        },
+        {
+            "account_id": str(receivable_account_id),
+            "description": f"Receivable reduced — {description}",
+            "debit": 0,
+            "credit": amount,
+            "customer_id": str(customer_id),
+        },
+    ]
+    return await accounting_service.prepare_journal(
+        organization_id=organization_id,
+        transaction_date=transaction_date,
+        description=description,
+        lines=lines,
+        source_type="credit_note",
+        source_id=source_id,
+    )
+
+
+async def record_purchase_return(
+    *,
+    organization_id: uuid.UUID,
+    supplier_id: uuid.UUID,
+    expense_account_id: uuid.UUID,
+    payable_account_id: uuid.UUID,
+    amount: float,
+    transaction_date: str,
+    description: str,
+    source_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Record a purchase return (debit note) journal.
+
+    Debit:  Accounts Payable (supplier) — the payable shrinks
+    Credit: Expense/Asset account — the purchase is reversed
+    """
+    lines = [
+        {
+            "account_id": str(payable_account_id),
+            "description": f"Payable reduced — {description}",
+            "debit": amount,
+            "credit": 0,
+            "supplier_id": str(supplier_id),
+        },
+        {
+            "account_id": str(expense_account_id),
+            "description": f"Purchase reversal — {description}",
+            "debit": 0,
+            "credit": amount,
+            "supplier_id": str(supplier_id),
+        },
+    ]
+    return await accounting_service.prepare_journal(
+        organization_id=organization_id,
+        transaction_date=transaction_date,
+        description=description,
+        lines=lines,
+        source_type="purchase_return",
+        source_id=source_id,
+    )
+
+
 async def record_expense(
     *,
     organization_id: uuid.UUID,
@@ -631,6 +717,79 @@ async def auto_journal(
                 description=description,
                 source_id=source_id,
                 supplier_id=supplier_id,
+            )
+            return {"journal_entry": entry}
+
+        elif document_type == "credit_note":
+            # Customer return / allowance — the invoice posting with the
+            # sides REVERSED: revenue is reversed and the receivable
+            # shrinks.  Same party-segregation resolution as the invoice
+            # block (the customer's own ledger; control-account fallback).
+            receivable = None
+            if customer_id:
+                receivable = await party_ledger_service.resolve_customer_receivable_account(
+                    organization_id, customer_id
+                )
+            if not receivable:
+                receivable = await accounting_service.resolve_account(
+                    organization_id, account_name="Accounts Receivable"
+                )
+            if not receivable:
+                receivable = await _resolve_default_account(
+                    organization_id, "ASSET", fallback_type="CURRENT_ASSET",
+                )
+            revenue = await _resolve_default_account(
+                organization_id, "REVENUE", fallback_type="INCOME",
+            )
+            if not receivable or not revenue:
+                return {"journal_warning": "Cannot resolve Receivable or Revenue accounts"}
+            entry = await record_credit_note(
+                organization_id=organization_id,
+                customer_id=customer_id or uuid.UUID(int=0),
+                receivable_account_id=uuid.UUID(receivable["id"]),
+                revenue_account_id=uuid.UUID(revenue["id"]),
+                amount=amount,
+                transaction_date=transaction_date,
+                description=description,
+                source_id=source_id,
+                project_id=project_id,
+            )
+            return {"journal_entry": entry}
+
+        elif document_type == "purchase_return":
+            # Debit note — the bill posting with the sides REVERSED: the
+            # payable shrinks and the expense/purchase is reversed.  A
+            # validated classifier hint routes the credit back to the
+            # exact asset/expense account the bill debited.
+            expense = hint_account if (
+                hint_account and hint_account.get("account_type") in ("EXPENSE", "ASSET")
+            ) else await _resolve_default_account(
+                organization_id, "EXPENSE",
+            )
+            payable = None
+            if supplier_id:
+                payable = await party_ledger_service.resolve_supplier_payable_account(
+                    organization_id, supplier_id
+                )
+            if not payable:
+                payable = await accounting_service.resolve_account(
+                    organization_id, account_name="Accounts Payable"
+                )
+            if not payable:
+                payable = await _resolve_default_account(
+                    organization_id, "LIABILITY", fallback_type="CURRENT_LIABILITY",
+                )
+            if not expense or not payable:
+                return {"journal_warning": "Cannot resolve Expense or Payable accounts"}
+            entry = await record_purchase_return(
+                organization_id=organization_id,
+                supplier_id=supplier_id or uuid.UUID(int=0),
+                expense_account_id=uuid.UUID(expense["id"]),
+                payable_account_id=uuid.UUID(payable["id"]),
+                amount=amount,
+                transaction_date=transaction_date,
+                description=description,
+                source_id=source_id,
             )
             return {"journal_entry": entry}
 

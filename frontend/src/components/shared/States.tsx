@@ -32,7 +32,13 @@ export function EmptyState({ title, hint }: { title: string; hint?: string }) {
   );
 }
 
-export function ErrorState({ message }: { message: string }) {
+export function ErrorState({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry?: () => void;
+}) {
   return (
     <div className="bg-bg-surface rounded-2xl border border-error-200 p-8 flex flex-col items-center text-center">
       <div className="w-12 h-12 rounded-2xl bg-error-50 flex items-center justify-center mb-3">
@@ -40,6 +46,14 @@ export function ErrorState({ message }: { message: string }) {
       </div>
       <p className="text-sm font-medium text-text-primary">Something went wrong</p>
       <p className="text-xs text-error-600 mt-1 max-w-md break-words">{message}</p>
+      {onRetry && (
+        <button
+          onClick={onRetry}
+          className="mt-3 px-3.5 py-1.5 rounded-xl bg-bg-muted border border-border-subtle text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
+        >
+          Try again
+        </button>
+      )}
     </div>
   );
 }

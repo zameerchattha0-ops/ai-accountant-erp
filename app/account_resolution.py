@@ -86,6 +86,80 @@ def nature_for_intent(intent: str, entities: Optional[Dict[str, Any]] = None) ->
 
 
 # ---------------------------------------------------------------------------
+# Category-level granularity: an item NEVER becomes an account.  "2 office
+# chairs" opens/uses a FURNITURE ledger (all beds/sofas/chairs/tables post
+# there), fittings their own ledger — matching the balance-sheet grouping
+# the user sees (PPE → Furniture, PPE → Fixtures & Fittings, …).
+# Order matters: the most specific family first.
+# ---------------------------------------------------------------------------
+_ITEM_CATEGORY_RULES: Tuple[Tuple[str, str], ...] = (
+    (r"bed|sofa|couch|chair|table|desk|cabinet|shelf|cupboard|wardrobe|furnitur",
+     "Furniture & Fixtures"),
+    (r"fitting|fixture|partition|false ceiling|flooring|racking",
+     "Fixtures & Fittings"),
+    (r"laptop|desktop|computer|printer|scanner|monitor|server|router|"
+     r"\bups\b|it equipment|keyboard|mouse",
+     "Computer Equipment"),
+    (r"vehicle|car\b|motorcycle|\bbike\b|truck|van\b|delivery vehicle",
+     "Vehicles"),
+    (r"generator|solar|air conditioner|\bac\b|inverter|boiler|pump|"
+     r"machinery|\bmachine\b|industrial equipment",
+     "Plant & Machinery"),
+    (r"license|licence|software|subscription|patent|trademark|copyright",
+     "Intangible Assets"),
+    (r"jewel|gold|silver|investment|shares|deposit",
+     "Other Non-Current Assets"),
+)
+
+
+def category_for_item(text: Any) -> str:
+    """The CATEGORY ledger an item belongs to (never the item's own name)."""
+    low = str(text or "").strip().lower()
+    if not low:
+        return "Other Equipment & Fixtures"
+    for pattern, category in _ITEM_CATEGORY_RULES:
+        if re.search(pattern, low):
+            return category
+    return "Other Equipment & Fixtures"
+
+
+async def heading_account_id(
+    organization_id: uuid.UUID, *, nature: str
+) -> Optional[str]:
+    """Id of the grouping account a category ledger should hang under.
+
+    ASSET → the Property/Plant & Equipment (or non-current-assets)
+    HEADING when the chart has one with real children, so a new
+    "Furniture & Fixtures" ledger posts UNDER PPE on the balance sheet.
+    Returns None when no such heading exists — the account is then created
+    top-level; a parent is never invented.
+    """
+    if str(nature or "").upper() != "ASSET":
+        return None
+    from app.repositories import account_repository as a_repo
+
+    try:
+        chart = await a_repo.get_chart_of_accounts(organization_id, limit=500)
+        grouping = await a_repo.get_grouping_account_ids(organization_id)
+    except Exception as exc:  # noqa: BLE001 — parent is best-effort
+        log.warning("account_resolution.heading_lookup_failed", error=str(exc)[:200])
+        return None
+    if not chart or not grouping:
+        return None
+    for keyword in (
+        "property, plant", "property plant", "plant and equipment",
+        "plant & equipment", "fixed asset", "non-current asset",
+    ):
+        for acc in chart:
+            aid = str(acc.get("id") or "")
+            if not aid or aid not in grouping:
+                continue  # only a real heading (it has children) qualifies
+            if keyword in str(acc.get("name") or "").lower():
+                return aid
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Account-DETERMINATION failure classification (execution rescue trigger).
 # Deliberately conservative: only errors whose remedy is a chart-of-accounts
 # gap (create the ledger or name an existing one) — never party/permission/
@@ -315,13 +389,16 @@ async def fixed_asset_account_gap(
     except Exception as exc:  # noqa: BLE001
         log.warning("account_resolution.asset_chart_failed", error=str(exc)[:200])
 
-    name = str(
+    # Category-level proposal: the ITEM never becomes an account — "office
+    # chairs" proposes the Furniture & Fixtures ledger (all beds/sofas/
+    # chairs/tables post there), fittings theirs, and so on.
+    name = category_for_item(
         entities.get("asset_name")
         or entities.get("item_description")
         or entities.get("description")
         or ""
-    ).strip()
-    gap = gap_for_nature(name or "Fixed Assets", "FIXED_ASSET", "fixed_asset_nature")
+    )
+    gap = gap_for_nature(name, "FIXED_ASSET", "fixed_asset_nature")
     gap.candidates = candidates
     return gap
 
@@ -435,13 +512,14 @@ def gap_from_execution_failure(
     ents = dict(entities or {})
     low = text.lower()
     example = re.search(r"e\.g\.\s*'(.+?)'", text)
-    name = (example.group(1).strip() if example else "") or str(
+    name = (example.group(1).strip() if example else "") or category_for_item(
         ents.get("asset_name")
         or ents.get("item_description")
         or ents.get("description")
         or ents.get("account_name")
         or ""
-    ).strip().replace("'", "")
+    )
+    name = str(name).strip().replace("'", "")
     if not name:
         if "expense" in low:
             name = "Expense"

@@ -735,6 +735,57 @@ async def _convert_quotation(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _create_credit_note(organization_id: uuid.UUID, **kw) -> ToolResult:
     data = await credit_note_service.create_credit_note(organization_id=organization_id, **kw)
+    # C3+C4 (mirrors create_invoice): a customer return is a real
+    # receivable event — the REVERSAL journal (Dr revenue / Cr receivable)
+    # is built deterministically from the document, auto-validated,
+    # auto-posted, source-tied back to the note, and the note leaves DRAFT
+    # so receivables/aging views reflect the credit.  Never an LLM choice.
+    amount = float(data.get("total", 0))
+    if amount > 0:
+        journal_result = await auto_journal(
+            organization_id=organization_id,
+            document_type="credit_note",
+            document=data,
+            amount=amount,
+            transaction_date=data.get("credit_note_date", ""),
+            description=(
+                f"Credit note {data.get('credit_note_number', data.get('id', ''))}"
+            ),
+            customer_id=(
+                uuid.UUID(str(data["customer_id"]))
+                if data.get("customer_id") else None
+            ),
+        )
+        data.update(journal_result)
+        prepared = journal_result.get("journal_entry") or {}
+        entry = prepared.get("entry") or {}
+        if entry.get("id"):
+            try:
+                entry_id = uuid.UUID(entry["id"])
+                await accounting_service.validate_journal(entry_id=entry_id)
+                await accounting_service.post_journal(entry_id=entry_id)
+                from app.repositories import credit_note_repository as cn_repo
+
+                await cn_repo.link_journal_to_credit_note(
+                    credit_note_id=uuid.UUID(str(data["id"])),
+                    journal_entry_id=entry_id,
+                )
+                await cn_repo.mark_issued(
+                    credit_note_id=uuid.UUID(str(data["id"]))
+                )
+                data["journal_entry_id"] = str(entry_id)
+                data["status"] = "ISSUED"
+                data["journal_posted"] = True
+            except Exception as exc:  # noqa: BLE001 — never fake success
+                log.warning(
+                    "tools.create_credit_note.post_journal_failed",
+                    entry_id=str(entry.get("id")),
+                    error=str(exc)[:300],
+                )
+                data["journal_posted"] = False
+                data["journal_warning"] = (
+                    f"Journal prepared but posting failed: {exc}"
+                )
     return ToolResult(tool_name="create_credit_note", success=True, data=data)
 
 # ===================================================================
@@ -743,6 +794,58 @@ async def _create_credit_note(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _create_purchase_return(organization_id: uuid.UUID, **kw) -> ToolResult:
     data = await purchase_return_service.create_purchase_return(organization_id=organization_id, **kw)
+    # C3+C4 (mirrors create_invoice / create_purchase_bill): a goods
+    # return to the supplier is a real payable event — the REVERSAL journal
+    # (Dr payable / Cr expense-asset) is built deterministically from the
+    # document, auto-validated, auto-posted, source-tied back to the row,
+    # and the return leaves DRAFT (OPEN) so payables/aging views reflect
+    # it.  Never an LLM choice.
+    amount = float(data.get("total", 0))
+    if amount > 0:
+        journal_result = await auto_journal(
+            organization_id=organization_id,
+            document_type="purchase_return",
+            document=data,
+            amount=amount,
+            transaction_date=data.get("return_date", ""),
+            description=(
+                f"Purchase return {data.get('return_number', data.get('id', ''))}"
+            ),
+            supplier_id=(
+                uuid.UUID(str(data["supplier_id"]))
+                if data.get("supplier_id") else None
+            ),
+        )
+        data.update(journal_result)
+        prepared = journal_result.get("journal_entry") or {}
+        entry = prepared.get("entry") or {}
+        if entry.get("id"):
+            try:
+                entry_id = uuid.UUID(entry["id"])
+                await accounting_service.validate_journal(entry_id=entry_id)
+                await accounting_service.post_journal(entry_id=entry_id)
+                from app.repositories import purchase_return_repository as pr_repo
+
+                await pr_repo.link_journal_to_purchase_return(
+                    return_id=uuid.UUID(str(data["id"])),
+                    journal_entry_id=entry_id,
+                )
+                await pr_repo.mark_open(
+                    return_id=uuid.UUID(str(data["id"]))
+                )
+                data["journal_entry_id"] = str(entry_id)
+                data["status"] = "OPEN"
+                data["journal_posted"] = True
+            except Exception as exc:  # noqa: BLE001 — never fake success
+                log.warning(
+                    "tools.create_purchase_return.post_journal_failed",
+                    entry_id=str(entry.get("id")),
+                    error=str(exc)[:300],
+                )
+                data["journal_posted"] = False
+                data["journal_warning"] = (
+                    f"Journal prepared but posting failed: {exc}"
+                )
     return ToolResult(tool_name="create_purchase_return", success=True, data=data)
 
 # ===================================================================

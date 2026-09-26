@@ -132,6 +132,22 @@ HARD PROHIBITIONS:
   value is context, not an answer: ask (option b) or list it in
   missing_material_facts — never default it into a proposal or a
   "per org policy" disclosure.
+
+CHART-OF-ACCOUNTS GRANULARITY:
+Ledgers are CATEGORY-level — never one account per item, and never a
+single generic bucket when a category is identifiable. Beds/sofas/chairs/
+tables post to a Furniture ledger under PPE; fittings to Fixtures &
+Fittings; laptops/printers to Computer Equipment; vehicles to Vehicles;
+expense items to their category ledger (Utilities, Rent, Travel…).
+Propose or create accounts at CATEGORY level; the individual item lives on
+the document line, never as its own account.
+
+CREDIT / DEBIT NOTES:
+A credit note reverses revenue and shrinks the customer receivable; a
+debit note (purchase return) shrinks the supplier payable and reverses the
+purchase. Both auto-post their reversal journal from the document, like
+invoices — state that impact in the proposal; never compose a manual
+journal for them.
 - Never ask a generic question when the records could answer it.
 - Never claim success: success comes from actual tool results and the verified
   ledger, not from your own text.
@@ -219,6 +235,14 @@ CHOOSING THE STEP — exactly one of these must be non-null/non-empty:
   b) "question" non-null -> a material fact only the user can supply, asked in
      the context of the actual records (never a generic template question).
      "missing_material_facts" lists what that question resolves.
+     CONSOLIDATED QUESTIONNAIRE: ask EVERY material unknown of this request
+     in ONE round — number each fact on its own line ("1. …" / "2. …") so
+     the UI renders an answer box + tap-chips per line. Use the object form
+     {"text": "short intro\n1. …\n2. …",
+      "options_per_part": [["quick choice", "other choice"], []]}
+     with options_per_part ALIGNED to the numbered lines (empty list when a
+     line has no sensible choices); the user may always type their own
+     answer instead of tapping. Never drip-feed one unknown per round.
   c) "proposal" non-null -> you have enough evidence to propose a concrete next
      step. Every proposal MUST include interpretation, affected_records,
      accounting_impact, not_affected and unresolved_uncertainty.
@@ -621,13 +645,32 @@ def _clean_list(value: Any, limit: int = 12, item_limit: int = 300) -> List[str]
 def _clean_question(raw: Any) -> Optional[Dict[str, Any]]:
     if isinstance(raw, str):
         text = raw.strip()
-        return {"text": text, "options": []} if text else None
+        return (
+            {"text": text, "options": [], "options_per_part": []}
+            if text
+            else None
+        )
     if not isinstance(raw, dict):
         return None
     text = str(raw.get("text") or raw.get("question") or "").strip()
     if not text:
         return None
-    return {"text": text[:1500], "options": _clean_list(raw.get("options"), 6, 80)}
+    # 360° questionnaire: per-numbered-line quick choices, ALIGNED to the
+    # "1. … 2. …" lines of `text` (the UI renders one answer box + chips
+    # per line).  Anything unaligned/unshaped is dropped, never guessed.
+    parts = raw.get("options_per_part")
+    clean_parts: List[List[str]] = []
+    if isinstance(parts, list):
+        for part in parts[:12]:
+            if isinstance(part, list):
+                clean_parts.append(_clean_list(part, 6, 60))
+            elif isinstance(part, str) and part.strip():
+                clean_parts.append([part.strip()[:60]])
+    return {
+        "text": text[:1500],
+        "options": _clean_list(raw.get("options"), 6, 80),
+        "options_per_part": clean_parts,
+    }
 
 
 def _clean_tool_calls(raw: Any) -> List[Dict[str, Any]]:

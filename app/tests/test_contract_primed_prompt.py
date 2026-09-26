@@ -13,10 +13,18 @@ Pinned invariants:
 * the deterministic gate STILL rejects invented names — priming never
   weakens validation;
 * ``run_reasoning_loop`` passes the SAME contracts to prompt and gate;
-* size: base stays under the legacy 11,500-char latency ceiling (measured
-  10,799) and the contract-primed production shape is pinned under
-  PRIMED_CEILING (measured 13,980 = +3,181 chars / ~795 input tokens —
-  deliberately accepted to eliminate a measured 6-11s rejection round).
+* size: base stays under BASE_CEILING and the contract-primed production
+  shape under PRIMED_CEILING.
+
+Ceiling history (measured, never silent):
+* 2026-09-23: base=10,799 / primed=13,980 → ceilings 11,500 / 14,500.
+* 2026-09-25: base=12,528 / primed=15,709 → ceilings 13,000 / 16,200.
+  +1,729 chars (~430 input tokens) from FOUR required instruction blocks:
+  settlement-assumption prohibition (cash incident), consolidated 360°
+  questionnaire, chart-of-accounts category granularity, and credit/debit
+  note impact rules.  Input-side only — generation is unchanged, and the
+  static head is byte-identical across rounds so the prefix cache absorbs
+  it after round 1.
 """
 
 import json
@@ -36,8 +44,8 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 11_500  # legacy pinned budget (contracts NOT passed — unchanged)
-PRIMED_CEILING = 14_500  # measured 13,980 on 2026-09-23; ~4% headroom
+BASE_CEILING = 13_000  # measured 12,528 on 2026-09-25 (see module docstring)
+PRIMED_CEILING = 16_200  # measured 15,709 on 2026-09-25 (~3% headroom)
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

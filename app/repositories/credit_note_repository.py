@@ -8,7 +8,7 @@ import uuid
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from app.database import fetch_many, fetch_one, insert_one
+from app.database import fetch_many, fetch_one, insert_one, update_one
 
 
 async def get_credit_note(
@@ -17,6 +17,17 @@ async def get_credit_note(
     return await fetch_one(
         "credit_notes",
         filters={"id": str(credit_note_id), "organization_id": str(organization_id)},
+    )
+
+
+async def list_credit_notes(
+    organization_id: uuid.UUID, *, limit: int = 500
+) -> List[Dict[str, Any]]:
+    return await fetch_many(
+        "credit_notes",
+        filters={"organization_id": str(organization_id)},
+        order="created_at.desc",
+        limit=limit,
     )
 
 
@@ -86,3 +97,39 @@ async def create_credit_note(
     credit_note["items"] = items
     credit_note["total"] = total
     return credit_note
+
+
+async def link_journal_to_credit_note(
+    *, credit_note_id: uuid.UUID, journal_entry_id: uuid.UUID
+) -> Optional[Dict[str, Any]]:
+    """Source-tie the posted journal back to the credit note row."""
+    return await update_one(
+        "credit_notes",
+        row_id=credit_note_id,
+        data={"journal_entry_id": str(journal_entry_id)},
+    )
+
+
+async def mark_issued(*, credit_note_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Transition DRAFT → ISSUED once the reversal journal is posted.
+
+    A posted credit-note journal is a real receivable event: the note must
+    leave DRAFT so receivables/aging views (which filter out DRAFT) reflect
+    the reversal.
+    """
+    return await update_one(
+        "credit_notes",
+        row_id=credit_note_id,
+        data={"status": "ISSUED"},
+    )
+
+
+async def set_status(
+    *, credit_note_id: uuid.UUID, status: str
+) -> Optional[Dict[str, Any]]:
+    """Status-only transition (DRAFT → ISSUED/VOIDED, ISSUED → VOIDED)."""
+    return await update_one(
+        "credit_notes",
+        row_id=credit_note_id,
+        data={"status": status},
+    )

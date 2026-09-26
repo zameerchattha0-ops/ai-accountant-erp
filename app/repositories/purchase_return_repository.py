@@ -8,7 +8,7 @@ import uuid
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from app.database import fetch_many, fetch_one, insert_one
+from app.database import fetch_many, fetch_one, insert_one, update_one
 
 
 async def get_purchase_return(
@@ -17,6 +17,17 @@ async def get_purchase_return(
     return await fetch_one(
         "purchase_returns",
         filters={"id": str(return_id), "organization_id": str(organization_id)},
+    )
+
+
+async def list_purchase_returns(
+    organization_id: uuid.UUID, *, limit: int = 500
+) -> List[Dict[str, Any]]:
+    return await fetch_many(
+        "purchase_returns",
+        filters={"organization_id": str(organization_id)},
+        order="created_at.desc",
+        limit=limit,
     )
 
 
@@ -81,3 +92,38 @@ async def create_purchase_return(
     purchase_return["items"] = items
     purchase_return["total"] = total
     return purchase_return
+
+
+async def link_journal_to_purchase_return(
+    *, return_id: uuid.UUID, journal_entry_id: uuid.UUID
+) -> Optional[Dict[str, Any]]:
+    """Source-tie the posted journal back to the purchase return row."""
+    return await update_one(
+        "purchase_returns",
+        row_id=return_id,
+        data={"journal_entry_id": str(journal_entry_id)},
+    )
+
+
+async def mark_open(*, return_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Transition DRAFT → OPEN once the reversal journal is posted.
+
+    bill_status has no ISSUED value — OPEN is the posted state (mirrors
+    purchase bills), so payables/aging views reflect the reversal.
+    """
+    return await update_one(
+        "purchase_returns",
+        row_id=return_id,
+        data={"status": "OPEN"},
+    )
+
+
+async def set_status(
+    *, return_id: uuid.UUID, status: str
+) -> Optional[Dict[str, Any]]:
+    """Status-only transition (DRAFT → OPEN/VOIDED, OPEN → VOIDED)."""
+    return await update_one(
+        "purchase_returns",
+        row_id=return_id,
+        data={"status": status},
+    )

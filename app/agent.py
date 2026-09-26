@@ -2690,11 +2690,25 @@ async def execute(
                         "question": _question[:500],
                         "evidence": _reasoning.as_dict().get("evidence"),
                     })
+                    # 360° questionnaire: per-numbered-line tap-chips ride
+                    # along as question_options (aligned by line index; the
+                    # frontend renders one answer box + chips per line and
+                    # still accepts free text).
+                    _q_parts = _reasoning.question.get("options_per_part") or []
+                    _q_opts = [
+                        [
+                            {"value": str(o), "label": str(o)}
+                            for o in (part or [])
+                        ]
+                        for part in _q_parts
+                        if isinstance(part, list)
+                    ] or None
                     return AgentResponse(
                         status=ExecutionStatus.AWAITING_CLARIFICATION,
                         execution_id=session_id,
                         question=_clar.get("question", _question),
                         options=_reasoning.question.get("options") or None,
+                        question_options=_q_opts,
                         required_information=_needed,
                         requires_user_input=True,
                     )
@@ -3595,6 +3609,7 @@ async def execute(
                 account_shape,
                 ensure_create_account_first,
                 gap_already_asked,
+                heading_account_id,
                 options_for_gap,
                 preflight_account_gaps,
                 question_for_gap,
@@ -3677,16 +3692,31 @@ async def execute(
                     _shape = account_shape(
                         getattr(_cls, "transaction_nature", None) or "OPERATING_EXPENSE"
                     )
+                    _create_args: dict = {
+                        "name": _confirmed_acct,
+                        "code": getattr(_cls, "proposed_account_code", None)
+                                or _shape[2],
+                        "account_type": _shape[0],
+                        "normal_balance": _shape[1],
+                        "description": "Created via the account-creation confirmation loop.",
+                    }
+                    # Category-level granularity: an ASSET category hangs
+                    # under the chart's PPE heading when one exists, so
+                    # "Furniture & Fixtures" appears UNDER Property, Plant &
+                    # Equipment on the balance sheet (never an invented
+                    # parent — None stays top-level).
+                    if _shape[0] == "ASSET":
+                        try:
+                            _heading = await heading_account_id(
+                                organization_id, nature=_shape[0]
+                            )
+                        except Exception:  # noqa: BLE001
+                            _heading = None
+                        if _heading:
+                            _create_args["parent_account_id"] = _heading
                     planned_tool_calls = ensure_create_account_first(
                         planned_tool_calls,
-                        arguments={
-                            "name": _confirmed_acct,
-                            "code": getattr(_cls, "proposed_account_code", None)
-                                    or _shape[2],
-                            "account_type": _shape[0],
-                            "normal_balance": _shape[1],
-                            "description": "Created via the account-creation confirmation loop.",
-                        },
+                        arguments=_create_args,
                     )
                     if "create_account" not in (execution_plan.potential_tools or []):
                         execution_plan.potential_tools = [

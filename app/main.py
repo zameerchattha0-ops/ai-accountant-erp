@@ -1290,6 +1290,243 @@ async def delete_catalogue_service(
 
 
 # ---------------------------------------------------------------------------
+# CREDIT NOTES (sales) — proper endpoints for the Credit Note module
+# (list/detail/create/status).  Journal posting happens deterministically
+# inside the create TOOL (agent path); document creation here mirrors the
+# UI's DRAFT-then-issue flow.
+# ---------------------------------------------------------------------------
+@app.get("/api/sales/credit-notes")
+async def list_credit_notes_endpoint(
+    query: str = "",
+    status: str = "ALL",
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Every credit note in the caller's organisation (newest first)."""
+    from app.repositories import credit_note_repository as cn_repo
+
+    rows = await cn_repo.list_credit_notes(auth.organization_id)
+    customers = await fetch_many(
+        "customers",
+        filters={"organization_id": str(auth.organization_id)},
+        select="id, name",
+        limit=1000,
+    )
+    names = {str(c.get("id")): str(c.get("name") or "") for c in customers or []}
+    q = (query or "").strip().lower()
+    status_up = (status or "ALL").upper()
+    items = []
+    for row in rows or []:
+        if status_up != "ALL" and str(row.get("status") or "").upper() != status_up:
+            continue
+        customer_name = names.get(str(row.get("customer_id")), "")
+        if q and not (
+            q in str(row.get("credit_note_number") or "").lower()
+            or q in customer_name.lower()
+            or q in str(row.get("reason") or "").lower()
+        ):
+            continue
+        items.append({**row, "customer_name": customer_name})
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/sales/credit-notes/{credit_note_id}")
+async def get_credit_note_endpoint(
+    credit_note_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """One credit note with its line items."""
+    from app.repositories import credit_note_repository as cn_repo
+
+    note = await cn_repo.get_credit_note(
+        auth.organization_id, credit_note_id=credit_note_id
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Credit note not found.")
+    items = await cn_repo.get_credit_note_items(
+        auth.organization_id, credit_note_id=credit_note_id
+    )
+    return {"item": {**note, "items": items}}
+
+
+@app.post("/api/sales/credit-notes", status_code=201)
+async def create_credit_note_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Create a credit note (DRAFT) with line items. Reason is mandatory."""
+    from app.services import credit_note_service
+
+    if not str(payload.get("reason") or "").strip():
+        raise HTTPException(
+            status_code=409, detail="A reason is required for a credit note."
+        )
+    if not payload.get("items"):
+        raise HTTPException(
+            status_code=409, detail="A credit note needs at least one line item."
+        )
+    if not (payload.get("customer_id") or payload.get("customer_name")):
+        raise HTTPException(status_code=409, detail="A customer is required.")
+    args = {
+        k: payload.get(k)
+        for k in (
+            "customer_id", "customer_name", "items", "invoice_id",
+            "reason", "credit_note_date", "currency_code",
+        )
+        if k in payload
+    }
+    try:
+        note = await credit_note_service.create_credit_note(
+            organization_id=auth.organization_id, **args
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"item": note}
+
+
+@app.patch("/api/sales/credit-notes/{credit_note_id}")
+async def update_credit_note_status_endpoint(
+    credit_note_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Status-only transition (DRAFT → ISSUED → VOIDED, etc.)."""
+    from app.repositories import credit_note_repository as cn_repo
+
+    status = str(payload.get("status") or "").upper()
+    if status not in ("DRAFT", "ISSUED", "VOIDED"):
+        raise HTTPException(
+            status_code=409,
+            detail="Status must be DRAFT, ISSUED or VOIDED.",
+        )
+    note = await cn_repo.get_credit_note(
+        auth.organization_id, credit_note_id=credit_note_id
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Credit note not found.")
+    updated = await cn_repo.set_status(
+        credit_note_id=credit_note_id, status=status
+    )
+    return {"item": updated}
+
+
+# ---------------------------------------------------------------------------
+# DEBIT NOTES (purchases) — the Debit Note module is the purchase_returns
+# document (goods returned to a supplier).  Same journal discipline as the
+# credit note: the reversal journal posts inside the create TOOL.
+# ---------------------------------------------------------------------------
+@app.get("/api/purchases/debit-notes")
+async def list_debit_notes_endpoint(
+    query: str = "",
+    status: str = "ALL",
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Every debit note (purchase return) in the caller's organisation."""
+    from app.repositories import purchase_return_repository as pr_repo
+
+    rows = await pr_repo.list_purchase_returns(auth.organization_id)
+    suppliers = await fetch_many(
+        "suppliers",
+        filters={"organization_id": str(auth.organization_id)},
+        select="id, name",
+        limit=1000,
+    )
+    names = {str(s.get("id")): str(s.get("name") or "") for s in suppliers or []}
+    q = (query or "").strip().lower()
+    status_up = (status or "ALL").upper()
+    items = []
+    for row in rows or []:
+        if status_up != "ALL" and str(row.get("status") or "").upper() != status_up:
+            continue
+        supplier_name = names.get(str(row.get("supplier_id")), "")
+        if q and not (
+            q in str(row.get("return_number") or "").lower()
+            or q in supplier_name.lower()
+            or q in str(row.get("reason") or "").lower()
+        ):
+            continue
+        items.append({**row, "supplier_name": supplier_name})
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/purchases/debit-notes/{return_id}")
+async def get_debit_note_endpoint(
+    return_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """One debit note (purchase return) with its line items."""
+    from app.repositories import purchase_return_repository as pr_repo
+
+    note = await pr_repo.get_purchase_return(
+        auth.organization_id, return_id=return_id
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Debit note not found.")
+    items = await pr_repo.get_purchase_return_items(
+        auth.organization_id, return_id=return_id
+    )
+    return {"item": {**note, "items": items}}
+
+
+@app.post("/api/purchases/debit-notes", status_code=201)
+async def create_debit_note_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Create a debit note / purchase return (DRAFT). Reason is mandatory."""
+    from app.services import purchase_return_service
+
+    if not str(payload.get("reason") or "").strip():
+        raise HTTPException(
+            status_code=409, detail="A reason is required for a debit note."
+        )
+    if not payload.get("items"):
+        raise HTTPException(
+            status_code=409, detail="A debit note needs at least one line item."
+        )
+    if not (payload.get("supplier_id") or payload.get("supplier_name")):
+        raise HTTPException(status_code=409, detail="A supplier is required.")
+    args = {
+        k: payload.get(k)
+        for k in (
+            "supplier_id", "supplier_name", "items", "bill_id",
+            "reason", "return_date", "currency_code",
+        )
+        if k in payload
+    }
+    try:
+        note = await purchase_return_service.create_purchase_return(
+            organization_id=auth.organization_id, **args
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"item": note}
+
+
+@app.patch("/api/purchases/debit-notes/{return_id}")
+async def update_debit_note_status_endpoint(
+    return_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Status-only transition (DRAFT → OPEN → VOIDED)."""
+    from app.repositories import purchase_return_repository as pr_repo
+
+    status = str(payload.get("status") or "").upper()
+    if status not in ("DRAFT", "OPEN", "VOIDED"):
+        raise HTTPException(
+            status_code=409,
+            detail="Status must be DRAFT, OPEN or VOIDED.",
+        )
+    note = await pr_repo.get_purchase_return(
+        auth.organization_id, return_id=return_id
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Debit note not found.")
+    updated = await pr_repo.set_status(return_id=return_id, status=status)
+    return {"item": updated}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
