@@ -5,6 +5,7 @@ import { ChevronDown, ChevronRight, Pencil, Plus, Printer, Search, Trash2, Undo2
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
+import AccountCombobox from "@/components/shared/AccountCombobox";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import StatusBadge from "@/components/shared/StatusBadge";
@@ -15,7 +16,7 @@ import type { Account, JournalEntry, JournalLine } from "@/lib/types/entities";
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
 
-type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type">;
+type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type" | "parent_account_id">;
 type LineRow = JournalLine & {
   account?: { code?: string; name?: string } | { code?: string; name?: string }[] | null;
 };
@@ -91,7 +92,7 @@ export default function JournalPage() {
     const supabase = createClient();
     supabase
       .from("accounts")
-      .select("id, code, name, account_type")
+      .select("id, code, name, account_type, parent_account_id")
       .eq("organization_id", org.organization_id)
       .eq("is_active", true)
       .order("code")
@@ -626,13 +627,23 @@ export default function JournalPage() {
             <div className="space-y-2">
               {form.lines.map((line, i) => (
                 <div key={i} className="grid grid-cols-2 sm:grid-cols-12 gap-2 items-center">
-                  <select className={`${inputCls} col-span-2 sm:col-span-4`} value={line.account_id}
-                    onChange={(e) => setLine(i, { account_id: e.target.value })}>
-                    <option value="">Account…</option>
-                    {accounts.map((a) => (
-                      <option key={a.id} value={a.id}>{a.code} - {a.name}</option>
-                    ))}
-                  </select>
+                  <AccountCombobox
+                    className="col-span-2 sm:col-span-4"
+                    inputId={`journal-line-account-${i}`}
+                    label={`Line ${i + 1} account`}
+                    placeholder="Search or create account…"
+                    accounts={accounts}
+                    organizationId={org?.organization_id ?? ""}
+                    value={line.account_id}
+                    onChange={(id) => setLine(i, { account_id: id })}
+                    onCreated={(acc) =>
+                      setAccounts((prev) =>
+                        [...prev, acc as AccountOption].sort((x, y) =>
+                          x.code.localeCompare(y.code)
+                        )
+                      )
+                    }
+                  />
                   <input className={`${inputCls} col-span-2 sm:col-span-3`} placeholder="Line note"
                     value={line.description}
                     onChange={(e) => setLine(i, { description: e.target.value })} />

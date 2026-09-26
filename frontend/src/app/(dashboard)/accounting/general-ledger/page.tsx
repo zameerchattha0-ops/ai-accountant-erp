@@ -5,6 +5,7 @@ import { Search } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
+import AccountCombobox from "@/components/shared/AccountCombobox";
 import PageHeader from "@/components/shared/PageHeader";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Account, GeneralLedgerRow } from "@/lib/types/entities";
@@ -12,7 +13,10 @@ import type { Account, GeneralLedgerRow } from "@/lib/types/entities";
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
 
-type AccountOption = Pick<Account, "id" | "code" | "name">;
+type AccountOption = Pick<
+  Account,
+  "id" | "code" | "name" | "account_type" | "parent_account_id"
+>;
 
 export default function GeneralLedgerPage() {
   const { org, loading: orgLoading } = useOrg();
@@ -50,7 +54,7 @@ export default function GeneralLedgerPage() {
     const supabase = createClient();
     supabase
       .from("accounts")
-      .select("id, code, name")
+      .select("id, code, name, account_type, parent_account_id")
       .eq("organization_id", org.organization_id)
       .eq("is_active", true)
       .order("code")
@@ -81,13 +85,19 @@ export default function GeneralLedgerPage() {
       />
 
       <div className="flex flex-col lg:flex-row gap-3">
-        <select className={`${inputCls} lg:max-w-64`} value={accountFilter}
-          onChange={(e) => setAccountFilter(e.target.value)}>
-          <option value="ALL">All accounts</option>
-          {accounts.map((a) => (
-            <option key={a.id} value={a.id}>{a.code} - {a.name}</option>
-          ))}
-        </select>
+        <AccountCombobox
+          className="w-full lg:max-w-64"
+          inputId="gl-account-filter"
+          label="Filter by account"
+          placeholder="All accounts"
+          accounts={accounts}
+          organizationId={org?.organization_id ?? ""}
+          value={accountFilter === "ALL" ? "" : accountFilter}
+          onChange={(id) => setAccountFilter(id || "ALL")}
+          allowClear
+          clearLabel="All accounts"
+          allowCreate={false}
+        />
         <div className="flex items-center gap-2">
           <input type="date" className={`${inputCls} w-40`} value={fromDate}
             onChange={(e) => setFromDate(e.target.value)} aria-label="From date" />

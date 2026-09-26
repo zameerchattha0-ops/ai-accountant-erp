@@ -6,6 +6,7 @@ import { Plus, Search, Trash2, Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
+import AccountCombobox from "@/components/shared/AccountCombobox";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import DraftDeleteButton from "@/components/shared/DraftDeleteButton";
@@ -43,7 +44,7 @@ type BillRow = PurchaseBill & {
   supplier?: { name?: string } | { name?: string }[] | null;
 };
 type SupplierOption = Pick<Supplier, "id" | "name">;
-type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type">;
+type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type" | "parent_account_id">;
 
 export default function PurchaseBillsPage() {
   const { org, loading: orgLoading } = useOrg();
@@ -92,7 +93,7 @@ export default function PurchaseBillsPage() {
       .then(({ data }) => setSuppliers((data as SupplierOption[]) ?? []));
     supabase
       .from("accounts")
-      .select("id, code, name, account_type")
+      .select("id, code, name, account_type, parent_account_id")
       .eq("organization_id", org.organization_id)
       .eq("account_type", "EXPENSE")
       .eq("is_active", true)
@@ -358,13 +359,24 @@ export default function PurchaseBillsPage() {
                   <input className={`${inputCls} col-span-5`} placeholder="Description"
                     value={line.description}
                     onChange={(e) => setLine(i, { description: e.target.value })} />
-                  <select className={`${inputCls} col-span-3`} value={line.expense_account_id}
-                    onChange={(e) => setLine(i, { expense_account_id: e.target.value })}>
-                    <option value="">Expense account…</option>
-                    {expenseAccounts.map((a) => (
-                      <option key={a.id} value={a.id}>{a.code} - {a.name}</option>
-                    ))}
-                  </select>
+                  <AccountCombobox
+                    className="col-span-3"
+                    inputId={`bill-line-account-${i}`}
+                    label={`Line ${i + 1} expense account`}
+                    placeholder="Search expense account…"
+                    accounts={expenseAccounts}
+                    organizationId={org?.organization_id ?? ""}
+                    value={line.expense_account_id}
+                    onChange={(id) => setLine(i, { expense_account_id: id })}
+                    createTypes={["EXPENSE"]}
+                    onCreated={(acc) =>
+                      setExpenseAccounts((prev) =>
+                        [...prev, acc as AccountOption].sort((x, y) =>
+                          x.code.localeCompare(y.code)
+                        )
+                      )
+                    }
+                  />
                   <input className={`${inputCls} col-span-1 text-right`} type="number" min="0" step="any" placeholder="Qty"
                     value={line.quantity}
                     onChange={(e) => setLine(i, { quantity: e.target.value })} />
