@@ -254,6 +254,11 @@ async def ai_execute(
 ):
     """Process a natural-language message through the AI agent."""
     from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
+    # c1f3faf regression: this name was referenced WITHOUT the local import,
+    # so every plain POST /api/ai/execute died with
+    # ``NameError: name 'get_client' is not defined`` (bare 500) before the
+    # agent ever ran.  Keep the lazy-import pattern used at lines 241/1071.
+    from app.ai_orchestrator import get_client
 
     log.info(
         "api.execute",
@@ -288,6 +293,13 @@ async def ai_clarify(
     from app.agent import (  # lazy: heavy agent stack (serverless cold-start)
         resume_with_clarification,
     )
+    # c1f3faf regression (THE production 500): ``questionnaire_client=
+    # get_client()`` below evaluated an UNDEFINED name — Python raises
+    # NameError while building the keyword arguments, i.e. BEFORE
+    # resume_with_clarification runs.  The user's answer was therefore never
+    # recorded (clarification stayed WAITING_FOR_USER with user_response
+    # NULL) and the client saw only a bare "Internal Server Error" body.
+    from app.ai_orchestrator import get_client
 
     response = await resume_with_clarification(
         session_id=answer.session_id,
@@ -422,6 +434,13 @@ async def ai_execute_stream(
             + "\n\n"
         )
         from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
+        # c1f3faf intent ("provider injection at the API boundary"): this is
+        # the PRIMARY prod path, yet it never passed a questionnaire client —
+        # fresh sends always fell back to deterministic phrasing while the
+        # clarify/execute endpoints injected one.  Inject the same singleton;
+        # build_questionnaire_with_llm swallows provider failures, so a down
+        # provider degrades to the deterministic questionnaire, never a 500.
+        from app.ai_orchestrator import get_client
 
         run_task = asyncio.create_task(
             execute(
@@ -431,6 +450,7 @@ async def ai_execute_stream(
                 auth=auth,
                 conversation_id=request.conversation_id,
                 attachments=request.attachments,
+                questionnaire_client=get_client(),
             )
         )
         seen_step_ids: set[str] = set()
