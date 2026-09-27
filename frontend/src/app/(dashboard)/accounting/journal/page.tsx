@@ -41,6 +41,14 @@ export default function JournalPage() {
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [search, setSearch] = useState("");
+  // SERVER-SIDE PAGING: the journal is unbounded — rendering every entry
+  // on one page was a data-load problem. 50 rows per page, newest journal
+  // NUMBER first (JV-000026 → JV-000025 → …), filters/search applied by
+  // the database, never by shipping the whole table to the browser.
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+  const PAGE_SIZE = 50;
   // Edit / delete / reverse
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -73,17 +81,41 @@ export default function JournalPage() {
   const load = useCallback(async () => {
     if (!org) return;
     const supabase = createClient();
+    // Sanitised for PostgREST `or()` syntax — commas/parens would break
+    // the filter expression, they are never meaningful in a journal search.
+    const q = debouncedSearch.replace(/[(),]/g, " ").trim();
     let query = supabase
       .from("journal_entries")
-      .select("*")
+      .select("*", { count: "exact" })
       .eq("organization_id", org.organization_id)
-      .order("transaction_date", { ascending: false })
-      .order("created_at", { ascending: false });
+      // NUMBER-WISE: JV numbers are zero-padded, so a string sort is the
+      // numeric sort the user expects (no more date-interleaved numbers).
+      .order("journal_number", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
     if (statusFilter !== "ALL") query = query.eq("status", statusFilter);
-    const { data, error: dbError } = await query;
+    if (q) {
+      query = query.or(
+        `journal_number.ilike.%${q}%,description.ilike.%${q}%,` +
+          `reference.ilike.%${q}%,source_type.ilike.%${q}%`
+      );
+    }
+    const { data, error: dbError, count } = await query;
     if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org, statusFilter]);
+    else {
+      setRows(data ?? []);
+      setTotalCount(count ?? 0);
+    }
+  }, [org, statusFilter, page, debouncedSearch]);
+
+  // Debounce the search so typing does not fire one DB query per keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedSearch(search);
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -105,23 +137,9 @@ export default function JournalPage() {
     return { debit, credit, balanced: Math.abs(debit - credit) < 0.005 };
   }, [form.lines]);
 
-  // Client-side search across number, description, reference and source so
-  // users can find an entry instantly without leaving the page.
-  const visibleRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows ?? [];
-    return (rows ?? []).filter((e) =>
-      [
-        e.journal_number,
-        e.description,
-        e.reference,
-        e.source_type,
-        e.transaction_date,
-      ]
-        .filter(Boolean)
-        .some((v) => String(v).toLowerCase().includes(q))
-    );
-  }, [rows, search]);
+  // Search/filter run SERVER-SIDE (see `load`), so the visible set is the
+  // fetched page exactly as returned — no second filtering pass here.
+  const visibleRows = rows ?? [];
 
   const toggleExpand = async (entryId: string) => {
     if (expanded === entryId) {
@@ -415,7 +433,7 @@ export default function JournalPage() {
 
       <div className="flex flex-wrap items-center gap-3 no-print">
         <select className={`${inputCls} max-w-44`} value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}>
+          onChange={(e) => { setStatusFilter(e.target.value); setPage(0); }}>
           {["ALL", "DRAFT", "VALIDATED", "POSTED", "REVERSED", "VOIDED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
           ))}
@@ -585,6 +603,40 @@ export default function JournalPage() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Server-side pager — the journal can hold thousands of entries;
+          only one page is ever rendered. */}
+      {!orgLoading && !error && totalCount > 0 && (
+        <div className="no-print flex flex-wrap items-center justify-between gap-3 text-sm">
+          <span className="text-text-muted">
+            Showing{" "}
+            <span className="text-text-primary font-medium tabular-nums">
+              {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, totalCount)}
+            </span>{" "}
+            of <span className="text-text-primary font-medium tabular-nums">{totalCount}</span>{" "}
+            entries
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-3 py-1.5 rounded-xl border border-border-subtle bg-bg-surface text-text-secondary hover:text-text-primary hover:border-ai-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Previous
+            </button>
+            <span className="text-xs text-text-muted tabular-nums">
+              Page {page + 1} of {Math.max(1, Math.ceil(totalCount / PAGE_SIZE))}
+            </span>
+            <button
+              onClick={() => setPage((p) => p + 1)}
+              disabled={(page + 1) * PAGE_SIZE >= totalCount}
+              className="px-3 py-1.5 rounded-xl border border-border-subtle bg-bg-surface text-text-secondary hover:text-text-primary hover:border-ai-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Next
+            </button>
+          </div>
         </div>
       )}
 

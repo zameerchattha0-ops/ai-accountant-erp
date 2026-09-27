@@ -214,6 +214,13 @@ class AgentResponse(BaseModel):
     # corresponding numbered sub-question; an inner ``None`` (or empty
     # list) means "free-text question — no chips".
     question_options: Optional[List[Optional[List[QuestionOption]]]] = None
+    # FIXED-FORMAT QUESTIONNAIRE (app/questionnaire.py): the ONE machine
+    # shape behind `question` — {version, intent, intro, questions:[{id,
+    # field, kind, question, options, answer_hint, why, required}]}.  The
+    # frontend renders each entry as a typed control (chips / date / money
+    # / number / text) and submits answers back BY FIELD, so wording can
+    # never break the answer routing.
+    questionnaire: Optional[Dict[str, Any]] = None
     confirmation_required: bool = False
     risk_level: Optional[str] = None
     data: Optional[Dict[str, Any]] = None
@@ -286,6 +293,13 @@ class ClarificationAnswer(BaseModel):
 
     session_id: uuid.UUID
     answer: str
+    # Field-routed answers for the FIXED-FORMAT questionnaire:
+    # [{"field": "useful_life_years", "answer": "5"}, …].  The planner
+    # merges these by FIELD (never by question wording), so an LLM-authored
+    # question can be reworded freely without breaking the routing.  The
+    # free-text ``answer`` stays for questions without a field (and for
+    # older clients).
+    answers: Optional[List[Dict[str, str]]] = None
 
 
 class ConfirmationDecision(BaseModel):

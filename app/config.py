@@ -359,6 +359,31 @@ class Settings(BaseSettings):
             "have falls back to the standard chain."
         ),
     )
+    # ---- LLM DECISION LAYER (classification) ----------------------------
+    # The DECISION of which economic nature a request has (income vs
+    # expense, asset vs liability, capitalise vs expense) and WHICH ledger
+    # receives the posting is accounting JUDGMENT and belongs to the LLM
+    # (app/llm_classification.py). Python only gathers candidates, validates
+    # the pick against the chart of accounts, and executes it. When the
+    # provider is unreachable/disabled the deterministic rule chain runs as
+    # FALLBACK — behaviour degrades to the old classifier, never to a guess.
+    llm_classification_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the LLM decision layer for transaction classification "
+            "(nature + account routing). Disabling restores the purely "
+            "deterministic classifier exactly."
+        ),
+    )
+    llm_classification_timeout: float = Field(
+        default=15.0,
+        description=(
+            "Per-decision wall-clock cap. MEASURED: the fast tier answers a "
+            "classification-sized prompt in 3.5-10s; this bounds the stage "
+            "so a slow provider degrades to the rule chain instead of "
+            "parking the request."
+        ),
+    )
     accounting_reasoning_max_rounds: int = Field(
         default=4,
         description=(

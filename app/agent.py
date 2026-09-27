@@ -2330,6 +2330,7 @@ async def execute(
     attachments: Optional[List[AttachmentRef]] = None,
     approved_tool_calls: Optional[List[ToolCall]] = None,
     confirmed_intent: Optional[str] = None,
+    questionnaire_client: Optional[Any] = None,
 ) -> AgentResponse:
     """Main entry point — process a user message through the full agent lifecycle.
 
@@ -2693,22 +2694,40 @@ async def execute(
                     # 360° questionnaire: per-numbered-line tap-chips ride
                     # along as question_options (aligned by line index; the
                     # frontend renders one answer box + chips per line and
-                    # still accepts free text).
-                    _q_parts = _reasoning.question.get("options_per_part") or []
-                    _q_opts = [
-                        [
-                            {"value": str(o), "label": str(o)}
-                            for o in (part or [])
-                        ]
-                        for part in _q_parts
-                        if isinstance(part, list)
-                    ] or None
+                    # still accepts free text).  When the reasoning model
+                    # authored the FIXED-FORMAT questionnaire, its
+                    # `questions[]` (field/kind/text/options) is the
+                    # authoritative payload — validated here, with any
+                    # question about a fact the user already stated
+                    # dropped.
+                    from app.questionnaire import questionnaire_from_authored
+
+                    _authored = questionnaire_from_authored(
+                        _reasoning.question,
+                        intent=execution_plan.intent,
+                        known=execution_plan.extracted_entities,
+                    )
+                    if _authored is not None and not _authored.is_empty():
+                        _q_opts = _authored.render_options()
+                        _authored_payload = _authored.to_payload()
+                    else:
+                        _q_parts = _reasoning.question.get("options_per_part") or []
+                        _q_opts = [
+                            [
+                                {"value": str(o), "label": str(o)}
+                                for o in (part or [])
+                            ]
+                            for part in _q_parts
+                            if isinstance(part, list)
+                        ] or None
+                        _authored_payload = None
                     return AgentResponse(
                         status=ExecutionStatus.AWAITING_CLARIFICATION,
                         execution_id=session_id,
                         question=_clar.get("question", _question),
                         options=_reasoning.question.get("options") or None,
                         question_options=_q_opts,
+                        questionnaire=_authored_payload,
                         required_information=_needed,
                         requires_user_input=True,
                     )
@@ -2858,15 +2877,22 @@ async def execute(
             # never park a turn whose plan the user already confirmed.
             and approved_tool_calls is None
         ):
-            from app.reasoning import plan_clarification_text
+            from app.questionnaire import build_questionnaire_with_llm
 
-            question = (
-                plan_clarification_text(
-                    execution_plan.clarification_questions,
-                    execution_plan.missing_fields,
-                )
-                or "Please provide more details."
+            # FIXED-FORMAT QUESTIONNAIRE — the LLM authors the question
+            # text/options inside a fixed schema (validated: allowed fields
+            # only, never a fact already known); the deterministic bank is
+            # the floor when no provider is wired or its output violates
+            # the contract.  `questionnaire_client` is injected by the API
+            # layer (None in hermetic tests → fully deterministic).
+            _questionnaire = await build_questionnaire_with_llm(
+                missing_fields=execution_plan.missing_fields,
+                questions=execution_plan.clarification_questions,
+                entities=execution_plan.extracted_entities,
+                intent=execution_plan.intent,
+                client=questionnaire_client,
             )
+            question = _questionnaire.render_text() or "Please provide more details."
             # offer the learned default inside the question
             # ("previously: cash - reply SAME to reuse").
             memory_hint = _preference_memory_hint(
@@ -2876,20 +2902,10 @@ async def execute(
                 question = f"{question}\n({memory_hint})"
             # R3.4a: never render model markdown in the question card.
             question = strip_markdown(question) or question
-            # R3.4b: data-driven tap-to-answer options — the backend
-            # emits one [{value, label}] list per question that has a
-            # finite option set (purpose, capitalization, settlement,
-            # operation, channel, nature, dates).  R4.6 FIX: empty
-            # entries are kept as None placeholders so each list stays
-            # INDEX-ALIGNED with its numbered sub-question — compacting
-            # the array shifted the chips onto the wrong questions.
-            question_options = [
-                options_for_question(q) or []
-                for q in execution_plan.clarification_questions
-            ]
-            question_options = (
-                question_options if any(question_options) else None
-            )
+            # R3.4b: data-driven tap-to-answer options — INDEX-ALIGNED with
+            # the numbered sub-questions (a None placeholder keeps the
+            # alignment when a question has no finite option set).
+            question_options = _questionnaire.render_options()
             clarification = await create_clarification(
                 session_id=session_id,
                 question=question,
@@ -2901,6 +2917,7 @@ async def execute(
                 question=clarification.get("question", question),
                 required_information=execution_plan.missing_fields,
                 question_options=question_options,
+                questionnaire=_questionnaire.to_payload(),
                 requires_user_input=True,
             )
         if execution_plan.requires_clarification:
@@ -3066,8 +3083,12 @@ async def execute(
 
         _phase_elapsed("context.built")
         # ---- PHASE 3b: INTELLIGENT TRANSACTION CLASSIFICATION (360°) ------
-        # Deterministic (no LLM): ERP configuration → item/account mapping →
-        # business rules → user answers.  If the treatment is MATERIALLY
+        # Facts gate first (user answers, ERP configuration).  The JUDGMENT
+        # part — nature and account routing (income vs expense, asset vs
+        # liability, which ledger) — is the LLM decision layer
+        # (app/llm_classification.py); the deterministic rules are its
+        # FALLBACK when the provider is off/unreachable.  If the treatment
+        # is MATERIALLY
         # AMBIGUOUS (e.g. laptop: fixed asset vs expense) and no authoritative
         # configuration exists, ASK — never default to a generic expense.
         from app.classifier import classify_transaction, _classification_question
@@ -4849,6 +4870,8 @@ async def resume_with_clarification(
     user_id: uuid.UUID,
     organization_id: uuid.UUID,
     auth: Optional[AuthContext] = None,
+    structured_answers: Optional[List[Dict[str, str]]] = None,
+    questionnaire_client: Optional[Any] = None,
 ) -> AgentResponse:
     """Resume a session after the user answered a clarification.
 
@@ -4915,6 +4938,24 @@ async def resume_with_clarification(
     # original request and the structured history as context.
     history = await get_clarification_history(session_id)
 
+    # FIELD-ROUTED ANSWERS (fixed-format questionnaire): each entry carries
+    # the field it answers, so merging never depends on the question's
+    # wording (an LLM-authored question can be reworded freely).  They are
+    # appended AFTER the free-text pair, so an explicit field answer wins
+    # over a keyword match from the same round.
+    if structured_answers:
+        for pair in structured_answers[:12]:
+            if not isinstance(pair, dict):
+                continue
+            field_name = str(pair.get("field") or "").strip()
+            value = str(pair.get("answer") or "").strip()
+            if not field_name or not value:
+                continue
+            history = [
+                *history,
+                {"field": field_name, "question": field_name, "answer": value},
+            ]
+
     original_request = session.get("user_request", "") or ""
     return await execute(
         user_message=original_request,
@@ -4923,6 +4964,7 @@ async def resume_with_clarification(
         auth=auth,
         conversation_id=session.get("conversation_id"),
         clarification_history=history,
+        questionnaire_client=questionnaire_client,
     )
 
 

@@ -270,6 +270,11 @@ async def ai_execute(
         auth=auth,
         conversation_id=request.conversation_id,
         attachments=request.attachments,
+        # FIXED-FORMAT QUESTIONNAIRE: the provider is injected HERE (the API
+        # boundary) so the agent can have the LLM author its clarification
+        # questions; hermetic tests call execute() directly and stay fully
+        # deterministic.
+        questionnaire_client=get_client(),
     )
     return response
 
@@ -290,6 +295,11 @@ async def ai_clarify(
         user_id=auth.user_id,
         organization_id=auth.organization_id,
         auth=auth,
+        # FIELD-ROUTED ANSWERS from the fixed-format questionnaire: each
+        # entry names the field it fills, so a reworded (LLM-authored)
+        # question can never lose its answer.
+        structured_answers=answer.answers,
+        questionnaire_client=get_client(),
     )
     return response
 

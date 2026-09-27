@@ -235,14 +235,23 @@ CHOOSING THE STEP — exactly one of these must be non-null/non-empty:
   b) "question" non-null -> a material fact only the user can supply, asked in
      the context of the actual records (never a generic template question).
      "missing_material_facts" lists what that question resolves.
-     CONSOLIDATED QUESTIONNAIRE: ask EVERY material unknown of this request
-     in ONE round — number each fact on its own line ("1. …" / "2. …") so
-     the UI renders an answer box + tap-chips per line. Use the object form
-     {"text": "short intro\n1. …\n2. …",
-      "options_per_part": [["quick choice", "other choice"], []]}
-     with options_per_part ALIGNED to the numbered lines (empty list when a
-     line has no sensible choices); the user may always type their own
-     answer instead of tapping. Never drip-feed one unknown per round.
+     CONSOLIDATED QUESTIONNAIRE: ask EVERY material unknown in ONE round,
+     FIXED FORMAT:
+     "question": {"text": "<intro>\n1. <q1>\n2. <q2>", "questions": [
+       {"field": "<erp field>", "kind": "choice|date|money|number|text",
+        "question": "<the numbered line>",
+        "options": [{"value": "<recorded>", "label": "<chip>"}],
+        "answer_hint": "<how>", "why": "<why>"}]}
+     Rules: text and questions list the SAME questions in order; field
+     must be an ERP field — transaction_date, payment_type,
+     transaction_nature, amount, supplier_name, customer_name,
+     item_description, quantity, asset_name, useful_life_years,
+     depreciation_method, salvage_value, account_name,
+     transaction_purpose, capitalization_decision, settlement_position,
+     disposal_type, proceeds_amount, period, note; never re-ask a stated
+     fact ("yesterday" is resolved); 2-6 {value,label} options per finite
+     choice else []; plain lines, no markdown.
+     Never drip-feed one unknown per round.
   c) "proposal" non-null -> you have enough evidence to propose a concrete next
      step. Every proposal MUST include interpretation, affected_records,
      accounting_impact, not_affected and unresolved_uncertainty.
@@ -666,10 +675,57 @@ def _clean_question(raw: Any) -> Optional[Dict[str, Any]]:
                 clean_parts.append(_clean_list(part, 6, 60))
             elif isinstance(part, str) and part.strip():
                 clean_parts.append([part.strip()[:60]])
+
+    # FIXED-FORMAT QUESTIONNAIRE: the model's own structured questions
+    # (field/kind/text/options).  Structurally cleaned HERE; the field
+    # vocabulary + already-known-fact filter is enforced by
+    # app.questionnaire.validate_authored_questions at the response site
+    # (only there are the request's known facts available).
+    clean_questions: List[Dict[str, Any]] = []
+    raw_questions = raw.get("questions")
+    if isinstance(raw_questions, list):
+        for entry in raw_questions[:12]:
+            if not isinstance(entry, dict):
+                continue
+            field_name = str(entry.get("field") or "").strip().lower()
+            question_text = str(entry.get("question") or "").strip()
+            if not field_name or not question_text:
+                continue
+            kind = str(entry.get("kind") or "text").strip().lower()
+            options: List[Dict[str, str]] = []
+            raw_options = entry.get("options")
+            if isinstance(raw_options, list):
+                for opt in raw_options[:6]:
+                    if isinstance(opt, dict):
+                        value = str(opt.get("value") or "").strip()[:60]
+                        label = str(opt.get("label") or value).strip()[:60]
+                    else:
+                        value = label = str(opt or "").strip()[:60]
+                    if value:
+                        options.append({"value": value, "label": label or value})
+            clean_questions.append(
+                {
+                    "field": field_name,
+                    "kind": kind,
+                    "question": question_text[:300],
+                    "options": options,
+                    "answer_hint": str(entry.get("answer_hint") or "").strip()[:120]
+                    or None,
+                    "why": str(entry.get("why") or "").strip()[:160] or None,
+                }
+            )
+    # Derive the per-line tap options from the structured questions when the
+    # model did not send options_per_part (ONE payload shape downstream).
+    if clean_questions and not clean_parts:
+        clean_parts = [
+            [opt["label"] for opt in q.get("options") or []][:6]
+            for q in clean_questions
+        ]
     return {
         "text": text[:1500],
         "options": _clean_list(raw.get("options"), 6, 80),
         "options_per_part": clean_parts,
+        "questions": clean_questions,
     }
 
 

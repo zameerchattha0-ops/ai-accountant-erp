@@ -33,7 +33,12 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.date_parser import parse_transaction_date, resolve_date_range
+from app.date_parser import (
+    parse_transaction_date,
+    resolve_date_range,
+    resolve_relative_date_text,
+)
+from app.questionnaire import QUESTION_BANK
 from app.reasoning import (
     DATE_REQUIRED_INTENTS,
     NATURE_DECISION_QUESTION,
@@ -966,17 +971,22 @@ def plan(
         # default to a paid expense — the settlement path handles it.
         payment = "CASH"
 
-    if payment == "CREDIT" and intent in (
-        "record_purchase", "record_cash_purchase", "record_expense",
-    ):
-        intent = "record_credit_purchase"
-    elif (
-        nature == "FIXED_ASSET" and payment == "CASH"
-        and intent in (*_purchase_family, "record_expense")
+    # A FIXED-ASSET purchase is a CAPITALIZATION, never a plain bill or
+    # expense — on cash OR credit.  (Before: only cash went to
+    # register_fixed_asset, so credit asset purchases landed as bills in an
+    # asset-named GL account with no asset record, no depreciation schedule
+    # and no disposal trail.  register_asset handles the payable itself.)
+    if (
+        nature == "FIXED_ASSET"
+        and intent in (*_purchase_family, "record_expense", "record_credit_purchase")
     ):
         intent = "register_fixed_asset"
         if not entities.get("asset_name") and entities.get("item_description"):
             entities["asset_name"] = entities["item_description"]
+    elif payment == "CREDIT" and intent in (
+        "record_purchase", "record_cash_purchase", "record_expense",
+    ):
+        intent = "record_credit_purchase"
     elif (
         nature in ("OPERATING_EXPENSE", "CONSUMABLE") and payment == "CASH"
         and intent in _purchase_family
@@ -995,21 +1005,45 @@ def plan(
 
     # 3c. WORK STREAM A - MANDATORY TRANSACTION-DATE PROTOCOL: validate the
     #     extracted/answered date through the deterministic parser (the LLM
-    #     never parses dates).  A date that fails validation is dropped -
-    #     never guessed - so the standardized date question joins the
-    #     consolidated questionnaire below.  "yesterday"/"today" in the
-    #     user's message were already resolved silently by _extract_date.
+    #     never parses dates).  A date that fails validation is RECOVERED
+    #     from the user's own words before it is ever dropped: "yesterday",
+    #     "2 days ago", "26 sep", "26/09" etc. resolve through the free-text
+    #     resolver, so the standardized date question only exists when the
+    #     user truly never stated a date.  (An invalid date — a typo, or a
+    #     date fabricated by the semantic prefill — used to be popped and
+    #     the user was asked for a date they had already given.)
     raw_date = entities.get("transaction_date")
     if raw_date:
         parsed = parse_transaction_date(str(raw_date))
         if parsed.ok:
             entities["transaction_date"] = parsed.iso_date
         else:
-            entities.pop("transaction_date", None)
+            recovered = resolve_relative_date_text(msg)
+            if recovered and recovered.ok:
+                entities["transaction_date"] = recovered.iso_date
+                log.info(
+                    "planner.transaction_date_recovered",
+                    raw=str(raw_date)[:64],
+                    recovered=recovered.iso_date,
+                    matched=recovered.matched_format,
+                )
+            else:
+                entities.pop("transaction_date", None)
+                log.info(
+                    "planner.transaction_date_invalid",
+                    raw=str(raw_date)[:64],
+                    error=parsed.error,
+                )
+    if not entities.get("transaction_date"):
+        # Nothing extracted/answered: the message itself may still carry a
+        # relative phrase ("on credit 2 days ago") the extractor missed.
+        recovered = resolve_relative_date_text(msg)
+        if recovered and recovered.ok:
+            entities["transaction_date"] = recovered.iso_date
             log.info(
-                "planner.transaction_date_invalid",
-                raw=str(raw_date)[:64],
-                error=parsed.error,
+                "planner.transaction_date_resolved_from_text",
+                date=recovered.iso_date,
+                matched=recovered.matched_format,
             )
 
     # 4. Determine requirements
@@ -1125,6 +1159,12 @@ _FIELD_QUESTION = {
         "What is the transaction date? Reply TODAY, or the date as "
         "YYYY-MM-DD or DD/MM/YYYY (for example 2026-09-04 or 04/09/2026)."
     ),
+    # Asset-acquisition policy — text lives in app/questionnaire.py (ONE
+    # bank for every consumer: the planner, the questionnaire renderer and
+    # the LLM phrasing prompt all read the same strings).
+    "useful_life_years": QUESTION_BANK["useful_life_years"].question,
+    "depreciation_method": QUESTION_BANK["depreciation_method"].question,
+    "salvage_value": QUESTION_BANK["salvage_value"].question,
 }
 
 
@@ -1321,6 +1361,29 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     if intent == "register_fixed_asset" and not entities.get("payment_method"):
         missing.append("payment_type")
 
+    # ASSET-ACQUISITION POLICY (never guessed): a capitalised asset needs a
+    # depreciation policy — useful life, method and (optionally) salvage —
+    # or an explicit "no schedule" decision.  Asked in the SAME
+    # consolidated round as the rest of the acquisition facts, in
+    # dependency order (life → method → salvage).  A registered asset with
+    # no policy is undisposable later (its book value can never be
+    # corrected), which is why this is material rather than optional.
+    if intent == "register_fixed_asset":
+        declined = bool(entities.get("depreciation_declined"))
+        life = entities.get("useful_life_years")
+        method = str(entities.get("depreciation_method") or "").upper()
+        if life is None and not declined and not method:
+            missing.append("useful_life_years")
+        elif not method:
+            missing.append("depreciation_method")
+        if (
+            life is not None
+            and method in ("STRAIGHT_LINE", "REDUCING_BALANCE")
+            and entities.get("salvage_value") is None
+        ):
+            missing.append("salvage_value")
+
+
     if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
         missing.append("amount")
 
@@ -1417,7 +1480,15 @@ def _explode_multi_answers(
                     "answer": value,
                 })
         else:
-            exploded.append({"question": question, "answer": answer})
+            exploded.append({
+                "question": question,
+                "answer": answer,
+                # FIELD-TAGGED answers (fixed-format questionnaire) keep
+                # their field: the numbered-split branches cannot map a
+                # part to a field, but a single field question never has
+                # numbered sub-questions, so it always lands here intact.
+                "field": qa.get("field"),
+            })
     return exploded
 
 
@@ -1449,9 +1520,13 @@ def _resolve_same_answers(
                 None,
             )
             if prior:
-                resolved.append({"question": question, "answer": prior})
+                resolved.append({
+                    "question": question, "answer": prior, "field": qa.get("field"),
+                })
             continue
-        resolved.append({"question": question, "answer": answer})
+        resolved.append({
+            "question": question, "answer": answer, "field": qa.get("field"),
+        })
     return resolved
 
 
@@ -1503,6 +1578,15 @@ def _merge_clarification_answers(
         question = (qa.get("question") or "").lower()
         answer = (qa.get("answer") or "").strip()
         if not answer:
+            continue
+
+        # FIELD-ROUTED ANSWER (fixed-format questionnaire): the answer
+        # carries the field it fills, so it lands in the right entity
+        # regardless of the question's wording — LLM-authored questions can
+        # be reworded freely.  Unknown fields fall through to the keyword
+        # chain below (never guessed).
+        field_tag = str(qa.get("field") or "").strip()
+        if field_tag and _merge_field_answer(merged, field_tag, answer):
             continue
 
         # the
@@ -1797,6 +1881,180 @@ def _parse_bare_date(text: str) -> Optional[str]:
     """Parse a date from a bare clarification answer."""
     # Delegate to the full date extractor
     return _extract_date(text, text.lower())
+
+
+_NATURE_VALUES = frozenset({
+    "FIXED_ASSET", "INVENTORY", "CONSUMABLE", "SERVICE", "OPERATING_EXPENSE",
+    "REVENUE", "OTHER_INCOME", "PREPAYMENT", "DEPOSIT_ADVANCE",
+    "INTANGIBLE_ASSET", "ASSET_DISPOSAL",
+})
+_DECLINE_WORDS = frozenset({"none", "no", "n/a", "na", "skip", "declined", "not now"})
+_METHOD_VALUE_MAP = {
+    "STRAIGHT_LINE": "STRAIGHT_LINE",
+    "STRAIGHT-LINE": "STRAIGHT_LINE",
+    "STRAIGHT LINE": "STRAIGHT_LINE",
+    "REDUCING_BALANCE": "REDUCING_BALANCE",
+    "REDUCING-BALANCE": "REDUCING_BALANCE",
+    "REDUCING BALANCE": "REDUCING_BALANCE",
+    "WDV": "REDUCING_BALANCE",
+    "DIMINISHING": "REDUCING_BALANCE",
+    "DECLINING": "REDUCING_BALANCE",
+}
+
+
+def _merge_field_answer(
+    merged: Dict[str, Any], field_name: str, answer: str
+) -> bool:
+    """Route a FIELD-TAGGED clarification answer into the entity set.
+
+    The fixed-format questionnaire carries the field each answer fills, so
+    an answer reaches its entity regardless of the question's wording (the
+    old keyword matching could not: a reworded question lost its answer).
+    Returns True when the field was handled — False lets the keyword chain
+    have its say (unknown fields only).
+    """
+    field = (field_name or "").strip().lower()
+    raw = (answer or "").strip()
+    if not field or not raw:
+        return False
+    low = raw.lower().strip(" .)'\"")
+    value = raw.strip()
+
+    if field == "transaction_date":
+        parsed = parse_transaction_date(value)
+        if not parsed.ok:
+            resolved = resolve_relative_date_text(value)
+            parsed = resolved if resolved is not None else parsed
+        merged["transaction_date"] = parsed.iso_date if parsed.ok else value
+        return True
+
+    if field == "useful_life_years":
+        if low in _DECLINE_WORDS:
+            merged["depreciation_declined"] = True
+            return True
+        number = _parse_bare_amount(value)
+        if number is not None and 1 <= number <= 60:
+            merged["useful_life_years"] = int(number)
+        # A stated-but-unparseable life is re-asked, never guessed.
+        return True
+
+    if field == "depreciation_method":
+        if low in _DECLINE_WORDS or low in ("c", "none for now"):
+            merged["depreciation_declined"] = True
+            return True
+        if low in ("a", "1"):
+            merged["depreciation_method"] = "STRAIGHT_LINE"
+        elif low in ("b", "2"):
+            merged["depreciation_method"] = "REDUCING_BALANCE"
+        else:
+            for key, method in _METHOD_VALUE_MAP.items():
+                if key.lower() in low:
+                    merged["depreciation_method"] = method
+                    break
+        rate = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", low)
+        if rate and merged.get("depreciation_method") == "REDUCING_BALANCE":
+            try:
+                merged["depreciation_rate_percent"] = float(rate.group(1))
+            except ValueError:
+                pass
+        return True
+
+    if field in ("salvage_value", "residual_value"):
+        if low in _DECLINE_WORDS:
+            merged["salvage_value"] = 0.0
+            return True
+        number = _parse_bare_amount(value)
+        if number is not None and number >= 0:
+            merged["salvage_value"] = number
+        return True
+
+    if field == "amount":
+        number = _parse_bare_amount(value)
+        if number is not None:
+            merged["amount"] = number
+        return True
+
+    if field == "quantity":
+        number = _parse_bare_amount(value)
+        if number is not None and number > 0:
+            merged["quantity"] = number
+        return True
+
+    if field in ("payment_type", "payment_method"):
+        merged["payment_method"] = _normalize_payment_method(value)
+        if merged["payment_method"] == "CREDIT":
+            merged.setdefault("settlement_position", "OUTSTANDING")
+        return True
+
+    if field == "transaction_nature":
+        candidate = low.replace(" ", "_").upper()
+        if candidate in _NATURE_VALUES:
+            merged["transaction_nature"] = candidate
+            return True
+        for nature in _NATURE_VALUES:  # "a fixed asset" / "the service"
+            if nature.lower().replace("_", " ") in low:
+                merged["transaction_nature"] = nature
+                return True
+        return True  # unresolved → re-asked
+
+    return _merge_field_answer_tail(merged, field, low, value)
+
+
+def _merge_field_answer_tail(
+    merged: Dict[str, Any], field: str, low: str, value: str
+) -> bool:
+    """Second half of :func:`_merge_field_answer` (text/list fields)."""
+    if field in ("supplier_name", "customer_name"):
+        if field == "supplier_name" and (
+            "local vendor" in low or low in ("local", "no party", "none")
+        ):
+            merged["supplier_name"] = "Local Vendor"
+            return True
+        if low in _DECLINE_WORDS:
+            return True
+        merged[field] = value
+        return True
+
+    if field == "item_description":
+        multi = _extract_line_items(value)
+        if multi:
+            merged["line_items"] = multi
+            merged["amount"] = _line_items_total(multi)
+        else:
+            merged["item_description"] = value
+        return True
+
+    if field in ("asset_name", "description", "note", "account_name",
+                 "revenue_account_name", "project_name", "period"):
+        if low in _DECLINE_WORDS:
+            return True
+        merged[field] = value
+        return True
+
+    if field == "disposal_type":
+        if "write" in low:
+            merged["disposal_type"] = "WRITE_OFF"
+        elif "sale" in low or "sold" in low or "sell" in low:
+            merged["disposal_type"] = "SALE"
+        elif "dispos" in low or "scrap" in low:
+            merged["disposal_type"] = "DISPOSAL"
+        return True
+
+    if field in ("proceeds_amount", "disposal_amount", "depreciation_amount"):
+        number = _parse_bare_amount(value)
+        if number is not None:
+            merged[field] = number
+        return True
+
+    if field == "capitalization_decision":
+        candidate = low.upper()
+        if candidate.startswith("CAP"):
+            merged["capitalization_decision"] = "CAPITALIZE"
+        elif candidate.startswith(("EXP", "ORDINARY")):
+            merged["capitalization_decision"] = "EXPENSE"
+        return True
+
+    return False
 
 
 def _normalize_payment_method(text: str) -> str:
@@ -2184,6 +2442,11 @@ def _extract_date(msg: str, msg_lower: str) -> Optional[str]:
         return (date.today() + timedelta(days=1)).isoformat()
     if re.search(r"\btoday\b", msg_lower):
         return date.today().isoformat()
+    # Free-text relative forms the keyword scan above cannot see
+    # ("2 days ago", "3 weeks ago") — ONE resolver, never two parsers.
+    resolved = resolve_relative_date_text(msg)
+    if resolved and resolved.ok:
+        return resolved.iso_date
     return None
 
 

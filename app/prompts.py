@@ -227,12 +227,12 @@ def build_user_content(message: str, context: AgentContext) -> str:
         names = [f"{a.get('code', '')} {a.get('name', '')}" for a in context.relevant_accounts[:10]]
         parts.append(f"Relevant accounts: {'; '.join(names)}")
 
-    # Deterministic transaction classification — authoritative accounting
+    # Transaction classification — authoritative accounting
     # context from the classifier (ERP configuration → rules → user answer).
     classification = getattr(context, "classification", None)
     if classification is not None:
         parts.append("")
-        parts.append("TRANSACTION CLASSIFICATION (deterministic — authoritative; computed from ERP configuration, business rules and user answers):")
+        parts.append("TRANSACTION CLASSIFICATION (authoritative — the accounting engine validates every account before posting):")
         if classification.transaction_nature:
             parts.append(f"  - Economic nature: {classification.transaction_nature} (confidence: {classification.confidence}, source: {classification.source})")
         else:

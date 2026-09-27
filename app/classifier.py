@@ -369,6 +369,39 @@ async def _candidate_expense_accounts(organization_id: uuid.UUID) -> List[str]:
     return names[:5]
 
 
+async def _llm_decision(
+    organization_id: uuid.UUID,
+    *,
+    intent: str,
+    entities: Dict[str, Any],
+    message: Optional[str],
+    nature_hint: Optional[str] = None,
+) -> Optional[TransactionClassification]:
+    """Consult the LLM decision layer (app/llm_classification.py).
+
+    The model DECIDES nature + account from Python-gathered candidates;
+    Python has already validated the pick before it gets here. Returns
+    ``None`` when the layer is disabled, unreachable, or its reply failed
+    validation — the caller then falls back to the deterministic chain.
+    Never swallows AssertionError (test no-LLM guards stay loud).
+    """
+    try:
+        from app import llm_classification
+
+        return await llm_classification.decide(
+            organization_id=organization_id,
+            intent=intent,
+            entities=entities,
+            message=message,
+            nature_hint=nature_hint,
+        )
+    except AssertionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — degrade to the rule chain
+        log.warning("classifier.llm_decision_failed", error=str(exc)[:200])
+        return None
+
+
 async def _search_account_by_nature(
     organization_id: uuid.UUID,
     nature: str,
@@ -564,12 +597,22 @@ async def classify_transaction(
 
     # Asset-lifecycle intents are deterministically FIXED_ASSET — the
     # economic nature is decided by the event itself, never inferred from
-    # price or physical appearance.
+    # price or physical appearance.  The NATURE is a fact of the intent;
+    # the ACCOUNT that receives it is a judgment call, so the LLM decision
+    # layer picks it (validated against the candidate set), with the
+    # old term search as fallback when the layer is off/unreachable.
     _ASSET_LIFECYCLE_INTENTS = (
         "register_fixed_asset", "dispose_fixed_asset",
         "record_asset_depreciation",
     )
     if intent in _ASSET_LIFECYCLE_INTENTS:
+        if resolve_account_hints:
+            decision = await _llm_decision(
+                organization_id, intent=intent, entities=entities,
+                message=message, nature_hint=FIXED_ASSET,
+            )
+            if decision is not None:
+                return decision
         account = (
             await _search_account_by_nature(organization_id, FIXED_ASSET, item)
             if resolve_account_hints
@@ -617,6 +660,29 @@ async def classify_transaction(
             if _raw_src in ("USER_ANSWER", "PREFERENCE", "DETERMINISTIC_RULE")
             else "USER_ANSWER"
         )
+        # The NATURE is the user's fact (forced via nature_hint); WHICH
+        # account receives it is judgment — the LLM picks from candidates
+        # (validated against THIS nature), term search is the fallback.
+        if resolve_account_hints:
+            decision = await _llm_decision(
+                organization_id, intent=intent, entities=entities,
+                message=message, nature_hint=nature,
+            )
+            if decision is not None:
+                # Keep the honest provenance of the USER's nature choice —
+                # only the account came from the model.
+                decision.source = explicit_source
+                decision.confidence = "HIGH"
+                if decision.account_hint_id or decision.requires_clarification:
+                    return decision
+                # Model decided nothing usable → keep its nature, no hint.
+                return TransactionClassification(
+                    transaction_nature=nature,
+                    confidence="HIGH",
+                    source=explicit_source,
+                    entity=item or entity_name,
+                    requires_clarification=False,
+                )
         account = (
             await _search_account_by_nature(organization_id, nature, item)
             if resolve_account_hints
@@ -704,6 +770,22 @@ async def classify_transaction(
                     )
         except Exception as exc:  # noqa: BLE001 — config lookup is best-effort
             log.warning("classifier.product_lookup_failed", error=str(exc))
+
+    # --- LLM DECISION LAYER (nature + account — the JUDGMENT zone) -------
+    # Everything above this line is FACTS (user answers, ERP configuration,
+    # the intent itself). From here on the classifier used to guess with
+    # keyword rules and search-term order — which is how a motorbike got
+    # debited to Computer Equipment ("computer equipment" was simply the
+    # first term with a match). The model now DECIDES nature + account from
+    # the live candidate set; the deterministic chain below is the FALLBACK
+    # when the layer is disabled/unreachable/invalid — never a co-author.
+    if resolve_account_hints:
+        decision = await _llm_decision(
+            organization_id, intent=intent, entities=entities,
+            message=message, nature_hint=None,
+        )
+        if decision is not None:
+            return decision
 
     # --- 3+4. DETERMINISTIC_RULES (incl. COA item mapping for natures). ---
     # The rules see the item AND the original message (e.g. "for resale",
