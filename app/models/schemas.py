@@ -474,6 +474,13 @@ class TransactionClassification(BaseModel):
     # clarification round.  Never auto-created without that confirmation.
     proposed_account_name: Optional[str] = None
     proposed_account_code: Optional[str] = None
+    # Parent HEADING the proposed account is created UNDER (validated against
+    # the live chart's grouping accounts at proposal time; re-resolved from
+    # the confirmation question's "under '<head>'" clause on the confirm
+    # turn). Segregation: the new ledger lands under the right statement
+    # section (PPE / Operating Expenses / ...) instead of top-level.
+    proposed_parent_id: Optional[str] = None
+    proposed_parent_name: Optional[str] = None
     # True when the user ALREADY confirmed creating the proposed account in
     # a prior clarification round — execution must run create_account
     # BEFORE the recording mutation (tool-order guard enforces this).

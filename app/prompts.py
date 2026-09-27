@@ -238,20 +238,42 @@ def build_user_content(message: str, context: AgentContext) -> str:
         else:
             parts.append("  - Economic nature: UNDETERMINED")
         if classification.account_hint_id:
-            parts.append(
-                f"  - Account hint: {classification.account_hint_code} "
-                f"{classification.account_hint_name} (id: {classification.account_hint_id})"
-            )
-            parts.append("    → Pass this account id as the 'account_id' argument when recording this transaction. The accounting engine will validate it.")
+            if getattr(classification, "requires_clarification", False):
+                # RELATED-treatment round: the hint is the CLOSEST EXISTING
+                # account, not yet consented - recording it now would bypass
+                # the informed-consent gate.
+                parts.append(
+                    f"  - Closest existing account (NOT yet approved): {classification.account_hint_code} "
+                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
+                )
+                parts.append(
+                    "    → Do NOT record to it yet: ask the clarification question first. "
+                    "Record ONLY after the user agrees to use it (then pass this account id), "
+                    "or after the confirmed new account exists."
+                )
+            else:
+                parts.append(
+                    f"  - Account hint: {classification.account_hint_code} "
+                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
+                )
+                parts.append("    → Pass this account id as the 'account_id' argument when recording this transaction. The accounting engine will validate it.")
         elif getattr(classification, "create_account_confirmed", False):
             proposed = getattr(classification, "proposed_account_name", None)
             code = getattr(classification, "proposed_account_code", None)
+            parent = getattr(classification, "proposed_parent_name", None)
             parts.append(
                 f"    → The user CONFIRMED creating the new account '{proposed or 'the proposed account'}'"
                 + (
                     f" (base code {code} — a free code in that series is "
                     "resolved automatically)"
                     if code else ""
+                )
+                + (
+                    f", as a child of the '{parent}' heading (resolve that "
+                    "heading's id with search_account and pass it as "
+                    "parent_account_id so the ledger segregates under the "
+                    "right statement section)"
+                    if parent else ""
                 )
                 + ". Run create_account for it FIRST, then record the "
                 "transaction against the newly created account. The "

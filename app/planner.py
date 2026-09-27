@@ -1701,6 +1701,36 @@ def _merge_clarification_answers(
                 m = re.search(r"no '(.+?)' account", qa.get("question") or "")
                 if m:
                     merged["create_account"] = m.group(1).strip()
+                    # PARENT PLACEMENT: "Should I create it under '<head>'"
+                    # - the child ledger is created UNDER that statement
+                    # heading (segregation of statement heads), never
+                    # top-level by omission.
+                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
+                    if pm and pm.group(1).strip():
+                        merged["create_parent_name"] = pm.group(1).strip()
+            elif (
+                # REFUSED the closest-existing leg of a RELATED-treatment
+                # round (owner directive: refusing the near-relevant account
+                # falls back to CREATING the dedicated child). The question
+                # itself carries both the name and the heading, so the
+                # refusal confirms creation under the right statement
+                # section — never a silent re-pick of the refused ledger.
+                "closest existing" in question
+                and (
+                    low in (
+                        "no", "n", "nope", "nah", "neither", "none",
+                        "nothing", "dont", "do not", "don't", "skip",
+                        "skip it", "use something else",
+                    )
+                    or low.startswith(("no,", "no ", "neither ", "none of"))
+                )
+            ):
+                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
+                if m:
+                    merged["create_account"] = m.group(1).strip()
+                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
+                    if pm and pm.group(1).strip():
+                        merged["create_parent_name"] = pm.group(1).strip()
             else:
                 named = re.sub(
                     r"^(no|n|use|pick|existing)\b[,.:;! ]*", "", low

@@ -234,6 +234,76 @@ async def _party_resolution_question(
     }
 
 
+async def _confirmed_create_args(
+    classification: Any,
+    organization_id: uuid.UUID,
+    *,
+    entities: Optional[Dict[str, Any]] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Arguments for the user-confirmed create_account round.
+
+    Parent resolution order (segregation of statement heads):
+      1. the classification's validated proposal parent (the LLM decision
+         layer picked it from the chart's HEADINGS at proposal time);
+      2. ``entities["create_parent_name"]`` - extracted from the
+         confirmation question's "under '<head>'" clause by the planner
+         merge (type-checked against the nature's shape);
+      3. the chart's PPE heading for ASSET creations (legacy fallback).
+    A parent is never invented: step 3 only fires for ASSET with a real
+    heading; otherwise the account is created top-level.
+    """
+    from app.account_resolution import (
+        account_exists,
+        account_shape,
+        heading_account_id,
+    )
+
+    ents = entities or {}
+    nature = getattr(classification, "transaction_nature", None) or "OPERATING_EXPENSE"
+    shape = account_shape(nature)
+    args: Dict[str, Any] = {
+        "name": str(
+            name
+            or ents.get("create_account")
+            or getattr(classification, "proposed_account_name", None)
+            or ""
+        ).strip(),
+        "code": getattr(classification, "proposed_account_code", None) or shape[2],
+        "account_type": shape[0],
+        "normal_balance": shape[1],
+        "description": "Created via the account-creation confirmation loop.",
+    }
+    parent_id = getattr(classification, "proposed_parent_id", None)
+    if not parent_id:
+        parent_name = str(
+            getattr(classification, "proposed_parent_name", None)
+            or ents.get("create_parent_name")
+            or ""
+        ).strip()
+        if parent_name:
+            try:
+                prow = await account_exists(organization_id, parent_name)
+            except Exception:  # noqa: BLE001 - parent lookup is best-effort
+                prow = None
+            if prow and str(prow.get("account_type") or "").upper() == shape[0]:
+                parent_id = str(prow.get("id") or "") or None
+    if parent_id:
+        args["parent_account_id"] = parent_id
+    elif shape[0] == "ASSET":
+        # Category-level granularity (legacy): an ASSET category hangs under
+        # the chart's PPE heading when one exists - "Furniture & Fixtures"
+        # appears UNDER Property, Plant & Equipment on the balance sheet
+        # (never an invented parent: None stays top-level).
+        try:
+            heading = await heading_account_id(organization_id, nature=shape[0])
+        except Exception:  # noqa: BLE001
+            heading = None
+        if heading:
+            args["parent_account_id"] = heading
+    return args
+
+
 def _expense_fast_path_call(
     entities: Dict[str, Any],
     classification,
@@ -3196,7 +3266,52 @@ async def execute(
                     candidates = list(
                         getattr(classification, "candidate_accounts", None) or []
                     )
-                    if candidates:
+                    # CONTRACT-FIRST: the decision layer's clarification_reason
+                    # is a planner-merge contract question ("should i create" +
+                    # no '<name>' account + under '<head>') — show IT, so YES
+                    # -> create the child under its heading and "use <related>"
+                    # -> the named account posts next turn (informed consent
+                    # closes BOTH legs of the treatment round).
+                    _clar = str(
+                        getattr(classification, "clarification_reason", None) or ""
+                    ).strip()
+                    _contract_ok = bool(
+                        getattr(classification, "proposed_account_name", None)
+                    ) and (
+                        "should i create" in _clar.lower()
+                        and re.search(r"no '(.+?)' account", _clar) is not None
+                    )
+                    if _contract_ok:
+                        question = _clar
+                        if getattr(classification, "account_hint_id", None):
+                            # RELATED leg: both choices of the treatment
+                            # round are tappable — use the near-relevant
+                            # ledger, or create the dedicated child.
+                            options = [
+                                f"Use {classification.account_hint_name}",
+                                "Yes, create it",
+                            ]
+                        else:
+                            # NONE leg: "Yes, create it" is the proposal;
+                            # the model's own candidate alternatives stay
+                            # tappable too (a bare name answers the merge
+                            # into entities["account_name"] and posts to
+                            # exactly that ledger).
+                            _cands = [
+                                str(c)
+                                for c in (
+                                    getattr(
+                                        classification, "candidate_accounts", None
+                                    )
+                                    or []
+                                )
+                            ][:3]
+                            options = (
+                                ["Yes, create it", *_cands]
+                                if _cands
+                                else ["Yes, create it", "Use an existing account"]
+                            )
+                    elif candidates:
                         suggestion = ", ".join(
                             f"'{c}'" for c in candidates[:4]
                         )
@@ -3627,10 +3742,8 @@ async def execute(
         if planned_tool_calls and not execution_plan.batch_items:
             from app.account_resolution import (
                 account_exists,
-                account_shape,
                 ensure_create_account_first,
                 gap_already_asked,
-                heading_account_id,
                 options_for_gap,
                 preflight_account_gaps,
                 question_for_gap,
@@ -3710,31 +3823,17 @@ async def execute(
                     tc.tool_name == "create_account" for tc in planned_tool_calls
                 ):
                     _cls = classification or execution_plan.classification
-                    _shape = account_shape(
-                        getattr(_cls, "transaction_nature", None) or "OPERATING_EXPENSE"
+                    # Name/code/type AND the parent heading are resolved by
+                    # the helper (validated proposal parent -> entities'
+                    # "under '<head>'" clause -> ASSET PPE-heading fallback),
+                    # so the created child lands segregated under the right
+                    # statement section.
+                    _create_args = await _confirmed_create_args(
+                        _cls,
+                        organization_id,
+                        entities=_ents,
+                        name=_confirmed_acct,
                     )
-                    _create_args: dict = {
-                        "name": _confirmed_acct,
-                        "code": getattr(_cls, "proposed_account_code", None)
-                                or _shape[2],
-                        "account_type": _shape[0],
-                        "normal_balance": _shape[1],
-                        "description": "Created via the account-creation confirmation loop.",
-                    }
-                    # Category-level granularity: an ASSET category hangs
-                    # under the chart's PPE heading when one exists, so
-                    # "Furniture & Fixtures" appears UNDER Property, Plant &
-                    # Equipment on the balance sheet (never an invented
-                    # parent — None stays top-level).
-                    if _shape[0] == "ASSET":
-                        try:
-                            _heading = await heading_account_id(
-                                organization_id, nature=_shape[0]
-                            )
-                        except Exception:  # noqa: BLE001
-                            _heading = None
-                        if _heading:
-                            _create_args["parent_account_id"] = _heading
                     planned_tool_calls = ensure_create_account_first(
                         planned_tool_calls,
                         arguments=_create_args,

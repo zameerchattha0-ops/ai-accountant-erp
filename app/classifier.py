@@ -584,6 +584,27 @@ async def classify_transaction(
         code = await _confirmed_account_code(
             organization_id, nature, confirmed_account
         )
+        # PARENT PLACEMENT: the confirmation question carried
+        # "under '<head>'" -> entities["create_parent_name"].  Resolved HERE
+        # so the injected create_account lands the child under the right
+        # statement heading - type-checked against the nature's shape, a
+        # heading from the wrong section never parents this ledger.
+        parent_id = parent_name = None
+        _req_parent = str(entities.get("create_parent_name") or "").strip()
+        if _req_parent:
+            from app.account_resolution import account_shape
+
+            try:
+                _prow = await account_exists(organization_id, _req_parent)
+            except Exception:  # noqa: BLE001 - parent lookup is best-effort
+                _prow = None
+            if _prow and str(_prow.get("account_type") or "").upper() == (
+                account_shape(nature)[0]
+            ):
+                parent_id = str(_prow.get("id") or "") or None
+                parent_name = (
+                    str(_prow.get("name") or "").strip() or _req_parent
+                )
         return TransactionClassification(
             transaction_nature=nature,
             confidence="HIGH",
@@ -591,9 +612,55 @@ async def classify_transaction(
             entity=item or entity_name,
             proposed_account_name=confirmed_account,
             proposed_account_code=code,
+            proposed_parent_id=parent_id,
+            proposed_parent_name=parent_name,
             create_account_confirmed=True,
             requires_clarification=False,
         )
+
+    # ---- USER AGREED TO USE AN EXISTING ACCOUNT (informed consent) ------
+    # The RELATED-treatment round offered the closest existing ledger
+    # ("use Vehicles") and the user AGREED - the answer-merge folded their
+    # choice into entities["account_name"].  Their explicit choice is a
+    # FACT of the same rank as entities["create_account"]: pin it as the
+    # hint (USER_ANSWER) so the entry posts to the account they approved,
+    # never to a re-guessed one.  A name the chart does not hold - or one
+    # whose section contradicts the nature - falls through to the normal
+    # chain, which asks again instead of guessing.
+    named_account = str(entities.get("account_name") or "").strip()
+    if named_account:
+        from app.account_resolution import account_exists, account_shape
+
+        named_row = await account_exists(organization_id, named_account)
+        if named_row:
+            named_nature = (
+                FIXED_ASSET
+                if intent in (
+                    "register_fixed_asset",
+                    "dispose_fixed_asset",
+                    "record_asset_depreciation",
+                )
+                else str(entities.get("transaction_nature") or "").upper()
+            )
+            if named_nature not in NATURES:
+                named_nature, _named_conf = rule_based_nature(
+                    " ".join(x for x in (item, message) if x), entities
+                )
+            if (
+                not named_nature
+                or str(named_row.get("account_type") or "").upper()
+                == account_shape(named_nature)[0]
+            ):
+                return TransactionClassification(
+                    transaction_nature=named_nature,
+                    confidence="HIGH",
+                    source="USER_ANSWER",
+                    entity=item or entity_name,
+                    account_hint_id=str(named_row.get("id") or "") or None,
+                    account_hint_code=str(named_row.get("code") or "") or None,
+                    account_hint_name=str(named_row.get("name") or "") or None,
+                    requires_clarification=False,
+                )
 
     # Asset-lifecycle intents are deterministically FIXED_ASSET — the
     # economic nature is decided by the event itself, never inferred from

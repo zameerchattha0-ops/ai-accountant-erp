@@ -1270,6 +1270,9 @@ def analyze_requirements(
             # free code) so the user can confirm creation with one tap.
             proposal_name = getattr(classification, "proposed_account_name", None)
             proposal_code = getattr(classification, "proposed_account_code", None)
+            proposal_parent = getattr(
+                classification, "proposed_parent_name", None
+            )
             if proposal_name:
                 gap_question = (
                     f"There is no '{proposal_name}' account in your chart of "
@@ -1278,6 +1281,7 @@ def analyze_requirements(
                         f" (suggested code {proposal_code})"
                         if proposal_code else ""
                     )
+                    + (f", under '{proposal_parent}'" if proposal_parent else "")
                     + ". Should I create it, or do you want to use a specific "
                     "existing account?"
                 )

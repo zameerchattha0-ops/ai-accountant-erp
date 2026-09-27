@@ -11,9 +11,11 @@ receives the posting — belongs to the LLM.
 
 THE SPLIT OF RESPONSIBILITY (never blurred):
 
-    LLM      — DECIDES the economic nature and routes the posting to one
-               account from the candidate set, or asks one question /
-               proposes the missing ledger when nothing fits.
+    LLM      - DECIDES the economic nature and the CORRECT TREATMENT:
+               which existing ledger receives the posting (exact fit, or
+               a near-relevant one only after the user agrees), or what
+               child account to create under which parent heading when
+               nothing in the chart fits.
     Python   — GATHERS the candidates (live chart of accounts), VALIDATES
                every decision against accounting invariants (candidate
                exists, is active, non-contra, account_type fits the
@@ -25,11 +27,33 @@ THE SPLIT OF RESPONSIBILITY (never blurred):
 FIXED CONTRACT — the model replies ONLY with this JSON shape (the same
 embeddable-format philosophy as app/questionnaire.py):
 
-    {"nature": "<vocabulary>", "account_id": "<candidate id or null>",
+    {"nature": "<vocabulary>", "fit": "EXACT|RELATED|NONE",
+     "account_id": "<candidate id or null>",
      "confidence": "HIGH|MEDIUM|LOW", "needs_clarification": true|false,
      "question": "", "options": [],
-     "propose_account": {"name","code","account_type"} or null,
+     "propose_account": {"name","code","account_type","parent_code"} or null,
      "rationale": "<one sentence>"}
+
+THE TREATMENT LADDER (what fit MEANS - the CORRECT ACCOUNTING TREATMENT,
+not merely "a ledger from the chart"):
+
+    EXACT   - a dedicated account for this treatment exists -> pick it
+              and post (no interruption).
+    RELATED - a relevant but NOT dedicated account exists -> pick it with
+              fit=RELATED: the user is INFORMED first ("closest existing:
+              X - use it, or create a dedicated one?") and the pick only
+              posts after they agree; a REFUSAL (or no relevant account at
+              all: fit=NONE) confirms the creation proposal — the dedicated
+              child under its heading — never a silent re-pick.
+    NONE    - nothing relevant exists -> account_id null +
+              propose_account: the right child account WITH its
+              parent_code heading, so the entry lands segregated under
+              the correct statement section (PPE / Operating Expenses /
+              Liabilities ...), never posted to a wrong-segregation head.
+
+parent_code is validated against the chart's HEADINGS: it must exist and
+its account_type must fit the proposed ledger; an invalid parent drops the
+whole proposal (a child in the wrong section is worse than no child).
 
 Facts stated by the user (``nature_hint``) are AUTHORITATIVE: the hint is
 forced over the model's ``nature`` and the account is re-validated against
@@ -123,11 +147,23 @@ DECISION RULES:
   (account_type ASSET); a consumable/service of this period -> EXPENSE.
 * account_id MUST be copied verbatim from CANDIDATES — never invent one.
 * account_type of the pick must FIT the chosen nature (see vocabulary).
+* fit decides the treatment:
+  - EXACT: a DEDICATED account for this treatment exists -> pick it,
+    fit="EXACT", needs_clarification=false (post directly).
+  - RELATED: a relevant but NOT dedicated account exists -> pick it with
+    fit="RELATED", AND give propose_account (the dedicated child to create
+    instead): the user is informed first and the pick posts ONLY after
+    they agree.
+  - NONE: nothing relevant -> fit="NONE", account_id null, propose_account.
 * needs_clarification=true ONLY when a material fact is genuinely missing
   AND no candidate fits — then ask exactly ONE plain-text question.
 * propose_account ONLY when the right ledger does not exist in the chart:
-  give its canonical name, a free code, and the correct account_type.
-* Never pick a contra account (accumulated depreciation) or an inactive
+  give its canonical name, a free code, the correct account_type, and
+  parent_code - the HEADINGS entry the child belongs under (its statement
+  section: PPE, Operating Expenses, Liabilities, ...). Omitting
+  parent_code while HEADINGS exist drops the proposal.
+* Never pick a heading (they only group - they never carry a posting),
+  never pick a contra account (accumulated depreciation) or an inactive
   account; never contradict FACTS."""
 
 
@@ -136,10 +172,22 @@ class CandidateSet:
     """Python-gathered evidence handed to the model (and used to validate)."""
 
     accounts: List[Dict[str, Any]] = field(default_factory=list)
+    # Grouping HEADINGS (accounts that are some account's parent): never
+    # posting candidates themselves - offered to the model as the legal
+    # parents under which a missing child ledger may be created.
+    headings: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def by_id(self) -> Dict[str, Dict[str, Any]]:
         return {str(a.get("id")): a for a in self.accounts}
+
+    @property
+    def headings_by_code(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(h.get("code") or ""): h
+            for h in self.headings
+            if str(h.get("code") or "")
+        }
 
     @property
     def names(self) -> List[str]:
@@ -148,7 +196,8 @@ class CandidateSet:
 
 async def gather_candidates(organization_id: uuid.UUID) -> CandidateSet:
     """Fetch the posting-worthy accounts: active, non-contra, non-control,
-    non-party-sub-ledger — one DB round-trip, the ONLY one this layer adds.
+    non-party-sub-ledger - one DB round-trip, the ONLY one this layer adds.
+    Grouping headings are split out into ``headings`` (parents, never posts).
     """
     from app.repositories import account_repository as a_repo
 
@@ -158,6 +207,15 @@ async def gather_candidates(organization_id: uuid.UUID) -> CandidateSet:
         log.warning("llm_classification.candidate_fetch_failed", error=str(exc)[:200])
         return CandidateSet()
 
+    # A grouping HEAD (any row that is some account's parent) never carries
+    # a posting - it is offered separately as the PARENT under which the
+    # model may create a missing child ledger. Derived from the SAME fetch
+    # (the select already carries parent_account_id): no extra DB round-trip.
+    parent_ids = {
+        str(r.get("parent_account_id"))
+        for r in rows or []
+        if r.get("parent_account_id")
+    }
     keep: List[Dict[str, Any]] = []
     for row in rows or []:
         code = str(row.get("code") or "")
@@ -175,7 +233,12 @@ async def gather_candidates(organization_id: uuid.UUID) -> CandidateSet:
             continue
         keep.append(row)
     keep.sort(key=lambda r: str(r.get("code") or ""))
-    return CandidateSet(accounts=keep[:_MAX_CANDIDATES])
+    headings = [r for r in keep if str(r.get("id")) in parent_ids]
+    postings = [r for r in keep if str(r.get("id")) not in parent_ids]
+    return CandidateSet(
+        accounts=postings[:_MAX_CANDIDATES],
+        headings=sorted(headings, key=lambda r: str(r.get("code") or "")),
+    )
 
 
 def _allowed_account_types(nature: Optional[str]) -> frozenset:
@@ -229,13 +292,27 @@ def build_prompt(
         f"{a.get('id')} | {a.get('code')} | {a.get('name')} | {a.get('account_type')}"
         for a in candidates.accounts
     ]
+    if candidates.headings:
+        lines += [
+            "",
+            "HEADINGS (code | name | account_type) - grouping accounts: NEVER",
+            "post to a heading, but propose_account.parent_code MUST name the",
+            "heading the new account belongs under (its statement section):",
+        ]
+        lines += [
+            f"{h.get('code')} | {h.get('name')} | {h.get('account_type')}"
+            for h in candidates.headings[:60]
+        ]
     lines += [
         "",
         "REPLY WITH ONLY THIS JSON (no markdown, no prose):",
-        '{"nature": "<vocabulary value>", "account_id": "<candidate id or null>",',
+        '{"nature": "<vocabulary value>", "fit": "EXACT|RELATED|NONE",',
+        ' "account_id": "<candidate id or null>",',
         ' "confidence": "HIGH|MEDIUM|LOW", "needs_clarification": false,',
         ' "question": "", "options": [],',
-        ' "propose_account": null, "rationale": "<one sentence>"}',
+        ' "propose_account": {"name":"","code":"","account_type":"",',
+        '                     "parent_code":""} or null,',
+        ' "rationale": "<one sentence>"}',
     ]
     return "\n".join(lines)
 
@@ -246,6 +323,47 @@ def _clean_line(value: Any, limit: int) -> str:
     text = re.sub(r"\s+", " ", text)
     return text[:limit]
 
+
+
+def _treatment_question(
+    *,
+    proposed_name: str,
+    proposed_code: Optional[str],
+    parent_name: Optional[str],
+    related_name: Optional[str] = None,
+    related_code: Optional[str] = None,
+) -> str:
+    """The account-treatment confirmation question.
+
+    TEXT CONTRACT with planner ``_merge_clarification_answers`` - the round
+    only routes when these phrases survive verbatim:
+      * "should i create" - a YES answer folds the quoted name into
+        ``entities["create_account"]``;
+      * ``no '<name>' account`` - the regex the YES arm extracts the name
+        from (apostrophes are stripped so extraction stays exact);
+      * ``under '<head>'`` - the parent heading, extracted into
+        ``entities["create_parent_name"]`` so the confirmed create_account
+        lands the child under the right statement section.
+    A "use ..." answer names an existing account instead
+    (``entities["account_name"]``), which the classifier pins as the
+    USER_ANSWER posting hint - informed consent closes both legs.
+    """
+    name = str(proposed_name or "").replace("'", "").strip()
+    head = str(parent_name or "").replace("'", "").strip()
+    rel = str(related_name or "").replace("'", "").strip()
+    text = f"There is no '{name}' account in your chart of accounts"
+    if rel:
+        text += (
+            f" — the closest existing is '{rel}'"
+            + (f" ({related_code})" if related_code else "")
+        )
+    if proposed_code:
+        text += f" (suggested code {proposed_code})"
+    text += ". Should I create it"
+    if head:
+        text += f" under '{head}'"
+    text += ", or use an existing account instead?"
+    return text
 
 
 def validate(
@@ -261,6 +379,17 @@ def validate(
     the caller then falls back to the deterministic chain.
     """
     if not isinstance(payload, dict):
+        return None
+
+    # --- fit: HOW WELL the picked account serves the treatment ----------
+    # EXACT = the dedicated ledger exists -> post.  RELATED = a relevant
+    # but NOT dedicated ledger exists -> the user must be INFORMED first
+    # (forced clarification below).  NONE = nothing relevant -> propose the
+    # right child under the correct heading.  An omitted fit defaults to
+    # EXACT-with-a-pick / NONE-without, the shape pre-fit replies used.
+    raw_fit = str(payload.get("fit") or "").strip().upper()
+    if raw_fit and raw_fit not in ("EXACT", "RELATED", "NONE"):
+        log.warning("llm_classification.reject", reason="unknown fit", raw=raw_fit)
         return None
 
     # --- nature (fact hint wins outright) -------------------------------
@@ -280,20 +409,22 @@ def validate(
 
     clarify = bool(payload.get("needs_clarification"))
     question = _clean_line(payload.get("question"), 300)
-    if clarify and not question:
-        log.warning("llm_classification.reject", reason="clarify without question")
-        return None
+    # (A clarify WITHOUT a question is rejected after the fit/proposal
+    #  rounds below, where the contract question may still be generated.)
     if nature is None and not clarify:
         log.warning("llm_classification.reject", reason="no nature, not asking")
         return None
 
-    # --- account proposal (missing ledger) ------------------------------
+    # --- account proposal (missing ledger) + its PARENT heading ---------
     proposal = payload.get("propose_account")
     proposed_name = proposed_code = None
+    proposed_parent_id: Optional[str] = None
+    proposed_parent_name: Optional[str] = None
     if isinstance(proposal, dict):
         proposed_name = _clean_line(proposal.get("name"), 60)
         proposed_code = str(proposal.get("code") or "").strip() or None
         p_type = str(proposal.get("account_type") or "").strip().upper()
+        parent_code = str(proposal.get("parent_code") or "").strip() or None
         if not proposed_name:
             proposal = None
         elif p_type not in _allowed_account_types(nature):
@@ -304,12 +435,48 @@ def validate(
                 nature=nature, account_type=p_type,
             )
             proposal = None
-        elif proposed_code and not re.fullmatch(r"\d{2,6}", proposed_code):
+        if proposal is not None and proposed_code and not re.fullmatch(
+            r"\d{2,6}", proposed_code
+        ):
             proposed_code = None
+        if proposal is not None:
+            # PARENT PLACEMENT (segregation of statement heads): the child
+            # must land under a REAL chart heading of its own section.
+            if parent_code is None and candidates.headings:
+                log.warning(
+                    "llm_classification.reject",
+                    reason="proposal without parent_code while headings exist",
+                    proposed=proposed_name,
+                )
+                proposal = None
+            elif parent_code:
+                parent = candidates.headings_by_code.get(parent_code)
+                if parent is None:
+                    log.warning(
+                        "llm_classification.reject",
+                        reason="parent_code is not a chart heading",
+                        parent_code=parent_code,
+                    )
+                    proposal = None
+                elif str(parent.get("account_type") or "").upper() != p_type:
+                    # Wrong statement section (an EXPENSE child under an
+                    # ASSET head) would mis-segregate the balance sheet.
+                    log.warning(
+                        "llm_classification.reject",
+                        reason="parent section does not fit proposal",
+                        parent_code=parent_code, account_type=p_type,
+                    )
+                    proposal = None
+                else:
+                    proposed_parent_id = str(parent.get("id"))
+                    proposed_parent_name = (
+                        str(parent.get("name") or "").strip() or None
+                    )
         if proposal is None:
             # A dropped proposal drops its name/code too — the
             # classification must never advertise a rejected ledger.
             proposed_name = proposed_code = None
+            proposed_parent_id = proposed_parent_name = None
 
     # --- account pick ---------------------------------------------------
     account: Optional[Dict[str, Any]] = None
@@ -342,6 +509,61 @@ def validate(
             return None
 
 
+    # --- fit semantics: EXACT posts, RELATED informs first, NONE proposes -
+    fit = raw_fit or ("EXACT" if account is not None else "NONE")
+    if fit == "NONE" and account is not None:
+        log.warning(
+            "llm_classification.reject",
+            reason="fit NONE contradicts a picked account",
+            account=str(account.get("name")),
+        )
+        return None
+    if fit == "RELATED" and account is None:
+        log.warning(
+            "llm_classification.reject", reason="fit RELATED without an account"
+        )
+        return None
+    if fit == "RELATED":
+        # INFORMED CONSENT: a relevant-but-not-exact ledger is NEVER posted
+        # to silently.  The round offers both legs of the owner's directive:
+        # use the near-relevant account, or create the dedicated child under
+        # its heading (the proposal is mandatory so "create" stays answerable).
+        if proposal is None:
+            log.warning(
+                "llm_classification.reject",
+                reason="RELATED without a create proposal",
+            )
+            return None
+        if question:
+            log.info(
+                "llm_classification.model_question_superseded", question=question
+            )
+        clarify = True
+        question = _treatment_question(
+            proposed_name=proposed_name,
+            proposed_code=proposed_code,
+            parent_name=proposed_parent_name,
+            related_name=str(account.get("name") or ""),
+            related_code=str(account.get("code") or ""),
+        )
+    elif proposal is not None:
+        # The creation round ALWAYS uses the contract question: the planner
+        # answer-merge keys on "should i create" + no '<name>' account, so a
+        # model-phrased question would break YES -> create routing.
+        if question:
+            log.info(
+                "llm_classification.model_question_superseded", question=question
+            )
+        clarify = True
+        question = _treatment_question(
+            proposed_name=proposed_name,
+            proposed_code=proposed_code,
+            parent_name=proposed_parent_name,
+        )
+    if clarify and not question:
+        log.warning("llm_classification.reject", reason="clarify without question")
+        return None
+
     # A decision must DO something: route, ask, or propose.
     if account is None and not clarify and proposal is None:
         log.warning("llm_classification.reject", reason="decision does nothing")
@@ -357,6 +579,13 @@ def validate(
                 options.append(name)
             if len(options) >= 4:
                 break
+        if fit == "RELATED" and account is not None:
+            # The near-relevant account is always the FIRST offer: using it
+            # is the user's first-choice leg; creation stays the second.
+            _rel = str(account.get("name") or "")
+            if _rel and _rel not in options:
+                options.insert(0, _rel)
+            options = options[:4]
 
     confidence = str(payload.get("confidence") or "MEDIUM").strip().upper()
     if confidence not in ("HIGH", "MEDIUM", "LOW"):
@@ -377,10 +606,14 @@ def validate(
             candidate_accounts=options or None,
             proposed_account_name=proposed_name,
             proposed_account_code=proposed_code,
+            proposed_parent_id=proposed_parent_id,
+            proposed_parent_name=proposed_parent_name,
             requires_clarification=True,
             clarification_reason=reason,
         )
 
+    # No proposal can reach here: a proposal ALWAYS forced the clarify
+    # round above (both legs — RELATED's and NONE's — are answer rounds).
     return TransactionClassification(
         transaction_nature=nature,
         confidence=confidence,
@@ -391,15 +624,10 @@ def validate(
         account_hint_name=str(account.get("name")) if account else None,
         proposed_account_name=proposed_name,
         proposed_account_code=proposed_code,
-        # A proposal is never silent: creation still goes through the
-        # user-confirmation round (agent config-gap question).
-        requires_clarification=proposal is not None,
-        clarification_reason=(
-            f"There is no '{proposed_name}' account in your chart of accounts"
-            + (f" (suggested code {proposed_code})" if proposed_code else "")
-            + ". Should I create it, or use an existing account?"
-            if proposal is not None else None
-        ),
+        proposed_parent_id=proposed_parent_id,
+        proposed_parent_name=proposed_parent_name,
+        requires_clarification=False,
+        clarification_reason=None,
     )
 
 
