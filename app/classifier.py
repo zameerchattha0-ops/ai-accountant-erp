@@ -402,15 +402,70 @@ async def _llm_decision(
         return None
 
 
+def _fold_token(word: str) -> str:
+    """Trivially plural-folded lowercase form for anchor comparison."""
+    w = word.lower()
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    return w
+
+
+# Words that carry no item identity in an anchor comparison.
+_ANCHOR_STOPWORDS = frozenset({
+    "the", "a", "an", "for", "of", "and", "or", "new", "old", "used",
+    "bought", "buy", "buying", "purchase", "purchased", "from", "with",
+    "some", "one", "two", "three", "four", "five", "units", "unit",
+    "pcs", "pc", "nos", "no", "set", "sets", "paid", "cash", "credit",
+    "amount", "worth",
+})
+
+
+def _item_anchor_tokens(item: str) -> List[str]:
+    """Significant folded words of the ITEM — its identity tokens."""
+    tokens: List[str] = []
+    for raw in re.split(r"[^a-z0-9]+", (item or "").lower()):
+        if len(raw) < 3 or raw in _ANCHOR_STOPWORDS:
+            continue
+        folded = _fold_token(raw)
+        if folded and folded not in tokens:
+            tokens.append(folded)
+    return tokens
+
+
+def _account_anchors_item(account: Dict[str, Any], item: str) -> bool:
+    """True when the item's OWN words name the account — a measurable fact.
+
+    "3 computers" anchors "1500 Computer Equipment"; "motorbike" can never
+    anchor it.  Category semantics (motorbike → Vehicles) require judgement
+    and belong to the LLM decision layer; this helper only proves the
+    trivial case where the chart literally carries the item's name.
+    """
+    account_tokens = {
+        _fold_token(w)
+        for w in re.split(r"[^a-z0-9]+", (account.get("name") or "").lower())
+        if w
+    }
+    if not account_tokens:
+        return False
+    return any(tok in account_tokens for tok in _item_anchor_tokens(item))
+
+
 async def _search_account_by_nature(
     organization_id: uuid.UUID,
     nature: str,
     item_description: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """Search the live Chart of Accounts for the best account for *nature*.
+    """Search the live Chart of Accounts for an account the ITEM names.
 
-    Tries nature-specific name terms first, then (for expenses) falls back
-    to the first active EXPENSE account.  Returns None when nothing matches.
+    ACCEPTANCE IS ANCHORED, NEVER TERM-ORDERED: an account is returned only
+    when (a) the item's own words name it ("3 computers" → "Computer
+    Equipment"), or (b) a curated expense rule ties the item to the
+    account's category ("electricity" → Utilities Expense).  A bare term
+    match on an item nothing anchors (a "motorbike" against "Computer
+    Equipment") is a SEMANTIC call — the LLM decision layer's — so this
+    helper returns None and the caller clarifies/creates instead of
+    silently debiting the wrong account.  Returns None when nothing
+    anchors.
     """
     from app.repositories import account_repository as a_repo
 
@@ -448,18 +503,27 @@ async def _search_account_by_nature(
         matches = [m for m in matches if _usable(m)]
         if not matches:
             continue
-        # Prefer an account whose name also relates to the item itself.
+        # (a) ITEM ANCHOR — the item's own words name the account: a fact,
+        #     usable for ANY nature.
         for m in matches:
-            if item and item.split()[0] in (m.get("name") or "").lower():
+            if _account_anchors_item(m, item):
                 return m
-        if expense_nature and item:
-            if rule_label is None:
-                continue
+        # (b) CURATED expense-category mapping: an expense rule ties the
+        #     item to a category (e.g. "electricity" → Utilities expense)
+        #     and the account must plausibly BE that category — never a
+        #     neighbouring account caught by term order.
+        if expense_nature and item and rule_label:
             lw = rule_label.lower()
             tw = term.lower()
-            if tw.split()[0] not in lw and lw.split()[0] not in tw:
-                continue
-        return matches[0]
+            if tw.split()[0] in lw or lw.split()[0] in tw:
+                for m in matches:
+                    if _account_matches_expense_label(m, rule_label):
+                        return m
+        # NO `return matches[0]` — term ORDER must never pick the account
+        # (that is how a motorbike was debited to Computer Equipment). An
+        # unanchored category is a semantic judgement: the LLM decision
+        # layer decides it when reachable, and the flow clarifies/creates
+        # when it is not.
 
     # Fallback for expense-type natures: ONLY a genuinely GENERIC expense
     # account (name contains general/other/miscellaneous/sundry/operating).
@@ -666,8 +730,10 @@ async def classify_transaction(
     # economic nature is decided by the event itself, never inferred from
     # price or physical appearance.  The NATURE is a fact of the intent;
     # the ACCOUNT that receives it is a judgment call, so the LLM decision
-    # layer picks it (validated against the candidate set), with the
-    # old term search as fallback when the layer is off/unreachable.
+    # layer picks it (validated against the candidate set).  When the layer
+    # is off/unreachable the ANCHORED COA mapping is the degraded fallback
+    # (only an account the item itself names); when nothing anchors, the
+    # flow clarifies — term order never decides.
     _ASSET_LIFECYCLE_INTENTS = (
         "register_fixed_asset", "dispose_fixed_asset",
         "record_asset_depreciation",
@@ -729,7 +795,8 @@ async def classify_transaction(
         )
         # The NATURE is the user's fact (forced via nature_hint); WHICH
         # account receives it is judgment — the LLM picks from candidates
-        # (validated against THIS nature), term search is the fallback.
+        # (validated against THIS nature); the anchored COA mapping is the
+        # degraded fallback and an unanchored item escalates to a question.
         if resolve_account_hints:
             decision = await _llm_decision(
                 organization_id, intent=intent, entities=entities,
@@ -984,9 +1051,10 @@ async def classify_transaction(
             requires_clarification=False,
         )
 
-    # --- 4b. ITEM_MAPPING: a durable item matched to an existing COA
-    # fixed-asset account is authoritatively classified (e.g. laptop →
-    # 1500 Computer Equipment) — no clarification needed.
+    # --- 4b. ITEM_MAPPING: a durable item whose OWN words name an existing
+    # COA fixed-asset account is a fact ("3 computers" → 1500 Computer
+    # Equipment) — no clarification needed.  An unanchored item is a
+    # semantic call the LLM decision layer owns; never term-order.
     if not nature and item:
         asset = await _search_account_by_nature(organization_id, FIXED_ASSET, item)
         if asset and asset.get("account_type") == "ASSET":
