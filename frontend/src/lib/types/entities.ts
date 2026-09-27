@@ -471,3 +471,61 @@ export interface CashFlowRow {
   entry_description: string;
   contra_description: string | null;
 }
+
+/**
+ * Employees module — quick-entry contract: ONLY full_name,
+ * date_of_joining and basic_salary are mandatory; everything else is
+ * optional detail.  Mirrors the `employees` table (migration 084).
+ */
+export interface Employee {
+  id: string;
+  organization_id: string;
+  employee_code: string | null;
+  full_name: string;
+  date_of_joining: string;
+  basic_salary: number;
+  status: string;
+  designation: string | null;
+  department: string | null;
+  employment_type: string | null;
+  cnic: string | null;
+  date_of_birth: string | null;
+  gender: string | null;
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+  bank_name: string | null;
+  bank_account_number: string | null;
+  tax_number: string | null;
+  pay_day: number | null;
+  probation_end_date: string | null;
+  resignation_date: string | null;
+  notes: string | null;
+  is_active: boolean;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One allowance/benefit component.  Rows with source "AI" were structured
+ * by the model from the user's natural-language sentence (raw_text keeps
+ * that sentence for audit); "MANUAL" rows come from a form.
+ */
+export interface EmployeeAllowance {
+  id: string;
+  organization_id: string;
+  employee_id: string;
+  component_kind: string;
+  allowance_type: string | null;
+  description: string;
+  amount: number;
+  frequency: string;
+  effective_from: string;
+  effective_to: string | null;
+  source: string;
+  raw_text: string | null;
+  ai_execution_id: string | null;
+  created_at: string;
+  updated_at: string;
+}

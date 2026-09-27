@@ -1,10 +1,8 @@
-import ComingSoon from "@/components/shared/ComingSoon";
+import { redirect } from "next/navigation";
 
+// The Expense Entries module was an empty ComingSoon stub and is now
+// REPLACED by Employees.  The route stays alive as a redirect so old links
+// (AIActionCard record_expense tile, bookmarks) never 404.
 export default function ExpensesPage() {
-  return (
-    <ComingSoon
-      title="Expense Entries"
-      description="Record day-to-day expenses with receipts and approval workflow. Meanwhile, record them conversationally: &quot;I paid Rs. 45,000 cash for office rent&quot; - the AI books the journal entry with the right accounts."
-    />
-  );
+  redirect("/employees");
 }

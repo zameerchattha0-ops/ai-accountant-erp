@@ -33,6 +33,7 @@ from app.services import (
     product_service,
     fixed_asset_service,
     service_service,
+    employee_service,
 )
 from datetime import date
 
@@ -857,6 +858,53 @@ async def _record_expense_payment(organization_id: uuid.UUID, **kw) -> ToolResul
     return ToolResult(tool_name="record_expense_payment", success=True, data=data)
 
 # ===================================================================
+# EMPLOYEE TOOLS
+# ===================================================================
+# Quick-entry module: ONLY full_name + date_of_joining + basic_salary are
+# mandatory.  Allowances are NEVER parsed in Python — the model structures
+# the user's natural-language sentence into allowances=[{description,
+# amount, frequency, allowance_type, effective_from}] and the service
+# validates each entry and writes the rows.  Validation failures come back
+# as success=False with a message written FOR THE MODEL to act on (it names
+# what to ask the user).
+
+async def _search_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
+    data = await employee_service.search(
+        organization_id, query=kw.get("query", ""), limit=kw.get("limit", 25)
+    )
+    return ToolResult(tool_name="search_employee", success=True, data=data)
+
+
+async def _get_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await employee_service.get(
+            organization_id,
+            employee=kw.get("employee"),
+            employee_id=kw.get("employee_id"),
+        )
+    except employee_service.EmployeeInputError as exc:
+        return ToolResult(tool_name="get_employee", success=False, error=str(exc))
+    return ToolResult(tool_name="get_employee", success=True, data=data)
+
+
+async def _create_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await employee_service.create(organization_id, **kw)
+    except employee_service.EmployeeInputError as exc:
+        return ToolResult(tool_name="create_employee", success=False, error=str(exc))
+    return ToolResult(tool_name="create_employee", success=True, data=data)
+
+
+async def _set_employee_allowances(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await employee_service.set_allowances(organization_id, **kw)
+    except employee_service.EmployeeInputError as exc:
+        return ToolResult(
+            tool_name="set_employee_allowances", success=False, error=str(exc)
+        )
+    return ToolResult(tool_name="set_employee_allowances", success=True, data=data)
+
+# ===================================================================
 # REGISTER ALL TOOLS
 # ===================================================================
 
@@ -865,6 +913,14 @@ register("search_customer", handler=_search_customer, read_only=True, descriptio
 register("get_customer", handler=_get_customer, read_only=True, description="Get customer details")
 register("create_customer", handler=_create_customer, read_only=False, contract=contract_from_callable(customer_service.create), description="Create a new customer")
 register("get_customer_ledger", handler=_get_customer_ledger, read_only=True, description="Get customer ledger")
+
+# Employee — quick-entry master data (mandatory: full_name, date_of_joining,
+# basic_salary).  Allowances arrive already STRUCTURED by the model; the
+# service validates each component and writes one row per part.
+register("search_employee", handler=_search_employee, read_only=True, description="Search employees by name, code, department or designation")
+register("get_employee", handler=_get_employee, read_only=True, description="Get one employee's full details plus allowance records")
+register("create_employee", handler=_create_employee, read_only=False, contract=contract_from_callable(employee_service.create), description="Create an employee: mandatory full_name, date_of_joining, basic_salary; every other detail is optional")
+register("set_employee_allowances", handler=_set_employee_allowances, read_only=False, contract=contract_from_callable(employee_service.set_allowances), description="Record an employee's allowances: structure the user's natural-language sentence into allowances=[{description, amount, frequency(monthly|one-time|annual), allowance_type, effective_from}] and pass raw_text; Python validates each entry and writes the rows (rejections name what to ask the user)")
 
 # Supplier
 register("search_supplier", handler=_search_supplier, read_only=True, description="Search suppliers by name or code")

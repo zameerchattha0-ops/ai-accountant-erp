@@ -28,6 +28,7 @@ _ACCOUNT_LOOKUPS = {"search_account", "get_chart_of_accounts"}
 _PRODUCT_LOOKUPS = {"search_product", "search_service"}
 _ASSET_LOOKUPS = {"search_fixed_asset", "get_fixed_asset"}
 _BANK_LOOKUPS = {"list_bank_accounts"}
+_EMPLOYEE_LOOKUPS = {"search_employee", "get_employee"}
 
 # Per-intent mutation/creation toolsets (the trusted core actions).
 _INTENT_TOOLS: dict[str, set[str]] = {
@@ -166,6 +167,7 @@ def excluded_for_intent(
 _LOOKUP_UNIVERSE = (
     _CUSTOMER_LOOKUPS | _SUPPLIER_LOOKUPS | _ACCOUNT_LOOKUPS
     | _PRODUCT_LOOKUPS | _ASSET_LOOKUPS | _BANK_LOOKUPS
+    | _EMPLOYEE_LOOKUPS
 )
 _JOURNAL_HELPERS = {"prepare_journal", "validate_journal", "post_journal"}
 

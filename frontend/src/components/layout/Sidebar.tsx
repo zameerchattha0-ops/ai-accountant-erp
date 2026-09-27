@@ -6,9 +6,10 @@ import { usePathname } from "next/navigation";
 import Image from "next/image";
 import {
   LayoutDashboard, FileText, ShoppingCart, Users, Truck,
-  FolderKanban, Receipt, CreditCard, Landmark, BookOpen,
+  FolderKanban, CreditCard, Landmark, BookOpen,
   BarChart3, Settings, ChevronDown, ChevronRight, Menu, X,
   Sparkles, PanelLeftClose, PanelLeft, Wallet, Package,
+  UserRound,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
@@ -63,9 +64,10 @@ const navItems: NavItem[] = [
     tone: { icon: "text-purple-600", chip: "bg-purple-50" } },
   { label: "Projects", href: "/projects", icon: FolderKanban,
     tone: { icon: "text-pink-600", chip: "bg-pink-50" } },
-  // Renamed from "Expenses": every row is an EXPENSE ENTRY (a recorded
-  // expense with its journal), matching "Journal Entries" above.
-  { label: "Expense Entries", href: "/expenses", icon: Receipt,
+  // Employees replaces the empty Expense Entries module: quick-entry
+  // master data (only name, joining date and basic salary are mandatory);
+  // allowances are written by the AI from the user's own words.
+  { label: "Employees", href: "/employees", icon: UserRound,
     tone: { icon: "text-orange-600", chip: "bg-orange-50" } },
   { label: "Payments", href: "/payments", icon: CreditCard,
     tone: { icon: "text-indigo-600", chip: "bg-indigo-50" } },
