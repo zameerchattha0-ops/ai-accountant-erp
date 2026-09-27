@@ -94,7 +94,15 @@ FastAPI backend (port 8000)  —  app/main.py
 ### Setup
 
 1. **Database:** apply the SQL migrations in `database/migrations/` in
-   filename order (`001…083`) to a fresh Supabase project.
+   filename order (`001…085`). There is no local Postgres CLI — use the
+   Management-API runner (needs `SUPABASE_ACCESS_TOKEN` in
+   `E:\Qoder\.secrets\tokens.env` next to your `.env`):
+
+   ```bat
+   venv\Scripts\python scripts\apply_migrations.py 084_create_employees.sql
+   ```
+
+   or paste the files into the Supabase SQL editor in the same order.
 2. **Backend config:** copy `.env.example` to `.env` and fill in your values.
    Never commit `.env`. The Gemini key lives in Supabase Vault and is read
    via the `get_gemini_api_key()` RPC (service_role only).
