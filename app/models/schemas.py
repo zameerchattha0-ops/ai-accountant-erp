@@ -332,8 +332,14 @@ class AgentContext(BaseModel):
     relevant_bank_accounts: List[Dict[str, Any]] = Field(default_factory=list)
     # Entities parsed from the user's request (ground truth for Gemini)
     extracted_entities: Dict[str, Any] = Field(default_factory=dict)
-    # Prior clarification Q&A (already answered — never re-ask)
-    clarification_history: List[Dict[str, str]] = Field(default_factory=list)
+    # Prior clarification Q&A (already answered — never re-ask).  Values are
+    # NOT all strings: ``required_information`` (the fields a round asked, in
+    # rendered order) rides along as a LIST so a typed numbered answer can be
+    # field-tagged positionally (see get_clarification_history).  Typed as
+    # Dict[str, Any] — a Dict[str, str] here raised a ValidationError on every
+    # resumed questionnaire turn (live defect: "An unexpected error occurred"
+    # on register_fixed_asset after the depreciation questions were answered).
+    clarification_history: List[Dict[str, Any]] = Field(default_factory=list)
     # learned organization-level defaults.  Rendered into the
     # model prompt as authoritative defaults the user set previously; the
     # planner already treats them as answered-for entities.

@@ -627,7 +627,7 @@ async def get_clarification_history(
 
 async def seed_clarification_history(
     session_id: uuid.UUID,
-    history: List[Dict[str, str]],
+    history: List[Dict[str, Any]],
 ) -> None:
     """Carry answered clarifications from a prior session into a resumed one.
 

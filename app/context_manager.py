@@ -37,7 +37,7 @@ async def build_context(
     user_id: uuid.UUID,
     intent: str,
     entity_hints: Optional[Dict[str, Any]] = None,
-    clarification_history: Optional[List[Dict[str, str]]] = None,
+    clarification_history: Optional[List[Dict[str, Any]]] = None,
     org_preferences: Optional[Dict[str, Any]] = None,
     domain_fetches: bool = True,
     organization: Optional[Dict[str, Any]] = None,

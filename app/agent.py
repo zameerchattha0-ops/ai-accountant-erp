@@ -2395,7 +2395,7 @@ async def execute(
     organization_id: uuid.UUID,
     auth: Optional[AuthContext] = None,
     conversation_id: Optional[str] = None,
-    clarification_history: Optional[List[Dict[str, str]]] = None,
+    clarification_history: Optional[List[Dict[str, Any]]] = None,
     confirmation_granted: bool = False,
     attachments: Optional[List[AttachmentRef]] = None,
     approved_tool_calls: Optional[List[ToolCall]] = None,

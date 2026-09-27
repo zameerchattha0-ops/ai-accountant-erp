@@ -432,7 +432,7 @@ def split_batch_request(user_message: str) -> List[str]:
 
 def _plan_batch(
     segments: List[str],
-    clarification_history: Optional[List[Dict[str, str]]],
+    clarification_history: Optional[List[Dict[str, Any]]],
     user_message: str = "",
     org_preferences: Optional[Dict[str, str]] = None,
 ) -> ExecutionPlan:
@@ -554,7 +554,7 @@ def _plan_batch(
 
 def plan(
     user_message: str,
-    clarification_history: Optional[List[Dict[str, str]]] = None,
+    clarification_history: Optional[List[Dict[str, Any]]] = None,
     org_preferences: Optional[Dict[str, str]] = None,
     prefill_entities: Optional[Dict[str, Any]] = None,
 ) -> ExecutionPlan:
