@@ -2,7 +2,7 @@
 -- 085 â€” Seed the Employees tools in the AI control plane
 -- ============================================================================
 -- Four tools (worker: app/tools/__init__.py):
---   search_employee / get_employee            READ     master_data
+--   search_employee / get_employee     QUERY   master_data
 --   create_employee / set_employee_allowances MUTATION master_data
 -- Without these rows the runtime authorize_tool() gate denies the slugs.
 -- The LLM structures the user's natural-language allowance sentence into the
@@ -20,7 +20,7 @@ select 'Search Employee', 'search_employee',
        'Search employees by name, code, department or designation',
        'Find an employee record in natural language',
        (select module_id from ai.tools where slug = 'create_customer' limit 1),
-       'READ', true, false, false, false, true, 'LOW', 'IMPLEMENTED',
+       'QUERY', true, false, false, false, true, 'LOW', 'IMPLEMENTED',
        'app.services.employee_service.search via tools._search_employee'
 where not exists (select 1 from ai.tools x where x.slug = 'search_employee');
 
@@ -32,7 +32,7 @@ select 'Get Employee', 'get_employee',
        'Get one employee''s full details plus their allowance records',
        'Show an employee record and its allowances',
        (select module_id from ai.tools where slug = 'create_customer' limit 1),
-       'READ', true, false, false, false, true, 'LOW', 'IMPLEMENTED',
+       'QUERY', true, false, false, false, true, 'LOW', 'IMPLEMENTED',
        'app.services.employee_service.get via tools._get_employee'
 where not exists (select 1 from ai.tools x where x.slug = 'get_employee');
 
