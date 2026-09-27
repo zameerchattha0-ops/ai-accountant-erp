@@ -2961,6 +2961,44 @@ async def execute(
                 entities=execution_plan.extracted_entities,
                 intent=execution_plan.intent,
                 client=questionnaire_client,
+                # the questionnaire model sees what was ALREADY answered —
+                # a field answered in a prior round is skip-and-filled
+                # (validated), never re-asked.
+                context_summary=(
+                    {"answered_history": prior_qa} if prior_qa else None
+                ),
+            )
+            # LLM-DECIDED SKIPS (validated): facts the model confirmed from
+            # the known facts/context replace their questions.  They are
+            # merged into the entities AND persisted as ANSWERED history
+            # (bank question + validated value), so every later round's
+            # merge picks them up and never re-asks what is already known.
+            _filled = getattr(_questionnaire, "filled_facts", None) or {}
+            if _filled:
+                try:
+                    execution_plan.extracted_entities.update(_filled)
+                except Exception:  # noqa: BLE001 — merge is best-effort
+                    pass
+                from app.questionnaire import spec_for as _spec_for
+
+                try:
+                    await seed_clarification_history(
+                        session_id,
+                        [
+                            {
+                                "question": (_spec_for(_f).question or _f),
+                                "answer": str(_v),
+                            }
+                            for _f, _v in _filled.items()
+                        ],
+                    )
+                except Exception:  # noqa: BLE001 — persistence is best-effort
+                    pass
+            # Only the questions actually ASKED stay in the contract — a
+            # filled (already answered) field must never reappear as
+            # required.
+            _asked_fields = list(_questionnaire.fields()) or list(
+                execution_plan.missing_fields
             )
             question = _questionnaire.render_text() or "Please provide more details."
             # offer the learned default inside the question
@@ -2979,13 +3017,13 @@ async def execute(
             clarification = await create_clarification(
                 session_id=session_id,
                 question=question,
-                required_fields=execution_plan.missing_fields,
+                required_fields=_asked_fields,
             )
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
                 question=clarification.get("question", question),
-                required_information=execution_plan.missing_fields,
+                required_information=_asked_fields,
                 question_options=question_options,
                 questionnaire=_questionnaire.to_payload(),
                 requires_user_input=True,

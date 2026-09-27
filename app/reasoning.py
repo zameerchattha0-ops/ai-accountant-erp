@@ -330,8 +330,18 @@ def resolve_nature_answer(question: str, answer: str) -> Optional[str]:
     if text in ("a", "b", "c", "d"):
         idx = "abcd".index(text)
         return spec["values"][idx] if idx < len(spec["values"]) else None
+    # Fixed-format questionnaire CHIP VALUES arrive as canonical tokens
+    # ("FIXED_ASSET", "OTHER_INCOME", …) — accept them directly, and run
+    # the keyword pass on the separator-normalised form so an underscored
+    # token ("fixed_asset") matches the spaced pattern too.  A TAPPED chip
+    # must never leave the field unanswered: that is how an already-given
+    # nature answer fell through and got asked again in the next round.
+    token = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    for value in spec["values"]:
+        if token == re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip():
+            return value
     for pattern, value in spec["keywords"]:
-        if re.search(pattern, text):
+        if re.search(pattern, token):
             return value
     return None
 

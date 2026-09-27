@@ -258,6 +258,14 @@ def questionnaire_schema() -> Dict[str, Any]:
                     },
                 },
             },
+            "filled": {
+                "type": "object",
+                "description": (
+                    "SKIP-AND-FILL facts (Python-validated): field -> value "
+                    "answers the model confirmed from the request/context. "
+                    "Filled fields are NOT asked."
+                ),
+            },
         },
     }
 
@@ -270,6 +278,10 @@ class Questionnaire:
     intro: str = QUESTIONNAIRE_INTRO
     questions: List[QuestionSpec] = dc_field(default_factory=list)
     source: str = "deterministic"  # deterministic | llm_assisted
+    # SKIP-AND-FILL: facts the questionnaire model confirmed from the
+    # provided facts/context (Python-validated).  The field is NOT asked
+    # and is recorded as answered history, so no later round re-asks it.
+    filled_facts: Dict[str, str] = dc_field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not self.questions
@@ -303,7 +315,7 @@ class Questionnaire:
 
     def to_payload(self) -> Dict[str, Any]:
         """The fixed-format payload (see :func:`questionnaire_schema`)."""
-        return {
+        payload: Dict[str, Any] = {
             "version": SCHEMA_VERSION,
             "intent": self.intent,
             "intro": self.intro or QUESTIONNAIRE_INTRO,
@@ -323,6 +335,9 @@ class Questionnaire:
                 for i, q in enumerate(self.questions, start=1)
             ],
         }
+        if self.filled_facts:
+            payload["filled"] = dict(self.filled_facts)
+        return payload
 
 
 def _known(value: Any) -> bool:
@@ -418,11 +433,22 @@ Reply with ONLY this JSON object (no prose, no markdown):
                 "question": "<ONE sentence, at most 300 characters>",
                 "options": [{"value": "<tapped answer>", "label": "<chip text>"}],
                 "answer_hint": "<how to answer>",
-                "why": "<why it is needed>"}]}
+                "why": "<why it is needed>"},
+               {"field": "<another MUST_ASK field, verbatim>",
+                "already_answered": true,
+                "value": "<the fact, copied from KNOWN_FACTS or CONTEXT>"}]}
+
+A MUST_ASK field whose answer ALREADY EXISTS in KNOWN_FACTS or CONTEXT
+(extraction simply missed it) is NOT asked — replace its question with the
+"already_answered" form above.  Python validates the value (a choice must
+be one of the draft's own option values, a date must parse, a money/number
+must be numeric) and then treats the field as ANSWERED.  An invalid fill
+is DISCARDED and the question is asked instead.
 
 Rules (any violation discards your answer):
-  1. Exactly one question per MUST_ASK field — never invent fields;
-  2. NEVER ask about anything in KNOWN_FACTS or CONTEXT;
+  1. One entry per MUST_ASK field — never invent fields; entries are
+     questions OR already_answered fills, never both for the same field;
+  2. NEVER ask about anything in KNOWN_FACTS or CONTEXT — skip-and-fill it;
   3. Keep the draft's meaning and number formats; you may only reword for
      clarity, and you must repeat the known facts the question relies on;
   4. For a finite decision set give 2-6 tap options; otherwise options [].
@@ -502,6 +528,63 @@ def _validate_llm_question(
     )
 
 
+def _norm_token(value: Any) -> str:
+    """Separator-insensitive token form ("FIXED_ASSET" == "fixed asset")."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _validate_llm_fill(
+    entry: Any, allowed: Dict[str, QuestionSpec]
+) -> Optional[Tuple[str, str]]:
+    """(field, validated value) for a SKIP-AND-FILL entry, else ``None``.
+
+    The questionnaire model may claim a MUST_ASK field is already answered
+    ONLY when the supplied value survives Python's own validation for the
+    field's kind:
+
+      * a DATE must parse mechanically (relative words like "yesterday"
+        are resolved to ISO — never trusted verbatim);
+      * a CHOICE must be one of the field's OWN option values (the model
+        has no fact vocabulary of its own);
+      * a MONEY / NUMBER must be numeric; a TEXT must be clean.
+
+    A rejected fill changes nothing: the deterministic question stays in
+    the round — the gap floor never loses a genuinely open question.
+    """
+    if not isinstance(entry, dict):
+        return None
+    field_name = str(entry.get("field") or "").strip()
+    if field_name not in allowed or not entry.get("already_answered"):
+        return None
+    spec = allowed[field_name]
+    raw_value = entry.get("value")
+    if raw_value in (None, "", [], {}):
+        return None
+    if spec.kind == KIND_DATE:
+        from app.date_parser import parse_transaction_date
+
+        parsed = parse_transaction_date(str(raw_value))
+        if getattr(parsed, "ok", False) and getattr(parsed, "iso_date", None):
+            return field_name, str(parsed.iso_date)
+        return None
+    if spec.options:
+        wanted = _norm_token(raw_value)
+        for value, _label in spec.options:
+            if _norm_token(value) == wanted:
+                return field_name, value
+        return None
+    if spec.kind in (KIND_MONEY, KIND_NUMBER):
+        try:
+            number = float(str(raw_value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+        return field_name, str(number)
+    text = _clean_text(raw_value, 120)
+    if not text:
+        return None
+    return field_name, text
+
+
 def _phrasing_prompt(
     base: Questionnaire,
     entities: Dict[str, Any],
@@ -567,7 +650,17 @@ async def build_questionnaire_with_llm(
 
     ordered: List[QuestionSpec] = []
     seen: set = set()
+    fills: Dict[str, str] = {}
     for entry in payload.get("questions") or []:
+        # SKIP-AND-FILL: the model may mark a MUST_ASK field answered when
+        # the fact exists in KNOWN_FACTS/CONTEXT — Python validates the
+        # value (choice vocabulary / date parse / numeric) and the field
+        # stops being asked.
+        if isinstance(entry, dict) and entry.get("already_answered"):
+            filled = _validate_llm_fill(entry, allowed)
+            if filled and filled[0] not in seen:
+                fills[filled[0]] = filled[1]
+            continue
         validated = _validate_llm_question(entry, allowed)
         if not validated:
             continue
@@ -576,19 +669,32 @@ async def build_questionnaire_with_llm(
             continue
         seen.add(field_name)
         ordered.append(spec)
-    # Every allowed field MUST be asked: fill the gaps deterministically.
+    # A validated fill never empties the round: the plan was built WITHOUT
+    # these facts, so at least ONE question survives (the highest-priority
+    # gap) — the answer round is what re-plans with the filled facts.
+    if fills and not ordered and base.questions:
+        survivor = base.questions[0]
+        fills.pop(survivor.field, None)
+        seen.add(survivor.field)
+        ordered.append(survivor)
+    # Every remaining field is still asked: fill the gaps deterministically.
     for question in base.questions:
-        if question.field not in seen:
+        if question.field not in seen and question.field not in fills:
             ordered.append(question)
 
     intro = _clean_text(payload.get("intro"), 160) or base.intro
     log.info(
         "questionnaire.llm_used",
         fields=[q.field for q in ordered],
+        filled=list(fills),
         rephrased=len(seen),
     )
     return Questionnaire(
-        intent=intent, intro=intro, questions=ordered, source="llm_assisted"
+        intent=intent,
+        intro=intro,
+        questions=ordered,
+        source="llm_assisted",
+        filled_facts=fills,
     )
 
 
