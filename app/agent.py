@@ -2947,27 +2947,42 @@ async def execute(
             # never park a turn whose plan the user already confirmed.
             and approved_tool_calls is None
         ):
-            from app.questionnaire import build_questionnaire_with_llm
-
-            # FIXED-FORMAT QUESTIONNAIRE — the LLM authors the question
-            # text/options inside a fixed schema (validated: allowed fields
-            # only, never a fact already known); the deterministic bank is
-            # the floor when no provider is wired or its output violates
-            # the contract.  `questionnaire_client` is injected by the API
-            # layer (None in hermetic tests → fully deterministic).
-            _questionnaire = await build_questionnaire_with_llm(
-                missing_fields=execution_plan.missing_fields,
-                questions=execution_plan.clarification_questions,
-                entities=execution_plan.extracted_entities,
-                intent=execution_plan.intent,
-                client=questionnaire_client,
-                # the questionnaire model sees what was ALREADY answered —
-                # a field answered in a prior round is skip-and-filled
-                # (validated), never re-asked.
-                context_summary=(
-                    {"answered_history": prior_qa} if prior_qa else None
-                ),
+            from app.questionnaire import (
+                author_questionnaire,
+                build_questionnaire_with_llm,
             )
+
+            # AUTHORED QUESTIONNAIRE — the Token Harbor model analyses the
+            # request + facts + answered history and WRITES the questions in
+            # the fixed JSON format the frontend renders (validated: the
+            # answer-routing field vocabulary only, never a known fact).
+            # The deterministic bank authors NOTHING on this path — it
+            # stands ONLY as the provider-down floor (same fixed format).
+            # `questionnaire_client` is injected by the API layer (None in
+            # hermetic tests → floor).
+            _questionnaire = await author_questionnaire(
+                client=questionnaire_client,
+                user_request=user_message,
+                intent=execution_plan.intent,
+                missing_fields=execution_plan.missing_fields,
+                entities=execution_plan.extracted_entities,
+                history=prior_qa,
+                today=(_preliminary or {}).get("today", ""),
+            )
+            if _questionnaire is None or _questionnaire.is_empty():
+                _questionnaire = await build_questionnaire_with_llm(
+                    missing_fields=execution_plan.missing_fields,
+                    questions=execution_plan.clarification_questions,
+                    entities=execution_plan.extracted_entities,
+                    intent=execution_plan.intent,
+                    client=questionnaire_client,
+                    # the questionnaire model sees what was ALREADY answered —
+                    # a field answered in a prior round is skip-and-filled
+                    # (validated), never re-asked.
+                    context_summary=(
+                        {"answered_history": prior_qa} if prior_qa else None
+                    ),
+                )
             # LLM-DECIDED SKIPS (validated): facts the model confirmed from
             # the known facts/context replace their questions.  They are
             # merged into the entities AND persisted as ANSWERED history
@@ -5000,6 +5015,40 @@ def _session_is_pending(session: Dict[str, Any]) -> bool:
     return str(session.get("status") or "") == "WAITING_FOR_USER"
 
 
+def _tag_numbered_answers(
+    history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Field-tag a round's TYPED numbered answer by line position.
+
+    An LLM-authored question may be worded any way, so a typed
+    ``1) … 2) …`` answer cannot be matched against keyword patterns.  The
+    round's ``required_information`` holds the fields in the SAME order as
+    the rendered lines (both come from ``questionnaire.fields()``), so each
+    line is zipped with its field and tagged — the merge's field-routed
+    branch then routes a typed answer exactly like a tap.  A line/field
+    count mismatch is NEVER zipped (no guessing); everything else falls
+    through to the keyword chain untouched.
+    """
+    tagged: List[Dict[str, Any]] = []
+    for row in history:
+        fields = row.get("required_information") or []
+        answer = str(row.get("answer") or "")
+        lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
+        if not fields or len(lines) != len(fields):
+            continue
+        for field_name, line in zip(list(fields), lines):
+            value = re.sub(r"^\d+\s*[.)]\s*", "", line).strip()
+            if field_name and value:
+                tagged.append(
+                    {
+                        "field": str(field_name),
+                        "question": str(field_name),
+                        "answer": value,
+                    }
+                )
+    return tagged
+
+
 async def resume_with_clarification(
     *,
     session_id: uuid.UUID,
@@ -5074,6 +5123,15 @@ async def resume_with_clarification(
     # merges each answer into the entity set, and Gemini receives both the
     # original request and the structured history as context.
     history = await get_clarification_history(session_id)
+
+    # POSITIONAL FIELD TAGS — a TYPED numbered answer is zipped with the
+    # round's own required_information (same order as the rendered lines),
+    # so it routes by FIELD exactly like a tap — never by matching the
+    # model's wording against keyword patterns.  Appended AFTER the
+    # free-text pairs: an explicit field answer wins over a keyword match.
+    _positional = _tag_numbered_answers(history)
+    if _positional:
+        history = [*history, *_positional]
 
     # FIELD-ROUTED ANSWERS (fixed-format questionnaire): each entry carries
     # the field it answers, so merging never depends on the question's

@@ -595,12 +595,15 @@ async def resolve_clarification(
 
 async def get_clarification_history(
     session_id: uuid.UUID,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """Return all ANSWERED clarifications for a session as Q&A pairs.
 
     Used to rebuild conversation context when a session resumes, so
     questions already answered are merged into entity extraction and
-    never asked again.
+    never asked again.  ``required_information`` rides along (the fields
+    the round asked, in the SAME order as its rendered lines) so a TYPED
+    numbered answer can be field-tagged positionally — an LLM-authored
+    question may be worded any way, so wording must never decide routing.
     """
     rows = await fetch_many(
         "ai_clarifications",
@@ -615,6 +618,7 @@ async def get_clarification_history(
         {
             "question": str(r.get("question") or ""),
             "answer": str(r.get("user_response") or ""),
+            "required_information": list(r.get("required_information") or []),
         }
         for r in rows
         if r.get("user_response")

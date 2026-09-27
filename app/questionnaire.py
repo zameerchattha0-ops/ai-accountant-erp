@@ -843,3 +843,165 @@ def questionnaire_from_authored(
         questions=specs_fallback, source="reasoning_llm_unstructured",
     )
 
+
+# ---------------------------------------------------------------------------
+# AUTHORED-BY-REQUEST QUESTIONNAIRE — the provider call that REPLACES the
+# template as the author of user-visible questions.  Whenever the plan still
+# has material gaps, the same Token Harbor model that reasons about the
+# request is given the request + facts + answered history and WRITES the
+# questionnaire itself, in the fixed JSON format the frontend renders.
+# Python validates only (answer-routing field vocabulary, known facts never
+# asked, option/kind/text shape) — the deterministic bank authors NOTHING on
+# this path; it stands as the provider-down floor.
+# ---------------------------------------------------------------------------
+
+# One-line gloss per routing field: guidance for the question WRITER (what
+# an answer to this field means in the books), never a question template.
+_FIELD_GLOSS: Dict[str, str] = {
+    "transaction_date": "when the event happened — a date",
+    "payment_type": "how it was settled — cash ledger, bank ledger, or on credit",
+    "payment_method": "the recorded settlement (CASH, BANK, CREDIT, ...)",
+    "transaction_nature": (
+        "what the item actually is — fixed asset, inventory-stocked product, "
+        "consumable/one-off expense, or service"
+    ),
+    "transaction_purpose": "what the money was actually for (rent, salaries, repairs, ...)",
+    "capitalization_decision": "capitalise the cost or expense it immediately",
+    "settlement_position": "paid now, still outstanding, or prepaid",
+    "amount": "the money amount",
+    "supplier_name": "which supplier",
+    "customer_name": "which customer",
+    "item_description": "what the item/product/service is",
+    "quantity": "how many units",
+    "asset_name": "the asset's name/identification",
+    "useful_life_years": "how many years the asset will be used",
+    "depreciation_method": "straight line or reducing balance",
+    "salvage_value": "the residual value at the end of the asset's life",
+    "account_name": "which ledger account to post to",
+    "disposal_type": "sold, scrapped, or written off",
+    "proceeds_amount": "the money received on a disposal",
+    "period": "the accounting period the entry belongs to",
+    "note": "any further detail the user wants recorded",
+}
+
+_AUTHORED_QUESTIONNAIRE_PROMPT = """You are the clarification writer of an accounting agent (assisted ERP).
+
+A request could not be posted yet because material facts are missing.  You
+analyse the user's request, the facts already extracted and the answers
+already given, then WRITE the questions that close the remaining gaps — in
+the product's fixed JSON format (the frontend renders it directly, and each
+"field" routes the answer back into the books).
+
+You are given:
+  * USER_REQUEST — the user's own words;
+  * INTENT — the operation the system will record;
+  * MISSING_MATERIAL_FACTS — the facts that currently block a correct posting;
+  * KNOWN_FACTS — already extracted from the user's own words (NEVER ask);
+  * ANSWERED_HISTORY — Q/A from earlier rounds (NEVER re-ask);
+  * FIELD_VOCABULARY — the ONLY field names an answer may route to.
+
+Reply with ONLY this JSON object (no prose, no markdown):
+
+{"intro": "<one short sentence>",
+ "questions": [{"field": "<one FIELD_VOCABULARY name>",
+                "kind": "choice|date|money|number|text",
+                "question": "<ONE sentence, at most 300 characters>",
+                "options": [{"value": "<the recorded answer>", "label": "<chip text>"}],
+                "answer_hint": "<how to answer>",
+                "why": "<why it is needed>"}]}
+
+Rules (any violation discards that question):
+  1. Ask EVERY missing material fact in this ONE questionnaire — never
+     invent fields and never ask anything in KNOWN_FACTS or ANSWERED_HISTORY;
+  2. A finite decision gets 2-6 options: "value" is what the answer records
+     ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [];
+  3. One sentence per question, plain text — no markdown, no numbering; repeat
+     the known facts the question relies on so it needs no outside context;
+  4. "field" is what routes the answer into the books — a question whose field
+     is not in FIELD_VOCABULARY is dropped;
+  5. TODAY (when given) resolves relative wording — never ask for what it
+     already resolves.
+"""
+
+
+def _authored_questionnaire_prompt(
+    *,
+    user_request: str,
+    intent: str,
+    missing_fields: Sequence[str],
+    entities: Optional[Dict[str, Any]] = None,
+    history: Optional[Sequence[Dict[str, str]]] = None,
+    today: str = "",
+) -> str:
+    """Assemble the authoring prompt (request + facts + vocabulary)."""
+    vocabulary = []
+    for name in sorted(AUTHORED_FIELDS):
+        gloss = _FIELD_GLOSS.get(name)
+        vocabulary.append(f"  - {name}: {gloss}" if gloss else f"  - {name}")
+    payload: Dict[str, Any] = {
+        "USER_REQUEST": user_request,
+        "INTENT": intent,
+        "MISSING_MATERIAL_FACTS": list(missing_fields),
+        "KNOWN_FACTS": {k: v for k, v in (entities or {}).items() if _known(v)},
+        "ANSWERED_HISTORY": list(history or []),
+        "TODAY": today,
+    }
+    return (
+        f"{_AUTHORED_QUESTIONNAIRE_PROMPT}\n"
+        "FIELD_VOCABULARY (the only allowed field names):\n"
+        + "\n".join(vocabulary)
+        + f"\n\nINPUT:\n{json.dumps(payload, default=str, ensure_ascii=False)}"
+    )
+
+
+async def author_questionnaire(
+    *,
+    client: Any = None,
+    user_request: str = "",
+    intent: str = "",
+    missing_fields: Sequence[str] = (),
+    entities: Optional[Dict[str, Any]] = None,
+    history: Optional[Sequence[Dict[str, str]]] = None,
+    today: str = "",
+) -> Optional[Questionnaire]:
+    """The provider WRITES the questionnaire for the open material gaps.
+
+    Returns ``None`` (the caller then uses the deterministic floor) when the
+    provider is absent/failed, the answer is unparseable, or no authored
+    question survived validation — a material gap is never silently dropped,
+    but no template text is shown while the model answered.
+    """
+    if client is None or not list(missing_fields or ()):
+        return None
+    prompt = _authored_questionnaire_prompt(
+        user_request=user_request,
+        intent=intent,
+        missing_fields=missing_fields,
+        entities=entities,
+        history=history,
+        today=today,
+    )
+    try:
+        raw = await client.generate_text_light(prompt)
+    except AssertionError:  # test guards must stay loud
+        raise
+    except Exception as exc:  # noqa: BLE001 — authoring is best-effort
+        log.info("questionnaire.author_unavailable", error=str(exc)[:200])
+        return None
+    payload = _extract_json(str(raw or ""))
+    if not payload:
+        log.info("questionnaire.author_rejected", reason="unparseable")
+        return None
+    specs = validate_authored_questions(payload.get("questions"), entities or {})
+    if not specs:
+        log.info("questionnaire.author_rejected", reason="no_valid_question")
+        return None
+    intro = _clean_text(payload.get("intro"), 200) or QUESTIONNAIRE_INTRO
+    log.info("questionnaire.authored", fields=[q.field for q in specs])
+    return Questionnaire(
+        intent=intent,
+        intro=intro,
+        questions=specs,
+        source="llm_authored",
+    )
+
