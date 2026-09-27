@@ -44,8 +44,13 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 13_000  # measured 12,528 on 2026-09-25 (see module docstring)
-PRIMED_CEILING = 16_200  # measured 15,709 on 2026-09-25 (~3% headroom)
+BASE_CEILING = 14_000  # measured 13,548 on 2026-09-27 (~3.3% headroom):
+# +548 chars of single-call questionnaire mandate (the model WRITES the
+# questions in the SAME response as the analysis).  The provider is already
+# measured on the contract-primed 15.7 KB prompt inside the same 30 s/round
+# timeout (6-25 s), so a 13.5 KB base stays inside the measured envelope.
+# Raise only with a fresh generation-latency measurement — never silently.
+PRIMED_CEILING = 17_300  # measured 16,729 on 2026-09-27 (~3.4% headroom)
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

@@ -2739,68 +2739,7 @@ async def execute(
                     execution_id=session_id,
                     summary=_text,
                 )
-            if _reasoning.status == _R_NEEDS_INPUT and _reasoning.question:
-                # The LLM asked a question GROUNDED in the records it just
-                # inspected — never a template question.
-                _question = str(_reasoning.question.get("text") or "").strip()
-                if _question:
-                    _needed = [
-                        str(f.get("fact") or "information")
-                        for f in (_reasoning.missing_facts or [])
-                    ] or ["information"]
-                    _clar = await create_clarification(
-                        session_id=session_id,
-                        question=_question,
-                        required_fields=_needed,
-                    )
-                    await _update_status(
-                        session_id, ExecutionStatus.AWAITING_CLARIFICATION
-                    )
-                    await _log_step(session_id, "AWAITING_CLARIFICATION", {
-                        "source": "accounting_reasoning",
-                        "question": _question[:500],
-                        "evidence": _reasoning.as_dict().get("evidence"),
-                    })
-                    # 360° questionnaire: per-numbered-line tap-chips ride
-                    # along as question_options (aligned by line index; the
-                    # frontend renders one answer box + chips per line and
-                    # still accepts free text).  When the reasoning model
-                    # authored the FIXED-FORMAT questionnaire, its
-                    # `questions[]` (field/kind/text/options) is the
-                    # authoritative payload — validated here, with any
-                    # question about a fact the user already stated
-                    # dropped.
-                    from app.questionnaire import questionnaire_from_authored
 
-                    _authored = questionnaire_from_authored(
-                        _reasoning.question,
-                        intent=execution_plan.intent,
-                        known=execution_plan.extracted_entities,
-                    )
-                    if _authored is not None and not _authored.is_empty():
-                        _q_opts = _authored.render_options()
-                        _authored_payload = _authored.to_payload()
-                    else:
-                        _q_parts = _reasoning.question.get("options_per_part") or []
-                        _q_opts = [
-                            [
-                                {"value": str(o), "label": str(o)}
-                                for o in (part or [])
-                            ]
-                            for part in _q_parts
-                            if isinstance(part, list)
-                        ] or None
-                        _authored_payload = None
-                    return AgentResponse(
-                        status=ExecutionStatus.AWAITING_CLARIFICATION,
-                        execution_id=session_id,
-                        question=_clar.get("question", _question),
-                        options=_reasoning.question.get("options") or None,
-                        question_options=_q_opts,
-                        questionnaire=_authored_payload,
-                        required_information=_needed,
-                        requires_user_input=True,
-                    )
             if _reasoning.status == _R_PROPOSAL and _reasoning.proposal:
                 _mutations = _proposed_mutation_tools(_reasoning)
                 if _mutations:
@@ -2930,6 +2869,82 @@ async def execute(
                 "intent": execution_plan.intent,
             })
         await _update_status(session_id, ExecutionStatus.PLANNING)
+
+        # ---- PHASE 2a0b: NEEDS_INPUT — the FIRST call's own questionnaire --
+        # The reasoning model asked instead of proposing: its SAME response carried
+        # analysis AND the fixed-format questionnaire (tap-ready options), so it is
+        # returned here — ONE provider round-trip, no authoring call.  Placed AFTER
+        # the planner binds execution_plan (the authored field vocabulary and the
+        # known-fact filter need its intent + extracted entities).  Before this move
+        # the branch used execution_plan BEFORE its binding — a latent NameError
+        # that silently killed every authored single-call questionnaire.
+        if (
+            _reasoning is not None
+            and not _reasoning.provider_failed
+            and _reasoning.status == _R_NEEDS_INPUT
+            and _reasoning.question
+        ):
+            # The LLM asked a question GROUNDED in the records it just
+            # inspected — never a template question.
+            _question = str(_reasoning.question.get("text") or "").strip()
+            if _question:
+                _needed = [
+                    str(f.get("fact") or "information")
+                    for f in (_reasoning.missing_facts or [])
+                ] or ["information"]
+                _clar = await create_clarification(
+                    session_id=session_id,
+                    question=_question,
+                    required_fields=_needed,
+                )
+                await _update_status(
+                    session_id, ExecutionStatus.AWAITING_CLARIFICATION
+                )
+                await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                    "source": "accounting_reasoning",
+                    "question": _question[:500],
+                    "evidence": _reasoning.as_dict().get("evidence"),
+                })
+                # 360° questionnaire: per-numbered-line tap-chips ride
+                # along as question_options (aligned by line index; the
+                # frontend renders one answer box + chips per line and
+                # still accepts free text).  When the reasoning model
+                # authored the FIXED-FORMAT questionnaire, its
+                # `questions[]` (field/kind/text/options) is the
+                # authoritative payload — validated here, with any
+                # question about a fact the user already stated
+                # dropped.
+                from app.questionnaire import questionnaire_from_authored
+
+                _authored = questionnaire_from_authored(
+                    _reasoning.question,
+                    intent=execution_plan.intent,
+                    known=execution_plan.extracted_entities,
+                )
+                if _authored is not None and not _authored.is_empty():
+                    _q_opts = _authored.render_options()
+                    _authored_payload = _authored.to_payload()
+                else:
+                    _q_parts = _reasoning.question.get("options_per_part") or []
+                    _q_opts = [
+                        [
+                            {"value": str(o), "label": str(o)}
+                            for o in (part or [])
+                        ]
+                        for part in _q_parts
+                        if isinstance(part, list)
+                    ] or None
+                    _authored_payload = None
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=_clar.get("question", _question),
+                    options=_reasoning.question.get("options") or None,
+                    question_options=_q_opts,
+                    questionnaire=_authored_payload,
+                    required_information=_needed,
+                    requires_user_input=True,
+                )
 
         # ---- PHASE 2b: CONSOLIDATED clarification check -------------------
         # Ask ONLY when the planner found genuinely-missing material info

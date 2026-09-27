@@ -235,6 +235,9 @@ CHOOSING THE STEP — exactly one of these must be non-null/non-empty:
   b) "question" non-null -> a material fact only the user can supply, asked in
      the context of the actual records (never a generic template question).
      "missing_material_facts" lists what that question resolves.
+     The questionnaire is written in THIS SAME response — understanding,
+     missing facts and the questions are ONE output; question-writing is
+     never deferred to another call.
      CONSOLIDATED QUESTIONNAIRE: ask EVERY material unknown in ONE round,
      FIXED FORMAT:
      "question": {"text": "<intro>\n1. <q1>\n2. <q2>", "questions": [
@@ -251,10 +254,16 @@ CHOOSING THE STEP — exactly one of these must be non-null/non-empty:
      disposal_type, proceeds_amount, period, note; never re-ask a stated
      fact ("yesterday" is resolved); 2-6 {value,label} options per finite
      choice else []; plain lines, no markdown.
+     Every question carries tap-ready "options" when the answer set is
+     finite — quick, actionable answers the user can tap.
      Never drip-feed one unknown per round.
   c) "proposal" non-null -> you have enough evidence to propose a concrete next
      step. Every proposal MUST include interpretation, affected_records,
      accounting_impact, not_affected and unresolved_uncertainty.
+     While "missing_material_facts" is non-empty a proposal is INVALID:
+     those facts block the posting — choose (b) and write the questionnaire
+     in this same response ("unresolved_uncertainty" covers only
+     NON-blocking unknowns).
   d) "refusal" non-null -> the request is unsafe, unsupported, or must not be
      executed; explain what is missing and what the safe alternative is.
   e) "complete": true -> the requested outcome is already achieved and verified
@@ -815,6 +824,17 @@ def validate_outcome(
         return violations
 
     if outcome.status == PROPOSAL:
+        # SINGLE-CALL CONTRACT: material facts BLOCK the posting, so a
+        # proposal that still declares them is fed back to the model — the
+        # SAME response must carry the consolidated questionnaire (step b),
+        # never defer the ask to a later pipeline stage (which would cost
+        # the user a second provider round-trip for the questions).
+        if outcome.missing_facts:
+            violations.append(
+                "missing_material_facts is non-empty, so a proposal is "
+                "invalid — write the consolidated questionnaire (step b) "
+                "in this SAME response instead."
+            )
         if not tools:
             violations.append(
                 "A proposal must name at least one tool from the offered list."
