@@ -36,7 +36,7 @@ Observation-only: nothing in this module feeds ``execution_plan.intent``
 
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, NamedTuple, Optional
+from typing import Dict, FrozenSet, NamedTuple, Optional, Tuple
 
 __all__ = [
     "DOCUMENT_NATURES",
@@ -50,6 +50,8 @@ __all__ = [
     "is_document_nature",
     "is_canonical_intent",
     "LEGACY_TRANSACTION_NATURE_FIELD",
+    "MODEL_ONLY_INTENTS",
+    "EVENT_TYPE_INTENT_COVERAGE",
 ]
 
 
@@ -164,8 +166,58 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "generate_customer_ledger", "generate_supplier_ledger",
         "project_profitability", "customer_balance", "supplier_balance",
         "list_expenses", "list_bank_accounts",
+        # §12.8 expressibility repair — model-only, no planner routing yet
+        # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment).
+        "reverse_journal", "record_correction", "record_adjustment",
     }
 )
+
+
+#: Model-expressible intents that the DETERMINISTIC planner cannot yet emit.
+#:
+#: Verified 2026-09-28 (AUDIT_REPORT §12.8): ``reverse_journal`` is a live
+#: tool (``app/tools/__init__.py``) with **zero** hits in ``planner.py``, and
+#: correction/adjustment have manual-journal operations but no intent.  These
+#: are canonical so the divergence study measures the LEGACY gap instead of
+#: miscounting the model's correct answer as ``MODEL_NONCANONICAL``.
+#:
+#: Deliberately vocabulary-only: no planner routing, no authority, no execution
+#: change (Wave A freeze, ``fc01502``).  Wiring them into
+#: ``planner._INTENT_PATTERNS`` / ``_tools_for_intent`` is Wave B/D work.
+MODEL_ONLY_INTENTS: FrozenSet[str] = frozenset(
+    {"reverse_journal", "record_correction", "record_adjustment"}
+)
+
+
+#: INVARIANT (AUDIT_REPORT §12.8): every ``event_type`` the reasoning contract
+#: offers must have at least one canonical intent capable of representing it.
+#:
+#: Status per value, VERIFIED against ``planner._INTENT_PATTERNS`` + the tool
+#: registry + the services — never inferred from similar names:
+#:
+#:   COVERED           an intent exists and routes today
+#:   COVERED (class.)  event classification, not its own mutation intent
+#:   MODEL-ONLY        expressible, but only the model can emit it (see above)
+#:
+#: ``continuation`` is deliberately ABSENT: it existed **only** in the enum —
+#: no definition, tool, intent or service anywhere — so it was removed from the
+#: contract rather than given invented meaning.
+EVENT_TYPE_INTENT_COVERAGE: Dict[str, Tuple[str, ...]] = {
+    "new_event": (
+        "record_sale", "record_purchase", "record_expense", "create_invoice",
+    ),
+    "settlement": ("record_receipt", "record_payment", "record_expense_payment"),
+    "transfer": ("record_bank_transfer",),
+    "disposal": ("dispose_fixed_asset",),
+    # allocation runs INSIDE the receipt/payment services (optional invoice
+    # allocation), so it is expressed through the settlement intents.
+    "allocation": ("record_receipt", "record_payment"),
+    "report": ("generate_trial_balance", "generate_general_ledger", "list_expenses"),
+    # model-only until planner routing lands (Wave B/D)
+    "reversal": ("reverse_journal",),
+    "correction": ("record_correction", "reverse_journal"),
+    "adjustment": ("record_adjustment",),
+}
 
 
 def account_shape(nature: Optional[str]) -> AccountShape:

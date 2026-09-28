@@ -322,3 +322,65 @@ class TestRejectionAtTheShapeBoundary:
         assert code == ""
 
 
+class TestEventTypeDefiniteness:
+    """AUDIT_REPORT §12.8 — the study is BLOCKED until this class is green.
+
+    Invariant: every ``event_type`` the reasoning contract offers must have at
+    least one canonical intent capable of representing it.  Otherwise a correct
+    model answer is miscounted as ``MODEL_NONCANONICAL`` (model error) when the
+    real cause is a contract/vocabulary defect.
+    """
+
+    @staticmethod
+    def _offered_event_types() -> set:
+        import re
+
+        from app.accounting_reasoning import _RESPONSE_SHAPE
+
+        match = re.search(r'"event_type":\s*"([^"]+)"', _RESPONSE_SHAPE)
+        assert match, "event_type enum missing from the reasoning contract"
+        return {value.strip() for value in match.group(1).split("|")}
+
+    def test_every_offered_event_type_has_expressible_coverage(self):
+        from app.accounting_vocabulary import EVENT_TYPE_INTENT_COVERAGE
+
+        offered = self._offered_event_types()
+        covered = set(EVENT_TYPE_INTENT_COVERAGE)
+        assert offered == covered, (
+            f"UNCOVERED event_types={sorted(offered - covered)}; "
+            f"STALE coverage entries={sorted(covered - offered)}"
+        )
+
+    def test_every_coverage_entry_resolves_to_a_canonical_intent(self):
+        from app.accounting_vocabulary import (
+            EVENT_TYPE_INTENT_COVERAGE,
+            is_canonical_intent,
+        )
+
+        for event_type, intents in EVENT_TYPE_INTENT_COVERAGE.items():
+            assert intents, f"{event_type} has no covering intent"
+            for intent in intents:
+                assert is_canonical_intent(intent), (event_type, intent)
+
+    def test_model_only_intents_are_canonical_but_not_planner_routable(self):
+        """Expressible to the model; NOT wired into the deterministic planner.
+
+        When Wave B/D gives them planner routing, this test fails on purpose —
+        the intent must then be reclassified from MODEL_ONLY to COVERED.
+        """
+        from app import planner
+        from app.accounting_vocabulary import CANONICAL_INTENTS, MODEL_ONLY_INTENTS
+
+        assert MODEL_ONLY_INTENTS <= CANONICAL_INTENTS
+        planner_intents = {intent for intent, _ in planner._INTENT_PATTERNS}
+        overlap = MODEL_ONLY_INTENTS & planner_intents
+        assert not overlap, (
+            "model-only intents gained planner routing — reclassify as COVERED: "
+            + str(sorted(overlap))
+        )
+
+    def test_undefined_event_type_is_not_offered(self):
+        """``continuation`` existed only in the enum; it must not return."""
+        assert "continuation" not in self._offered_event_types()
+
+

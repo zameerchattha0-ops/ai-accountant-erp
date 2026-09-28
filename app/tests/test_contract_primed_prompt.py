@@ -42,6 +42,11 @@ Ceiling history (measured, never silent):
   taken — the primary provider returned HTTP 429 (free-tier daily cap)
   throughout this change — so re-measuring generation latency on this shape is
   an explicit A→B gate item (AUDIT_REPORT §8), not a claim made here.
+ * 2026-09-28 (§12.8): base=14,076 / primed=17,811 (−13 chars each).  The
+  UNDEFINED `continuation` event_type was removed from the reasoning contract:
+  it existed ONLY in that enum — no intent, tool, service or definition
+  anywhere — so the model could never answer it canonically (AUDIT_REPORT
+  §12.8).  Shrink only; ceilings unchanged.
 """
 
 import json
@@ -61,13 +66,13 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 14_500  # measured 14,089 on 2026-09-28 (Wave A observation
-# block; the ceiling history above records the +434-char breakdown).  The
-# provider is already measured on the contract-primed 17.8 KB prompt inside
-# the same 30 s/round timeout (6-25 s), so a 14.1 KB base stays inside the
-# measured envelope.  Raise only with a fresh generation-latency measurement —
-# never silently.
-PRIMED_CEILING = 18_200  # measured 17,824 on 2026-09-28 (Wave A, ~2.1%
+BASE_CEILING = 14_500  # measured 14,076 on 2026-09-28 (Wave A observation
+# block, then the §12.8 shrink of the undefined `continuation` event_type; the
+# ceiling history above records both).  The provider is already measured on the
+# contract-primed 17.8 KB prompt inside the same 30 s/round timeout (6-25 s),
+# so a 14.1 KB base stays inside the measured envelope.  Raise only with a
+# fresh generation-latency measurement — never silently.
+PRIMED_CEILING = 18_200  # measured 17,811 on 2026-09-28 (Wave A, ~2.1%
 # headroom) — the Wave A observation block on top of the payroll tool
 # contracts (migration 086); generation-latency re-measurement is an A→B gate
 # item recorded in E:\Qoder\AUDIT_REPORT.md §8.

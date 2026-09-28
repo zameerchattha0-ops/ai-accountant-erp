@@ -202,7 +202,7 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
     "economic_event": "<the real-world event, in accounting terms>",
     "what_user_wants": "<the outcome the user is trying to achieve>",
     "basis": "<which records or wording support this reading>",
-    "event_type": "new_event|correction|settlement|allocation|transfer|adjustment|disposal|reversal|continuation|report"
+    "event_type": "new_event|correction|settlement|allocation|transfer|adjustment|disposal|reversal|report"
   },
   "evidence_requests": [
     {"kind": "<evidence kind>", "why": "<why the accounting decision needs it>",
