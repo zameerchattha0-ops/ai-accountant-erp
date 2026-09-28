@@ -93,6 +93,14 @@ _INTENT_TOOLS: dict[str, set[str]] = {
     "record_asset_depreciation": {
         "record_asset_depreciation", "prepare_journal", "post_journal",
     },
+    # Payroll: a run posts ONE journal for the whole roster; a single payment
+    # settles one employee's accrual.  Both live under this intent so a plan
+    # that names either tool reconciles here and inherits the confirmation
+    # gate (planner._CONFIRMATION_INTENTS).
+    "run_payroll": {
+        "run_payroll", "pay_employee_salary",
+        "prepare_journal", "validate_journal", "post_journal",
+    },
     "create_product": {"create_product"},
     "create_service": {"create_service"},
 }
@@ -123,6 +131,10 @@ def _lookups_for_intent(intent: str) -> Set[str]:
         lookups |= _CUSTOMER_LOOKUPS | _PRODUCT_LOOKUPS
     if "asset" in intent:
         lookups |= _ASSET_LOOKUPS | _ACCOUNT_LOOKUPS
+    if "payroll" in intent or "salary" in intent:
+        # The roster (who is paid), the settlement account and the salary /
+        # accrued-salaries ledgers are all needed to carry a run out.
+        lookups |= _EMPLOYEE_LOOKUPS | _BANK_LOOKUPS | _ACCOUNT_LOOKUPS
     if "bank" in intent or "transfer" in intent or "receipt" in intent:
         lookups |= _BANK_LOOKUPS
     if intent in ("record_expense", "create_credit_note",

@@ -93,6 +93,9 @@ _CONFIRMATION_INTENTS = frozenset({
     "record_bank_transfer", "create_bank_account",
     "register_fixed_asset", "dispose_fixed_asset",
     "record_asset_depreciation",
+    # Payroll moves real money (or books the salary liability) and is
+    # computed from the roster — the user always authorizes the run first.
+    "run_payroll",
     # Quotation → invoice conversion posts a receivable journal, so the
     # user confirms before the accounting mutation (same as create_invoice).
     "convert_quotation",
@@ -144,6 +147,20 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("create_quotation", [r"quotation", r"quote", r"price\s*quote", r"create.*quote", r"send.*quotation"]),
     ("create_credit_note", [r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit"]),
     ("create_purchase_return", [r"purchase\s*return", r"return.*goods.*supplier", r"return.*to.*supplier", r"send.*back.*supplier"]),
+    # Payroll (Employees Phase 2).  An ACTION verb is required — a bare
+    # "payroll" keyword would swallow query phrasings ("show payroll") and
+    # drag them into a mutation's confirmation ladder.  A plan that names the
+    # payroll TOOL under any other intent is reconciled to this intent by
+    # tool_selector.reconcile_intent_with_tools (FIX-5), which then applies
+    # the confirmation gate.
+    ("run_payroll", [
+        r"(?:run|process|do|make|execute|prepare|record)[^.\n]*\bpayroll\b",
+        r"\bpayroll\b[^.\n]*\b(?:run|processing)\b",
+        r"\bpa(?:y|id|ying)\b[^.\n]{0,40}\bsalar(?:y|ies)\b",
+        r"\bsalar(?:y|ies)\b[^.\n]{0,20}\b(?:payment|disburs\w*|payout|run)\b",
+        r"pay\s+(?:the\s+)?(?:staff|employees|workers|team)\b",
+        r"\bwages\b[^.\n]{0,20}\b(?:pay|paying|disburs\w*)\b",
+    ]),
     ("record_expense_payment", [r"paid.*expense", r"expense.*payment", r"paid.*bill", r"settled.*bill"]),
     # Mutations
     ("create_invoice", [r"create.*invoice", r"invoice.*for", r"bill.*customer"]),
@@ -207,7 +224,7 @@ _SEMANTIC_INTENTS = frozenset({
     "record_credit_purchase", "record_cash_purchase", "record_purchase",
     "record_expense", "record_receipt", "record_payment",
     "create_invoice", "create_purchase_bill", "create_credit_note",
-    "create_purchase_return",
+    "create_purchase_return", "run_payroll",
 })
 
 # every mutation
@@ -2515,6 +2532,7 @@ def _tools_for_intent(intent: str) -> List[str]:
         "register_fixed_asset": ["search_fixed_asset", "search_supplier", "search_account", "register_fixed_asset"],
         "dispose_fixed_asset": ["search_fixed_asset", "search_account", "dispose_fixed_asset"],
         "record_asset_depreciation": ["search_fixed_asset", "search_account", "record_asset_depreciation"],
+        "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
         "create_product": ["search_product", "create_product"],
         "create_service": ["search_service", "create_service"],
         "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
@@ -2551,6 +2569,7 @@ def _context_for_intent(intent: str) -> List[str]:
         "register_fixed_asset": ["chart_of_accounts", "supplier_master", "bank_accounts", "accounting_periods"],
         "dispose_fixed_asset": ["chart_of_accounts", "bank_accounts", "accounting_periods"],
         "record_asset_depreciation": ["chart_of_accounts", "accounting_periods"],
+        "run_payroll": ["employee_master", "chart_of_accounts", "bank_accounts", "accounting_periods"],
         "create_product": ["chart_of_accounts"],
         "create_service": ["chart_of_accounts"],
         "create_bank_account": ["chart_of_accounts"],
@@ -2585,6 +2604,7 @@ def _outcome(intent: str) -> str:
         "register_fixed_asset": "Fixed asset registered and capitalised with journal entry",
         "dispose_fixed_asset": "Fixed asset disposed of with gain/loss journal entry",
         "record_asset_depreciation": "Asset depreciation recorded with journal entry",
+        "run_payroll": "Payroll run recorded with journal entry",
         "create_product": "Product added to the catalog",
         "create_service": "Service added to the catalog",
         "create_bank_account": "Bank account created with linked GL account",

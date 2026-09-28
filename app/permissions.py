@@ -122,10 +122,10 @@ def _role_capability_map(role_permissions: List[str]) -> Set[str]:
             caps.update([
                 "sales", "purchases", "expenses", "payments",
                 "reporting", "master_data", "journal_management",
-                "assets",
+                "assets", "payroll",
             ])
         elif domain == "accounting":
-            caps.update(["journal_management", "master_data", "assets"])
+            caps.update(["journal_management", "master_data", "assets", "payroll"])
         elif domain == "sales":
             caps.add("sales")
         elif domain == "purchases":

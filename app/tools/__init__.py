@@ -34,6 +34,7 @@ from app.services import (
     fixed_asset_service,
     service_service,
     employee_service,
+    payroll_service,
 )
 from datetime import date
 
@@ -904,6 +905,51 @@ async def _set_employee_allowances(organization_id: uuid.UUID, **kw) -> ToolResu
         )
     return ToolResult(tool_name="set_employee_allowances", success=True, data=data)
 
+
+# Payroll — Phase 2 of the Employees module.  The service COMPUTES each salary
+# from the records (basic + active monthly allowances − deductions) and posts
+# the journal; the model only supplies what it read from the user.  A run whose
+# journal failed is reported as a FAILED call (never a silent success), and the
+# computation is always returned so the agent can explain the real state.
+async def _run_payroll(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await payroll_service.run_payroll(organization_id, **kw)
+    except payroll_service.PayrollInputError as exc:
+        return ToolResult(tool_name="run_payroll", success=False, error=str(exc))
+    if not data.get("journal_posted"):
+        return ToolResult(
+            tool_name="run_payroll",
+            success=False,
+            error=(
+                "The payroll journal could not be posted: "
+                f"{data.get('journal_error')} — report this to the user; the "
+                "run is NOT recorded."
+            ),
+            data=data,
+        )
+    return ToolResult(tool_name="run_payroll", success=True, data=data)
+
+
+async def _pay_employee_salary(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await payroll_service.pay_employee_salary(organization_id, **kw)
+    except payroll_service.PayrollInputError as exc:
+        return ToolResult(
+            tool_name="pay_employee_salary", success=False, error=str(exc)
+        )
+    if not data.get("journal_posted"):
+        return ToolResult(
+            tool_name="pay_employee_salary",
+            success=False,
+            error=(
+                "The salary-payment journal could not be posted: "
+                f"{data.get('journal_error')} — report this to the user; the "
+                "payment is NOT recorded."
+            ),
+            data=data,
+        )
+    return ToolResult(tool_name="pay_employee_salary", success=True, data=data)
+
 # ===================================================================
 # REGISTER ALL TOOLS
 # ===================================================================
@@ -921,6 +967,11 @@ register("search_employee", handler=_search_employee, read_only=True, descriptio
 register("get_employee", handler=_get_employee, read_only=True, description="Get one employee's full details plus allowance records")
 register("create_employee", handler=_create_employee, read_only=False, contract=contract_from_callable(employee_service.create), description="Create an employee: mandatory full_name, date_of_joining, basic_salary; every other detail is optional")
 register("set_employee_allowances", handler=_set_employee_allowances, read_only=False, contract=contract_from_callable(employee_service.set_allowances), description="Record an employee's allowances: structure the user's natural-language sentence into allowances=[{description, amount, frequency(monthly|one-time|annual), allowance_type, effective_from}] and pass raw_text; Python validates each entry and writes the rows (rejections name what to ask the user)")
+
+# Payroll — the model decides WHICH tool and the settlement treatment; the
+# service computes every amount from the employee records and posts the journal.
+register("run_payroll", handler=_run_payroll, read_only=False, contract=contract_from_callable(payroll_service.run_payroll), description="Run payroll for every active employee: computes each one's salary (basic + monthly allowances − deductions recorded on the employee) and posts ONE journal — Dr Salaries / Cr Accrued Salaries, or Cr bank when payment_method=PAID. Pass payment_method=PAID when the user says the salaries are/were actually paid, ACCRUED when they are owed/accrued (default). One-time/annual components are excluded and reported back")
+register("pay_employee_salary", handler=_pay_employee_salary, read_only=False, contract=contract_from_callable(payroll_service.pay_employee_salary), description="Pay ONE employee's salary (settles the accrual): resolves the employee by code/name, debits Accrued Salaries (or the Salaries expense account when no accrual ledger exists) and credits bank/cash. Pass the amount only when the user stated a figure — otherwise it is computed from the employee's records")
 
 # Supplier
 register("search_supplier", handler=_search_supplier, read_only=True, description="Search suppliers by name or code")

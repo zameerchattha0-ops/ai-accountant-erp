@@ -178,6 +178,18 @@ async def _resolve_employee(
     )
 
 
+async def resolve(
+    organization_id: uuid.UUID, reference: Any
+) -> Dict[str, Any]:
+    """Public entry point to the code/name/uuid resolver.
+
+    Payroll (``app/services/payroll_service.py``) pays ONE employee and must
+    resolve the reference the same way the Employees module does — one
+    resolver, never a second variant.
+    """
+    return await _resolve_employee(organization_id, reference)
+
+
 async def create(
     organization_id: uuid.UUID,
     *,

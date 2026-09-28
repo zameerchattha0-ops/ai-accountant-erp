@@ -66,6 +66,23 @@ async def search_employees(
     return normalized_matches(candidates, text, limit=limit, field="full_name")
 
 
+async def list_employees(
+    organization_id: uuid.UUID, *, limit: int = 500
+) -> List[Dict[str, Any]]:
+    """Every employee row in the organisation (payroll reads the full roster).
+
+    One bounded query — the per-employee eligibility decision (status,
+    joining date) is made by the payroll service, never here.
+    """
+    return await fetch_many(
+        "employees",
+        filters={"organization_id": str(organization_id)},
+        select=_SELECT,
+        order="full_name.asc",
+        limit=limit,
+    )
+
+
 async def get_employee(
     organization_id: uuid.UUID, *, employee_id: uuid.UUID
 ) -> Optional[Dict[str, Any]]:
@@ -140,6 +157,23 @@ async def list_allowances(
             "employee_id": str(employee_id),
             "organization_id": str(organization_id),
         },
+        select=_ALLOWANCE_SELECT,
+        order="effective_from.desc",
+        limit=limit,
+    )
+
+
+async def list_allowances_for_organization(
+    organization_id: uuid.UUID, *, limit: int = 2000
+) -> List[Dict[str, Any]]:
+    """Every allowance/component row of the organisation in ONE query.
+
+    A payroll run needs the components of the whole roster; calling
+    ``list_allowances`` per employee would be N round-trips.
+    """
+    return await fetch_many(
+        "employee_allowances",
+        filters={"organization_id": str(organization_id)},
         select=_ALLOWANCE_SELECT,
         order="effective_from.desc",
         limit=limit,

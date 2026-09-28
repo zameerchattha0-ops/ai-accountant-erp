@@ -25,6 +25,13 @@ Ceiling history (measured, never silent):
   note impact rules.  Input-side only — generation is unchanged, and the
   static head is byte-identical across rounds so the prefix cache absorbs
   it after round 1.
+* 2026-09-28: base=13,655 / primed=17,390 → PRIMED ceiling 17,300 → 17,600
+  (base unchanged).  +661 chars / ~+165 input tokens (+1.0%) from the TWO
+  payroll mutation tools (Employees Phase 2, migration 086): 317 chars of
+  contract lines (run_payroll 148 + pay_employee_salary 167 — the explicit
+  account-override parameters) and ~344 chars of slug/offered-tools drift
+  measured against the last recorded 16,729.  Input-side only, static head,
+  prefix-cached after round 1 — the same shape every earlier raise had.
 """
 
 import json
@@ -50,7 +57,9 @@ BASE_CEILING = 14_000  # measured 13,548 on 2026-09-27 (~3.3% headroom):
 # measured on the contract-primed 15.7 KB prompt inside the same 30 s/round
 # timeout (6-25 s), so a 13.5 KB base stays inside the measured envelope.
 # Raise only with a fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 17_300  # measured 16,729 on 2026-09-27 (~3.4% headroom)
+PRIMED_CEILING = 17_600  # measured 17,390 on 2026-09-28 (~1.2% headroom) —
+# the payroll mutation tools (run_payroll / pay_employee_salary, migration
+# 086) add ~317 chars of contract lines; see the ceiling history above.
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

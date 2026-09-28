@@ -56,6 +56,11 @@ FINANCIAL_MUTATION_TOOLS = frozenset({
     "register_fixed_asset",
     "dispose_fixed_asset",
     "record_asset_depreciation",
+    # Payroll (Employees Phase 2): a run posts ONE journal for the roster, and
+    # a single payment posts its own — same exactly-once claim semantics as
+    # every other book-writing tool.
+    "run_payroll",
+    "pay_employee_salary",
 })
 
 # ---------------------------------------------------------------------------

@@ -1111,6 +1111,9 @@ DATE_REQUIRED_INTENTS = {
     "record_expense_payment", "record_bank_transfer",
     "register_fixed_asset", "create_quotation",
     "dispose_fixed_asset", "record_asset_depreciation",
+    # Payroll: the date decides the period AND which allowance components are
+    # in force (never silently defaulted to today).
+    "run_payroll",
 }
 
 
@@ -1579,6 +1582,10 @@ _EVENT_MAP: Dict[str, EconomicEvent] = {
     # Expenditures
     "record_expense": EconomicEvent.EXPENDITURE,
     # Settlements
+    # Payroll (Employees Phase 2): the salary expense recognition and its
+    # settlement — EXPENDITURE carries the expense + journal + cash/bank
+    # impact the reasoning prompt reasons about.
+    "run_payroll": EconomicEvent.EXPENDITURE,
     "record_receipt": EconomicEvent.SETTLEMENT_IN,
     "record_payment": EconomicEvent.SETTLEMENT_OUT,
     "record_expense_payment": EconomicEvent.SETTLEMENT_OUT,

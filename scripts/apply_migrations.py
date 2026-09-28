@@ -13,7 +13,7 @@ Modes::
     python scripts/apply_migrations.py 086_payroll.sql
     # apply an arbitrary .sql file (probes, one-off DDL)
     python scripts/apply_migrations.py path/to/file.sql
-    # no args: idempotent re-check of 084/085 + employee verification
+    # no args: idempotent re-check of 084/085/086 + employees/payroll verify
     python scripts/apply_migrations.py
     # replay the browser's exact PostgREST GETs (console-404 hunting)
     python scripts/apply_migrations.py --rest
@@ -31,17 +31,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent   # scripts/ sits inside the repo root
 SECRETS = Path(r"E:\Qoder\.secrets\tokens.env")
 MIG = ROOT / "database" / "migrations"
-FILES = ["084_create_employees.sql", "085_seed_employee_tools_control_plane.sql"]
+FILES = [
+    "084_create_employees.sql",
+    "085_seed_employee_tools_control_plane.sql",
+    "086_seed_payroll_tools_control_plane.sql",
+]
 
 VERIFY_SQL = """
 select to_regclass('public.employees')            as employees,
        to_regclass('public.employee_allowances')  as allowances;
 select slug, tool_type, status from ai.tools
  where slug in ('search_employee','get_employee',
-                'create_employee','set_employee_allowances')
+                'create_employee','set_employee_allowances',
+                'run_payroll','pay_employee_salary')
  order by slug;
 select capability, allowed_tools from ai.permissions
- where capability = 'master_data';
+ where capability in ('master_data', 'payroll')
+ order by capability;
 """
 
 
