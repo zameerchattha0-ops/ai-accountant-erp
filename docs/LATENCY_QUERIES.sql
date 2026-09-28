@@ -133,7 +133,7 @@ select
   input_summary::jsonb->>'result' as result,
   count(*)                        as turns,
   count(distinct execution_session_id) as sessions
-from ai_execution_steps
+from ai.execution_steps
 where description = 'INTENT_COMPARISON'
   and input_summary is not null
   and right(input_summary, 1) in ('}', ']')   -- legacy-shear guard
@@ -146,7 +146,7 @@ with comp as (
     input_summary::jsonb->>'model_intent' as model_intent,
     input_summary::jsonb->>'legacy_intent' as legacy_intent,
     input_summary::jsonb->>'result'        as result
-  from ai_execution_steps
+  from ai.execution_steps
   where description = 'INTENT_COMPARISON'
     and input_summary is not null
     and right(input_summary, 1) in ('}', ']')
@@ -170,7 +170,7 @@ with comp as (
     input_summary::jsonb->>'model_intent'  as model_intent,
     input_summary::jsonb->>'legacy_intent'  as legacy_intent,
     input_summary::jsonb->>'result'         as result
-  from ai_execution_steps
+  from ai.execution_steps
   where description = 'INTENT_COMPARISON'
     and input_summary is not null
     and right(input_summary, 1) in ('}', ']')
