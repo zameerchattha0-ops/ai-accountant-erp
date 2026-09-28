@@ -213,6 +213,9 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
      "question": "<the question to ask the user>"}
   ],
   "question": null,
+  "decision": {"intent": "<planner intent>", "treatment": "<nature>", "document_nature": "<GOODS|SERVICE|ASSET_DISPOSAL|OTHER_INCOME>"},
+  "prerequisites": [{"name": "", "status": "present|missing|ambiguous", "resolution": "reuse|create|ask"}],
+OPTIONAL BLOCK: "decision" and "prerequisites" are observation metadata. Use ONLY canonical values (a planner intent, a nature from your own vocabulary) — omit them rather than invent one.
   "proposal": {
     "interpretation": "<the business interpretation you are proposing>",
     "affected_records": ["<record/ledger that will change>"],
@@ -330,6 +333,11 @@ class ReasoningOutcome:
     #: explicit empty list counts as the statement it is).
     stated_disclosures: List[str] = field(default_factory=list)
     refusal: Optional[Dict[str, Any]] = None
+    #: Wave A observation block (AUDIT_REPORT §7) — parsed and compared against
+    #: the legacy intent, but NEVER consumed by execution_plan until Wave B,
+    #: once the A→B gate (§8) has measured divergence on real turns.
+    decision: Dict[str, Any] = field(default_factory=dict)
+    prerequisites: List[Dict[str, Any]] = field(default_factory=list)
     violations: List[str] = field(default_factory=list)
     provider_failed: bool = False
     #: True when the provider was actually CALLED and failed (timeout, error,
@@ -354,6 +362,8 @@ class ReasoningOutcome:
                 t.get("tool_name") for t in (self.proposal or {}).get("tools", [])
             ],
             "violations": self.violations,
+            "decision": self.decision,
+            "prerequisite_count": len(self.prerequisites),
             "provider_failed": self.provider_failed,
             "rounds": self.rounds,
         }
@@ -945,6 +955,55 @@ def _status_from_decision(parsed: Dict[str, Any]) -> str:
     return UNSUPPORTED
 
 
+def _clean_decision(raw: Any) -> Dict[str, str]:
+    """Parse the optional Wave A ``decision`` block (strings only, bounded).
+
+    Deliberately NO vocabulary check here: canonicality is evaluated by the
+    DIVERGENCE COMPARISON in agent.py, so a non-canonical value is recorded as
+    MODEL_NONCANONICAL instead of silently dropped — and instead of rejecting
+    the whole proposal, which would change behavior in an observation-only
+    Wave (AUDIT_REPORT §7/§8).  Wave B turns canonicality into a violation.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    intent = str(raw.get("intent") or "").strip().lower()
+    if intent:
+        out["intent"] = intent[:64]
+    for key in ("treatment", "document_nature"):
+        value = str(raw.get(key) or "").strip().upper()
+        if value:
+            out[key] = value[:40]
+    return out
+
+
+def _clean_prerequisites(raw: Any) -> List[Dict[str, str]]:
+    """Parse the optional Wave A ``prerequisites`` block (bounded, no action).
+
+    Recorded only — no prerequisite is created, resolved or skipped by this
+    block.  Acting on it is Wave C work (AUDIT_REPORT §7).
+    """
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in raw[:6]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        entry = {"name": name}
+        for key in ("status", "resolution"):
+            value = str(item.get(key) or "").strip().lower()[:24]
+            if value:
+                entry[key] = value
+        why = str(item.get("why") or "").strip()[:200]
+        if why:
+            entry["why"] = why
+        out.append(entry)
+    return out
+
+
 def _outcome_from_parsed(parsed: Dict[str, Any], *, rounds: int) -> ReasoningOutcome:
     status = _status_from_decision(parsed)
     understanding = parsed.get("understanding")
@@ -964,6 +1023,8 @@ def _outcome_from_parsed(parsed: Dict[str, Any], *, rounds: int) -> ReasoningOut
         ][:6],
         proposal=_clean_proposal(parsed.get("proposal")),
         stated_disclosures=_stated_disclosures(parsed.get("proposal")),
+        decision=_clean_decision(parsed.get("decision")),
+        prerequisites=_clean_prerequisites(parsed.get("prerequisites")),
         refusal=parsed.get("refusal") if isinstance(parsed.get("refusal"), dict) else None,
         rounds=rounds,
     )

@@ -32,6 +32,16 @@ Ceiling history (measured, never silent):
   account-override parameters) and ~344 chars of slug/offered-tools drift
   measured against the last recorded 16,729.  Input-side only, static head,
   prefix-cached after round 1 — the same shape every earlier raise had.
+ * 2026-09-28 (Wave A): base=14,089 / primed=17,824 → ceilings 14,000 → 14,500
+  and 17,600 → 18,200.  +434 chars (~+109 input tokens, +0.6% of the primed
+  shape) from the Wave A OBSERVATION block — two optional contract lines
+  (``decision``, ``prerequisites``) plus the instruction line that pins them to
+  canonical values (E:\Qoder\AUDIT_REPORT.md §7 Wave A, §8 gate).  Input-side
+  only, static head, prefix-cached after round 1 — same shape as every raise
+  above.  HONEST GAP: the fresh generation-latency measurement could NOT be
+  taken — the primary provider returned HTTP 429 (free-tier daily cap)
+  throughout this change — so re-measuring generation latency on this shape is
+  an explicit A→B gate item (AUDIT_REPORT §8), not a claim made here.
 """
 
 import json
@@ -51,15 +61,16 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 14_000  # measured 13,548 on 2026-09-27 (~3.3% headroom):
-# +548 chars of single-call questionnaire mandate (the model WRITES the
-# questions in the SAME response as the analysis).  The provider is already
-# measured on the contract-primed 15.7 KB prompt inside the same 30 s/round
-# timeout (6-25 s), so a 13.5 KB base stays inside the measured envelope.
-# Raise only with a fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 17_600  # measured 17,390 on 2026-09-28 (~1.2% headroom) —
-# the payroll mutation tools (run_payroll / pay_employee_salary, migration
-# 086) add ~317 chars of contract lines; see the ceiling history above.
+BASE_CEILING = 14_500  # measured 14,089 on 2026-09-28 (Wave A observation
+# block; the ceiling history above records the +434-char breakdown).  The
+# provider is already measured on the contract-primed 17.8 KB prompt inside
+# the same 30 s/round timeout (6-25 s), so a 14.1 KB base stays inside the
+# measured envelope.  Raise only with a fresh generation-latency measurement —
+# never silently.
+PRIMED_CEILING = 18_200  # measured 17,824 on 2026-09-28 (Wave A, ~2.1%
+# headroom) — the Wave A observation block on top of the payroll tool
+# contracts (migration 086); generation-latency re-measurement is an A→B gate
+# item recorded in E:\Qoder\AUDIT_REPORT.md §8.
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

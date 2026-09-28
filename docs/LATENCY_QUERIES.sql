@@ -120,3 +120,65 @@ select
   ) as planning_llm_calls,
   count(*) filter (where description = 'ACCOUNTING_REASONING') as reasoning_runs
 from ai_execution_steps;
+
+-- 9) WAVE A — SINGLE-OWNER DIVERGENCE METRIC  (E:\Qoder\AUDIT_REPORT.md §8)
+-- -----------------------------------------------------------------------
+-- Step marker INTENT_COMPARISON records MODEL_INTENT vs LEGACY_INTENT for
+-- every turn that reached the planner.  Wave B (model becomes authoritative)
+-- may NOT begin until >= 200 comparable turns are collected AND every
+-- divergence below is classified (which side was wrong, and why).
+
+-- 9a) result distribution
+select
+  input_summary::jsonb->>'result' as result,
+  count(*)                        as turns,
+  count(distinct execution_session_id) as sessions
+from ai_execution_steps
+where description = 'INTENT_COMPARISON'
+  and input_summary is not null
+  and right(input_summary, 1) in ('}', ']')   -- legacy-shear guard
+group by 1
+order by turns desc;
+
+-- 9b) divergence rate over COMPARABLE turns (both intents canonical)
+with comp as (
+  select
+    input_summary::jsonb->>'model_intent' as model_intent,
+    input_summary::jsonb->>'legacy_intent' as legacy_intent,
+    input_summary::jsonb->>'result'        as result
+  from ai_execution_steps
+  where description = 'INTENT_COMPARISON'
+    and input_summary is not null
+    and right(input_summary, 1) in ('}', ']')
+)
+select
+  count(*) filter (where result = 'AGREEMENT')         as agreement,
+  count(*) filter (where result = 'DIVERGENT_INTENT')  as divergent,
+  count(*) filter (where result = 'MODEL_ABSENT')      as model_absent,
+  count(*) filter (where result = 'MODEL_NONCANONICAL') as model_noncanonical,
+  count(*) filter (where result = 'LEGACY_ABSENT')     as legacy_absent,
+  round(
+    100.0 * count(*) filter (where result = 'DIVERGENT_INTENT')
+    / nullif(count(*) filter (where result in ('AGREEMENT', 'DIVERGENT_INTENT')), 0),
+    2
+  ) as divergence_pct_of_comparable_turns
+from comp;
+
+-- 9c) WHICH intents disagree — classify every row before Wave B (§8 gate)
+with comp as (
+  select
+    input_summary::jsonb->>'model_intent'  as model_intent,
+    input_summary::jsonb->>'legacy_intent'  as legacy_intent,
+    input_summary::jsonb->>'result'         as result
+  from ai_execution_steps
+  where description = 'INTENT_COMPARISON'
+    and input_summary is not null
+    and right(input_summary, 1) in ('}', ']')
+)
+select model_intent, legacy_intent, count(*) as turns
+from comp
+where result = 'DIVERGENT_INTENT'
+group by 1, 2
+order by turns desc
+limit 25;
+

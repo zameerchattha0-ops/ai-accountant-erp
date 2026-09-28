@@ -231,7 +231,7 @@ async def _confirmed_account_code(
     rest take the nature's base series probed for the next free code —
     ``create_account`` re-resolves collisions again at execution time.
     """
-    from app.account_resolution import account_shape
+    from app.account_resolution import InvalidAccountingNature, account_shape
     from app.repositories import account_repository as a_repo
 
     seed = next(
@@ -242,7 +242,22 @@ async def _confirmed_account_code(
         ),
         None,
     )
-    base = seed[1] if seed else account_shape(nature)[2]
+    if seed:
+        base = seed[1]
+    else:
+        try:
+            base = account_shape(nature)[2]
+        except InvalidAccountingNature:
+            # Wave A (AUDIT_REPORT §3.1): no determined code series for this
+            # treatment.  An empty code is a REJECTION, not an invented 6100
+            # expense series — create_account resolves a free code itself, and
+            # the account-shape guards downstream refuse to guess a section.
+            log.warning(
+                "classifier.unsupported_treatment_code",
+                nature=str(nature)[:40],
+                name=str(name)[:60],
+            )
+            return ""
     try:
         return str(await a_repo.next_available_code(organization_id, base))
     except Exception as exc:  # noqa: BLE001 — best-effort; the tool re-resolves
@@ -662,8 +677,21 @@ async def classify_transaction(
                 _prow = await account_exists(organization_id, _req_parent)
             except Exception:  # noqa: BLE001 - parent lookup is best-effort
                 _prow = None
-            if _prow and str(_prow.get("account_type") or "").upper() == (
-                account_shape(nature)[0]
+            # Wave A (AUDIT_REPORT §3.1): an undetermined treatment cannot
+            # certify a statement section, so no parent is asserted — the
+            # account is created top-level rather than under a guessed heading.
+            try:
+                _expected_type = account_shape(nature)[0]
+            except InvalidAccountingNature:
+                log.warning(
+                    "classifier.unsupported_treatment_parent",
+                    nature=str(nature)[:40],
+                )
+                _expected_type = None
+            if (
+                _prow
+                and _expected_type
+                and str(_prow.get("account_type") or "").upper() == _expected_type
             ):
                 parent_id = str(_prow.get("id") or "") or None
                 parent_name = (
@@ -710,10 +738,26 @@ async def classify_transaction(
                 named_nature, _named_conf = rule_based_nature(
                     " ".join(x for x in (item, message) if x), entities
                 )
+            # Wave A (AUDIT_REPORT §3.1): an undetermined treatment cannot
+            # prove the named ledger's section, so the match FAILS and the run
+            # falls through to the chain that asks again — never a silent
+            # "close enough" acceptance against a defaulted expense shape.
+            _named_section = None
+            if named_nature:
+                try:
+                    _named_section = account_shape(named_nature)[0]
+                except InvalidAccountingNature:
+                    log.warning(
+                        "classifier.unsupported_treatment_named_account",
+                        nature=str(named_nature)[:40],
+                    )
             if (
                 not named_nature
-                or str(named_row.get("account_type") or "").upper()
-                == account_shape(named_nature)[0]
+                or (
+                    _named_section is not None
+                    and str(named_row.get("account_type") or "").upper()
+                    == _named_section
+                )
             ):
                 return TransactionClassification(
                     transaction_nature=named_nature,

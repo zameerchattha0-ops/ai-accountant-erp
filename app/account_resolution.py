@@ -44,30 +44,27 @@ log = structlog.get_logger(__name__)
 # the CHECK constraint ASSET/EXPENSE→DEBIT, LIABILITY/EQUITY/REVENUE→CREDIT
 # (migration 005).
 # ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH (Wave A) — app/accounting_vocabulary.py; see
+# E:\Qoder\AUDIT_REPORT.md §3.1.  The old `_DEFAULT_SHAPE`
+# ("EXPENSE", "DEBIT", "6100") is GONE: an unknown treatment now raises
+# InvalidAccountingNature instead of silently becoming an operating expense.
+from app.accounting_vocabulary import (
+    ACCOUNT_SHAPES as _VOCAB_SHAPES,
+    InvalidAccountingNature,
+    account_shape,
+)
+
+#: Membership guards only (``nature in _ACCOUNT_SHAPES``).  Same keys as the
+#: vocabulary module — derived, never a second inventory.
 _ACCOUNT_SHAPES: Dict[str, Tuple[str, str, str, str]] = {
-    "FIXED_ASSET": ("ASSET", "DEBIT", "1500", "IFRS: property, plant and equipment"),
-    "INTANGIBLE_ASSET": ("ASSET", "DEBIT", "1510", "IFRS: intangible assets"),
-    "INVENTORY": ("ASSET", "DEBIT", "1200", "IFRS: inventories"),
-    "PREPAYMENT": ("ASSET", "DEBIT", "1400", "IFRS: prepayments"),
-    "DEPOSIT_ADVANCE": ("ASSET", "DEBIT", "1410", "IFRS: deposits and advances"),
-    "OPERATING_EXPENSE": (
-        "EXPENSE", "DEBIT", "6100", "IFRS: operating / administrative expenses",
-    ),
-    "CONSUMABLE": (
-        "EXPENSE", "DEBIT", "6190", "IFRS: consumables (operating expenses)",
-    ),
-    "SERVICE": ("EXPENSE", "DEBIT", "6100", "IFRS: operating expenses"),
-    "REVENUE": (
-        "REVENUE", "CREDIT", "4100", "IFRS 15: revenue from contracts with customers",
-    ),
-    "OTHER_INCOME": ("REVENUE", "CREDIT", "4200", "IFRS: other income"),
+    name: (
+        shape.account_type,
+        shape.normal_balance,
+        shape.base_code,
+        shape.ifrs_hint,
+    )
+    for name, shape in _VOCAB_SHAPES.items()
 }
-_DEFAULT_SHAPE = ("EXPENSE", "DEBIT", "6100", "IFRS: operating expenses")
-
-
-def account_shape(nature: Optional[str]) -> Tuple[str, str, str, str]:
-    """(account_type, normal_balance, base_code, ifrs_hint) for *nature*."""
-    return _ACCOUNT_SHAPES.get(str(nature or "").upper(), _DEFAULT_SHAPE)
 
 
 def nature_for_intent(intent: str, entities: Optional[Dict[str, Any]] = None) -> str:
@@ -200,8 +197,25 @@ class AccountGap:
     candidates: List[str] = field(default_factory=list)
 
 
-def gap_for_nature(name: str, nature: Optional[str], source: str) -> AccountGap:
-    at, nb, code, ifrs = account_shape(nature)
+def gap_for_nature(
+    name: str, nature: Optional[str], source: str
+) -> Optional[AccountGap]:
+    """Shape-backed gap, or ``None`` when the treatment has no determined shape.
+
+    Wave A (AUDIT_REPORT §3.1): an unknown treatment is a REJECTION, not an
+    expense.  ``None`` means no gap is proposed here — the run falls through to
+    its normal ask/FAILED path instead of inventing a 6100 ledger.
+    """
+    try:
+        at, nb, code, ifrs = account_shape(nature)
+    except InvalidAccountingNature:
+        log.warning(
+            "account_resolution.unsupported_treatment",
+            name=str(name)[:80],
+            nature=str(nature)[:40],
+            source=source,
+        )
+        return None
     return AccountGap(
         name=name, account_type=at, normal_balance=nb,
         base_code=code, ifrs_hint=ifrs, source=source,

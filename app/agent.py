@@ -2190,6 +2190,52 @@ async def _resolve_gate_questions(
     )
 
 
+async def _log_intent_comparison(
+    session_id: uuid.UUID, reasoning: Any, legacy_intent: str
+) -> None:
+    """WAVE A: record MODEL_INTENT vs LEGACY_INTENT (AUDIT_REPORT §8).
+
+    Observation only — it never mutates ``execution_plan.intent``.  Results:
+
+    * ``AGREEMENT`` — model intent is canonical and equals the legacy intent
+    * ``DIVERGENT_INTENT`` — model intent is canonical and differs
+    * ``MODEL_ABSENT`` — no reasoning outcome, provider failed, or block omitted
+    * ``MODEL_NONCANONICAL`` — the model answered with a value outside the
+      canonical set: recorded for the metric, never silently accepted
+    * ``LEGACY_ABSENT`` — the deterministic path produced no intent
+
+    Payload carries intents and counts only — never chain-of-thought
+    (mirrors the progress-endpoint rule, ``main.py:543-549``).  Any failure to
+    record must never break the turn it is observing.
+    """
+    from app.accounting_vocabulary import is_canonical_intent
+
+    decision = getattr(reasoning, "decision", None) or {}
+    model_intent = str(decision.get("intent") or "").strip().lower()
+    legacy = str(legacy_intent or "").strip().lower()
+    if not model_intent:
+        result = "MODEL_ABSENT"
+    elif not is_canonical_intent(model_intent):
+        result = "MODEL_NONCANONICAL"
+    elif not legacy:
+        result = "LEGACY_ABSENT"
+    elif model_intent == legacy:
+        result = "AGREEMENT"
+    else:
+        result = "DIVERGENT_INTENT"
+    try:
+        await _log_step(session_id, "INTENT_COMPARISON", {
+            "result": result,
+            "model_intent": model_intent[:64],
+            "legacy_intent": legacy[:64],
+            "treatment": str(decision.get("treatment") or "")[:40],
+            "document_nature": str(decision.get("document_nature") or "")[:40],
+            "prerequisites": len(getattr(reasoning, "prerequisites", None) or []),
+        })
+    except Exception as exc:  # noqa: BLE001 — observation must never break a turn
+        log.warning("agent.intent_comparison_failed", error=str(exc)[:200])
+
+
 def _record_phase_timing(
     store: Dict[str, Any], t0: float, marker: str, extra: Dict[str, Any]
 ) -> None:
@@ -2822,6 +2868,14 @@ async def execute(
             # verification all operate on the APPROVED event.
             execution_plan.intent = str(confirmed_intent)
         _phase_elapsed("planner.done", intent=execution_plan.intent)
+        # ---- WAVE A: INTENT COMPARISON (observation only) ------------------
+        # AUDIT_REPORT §7 Wave A: record MODEL_INTENT vs LEGACY_INTENT and the
+        # result (AGREEMENT / DIVERGENT_INTENT / MODEL_ABSENT /
+        # MODEL_NONCANONICAL).  This block deliberately does NOT touch
+        # execution_plan.intent — the model becomes authoritative only in
+        # Wave B, after the A→B gate has measured divergence on real turns
+        # (AUDIT_REPORT §8).  Payload carries intents only, never CoT.
+        await _log_intent_comparison(session_id, _reasoning, execution_plan.intent)
 
         # deterministic semantic tool shortlist.  Seeds the
         # exclusion set so the model only SEES the tools relevant to this
@@ -3896,26 +3950,48 @@ async def execute(
                     # "under '<head>'" clause -> ASSET PPE-heading fallback),
                     # so the created child lands segregated under the right
                     # statement section.
-                    _create_args = await _confirmed_create_args(
-                        _cls,
-                        organization_id,
-                        entities=_ents,
-                        name=_confirmed_acct,
-                    )
-                    planned_tool_calls = ensure_create_account_first(
-                        planned_tool_calls,
-                        arguments=_create_args,
-                    )
-                    if "create_account" not in (execution_plan.potential_tools or []):
-                        execution_plan.potential_tools = [
-                            *(execution_plan.potential_tools or []), "create_account",
-                        ]
-                    excluded_tools.discard("create_account")
-                    await _log_step(session_id, "PLANNING", {
-                        "source": "account_creation_injected",
-                        "account": _confirmed_acct,
-                        "tools": [tc.tool_name for tc in planned_tool_calls],
-                    })
+                    from app.account_resolution import InvalidAccountingNature
+
+                    _create_args = None
+                    try:
+                        _create_args = await _confirmed_create_args(
+                            _cls,
+                            organization_id,
+                            entities=_ents,
+                            name=_confirmed_acct,
+                        )
+                    except InvalidAccountingNature as _shape_exc:
+                        # Wave A (AUDIT_REPORT §3.1): this treatment has no
+                        # determined account shape, so injecting create_account
+                        # would invent account_type / code series.  REJECTION:
+                        # the plan proceeds without the creation and the tool's
+                        # own account-gap path asks which ledger applies.
+                        log.warning(
+                            "agent.account_creation_rejected_unsupported_treatment",
+                            error=str(_shape_exc)[:200],
+                            session_id=str(session_id),
+                        )
+                        await _log_step(session_id, "ACCOUNT_CREATION_REJECTED", {
+                            "reason": "unsupported_treatment",
+                            "account": _confirmed_acct,
+                        })
+                    if _create_args is not None:
+                        planned_tool_calls = ensure_create_account_first(
+                            planned_tool_calls,
+                            arguments=_create_args,
+                        )
+                        if "create_account" not in (
+                            execution_plan.potential_tools or []
+                        ):
+                            execution_plan.potential_tools = [
+                                *(execution_plan.potential_tools or []), "create_account",
+                            ]
+                        excluded_tools.discard("create_account")
+                        await _log_step(session_id, "PLANNING", {
+                            "source": "account_creation_injected",
+                            "account": _confirmed_acct,
+                            "tools": [tc.tool_name for tc in planned_tool_calls],
+                        })
 
         # ---- PHASE 5: CONFIRMATION GATE (BEFORE execution) ---------------
         # Skipped when resuming an already-approved session
