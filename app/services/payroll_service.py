@@ -14,6 +14,11 @@ Design contract (LLM-first, deterministic execution):
 * every amount is COMPUTED from the employee's records — the basic salary
   plus the MONTHLY allowance components in force on the payroll date, net of
   the MONTHLY deductions — never taken from the model's sentence;
+* MONTHLY deductions reduce the NET pay AND therefore the posted salary
+  expense (net-basis booking — no deductions-payable ledger is invented);
+  the result reports gross / deductions / net per employee so the treatment
+  is always visible, and the withheld amount can be booked separately when
+  the user says where it goes;
 * ONE-TIME / ANNUAL components are NOT part of a recurring run (a second run
   would pay them again); they are REPORTED back, never silently dropped;
 * the journal is posted through ``accounting_service`` (prepare → validate →
