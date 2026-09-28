@@ -410,6 +410,25 @@ class Settings(BaseSettings):
             "to restore strictly sequential fetching."
         ),
     )
+    # ---- STAGE 2: TWO-CALL OBSERVATION (diagnostic only) -----------------
+    # When enabled, the reasoning loop additionally projects each parsed
+    # authoritative response onto the future TWO-CALL contracts (Call 1 =
+    # semantic intake, Call 2 = accounting decision) and records one
+    # TWO_CALL_OBSERVATION execution step (free-form marker convention:
+    # INTENT_COMPARISON / CLIENT_TTFB).  The observation NEVER influences
+    # intent, execution plan, treatment, ledger, prerequisites, proposal,
+    # confirmation or execution — the §12 authority gate stays closed.
+    # Default OFF and fail-closed: a missing or false value disables the
+    # observation and today's runtime is unchanged.
+    two_call_observation_enabled: bool = Field(
+        default=False,
+        description=(
+            "Record a TWO_CALL_OBSERVATION projection (Contract A/B) of the "
+            "authoritative reasoning response as an audit step. Diagnostic "
+            "only — never feeds intent, plan, proposal or execution. "
+            "Default False (fail-closed)."
+        ),
+    )
     # ---------------------------------------------------------------------
     # MODEL TIERS (measured, 2026-09-20)
     #

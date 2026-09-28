@@ -1194,6 +1194,42 @@ def deserialize_evidence_memo(payload: Any) -> List[EvidenceResult]:
         return []
 
 
+def _observe_two_call(
+    parsed: Dict[str, Any],
+    *,
+    round_index: int,
+    elapsed_ms: Optional[int],
+    notify: Any,
+) -> None:
+    """STAGE 2 — two-call OBSERVATION (diagnostic only, fail-closed).
+
+    Projects the EXISTING authoritative response onto the future Call A /
+    Call B contracts and forwards the projection to the audit hook.  Gated by
+    ``settings.two_call_observation_enabled`` (default False): with the flag
+    off this returns before anything two-call related is imported, so today's
+    runtime is unchanged.  Returns nothing, never raises, and its payload is
+    never read back — an observation failure must leave the transaction path
+    exactly as it was (§13).
+    """
+    try:
+        from app.config import get_settings
+
+        if not bool(getattr(get_settings(), "two_call_observation_enabled", False)):
+            return
+        from app.two_call_observation import build_two_call_observation
+
+        notify(
+            "TWO_CALL_OBSERVATION",
+            build_two_call_observation(
+                parsed, round_index=round_index, elapsed_ms=elapsed_ms
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — observation must never break a turn
+        log.warning(
+            "accounting_reasoning.two_call_observation_failed", error=str(exc)[:200]
+        )
+
+
 async def run_reasoning_loop(
     facts: ReasoningFacts,
     *,
@@ -1217,6 +1253,7 @@ async def run_reasoning_loop(
     keeps its deterministic behaviour instead of fabricating a decision.
     """
     import asyncio
+    import time
 
     from app.config import get_settings
 
@@ -1331,6 +1368,7 @@ async def run_reasoning_loop(
             )
         round_budget = min(budget, remaining)
         rounds_used = round_index + 1
+        round_started = time.monotonic()
         prompt = build_reasoning_prompt(
             facts,
             evidence_block=evidence_block,
@@ -1389,6 +1427,15 @@ async def run_reasoning_loop(
 
         outcome = _outcome_from_parsed(parsed, rounds=rounds_used)
         outcome.evidence_results = list(gathered)
+
+        # STAGE 2: two-call observation (flag-gated, diagnostic only — the
+        # payload is forwarded to the audit hook and nothing is read back).
+        _observe_two_call(
+            parsed,
+            round_index=rounds_used,
+            elapsed_ms=int((time.monotonic() - round_started) * 1000),
+            notify=_notify,
+        )
 
         # (a) The model wants the books before deciding.
         if outcome.status == NEEDS_EVIDENCE:
