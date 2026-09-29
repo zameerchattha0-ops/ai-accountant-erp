@@ -912,6 +912,31 @@ def parse_evidence_requests(raw: Any) -> List[EvidenceRequest]:
     return out
 
 
+def deferred_evidence_requests(raw: Any) -> List[str]:
+    """Kinds requested BEYOND ``MAX_REQUESTS_PER_ROUND`` — never silently lost.
+
+    The cap bounds one round's database work (and the rendered evidence block).
+    It must never make a model-requested lookup *disappear*: a request that is
+    not fetched must be reported back to the model so it can re-ask next round.
+    Callers therefore pair this with :func:`parse_evidence_requests` and surface
+    the names as an explicit deferral notice (AUDIT_REPORT §7).
+
+    Returns the kind names in request order; ``[]`` when nothing was deferred.
+    """
+    if not isinstance(raw, list):
+        return []
+    deferred: List[str] = []
+    for item in raw[MAX_REQUESTS_PER_ROUND:]:
+        if isinstance(item, str):
+            kind = item.strip().lower()
+        elif isinstance(item, dict):
+            kind = str(item.get("kind") or item.get("name") or "").strip().lower()
+        else:
+            kind = ""
+        deferred.append(kind or "(unnamed)")
+    return deferred
+
+
 def validate_evidence_request(request: EvidenceRequest) -> Optional[str]:
     """Return a rejection message, or None when the request is allowed.
 

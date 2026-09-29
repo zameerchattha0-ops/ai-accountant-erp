@@ -2434,6 +2434,128 @@ def _resolve_declared_aliases_from_evidence(
     return replacements
 
 
+def _two_call_runtime_enabled(settings: Any) -> bool:
+    """STAGE 3 flag — fail-closed; separate from the observation flag."""
+    return bool(getattr(settings, "two_call_runtime_enabled", False))
+
+
+async def _two_call_turn_response(
+    session_id: uuid.UUID, outcome: Any
+) -> AgentResponse:
+    """Map a CANDIDATE-ONLY two-call outcome onto the session (nothing runs).
+
+    The runtime never executes; this translator only records the candidate,
+    parks on a genuine clarification need (existing mechanism) or fails
+    honestly.  It never falls back to the monolithic interpretation.
+    """
+    from app.two_call_runtime import (
+        AWAITING_CLARIFICATION as _TC_AWAIT,
+        CANDIDATE_COMPLETE as _TC_COMPLETE,
+        CANDIDATE_READY as _TC_READY,
+        CANDIDATE_REFUSAL as _TC_REFUSAL,
+    )
+
+    if outcome.status == _TC_AWAIT:
+        question = str((outcome.question or {}).get("text") or "").strip() or (
+            "I need one more detail before this can be recorded."
+        )
+        required = list(outcome.required_fields or ["information"])
+        clarification = await create_clarification(
+            session_id=session_id, question=question, required_fields=required
+        )
+        await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+        await _log_step(session_id, "AWAITING_CLARIFICATION", {
+            "source": "two_call_runtime",
+            "question": question[:500],
+            "required_information": required,
+        })
+        authored_payload = None
+        try:
+            from app.questionnaire import questionnaire_from_authored
+
+            authored = questionnaire_from_authored(
+                outcome.question or {}, intent="", known={}
+            )
+            if authored is not None and not authored.is_empty():
+                authored_payload = authored.to_payload()
+        except Exception:  # noqa: BLE001 — the park must never fail on shape
+            authored_payload = None
+        return AgentResponse(
+            status=ExecutionStatus.AWAITING_CLARIFICATION,
+            execution_id=session_id,
+            question=clarification.get("question", question),
+            questionnaire=authored_payload,
+            required_information=required,
+            requires_user_input=True,
+        )
+
+    if outcome.status == _TC_READY:
+        candidate = dict(outcome.candidate or {})
+        await _update_status(session_id, ExecutionStatus.COMPLETED)
+        await _log_step(session_id, "COMPLETED", {
+            "reason": "two_call_candidate_only",
+            "intent": candidate.get("intent"),
+            "document_nature": candidate.get("document_nature"),
+            "treatment": candidate.get("treatment"),
+            "prerequisite_count": candidate.get("prerequisites"),
+            "proposed_tools": candidate.get("tools"),
+            "note": "STAGE 3 candidate — nothing was executed",
+        })
+        return AgentResponse(
+            status=ExecutionStatus.COMPLETED,
+            execution_id=session_id,
+            summary=(
+                "Two-call candidate interpretation recorded (Stage 3 — nothing "
+                f"was executed). Intent: {candidate.get('intent') or '—'}; "
+                f"treatment: {candidate.get('treatment') or '—'}; "
+                f"prerequisites: {candidate.get('prerequisites') or 0}."
+            ),
+        )
+
+    if outcome.status == _TC_REFUSAL:
+        from app.accounting_reasoning import refusal_text as _refusal_text_fn
+
+        text = _refusal_text_fn(outcome.refusal) or (
+            "This request cannot be executed safely as stated."
+        )
+        await _update_status(session_id, ExecutionStatus.REJECTED)
+        await _log_step(session_id, "REFUSED_BY_REASONING", {
+            "source": "two_call_runtime", "reason": text,
+        })
+        return AgentResponse(
+            status=ExecutionStatus.REJECTED, execution_id=session_id, summary=text
+        )
+
+    if outcome.status == _TC_COMPLETE:
+        await _update_status(session_id, ExecutionStatus.COMPLETED)
+        await _log_step(session_id, "COMPLETED", {
+            "reason": "two_call_already_recorded",
+            "note": "candidate only — nothing was executed",
+        })
+        return AgentResponse(
+            status=ExecutionStatus.COMPLETED,
+            execution_id=session_id,
+            summary=(
+                "The decision role reports this is already recorded. "
+                "Nothing was executed."
+            ),
+        )
+
+    await _update_status(session_id, ExecutionStatus.FAILED)
+    await _log_step(session_id, "FAILED", {
+        "reason": "two_call_runtime_failed",
+        "detail": str(outcome.reason or "")[:200],
+    })
+    return AgentResponse(
+        status=ExecutionStatus.FAILED,
+        execution_id=session_id,
+        summary=(
+            "The two-call runtime could not produce a valid accounting "
+            "decision. Nothing was recorded; please try again."
+        ),
+    )
+
+
 async def execute(
     *,
     user_message: str,
@@ -2626,6 +2748,56 @@ async def execute(
         _org_row, _fy_row, _period_row = await _org_facts_task
         _reasoning_calls: Optional[List[ToolCall]] = None
         from app.planner import split_batch_request as _split_batch_now
+
+        # ---- STAGE 3: TWO-CALL SEMANTIC RUNTIME (flag-gated, candidate) ----
+        # TWO_CALL_RUNTIME_ENABLED (default False) — separate from
+        # TWO_CALL_OBSERVATION_ENABLED.  Fresh interpretation turns run
+        # Call 1 → Python acquisition → Call 2 → validation and STOP as a
+        # candidate.  Approved-plan resumes and batch requests keep their
+        # existing paths.  Nothing below this branch runs while the flag is
+        # TRUE, so a two-call failure can never fall back to the monolithic
+        # interpretation (§18); that path exists only when the flag is OFF.
+        if (
+            approved_tool_calls is None
+            and not _split_batch_now(user_message)
+            and _two_call_runtime_enabled(_settings)
+        ):
+            from app.two_call_runtime import (
+                run_two_call_runtime as _run_two_call_runtime,
+            )
+
+            _two_call_context = {
+                "organization": {
+                    key: (_org_row or {}).get(key)
+                    for key in ("name", "legal_name", "currency", "country")
+                    if (_org_row or {}).get(key) is not None
+                },
+                "fiscal_year": {
+                    key: (_fy_row or {}).get(key)
+                    for key in ("name", "start_date", "end_date", "is_current")
+                    if (_fy_row or {}).get(key) is not None
+                },
+                "accounting_period": {
+                    key: (_period_row or {}).get(key)
+                    for key in ("name", "start_date", "end_date", "status",
+                                "is_closed")
+                    if (_period_row or {}).get(key) is not None
+                },
+            }
+            _two_call_result = await _run_two_call_runtime(
+                user_request=user_message,
+                organization_id=organization_id,
+                session_id=session_id,
+                auth=auth,
+                conversation_history=list(prior_qa),
+                orchestrator=get_client(),
+                preliminary=_preliminary,
+                accounting_context=_two_call_context,
+                step_logger=lambda event, payload: _spawn_step_write(
+                    _log_step(session_id, event, payload)
+                ),
+            )
+            return await _two_call_turn_response(session_id, _two_call_result)
 
         # P0-① (forensic latency report): an APPROVED turn re-enters with a
         # FROZEN plan — nothing downstream of the approved-reuse branch

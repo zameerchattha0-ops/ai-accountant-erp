@@ -53,6 +53,7 @@ from app.books_evidence import (
     EVIDENCE_LABEL,
     EvidenceRequest,
     EvidenceResult,
+    deferred_evidence_requests,
     evidence_catalog_text,
     gather_evidence,
     parse_evidence_requests,
@@ -1532,6 +1533,20 @@ async def run_reasoning_loop(
                     + ", ".join(sorted(set(prefetched_kinds)))
                     + " prefetched in parallel with this round's model call "
                     "(speculative read-only lookup)."
+                )
+            # AUDIT_REPORT §7: the per-round cap must never make a requested
+            # lookup disappear silently — name what was deferred so the model
+            # can re-ask explicitly (the cap itself is unchanged).
+            deferred_kinds = deferred_evidence_requests(
+                parsed.get("evidence_requests")
+            )
+            if deferred_kinds:
+                evidence_block += (
+                    "\n  · NOTE: "
+                    + ", ".join(sorted(set(deferred_kinds)))
+                    + " requested BEYOND this round's evidence cap and were "
+                    "DEFERRED, not fetched — re-request them explicitly if you "
+                    "still need them."
                 )
             _notify(
                 "EVIDENCE_RETURNED",

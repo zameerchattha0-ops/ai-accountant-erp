@@ -429,6 +429,37 @@ class Settings(BaseSettings):
             "Default False (fail-closed)."
         ),
     )
+    # ---- STAGE 3: TWO-CALL SEMANTIC RUNTIME (candidate-only) -------------
+    # When enabled, fresh interpretation turns run the real two-call runtime
+    # (Call 1 semantic intake → Python evidence/acquisition → Call 2
+    # accounting decision → Python validation) and STOP as a CANDIDATE:
+    # nothing executes, no confirmation snapshot, no accounting mutation.
+    # Completely SEPARATE from two_call_observation_enabled.  Approved-plan
+    # resumes and batch requests keep their existing paths; a two-call
+    # failure never falls back to the monolithic interpretation.
+    # Default OFF and fail-closed: a missing or false value preserves the
+    # current runtime exactly.
+    two_call_runtime_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the Stage 3 two-call semantic runtime (candidate-only) for "
+            "fresh interpretation turns. Nothing executes in this stage. "
+            "Default False (fail-closed; monolithic path unchanged)."
+        ),
+    )
+    two_call_runtime_total_timeout: float = Field(
+        default=60.0,
+        description=(
+            "Wall-clock budget for the WHOLE two-call turn (all Call 1 and "
+            "Call 2 rounds combined). The per-call cap alone lets up to "
+            "CALL1_MAX_ROUNDS + CALL2_MAX_ATTEMPTS calls add up (6 x 30 s), so "
+            "this bounds the turn the user waits on — the same shape as "
+            "accounting_reasoning_total_timeout for the monolithic stage. "
+            "Must stay below the host function timeout. On exhaustion the "
+            "runtime fails honestly (turn_budget_exhausted); it never "
+            "fabricates a decision and never falls back."
+        ),
+    )
     # ---------------------------------------------------------------------
     # MODEL TIERS (measured, 2026-09-20)
     #
