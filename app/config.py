@@ -174,13 +174,14 @@ class Settings(BaseSettings):
         ),
     )
     qwen_timeout_seconds: float = Field(
-        default=30.0,
+        default=90.0,
         description=(
-            "Per-ATTEMPT HTTP timeout. Was 120s, which combined with the "
-            "client's internal retries and the multi-model chain allowed a "
-            "single stalled provider to consume minutes of a request. The "
-            "provider round-trip itself is ~3-5s from the deployed region, so "
-            "30s is a generous ceiling for a real generation."
+            "Per-ATTEMPT HTTP timeout. Was 30s (cut from 120s when rounds "
+            "were 12s), but a timeout here RETRIES instead of accepting a "
+            "generation that is seconds from finishing: measured live "
+            "2026-09, thinking models need 40-64s on the reasoning prompt "
+            "(64.3s at 8192 tokens). The STAGE budget bounds the turn, so "
+            "one honest attempt gets its full window."
         ),
     )
 
@@ -218,11 +219,13 @@ class Settings(BaseSettings):
         ),
     )
     th_timeout_seconds: float = Field(
-        default=60.0,
+        default=90.0,
         description=(
-            "Per-ATTEMPT HTTP timeout for Harbor calls. Free-tier routing can "
-            "take longer than the Qwen workspace round-trip (esp. first "
-            "vision tokens), so this is above qwen_timeout_seconds."
+            "Per-ATTEMPT HTTP timeout for Harbor calls. Was 60s — below the "
+            "64.3s measured generation of the deep thinking model with "
+            "thinking enabled (2026-09-29), so a valid answer was being "
+            "killed at the client. Free-tier routing can take longer than "
+            "the Qwen workspace round-trip (esp. first vision tokens)."
         ),
     )
 
@@ -323,23 +326,28 @@ class Settings(BaseSettings):
         ),
     )
     accounting_reasoning_timeout: float = Field(
-        default=30.0,
+        default=90.0,
         description=(
-            "Per-round wall-clock cap for the accounting reasoning call. "
-            "MEASURED: the reasoning prompt is the largest call in the "
-            "pipeline (~12 KB: rules + evidence catalog + the trusted tool "
-            "vocabulary), and the provider needs 6-25s for it — the earlier "
-            "12s cap made the FIRST round time out on every request, which "
-            "silently degraded every request to the legacy route. Keep this "
-            "above the provider's real latency."
+            "Per-round wall-clock cap for the accounting reasoning call. Was "
+            "30s: the largest call in the pipeline (~12 KB) is answered in "
+            "6-25s warm, but thinking models measured 40-64s — a 30s round "
+            "cap discards a generation that is seconds from completing (the "
+            "answer fits the output cap; only the clock kills it). The whole "
+            "stage is bounded by accounting_reasoning_total_timeout."
         ),
     )
     accounting_reasoning_total_timeout: float = Field(
-        default=45.0,
+        default=135.0,
         description=(
-            "Wall-clock cap for the WHOLE reasoning loop (all rounds). A "
-            "per-round cap alone lets three slow rounds add up; this bounds "
-            "the stage the user waits on before the pipeline degrades."
+            "Wall-clock cap for the WHOLE reasoning loop (all rounds). Was "
+            "45s and PRODUCED A FALSE FAILURE 2026-09-29 17:44 (session "
+            "a9b81e3e): round 1 answered in 20.5s, evidence returned in "
+            "3.1s, round 2 was cut mid-generation at ~22s when this budget "
+            "expired -> 'provider_unavailable' -> user-facing 'The AI "
+            "provider did not answer in time' — while the provider was "
+            "perfectly healthy. The ladder now fits the host ceiling "
+            "(Vercel Fluid, Hobby: 300s): reasoning 135 + classification 15 "
+            "+ execution 120 + preamble ~15 = ~285s worst stacked path."
         ),
     )
     accounting_reasoning_model_chain: str = Field(

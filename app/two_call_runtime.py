@@ -700,7 +700,7 @@ async def run_two_call_runtime(
             from app.books_evidence import gather_evidence
 
             gather = gather_evidence
-        request_timeout = float(getattr(settings, "accounting_reasoning_timeout", 30.0))
+        request_timeout = float(getattr(settings, "accounting_reasoning_timeout", 90.0))
         # WHOLE-TURN budget: the per-call cap alone lets 6 calls add up to three
         # minutes.  Mirrors accounting_reasoning_total_timeout for the
         # monolithic stage; on exhaustion the runtime fails honestly.

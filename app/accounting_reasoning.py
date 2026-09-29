@@ -1262,10 +1262,10 @@ async def run_reasoning_loop(
     budget = (
         timeout_seconds
         if timeout_seconds is not None
-        else float(getattr(settings, "accounting_reasoning_timeout", 30.0))
+        else float(getattr(settings, "accounting_reasoning_timeout", 90.0))
     )
     total_budget = float(
-        getattr(settings, "accounting_reasoning_total_timeout", 45.0)
+        getattr(settings, "accounting_reasoning_total_timeout", 135.0)
     )
     # Optional dedicated model chain for this one call (see the config field).
     # It is passed ONLY to providers that declare it, so the stage keeps working
