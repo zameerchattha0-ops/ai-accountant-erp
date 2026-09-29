@@ -250,7 +250,7 @@ async def test_ambiguous_payment_parks_at_call1_questionnaire():
     """Settlement vs advance is a FACT question — Call 1 asks, Call 2 waits."""
     question = {
         "text": "Was this received against an existing invoice or as an advance?",
-        "questions": [{"field": "payment_nature", "kind": "choice",
+        "questions": [{"field": "settlement_position", "kind": "choice",
                        "question": "Against an invoice or as an advance?",
                        "options": ["Against an invoice", "As an advance"]}],
     }
@@ -259,7 +259,7 @@ async def test_ambiguous_payment_parks_at_call1_questionnaire():
     )
     assert outcome.status == tcr.AWAITING_CLARIFICATION
     assert provider.calls == 1              # Call 2 never ran
-    assert outcome.required_fields == ["payment_nature"]
+    assert outcome.required_fields == ["settlement_position"]
     _assert_observation_only(events)
 
 
@@ -372,12 +372,12 @@ async def test_evidence_required_transaction_gathers_then_decides():
 @pytest.mark.asyncio
 async def test_call2_user_fact_requirement_routes_through_call1():
     asked = decision_reply(proposal=False, needs=[{
-        "kind": "USER_FACT", "name": "purpose_of_purchase",
+        "kind": "USER_FACT", "name": "transaction_purpose",
         "why_required": "capital vs operating treatment depends on it",
     }])
     question = {
         "text": "Are the laptops for business use?",
-        "questions": [{"field": "purpose_of_purchase", "kind": "choice",
+        "questions": [{"field": "transaction_purpose", "kind": "choice",
                        "question": "Business use?",
                        "options": ["Business", "Personal"]}],
     }

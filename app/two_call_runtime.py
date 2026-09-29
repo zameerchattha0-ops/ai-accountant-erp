@@ -28,6 +28,7 @@ Hard rules implemented here:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -162,6 +163,13 @@ def _vocab(values: Any) -> str:
     return ", ".join(sorted(str(v) for v in values))
 
 
+def _authored_field_names() -> List[str]:
+    """The shipped questionnaire field vocabulary (single source of truth)."""
+    from app.questionnaire import AUTHORED_FIELDS
+
+    return sorted(AUTHORED_FIELDS)
+
+
 def _render_history(history: Sequence[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for pair in list(history)[-8:]:
@@ -178,6 +186,60 @@ def _pick(row: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return {}
     return {k: row[k] for k in keys if row.get(k) is not None}
+
+
+def _mechanical_entry(orchestrator: Any) -> Any:
+    """Prefer the MECHANICAL (fast-tier) text entry for CALL 1.
+
+    ``generate_text_light`` is the shipped entry point for work that needs no
+    accounting judgement (semantic fact extraction, perception, classification)
+    and routes to ``accounting_fast_chain_list``.  CALL 1 — reading the user's
+    words into facts — is exactly that work, so it must not be sent to a deep
+    THINKING model.
+
+    Measured on the live gateway (2026-09-29, the shipped Call-1 prompt):
+    ``generate_text`` starts with Token Harbor's thinking model, whose
+    ``reasoning_content`` consumed the whole 2,048-token output cap and returned
+    EMPTY content — finish_reason 'length', 8,466 chars of reasoning, 0 chars of
+    answer, 20.4 s.  With thinking off the same task answered in 6.0 s / 520
+    tokens.  The fast tier is the designed route for mechanical work; CALL 2
+    (accounting judgement) keeps the deep entry.
+
+    Falls back to ``generate_text`` so any orchestrator implementation — and
+    every test double — keeps working unchanged.
+
+    When the entry understands ``tier_first`` (the real orchestrator does;
+    ``**kw`` test doubles absorb it), the wrapper passes ``tier_first=True``
+    so the fast chain LEADS the call. Without it the orchestrator fronts
+    every text turn with the Token Harbor thinking model, which measured
+    live (2026-09-29) burning the whole 2,048-token output budget on
+    reasoning and returning EMPTY content on this exact intake prompt —
+    the tier was ordered but never reached first. A plain signature (no
+    ``tier_first``, no ``**kw``) falls back to the default call, so older
+    orchestrators and strict doubles are untouched.
+    """
+    entry = None
+    for name in ("generate_text_light", "generate_text"):
+        candidate = getattr(orchestrator, name, None)
+        if callable(candidate):
+            entry = candidate
+            break
+    if entry is None:
+        return None
+    try:
+        params = inspect.signature(entry).parameters
+        accepts = "tier_first" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):  # pragma: no cover — exotic callables
+        accepts = False
+    if not accepts:
+        return entry
+
+    async def _chain_first_entry(*, prompt: str) -> str:
+        return await entry(prompt=prompt, tier_first=True)  # type: ignore[call-arg]
+
+    return _chain_first_entry
 
 
 def build_intake_prompt(
@@ -210,21 +272,40 @@ def build_intake_prompt(
         "   implied by its wording (SAFELY_INFERRED). Never invent amounts,",
         "   dates, parties or tax treatment.",
         "3. missing_material_facts: facts that materially affect bookkeeping",
-        "   and are NOT known yet (amount, date, paid-vs-unpaid, tax",
+        "   and are NOT known yet — absent from BOTH the user request AND the",
+        "   Question/answer history below (amount, date, paid-vs-unpaid, tax",
         "   inclusive, resale vs internal use). Say WHY each is required.",
         "4. questionnaire: when the user must supply a fact, ask for the FACT",
         "   in one plain question. Each entry MUST be {\"field\": <erp field>,",
         "   \"kind\": choice|date|money|number|text, \"question\": <the text>,",
         "   \"options\": [...]}; 'field' and 'question' are REQUIRED — never use",
-        "   'name' or 'prompt' as keys. Omit the block when nothing needs asking.",
+        "   'name' or 'prompt' as keys. 'field' MUST be one of the allowed",
+        f"   field names: {_vocab(_authored_field_names())}.",
+        "   Omit the block when nothing needs asking.",
+        "   The BLOCK itself MUST include a \"text\" key — a one-line summary of",
+        "   the ask — or the contract rejects your whole reply.",
+        "   NEVER ask for a fact the user request already states or the",
+        "   Question/answer history already answered — check both first;",
+        "   re-asking a known fact wastes the user's turn.",
         "   Never ask an accounting-decision question ('how should I record this',",
         "   'is this a receivable') — that is CALL 2's job, never yours.",
+        "   Do NOT ask for accounting-POLICY detail (depreciation method/life/",
+        "   salvage, account or GL codes, categorization) — CALL 2 owns those",
+        "   decisions and states them as needs; asking them here bypasses",
+        "   CALL 2 and delays the turn. Ask only for facts about the event",
+        "   itself: who, what, when, how much, how paid, what for.",
+        "   Account and GL-code lookups are BOOKS lookups, not user facts:",
+        "   request them via evidence_requests (chart_of_accounts,",
+        "   bank_accounts, …) and only ask the user if the books cannot answer.",
         "5. evidence_requests: read-only looks at the BOOKS that could answer",
         "   a fact. Use ONLY these kinds and ONLY the arguments each one",
         "   declares (an undeclared argument is rejected and wastes a round):",
         evidence_catalog_text(),
         '   Shape: {"kind": <catalogue kind>, "why": <reason>, "args": {…}}.',
         "   Prefer the books over asking the user when they can answer.",
+        "6. BREVITY: every field is MACHINE-READ. ONE short clause per text",
+        "   field (<= 120 characters): no prose, no explanation, no restatement",
+        "   of the request, no markdown. Anything longer is discarded weight.",
         "",
         "CONTEXT",
         "User request:",
@@ -304,6 +385,9 @@ def build_decision_prompt(
         "   treatment, document_nature, ledger, decision) as the thing the",
         "   user must supply — that is YOUR interpretation, never theirs.",
         "5. Missing material facts block a proposal: return them in needs[].",
+        "6. BREVITY: 'interpretation' and 'confirmation' are ONE sentence each;",
+        "   every affected/impact 'reason' is one short clause (<= 120 chars);",
+        "   no prose outside the JSON, no restatement, no markdown.",
         "",
         "STAGE 3 CONTRACT: your answer is validated and RECORDED as a",
         "candidate. It is NEVER executed in this stage — no journal, no",
@@ -387,6 +471,89 @@ def _required_fields(question: Optional[Dict[str, Any]]) -> List[str]:
         if isinstance(entry, dict) and str(entry.get("field") or "").strip()
     ]
     return fields[:12] or ["information"]
+
+
+def _known_facts(
+    payload: Dict[str, Any],
+    conversation_history: Sequence[Dict[str, Any]],
+    preliminary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Field -> value facts ALREADY established for this turn.
+
+    Mechanical collection only (no interpretation): Python literal
+    extraction values, intake facts explicitly stated (or trivially implied)
+    by the user, and conversation-history entries that carry a ``field``.
+    """
+    known: Dict[str, Any] = {}
+    if isinstance(preliminary, dict):
+        known.update(
+            {str(k): v for k, v in preliminary.items() if v is not None}
+        )
+    facts = payload.get("facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            name = str(fact.get("name") or "").strip()
+            value = fact.get("value")
+            if (
+                name
+                and value is not None
+                and fact.get("state") in ("EXPLICIT", "SAFELY_INFERRED")
+            ):
+                known.setdefault(name, value)
+    for pair in conversation_history or ():
+        if not isinstance(pair, dict):
+            continue
+        field_name = str(pair.get("field") or "").strip()
+        answer = pair.get("answer")
+        if field_name and answer:
+            known.setdefault(field_name, answer)
+    return known
+
+
+def _filter_intake_questionnaire(
+    payload: Dict[str, Any],
+    conversation_history: Sequence[Dict[str, Any]] = (),
+    preliminary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Apply the SHIPPED authored-question floor to Call 1's questionnaire.
+
+    ``questionnaire.validate_authored_questions`` is the field-vocabulary +
+    never-re-ask-known filter the monolithic response site uses. Stage 3's
+    park site must apply the SAME filter, or Call 1 asks unknown field names
+    and re-asks stated facts (live 2026-09-29: a 12-turn spiral re-asking
+    supplier_name / bank_account_name that were already stated or answered).
+    Entries are never repaired: unknown, duplicate and already-known fields
+    are dropped. When nothing survives, the block disappears and intake is
+    admitted instead of parking on a question Python already knows the
+    answer to.
+    """
+    from app.questionnaire import validate_authored_questions
+
+    questionnaire = payload.get("questionnaire")
+    if not isinstance(questionnaire, dict):
+        return
+    entries = questionnaire.get("questions")
+    if not isinstance(entries, list):
+        return
+    specs = validate_authored_questions(
+        entries, _known_facts(payload, conversation_history, preliminary)
+    )
+    kept = {spec.field for spec in specs}
+    kept_entries: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("field") or "").strip()
+        if name in kept and name not in seen:
+            seen.add(name)
+            kept_entries.append(entry)
+    if kept_entries:
+        questionnaire["questions"] = kept_entries
+    else:
+        payload.pop("questionnaire", None)
 
 
 _CALL1_FIELD_KEYS = (
@@ -512,8 +679,20 @@ async def run_two_call_runtime(
         from app.config import get_settings
 
         settings = get_settings()
-        generate = getattr(orchestrator, "generate_text", None)
-        if not callable(generate) or not str(user_request or "").strip():
+        # CALL 1 = mechanical intake (fast tier); CALL 2 = accounting
+        # judgement (deep tier).  See _mechanical_entry for the measured
+        # reason a thinking model must not serve the intake call.
+        generate_intake = _mechanical_entry(orchestrator)
+        generate_decision = getattr(orchestrator, "generate_text", None)
+        if not callable(generate_decision) and not callable(generate_intake):
+            outcome.status = PROVIDER_FAILED
+            outcome.reason = "no_provider_or_empty_request"
+            return _finish(outcome, step_logger, started)
+        if generate_intake is None:
+            generate_intake = generate_decision
+        if generate_decision is None:
+            generate_decision = generate_intake
+        if not str(user_request or "").strip():
             outcome.status = PROVIDER_FAILED
             outcome.reason = "no_provider_or_empty_request"
             return _finish(outcome, step_logger, started)
@@ -615,7 +794,9 @@ async def run_two_call_runtime(
                 )
                 t0 = time.monotonic()
                 try:
-                    raw = await _call_model(generate, prompt, timeout=call_timeout)
+                    raw = await _call_model(
+                        generate_intake, prompt, timeout=call_timeout
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 — transport failure
@@ -645,6 +826,12 @@ async def run_two_call_runtime(
                     feedback = ["Contract A violations:"] + list(violations)
                     continue
 
+                # Deterministic question floor: shipped field vocabulary +
+                # never-re-ask-known BEFORE any park decision (see
+                # _filter_intake_questionnaire).
+                _filter_intake_questionnaire(
+                    payload, conversation_history, preliminary
+                )
                 outcome.call1 = payload
                 question = _question_from_intake(payload)
                 if question:  # Call 1 owns the question → existing park
@@ -701,7 +888,9 @@ async def run_two_call_runtime(
             )
             t0 = time.monotonic()
             try:
-                raw = await _call_model(generate, prompt, timeout=call_timeout)
+                raw = await _call_model(
+                    generate_decision, prompt, timeout=call_timeout
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — transport failure

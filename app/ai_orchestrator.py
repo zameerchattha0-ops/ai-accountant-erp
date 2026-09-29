@@ -158,6 +158,7 @@ class AIOrchestrator:
         *,
         requires_vision: bool = False,
         text_chain: Optional[List[str]] = None,
+        tier_first: bool = False,
     ) -> List[Dict[str, Any]]:
         """Ordered candidate list for the request's capability needs.
 
@@ -172,6 +173,16 @@ class AIOrchestrator:
         extraction stages name the fast chain. An unknown model name simply
         produces no candidate for it — the rest of the requested chain, then
         Gemini, still run.
+
+        ``tier_first`` (default False — no existing caller changes behaviour)
+        skips the Token Harbor primary so an EXPLICITLY requested tier chain
+        runs first. The primary is a THINKING model that spends the output
+        budget on reasoning before any answer tokens; measured live
+        (2026-09-29) it returned empty content on a mechanical intake prompt
+        (finish_reason 'length', 8,466 chars of reasoning, 0 chars of answer,
+        20.4 s). Mechanical callers that name their chain (Stage 3 CALL 1)
+        opt in so the fast tier actually leads; Gemini remains the last
+        resort either way. Ignored when no ``text_chain`` is given.
         """
         settings = get_settings()
         candidates: List[Dict[str, Any]] = []
@@ -205,15 +216,19 @@ class AIOrchestrator:
         else:
             # Token Harbor / DeepSeek V4.1 — PRIMARY for every text/tool turn
             # (all model tiers: the tier chains below become the ordered
-            # fallback behind it).
-            candidates.append(
-                {
-                    "provider": "token-harbor",
-                    "model": settings.th_text_model,
-                    "capability": "text_tools",
-                    "factory": (lambda m=settings.th_text_model: self._get_harbor(m)),
-                }
-            )
+            # fallback behind it).  `tier_first=True` is the documented
+            # opt-out for callers that explicitly requested a tier chain: the
+            # requested chain leads instead of the primary, so a thinking
+            # model never fronts a mechanical call.  Default is unchanged.
+            if not (tier_first and text_chain):
+                candidates.append(
+                    {
+                        "provider": "token-harbor",
+                        "model": settings.th_text_model,
+                        "capability": "text_tools",
+                        "factory": (lambda m=settings.th_text_model: self._get_harbor(m)),
+                    }
+                )
             chain = [m for m in (text_chain or []) if m] or settings.qwen_chain_list
             for model in chain:
                 candidates.append(
@@ -365,6 +380,7 @@ class AIOrchestrator:
         prompt: str,
         context: Optional[AgentContext] = None,
         model_chain: Optional[List[str]] = None,
+        tier_first: bool = False,
     ) -> str:
         """Plain text generation across the same capability chain.
 
@@ -386,10 +402,14 @@ class AIOrchestrator:
             accepts_chain = False
         if model_chain and accepts_chain:
             candidates = self._candidate_providers(
-                requires_vision=False, text_chain=model_chain
+                requires_vision=False,
+                text_chain=model_chain,
+                tier_first=tier_first,
             )
         else:
-            candidates = self._candidate_providers(requires_vision=False)
+            candidates = self._candidate_providers(
+                requires_vision=False, tier_first=tier_first
+            )
         for candidate in candidates:
             name = candidate["provider"]
             model = candidate["model"]
@@ -414,6 +434,7 @@ class AIOrchestrator:
         *,
         prompt: str,
         context: Optional[AgentContext] = None,
+        tier_first: bool = False,
     ) -> str:
         """Text generation on the FAST tier — MECHANICAL work only.
 
@@ -429,10 +450,17 @@ class AIOrchestrator:
         8.1s — the difference is reasoning tokens the mechanical stages never
         use. ``ACCOUNTING_FAST_MODEL_CHAIN=standard`` disables the tier (the
         standard chain is used), so behaviour can be reverted by config alone.
+
+        ``tier_first=True`` additionally skips the Token Harbor primary so the
+        fast chain actually LEADS the call (see ``_candidate_providers``);
+        default False keeps the shipped primary-first order.
         """
         chain = get_settings().accounting_fast_chain_list
         return await self.generate_text(
-            prompt=prompt, context=context, model_chain=chain
+            prompt=prompt,
+            context=context,
+            model_chain=chain,
+            tier_first=tier_first,
         )
 
     # -------------------------------------------------------------------

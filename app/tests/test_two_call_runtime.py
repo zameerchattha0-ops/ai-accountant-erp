@@ -193,7 +193,7 @@ async def test_call1_questionnaire_parks_before_call2():
     outcome, provider, _ = await _run([
         intake_reply(question={
             "text": "Was this paid on receipt?",
-            "questions": [{"field": "payment_timing", "kind": "choice",
+            "questions": [{"field": "payment_type", "kind": "choice",
                            "question": "Paid on receipt?",
                            "options": ["Yes", "No"]}],
         }),
@@ -201,7 +201,7 @@ async def test_call1_questionnaire_parks_before_call2():
     assert outcome.status == tcr.AWAITING_CLARIFICATION
     assert provider.calls == 1          # Call 2 never ran
     assert outcome.call2 is None
-    assert outcome.required_fields == ["payment_timing"]
+    assert outcome.required_fields == ["payment_type"]
 
 
 @pytest.mark.asyncio
@@ -329,11 +329,11 @@ async def test_needs_evidence_uses_books_then_call1_again():
 @pytest.mark.asyncio
 async def test_needs_user_fact_routes_through_call1_questionnaire():
     asked = decision_reply(proposal=False, needs=[{
-        "kind": "USER_FACT", "name": "purpose_of_purchase",
+        "kind": "USER_FACT", "name": "transaction_purpose",
         "why_required": "capital vs operating",
     }])
     questionnaire = {"text": "Are the laptops for business use?",
-                     "questions": [{"field": "purpose_of_purchase",
+                     "questions": [{"field": "transaction_purpose",
                                     "kind": "choice",
                                     "question": "Business use?",
                                     "options": ["Business", "Personal"]}]}
@@ -344,7 +344,7 @@ async def test_needs_user_fact_routes_through_call1_questionnaire():
     assert provider.calls == 3
     # The wording is CALL 1's — Call 2 never authors questions (§13).
     assert "Are the laptops for business use?" in outcome.question["text"]
-    assert outcome.required_fields == ["purpose_of_purchase"]
+    assert outcome.required_fields == ["transaction_purpose"]
     assert outcome.call2 is not None and "question" not in outcome.call2
 
 
@@ -499,7 +499,7 @@ async def test_observation_failure_cannot_break_the_runtime():
 async def test_observation_statuses_for_park_and_failure():
     _, _, park_events = await _run([
         intake_reply(question={"text": "Which invoice?",
-                               "questions": [{"field": "invoice_id",
+                               "questions": [{"field": "description",
                                               "kind": "text",
                                               "question": "Which invoice?"}]})
     ])
@@ -620,6 +620,191 @@ async def test_intake_prompt_teaches_the_questionnaire_entry_schema():
     # and the skeleton itself carries an exemplar entry, not an empty list
     assert tcr._CALL1_REPLY_SKELETON["questionnaire"]["questions"][0]["field"]
     assert tcr._CALL1_REPLY_SKELETON["questionnaire"]["questions"][0]["question"]
+
+
+def test_call1_uses_the_mechanical_fast_tier_and_call2_the_deep_one():
+    """The measured fix: CALL 1 must not be sent to a thinking model.
+
+    Live evidence: `generate_text` starts with Token Harbor's thinking model,
+    whose reasoning_content consumed the whole 2,048-token cap and returned
+    EMPTY content (finish_reason 'length', 8,466 chars of reasoning, 0 chars of
+    answer, 20.4 s).  CALL 1 is mechanical intake, so it uses the shipped
+    fast-tier entry (`generate_text_light`) AND asks for `tier_first=True` so
+    the fast chain actually leads; CALL 2 keeps the deep entry.
+    """
+    import asyncio
+
+    seen = []
+
+    class _Tiered:
+        async def generate_text_light(self, *, prompt: str = "", **kw):
+            seen.append(("light", kw.get("tier_first")))
+            return intake_reply()
+
+        async def generate_text(self, *, prompt: str = "", **kw):
+            seen.append(("deep", kw.get("tier_first")))
+            return decision_reply()
+
+    outcome = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        tcr.run_two_call_runtime(
+            user_request=MSG, organization_id=ORG, orchestrator=_Tiered()
+        )
+    )
+    assert outcome.status == tcr.CANDIDATE_READY
+    # intake on the fast tier with the chain first; decision deep, default order
+    assert seen == [("light", True), ("deep", None)], seen
+
+
+def test_intake_entry_tolerates_a_strict_signature_without_tier_first():
+    """An entry with no `tier_first` and no `**kw` still works (older
+    orchestrators / strict doubles): the wrapper falls back to the plain call."""
+    import asyncio
+
+    class _Strict:
+        async def generate_text_light(self, *, prompt: str):
+            return intake_reply()
+
+        async def generate_text(self, *, prompt: str):
+            return decision_reply()
+
+    outcome = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        tcr.run_two_call_runtime(
+            user_request=MSG, organization_id=ORG, orchestrator=_Strict()
+        )
+    )
+    assert outcome.status == tcr.CANDIDATE_READY
+
+
+@pytest.mark.asyncio
+async def test_call1_falls_back_to_the_deep_entry_when_no_light_tier():
+    """Every existing orchestrator/test double keeps working unchanged."""
+    outcome, provider, _ = await _run([intake_reply(), decision_reply()])
+    assert outcome.status == tcr.CANDIDATE_READY
+    assert provider.calls == 2
+
+
+def test_intake_prompt_requires_questionnaire_text_and_forbids_reasking():
+    """Live evidence (2026-09-29): round-1 replies were rejected with
+    `contract A: questionnaire.text is required` twice, and Call 1 re-asked
+    dates/GST the request already stated. The prompt must teach both."""
+    intake = tcr.build_intake_prompt(
+        user_request=MSG,
+        conversation_history=[{"question": "q1", "answer": "a1"}],
+    )
+    # the required top-level block key
+    assert '"text" key' in intake
+    # never re-ask what the request or the Q/A history already answers
+    assert "NEVER ask for a fact the user request already states" in intake
+    assert "Question/answer history already answered" in intake
+    # GL codes come from the books, not from the user (live turn 6 asked for
+    # five account codes instead of using chart_of_accounts evidence)
+    assert "Account and GL-code lookups are BOOKS lookups" in intake
+    # accounting-policy asks belong to CALL 2's needs[] (live turns 7-19
+    # spiralled on depreciation/code/classification questions)
+    assert "Do NOT ask for accounting-POLICY detail" in intake
+
+
+def test_intake_questionnaire_uses_the_shipped_question_floor():
+    """Live 2026-09-29: Call 1 asked unknown fields (asset_capitalization,
+    gl_account_code) and re-asked stated facts (supplier_name), spiralling
+    12 turns. The shipped validate_authored_questions floor — field
+    vocabulary + never-re-ask-known — must run before any park."""
+    payload = {
+        "understanding": {"economic_event": "x"},
+        "facts": [
+            {"name": "supplier_name", "value": "FDS Labs Pvt", "state": "EXPLICIT"},
+        ],
+        "questionnaire": {
+            "text": "confirm",
+            "questions": [
+                {"field": "supplier_name", "kind": "text", "question": "Supplier?"},
+                {"field": "gl_account_code", "kind": "text", "question": "GL?"},
+                {"field": "transaction_date", "kind": "date", "question": "Date?"},
+            ],
+        },
+    }
+    tcr._filter_intake_questionnaire(payload)
+    fields = [q["field"] for q in payload["questionnaire"]["questions"]]
+    # already-known fact dropped; unknown field dropped; valid gap kept —
+    # exactly once even when the model repeats it (live: asset_code x3)
+    assert fields == ["transaction_date"], fields
+
+
+def test_duplicate_model_questions_collapse_to_one_entry():
+    payload = {
+        "understanding": {"economic_event": "x"},
+        "questionnaire": {
+            "text": "code?",
+            "questions": [
+                {"field": "asset_code", "kind": "text", "question": "Code?"},
+                {"field": "asset_code", "kind": "text", "question": "Code?"},
+                {"field": "asset_code", "kind": "text", "question": "Code?"},
+            ],
+        },
+    }
+    tcr._filter_intake_questionnaire(payload)
+    assert [q["field"] for q in payload["questionnaire"]["questions"]] == [
+        "asset_code"
+    ]
+
+
+def test_all_known_questionnaire_disappears_and_intake_is_admitted():
+    """A question Python already knows the answer to never parks the turn."""
+    payload = {
+        "understanding": {"economic_event": "x"},
+        "facts": [
+            {"name": "supplier_name", "value": "FDS Labs", "state": "EXPLICIT"},
+        ],
+        "questionnaire": {
+            "text": "confirm supplier",
+            "questions": [
+                {"field": "supplier_name", "kind": "text", "question": "Supplier?"},
+            ],
+        },
+    }
+    tcr._filter_intake_questionnaire(payload)
+    assert "questionnaire" not in payload
+    assert tcr._intake_admissible(payload)
+
+
+def test_history_field_answers_are_never_re_asked():
+    """Answered fields (history carries field+answer) are filtered out."""
+    payload = {
+        "understanding": {"economic_event": "x"},
+        "questionnaire": {
+            "text": "again",
+            "questions": [
+                {"field": "supplier_name", "kind": "text", "question": "Supplier?"},
+                {"field": "payment_type", "kind": "choice", "question": "Pay type?",
+                 "options": ["CASH", "CREDIT"]},
+            ],
+        },
+    }
+    tcr._filter_intake_questionnaire(
+        payload,
+        conversation_history=[{"field": "payment_type", "answer": "CREDIT"}],
+    )
+    fields = [q["field"] for q in payload["questionnaire"]["questions"]]
+    assert fields == ["supplier_name"], fields
+
+
+def test_intake_prompt_names_the_allowed_field_vocabulary():
+    """The model can only use field names it has been shown."""
+    intake = tcr.build_intake_prompt(user_request=MSG)
+    assert "field names: " in intake
+    assert "supplier_name" in intake and "capitalization_decision" in intake
+
+
+def test_both_prompts_state_the_brevity_bounds():
+    """Only controlled, precise output: prose costs tokens nobody reads."""
+    intake = tcr.build_intake_prompt(user_request=MSG)
+    decision = tcr.build_decision_prompt(
+        user_request=MSG,
+        intake_packet={"understanding": {"economic_event": "x"}},
+    )
+    assert "BREVITY" in intake and "BREVITY" in decision
+    assert "MACHINE-READ" in intake
+    assert "ONE sentence" in decision
 
 
 def test_both_prompts_teach_the_evidence_argument_schema():

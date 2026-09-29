@@ -161,7 +161,7 @@ async def test_flag_on_clarification_parks_via_existing_mechanism(monkeypatch):
     provider = _Scripted([
         intake_reply(question={
             "text": "Was this payment received against an invoice?",
-            "questions": [{"field": "payment_nature", "kind": "text",
+            "questions": [{"field": "settlement_position", "kind": "text",
                            "question": "Against an invoice or as an advance?"}],
         }),
     ])
