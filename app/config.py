@@ -272,6 +272,30 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20)
 
     # ---- Semantic understanding layer --------------------
+    # ---- PRESENTATION PROFILE (2026-09-30): DETERMINISTIC-FIRST ----------
+    # The three AI-primary stages below (semantic understanding, accounting
+    # reasoning, LLM classification) ship DISABLED, so a turn runs the
+    # deterministic pipeline: keyword/anchored extraction, rule classification,
+    # and TEMPLATE questionnaires that ask ONLY the fields the user has not
+    # already supplied (``planner._missing_fields`` → ``_questions_for_fields``
+    # → ``questionnaire.build_questionnaire``).  Every round re-derives the gaps
+    # from the ORIGINAL REQUEST + the answers so far
+    # (``planner._merge_clarification_answers``), so a questionnaire never
+    # repeats a fact the user already gave.
+    #
+    # WHY: the primary text model returns EMPTY content whenever its hidden
+    # reasoning fills the shared 2,048-token output cap (measured:
+    # ``finish_reason=length``, content 0 chars, reasoning 9,358 chars, 19.7 s —
+    # see ``docs/EMPTY_ANSWER_ROOT_CAUSE.md``), which the pipeline reports to
+    # the user as a provider failure.  Fewer AI stages means fewer such turns,
+    # and no model-authored questionnaire spending that cap.
+    #
+    # The complete AI-primary implementation is preserved on branch
+    # ``archive/llm-primary-reasoning`` (``75a6f20``) for the long-output
+    # provider.  Re-enable any stage from the environment:
+    # ``SEMANTIC_LLM_ENABLED=1`` · ``ACCOUNTING_REASONING_ENABLED=1`` ·
+    # ``LLM_CLASSIFICATION_ENABLED=1``.
+    #
     # This is the PRIMARY semantic interpretation stage of the ERP: the user's
     # natural-language request goes to the LLM FIRST, together with the
     # reasoning rulebook and a bounded, organization-scoped ERP context
@@ -281,9 +305,11 @@ class Settings(BaseSettings):
     # is disabled, down, slow or returns unparseable output, the stage
     # degrades to exactly the previous keyword behaviour.
     semantic_llm_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "Enable the LLM semantic understanding layer (primary interpreter)."
+            "Enable the LLM semantic understanding layer (primary interpreter). "
+            "PRESENTATION PROFILE: default False — the deterministic keyword "
+            "extractor runs instead. See the profile note above."
         ),
     )
     semantic_llm_timeout_seconds: float = Field(
@@ -318,11 +344,14 @@ class Settings(BaseSettings):
     # constraints, execution).  When the provider is unavailable the stage
     # degrades to the previous deterministic behaviour — never to a guess.
     accounting_reasoning_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Enable the LLM accounting-reasoning loop (primary reasoning "
             "layer). Disabling it restores the previous deterministic "
-            "pipeline exactly."
+            "pipeline exactly. PRESENTATION PROFILE: default False — the "
+            "deterministic pipeline + template questionnaires run instead; "
+            "no model-authored questionnaire is generated. See the profile "
+            "note above."
         ),
     )
     accounting_reasoning_timeout: float = Field(
@@ -376,11 +405,13 @@ class Settings(BaseSettings):
     # provider is unreachable/disabled the deterministic rule chain runs as
     # FALLBACK — behaviour degrades to the old classifier, never to a guess.
     llm_classification_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Enable the LLM decision layer for transaction classification "
             "(nature + account routing). Disabling restores the purely "
-            "deterministic classifier exactly."
+            "deterministic classifier exactly. PRESENTATION PROFILE: default "
+            "False — the anchored rule chain decides the nature and the "
+            "ledger. See the profile note above."
         ),
     )
     llm_classification_timeout: float = Field(

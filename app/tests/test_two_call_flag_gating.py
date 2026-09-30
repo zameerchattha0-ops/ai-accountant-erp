@@ -32,6 +32,17 @@ def _flag(monkeypatch, value: bool) -> None:
     monkeypatch.setattr(get_settings(), "two_call_runtime_enabled", value)
 
 
+def _legacy_loop_on(monkeypatch) -> None:
+    """Enable the accounting-reasoning stage for tests that PIN its wiring.
+
+    The shipped profile defaults the stage OFF (``app/config.py``
+    "PRESENTATION PROFILE"), so a test that stubs ``run_reasoning_loop`` must
+    switch the stage on — otherwise the agent never consults the stub and the
+    assertion below would prove nothing.
+    """
+    monkeypatch.setattr(get_settings(), "accounting_reasoning_enabled", True)
+
+
 async def _forbidden(*a, **k):
     raise AssertionError("the monolithic path must not run while the flag is ON")
 
@@ -70,6 +81,7 @@ async def test_flag_off_never_enters_the_two_call_runtime(monkeypatch):
         classify_clarification=False,
     )
     _flag(monkeypatch, False)
+    _legacy_loop_on(monkeypatch)   # this test pins the LEGACY loop wiring
 
     async def _runtime_bomb(**kw):
         raise AssertionError("two-call runtime entered while the flag is OFF")
@@ -299,6 +311,7 @@ async def test_observation_on_runtime_off_does_not_activate_the_runtime(
     )
     monkeypatch.setattr(get_settings(), "two_call_observation_enabled", True)
     _flag(monkeypatch, False)
+    _legacy_loop_on(monkeypatch)   # this test pins the LEGACY loop wiring
 
     async def _runtime_bomb(**kw):
         raise AssertionError("observation flag activated the two-call runtime")

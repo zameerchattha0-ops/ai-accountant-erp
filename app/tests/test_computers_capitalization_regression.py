@@ -362,6 +362,12 @@ async def test_proposal_conflict_fails_closed_before_confirmation(monkeypatch):
         classify_nature="OPERATING_EXPENSE",   # 3d adds the prohibition
         classify_clarification=True,           # gate must NOT park first
     )
+    # The accounting-reasoning stage ships OFF in the presentation profile
+    # (app/config.py "PRESENTATION PROFILE"); this test pins the FIX-6 wiring
+    # between the reasoning proposal and the gate, so enable the stage.
+    from app.config import get_settings as _get_settings
+
+    monkeypatch.setattr(_get_settings(), "accounting_reasoning_enabled", True)
     # reasoning proposes the asset tool (the incident's proposal):
     _asset_outcome = ReasoningOutcome(
         status=PROPOSAL,

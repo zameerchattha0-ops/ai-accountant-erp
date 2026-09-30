@@ -123,6 +123,12 @@ async def test_needs_input_returns_the_authored_questionnaire_single_call(
         classify_nature=None,
         classify_clarification=False,
     )
+    # The accounting-reasoning stage ships OFF in the presentation profile
+    # (app/config.py "PRESENTATION PROFILE"); this test pins the SINGLE-CALL
+    # questionnaire wiring, so enable the stage it exercises.
+    from app.config import get_settings as _get_settings
+
+    monkeypatch.setattr(_get_settings(), "accounting_reasoning_enabled", True)
     monkeypatch.setattr(
         "app.accounting_reasoning.run_reasoning_loop",
         _AM(
