@@ -1716,6 +1716,15 @@ def _merge_clarification_answers(
         if not answer:
             continue
 
+        # A DECISION CHIP of ANOTHER gate never becomes content: the catalog
+        # labels ("Yes - add to catalog" / "No - one-off lines only") may only
+        # be read by the catalog branch below.  Genuine refusals ("No",
+        # "neither", "None of those") stay valid answers for their own gates —
+        # they must keep flowing to the branch that parses them.
+        if _is_catalog_chip(answer) and "catalog check:" not in question:
+            log.info("planner.control_answer_dropped", answer=answer[:60])
+            continue
+
         # FIELD-ROUTED ANSWER (fixed-format questionnaire): the answer
         # carries the field it fills, so it lands in the right entity
         # regardless of the question's wording — LLM-authored questions can
@@ -1934,6 +1943,21 @@ def _merge_clarification_answers(
         # Development Revenue").
         if "revenue ledger check:" in question:
             low = answer.lower()
+            # CHIP SHAPE: the proposed labels are themselves answers
+            # ("Create 'X' under Y" / "Use the existing 'X' account") — parse
+            # them into the decision + name instead of storing the whole chip
+            # as an account name.
+            if low.startswith("create '"):
+                merged["revenue_ledger_decision"] = "CREATE"
+                continue
+            if low.startswith("use the existing"):
+                import re as _re
+
+                _m = _re.search(r"'(.+?)'", answer)
+                merged["revenue_ledger_decision"] = "USE_EXISTING"
+                if _m:
+                    merged["revenue_account_name"] = _m.group(1)
+                continue
             if low.startswith(("yes", "create", "ok", "y")):
                 merged["revenue_ledger_decision"] = "CREATE"
             else:
@@ -2068,6 +2092,28 @@ _METHOD_VALUE_MAP = {
 }
 
 
+def _is_control_answer(value: Any) -> bool:
+    """A reply that is a DECISION CHIP, not content.
+
+    "Yes - add to catalog", "No - one-off lines only", "Create 'X' under Y",
+    "Use the existing 'X' account" — these answer gates; they must never be
+    stored as an item, party or ledger name (an account proposed as
+    "Yes - add to catalog Sales" is exactly what this prevented).
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith(("yes -", "no -", "create '", "use the existing")):
+        return True
+    return text in ("yes", "no", "y", "n", "ok", "okay")
+
+
+def _is_catalog_chip(value: Any) -> bool:
+    """The two labels of the CATALOG gate — chips, never content."""
+    text = str(value or "").strip().lower()
+    return text.startswith(("yes - add to catalog", "no - one-off"))
+
+
 def _merge_field_answer(
     merged: Dict[str, Any], field_name: str, answer: str
 ) -> bool:
@@ -2200,6 +2246,23 @@ def _merge_field_answer_tail(
         return True
 
     if field == "item_description":
+        # NEVER let a decision chip become the item it was answering about
+        # ("Yes - add to catalog", "No - one-off lines only", a proposed
+        # account name).  A control answer is routed by the keyword chain to
+        # ITS decision field; overwriting real content with it is how an
+        # account got proposed as "Yes - add to catalog Sales".
+        if _is_control_answer(value):
+            log.info(
+                "planner.control_answer_rejected",
+                field=field,
+                answer=value[:60],
+            )
+            return False
+        existing = str(merged.get("item_description") or "").strip()
+        if existing and not _is_control_answer(existing):
+            # An already-stated item is content; a later control-shaped reply
+            # must never replace it.
+            return False
         multi = _extract_line_items(value)
         if multi:
             merged["line_items"] = multi

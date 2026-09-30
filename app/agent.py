@@ -3860,10 +3860,18 @@ async def execute(
         _phase_elapsed("catalog_question.start")
         # P1-⑨: lookup already resolved concurrently above.
         if catalog_question:
+            # A DECISION question, not an item question.  The old tag here was
+            # ["item_description"], so the chip answer ("Yes - add to catalog")
+            # was stored as the invoice item — destroying "consultancy
+            # charges" — while `continue` skipped the branch below, so the
+            # decision was never recorded either; the next turn then proposed
+            # a revenue ledger literally named "Yes - add to catalog Sales".
+            # "catalog_decision" is not a merge field, so the answer falls to
+            # the keyword chain where the decision IS parsed.
             clarification = await create_clarification(
                 session_id=session_id,
                 question=catalog_question["question"],
-                required_fields=["item_description"],
+                required_fields=["catalog_decision"],
             )
             await _log_step(session_id, "AWAITING_CLARIFICATION", {
                 "source": "catalog_check",
