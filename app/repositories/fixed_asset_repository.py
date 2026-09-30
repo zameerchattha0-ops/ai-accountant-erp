@@ -74,6 +74,80 @@ async def get_asset(
     )
 
 
+async def list_asset_categories(
+    organization_id: uuid.UUID, *, limit: int = 200
+) -> List[Dict[str, Any]]:
+    """The organisation's asset categories (default life / method / GL accounts).
+
+    A category is pure CONFIGURATION: it never posts anything, it only prefills
+    the acquisition form (and the AI's defaults) with the organisation's own
+    policy — so registering an asset never has to invent a life or a method.
+    """
+    return await fetch_many(
+        "asset_categories",
+        filters={"organization_id": str(organization_id)},
+        order="name.asc",
+        limit=limit,
+    )
+
+
+async def get_asset_category(
+    organization_id: uuid.UUID, *, category_id: uuid.UUID
+) -> Optional[Dict[str, Any]]:
+    return await fetch_one(
+        "asset_categories",
+        filters={
+            "id": str(category_id),
+            "organization_id": str(organization_id),
+        },
+    )
+
+
+async def create_asset_category(
+    *,
+    organization_id: uuid.UUID,
+    name: str,
+    description: Optional[str] = None,
+    default_useful_life_years: Optional[int] = None,
+    default_depreciation_method: str = "STRAIGHT_LINE",
+    default_asset_account_id: Optional[uuid.UUID] = None,
+    default_depreciation_expense_account_id: Optional[uuid.UUID] = None,
+    default_accumulated_depreciation_account_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    return await insert_one(
+        "asset_categories",
+        data={
+            "organization_id": str(organization_id),
+            "name": name,
+            "description": description,
+            "default_useful_life_years": default_useful_life_years,
+            "default_depreciation_method": default_depreciation_method,
+            "default_asset_account_id": (
+                str(default_asset_account_id) if default_asset_account_id else None
+            ),
+            "default_depreciation_expense_account_id": (
+                str(default_depreciation_expense_account_id)
+                if default_depreciation_expense_account_id else None
+            ),
+            "default_accumulated_depreciation_account_id": (
+                str(default_accumulated_depreciation_account_id)
+                if default_accumulated_depreciation_account_id else None
+            ),
+        },
+    )
+
+
+async def update_asset_category(
+    row_id: uuid.UUID, *, fields: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Update mutable category columns by primary key (ownership pre-checked)."""
+    payload = {
+        key: (str(value) if isinstance(value, uuid.UUID) else value)
+        for key, value in fields.items()
+    }
+    return await update_one("asset_categories", row_id=row_id, data=payload)
+
+
 async def create_asset(
     *,
     organization_id: uuid.UUID,

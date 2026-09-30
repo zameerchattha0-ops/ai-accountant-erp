@@ -1,5 +1,5 @@
 import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, SessionSummary, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
-import type { FixedAsset } from "@/lib/types/entities";
+import type { AssetCategory, FixedAsset } from "@/lib/types/entities";
 
 // Same-origin by default: on Vercel the FastAPI backend is served under
 // /api/* of the same domain (see vercel.json "services"). For local dev set
@@ -528,10 +528,20 @@ export interface RegisterFixedAssetPayload {
   purchase_date?: string;
   payment_method?: string;
   supplier_name?: string | null;
+  /** Explicit ASSET account pick (the form's picker); omitted = name match. */
+  asset_account_id?: string | null;
   useful_life_years?: number | null;
   depreciation_method?: string;
   salvage_value?: number;
   description?: string | null;
+  /** Category whose defaults (life / method / GL accounts) the form carried. */
+  category_id?: string | null;
+  /**
+   * The form's GL picks. Sent when chosen; the backend still resolves them
+   * deterministically when omitted, so a blank field is never an error.
+   */
+  depreciation_expense_account_id?: string | null;
+  accumulated_depreciation_account_id?: string | null;
 }
 
 /**
@@ -550,7 +560,13 @@ export async function registerFixedAsset(
 /** Post one depreciation charge (blank amount = the asset's own policy). */
 export async function recordAssetDepreciation(
   assetId: string,
-  payload: { depreciation_amount?: number | null; transaction_date?: string }
+  payload: {
+    depreciation_amount?: number | null;
+    transaction_date?: string;
+    /** Explicit GL picks (used when the asset row carries none). */
+    depreciation_expense_account_id?: string | null;
+    accumulated_depreciation_account_id?: string | null;
+  }
 ): Promise<{ item: FixedAsset }> {
   return fetchApi<{ item: FixedAsset }>(
     `/api/fixed-assets/${assetId}/depreciation`,
@@ -571,6 +587,46 @@ export async function disposeFixedAsset(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+/* ---- Asset categories (configuration: default life / method / GL accounts) ---- */
+
+export interface AssetCategoryPayload {
+  name: string;
+  description?: string | null;
+  default_useful_life_years?: number | null;
+  default_depreciation_method?: string;
+  default_asset_account_id?: string | null;
+  default_depreciation_expense_account_id?: string | null;
+  default_accumulated_depreciation_account_id?: string | null;
+}
+
+/** The categories the register form prefills from. */
+export async function listFixedAssetCategories(): Promise<{
+  items: AssetCategory[];
+}> {
+  return fetchApi<{ items: AssetCategory[] }>("/api/fixed-assets/categories");
+}
+
+/** Create a category (409 when the name is taken or the policy is invalid). */
+export async function createFixedAssetCategory(
+  payload: AssetCategoryPayload
+): Promise<{ item: AssetCategory }> {
+  return fetchApi<{ item: AssetCategory }>("/api/fixed-assets/categories", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Edit a category's defaults. */
+export async function updateFixedAssetCategory(
+  categoryId: string,
+  payload: Partial<AssetCategoryPayload>
+): Promise<{ item: AssetCategory }> {
+  return fetchApi<{ item: AssetCategory }>(
+    `/api/fixed-assets/categories/${categoryId}`,
+    { method: "PATCH", body: JSON.stringify(payload) }
+  );
 }
 
 /* ---- Health ---- */

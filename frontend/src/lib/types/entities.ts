@@ -551,4 +551,27 @@ export interface FixedAsset {
   book_value: number;
   status: "ACTIVE" | "FULLY_DEPRECIATED" | "DISPOSED" | "SOLD" | "WRITTEN_OFF";
   gl_asset_account_id?: string | null;
+  /** Resolved once at registration so the later charge finds them on the row. */
+  gl_depreciation_expense_account_id?: string | null;
+  gl_accumulated_depreciation_account_id?: string | null;
+  category_id?: string | null;
+}
+
+/**
+ * An asset category (``asset_categories``): pure CONFIGURATION — default
+ * useful life, method and GL accounts that prefill the acquisition form.
+ * It never posts anything itself.
+ */
+export interface AssetCategory {
+  id: string;
+  organization_id?: string;
+  name: string;
+  description?: string | null;
+  default_useful_life_years: number | null;
+  default_depreciation_method: string;
+  default_asset_account_id?: string | null;
+  default_depreciation_expense_account_id?: string | null;
+  default_accumulated_depreciation_account_id?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }

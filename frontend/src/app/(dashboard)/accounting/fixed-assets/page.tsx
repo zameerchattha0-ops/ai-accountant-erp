@@ -1,9 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { Banknote, Plus, Search, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Banknote, FolderCog, Plus, Search, Trash2 } from "lucide-react";
+import { createClient } from "@/lib/supabase/client";
 import {
+  createFixedAssetCategory,
   disposeFixedAsset,
+  listFixedAssetCategories,
   listFixedAssets,
   recordAssetDepreciation,
   registerFixedAsset,
@@ -11,11 +14,21 @@ import {
 } from "@/lib/api/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
+import {
+  accountOptions,
+  applyCategoryDefaults,
+  depreciationBlocker,
+  filterAssets,
+  messageOf,
+  registerBlocker,
+  setupNotices,
+  unknownSupplierNotice,
+} from "@/lib/fixed-assets/logic";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
-import type { FixedAsset } from "@/lib/types/entities";
+import type { Account, AssetCategory, FixedAsset } from "@/lib/types/entities";
 
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
@@ -33,18 +46,6 @@ const OPEN_STATUSES = new Set(["ACTIVE", "FULLY_DEPRECIATED"]);
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-/** The API carries the refusal text in ``detail`` — surface it verbatim. */
-function messageOf(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.detail === "string") return parsed.detail;
-  } catch {
-    /* plain-text error — already readable */
-  }
-  return raw;
-}
-
 interface RegisterForm {
   name: string;
   purchase_cost: string;
@@ -55,6 +56,11 @@ interface RegisterForm {
   depreciation_method: string;
   salvage_value: string;
   description: string;
+  /** "" = let the backend resolve deterministically (never an error). */
+  category_id: string;
+  asset_account_id: string;
+  depreciation_expense_account_id: string;
+  accumulated_depreciation_account_id: string;
 }
 
 const EMPTY_REGISTER: RegisterForm = {
@@ -67,6 +73,10 @@ const EMPTY_REGISTER: RegisterForm = {
   depreciation_method: "STRAIGHT_LINE",
   salvage_value: "",
   description: "",
+  category_id: "",
+  asset_account_id: "",
+  depreciation_expense_account_id: "",
+  accumulated_depreciation_account_id: "",
 };
 
 export default function FixedAssetsPage() {
@@ -85,12 +95,32 @@ export default function FixedAssetsPage() {
   const [depForm, setDepForm] = useState({
     transaction_date: today(),
     depreciation_amount: "",
+    depreciation_expense_account_id: "",
+    accumulated_depreciation_account_id: "",
   });
   const [disposeTarget, setDisposeTarget] = useState<FixedAsset | null>(null);
   const [disposeForm, setDisposeForm] = useState({
     transaction_date: today(),
     disposal_type: "DISPOSAL",
     disposal_amount: "",
+  });
+
+  // Configuration the FORMS need: chart of accounts (GL pickers + preflight),
+  // suppliers (exact-name refusals), and the asset categories themselves.
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [suppliers, setSuppliers] = useState<{ name: string }[]>([]);
+  const [categories, setCategories] = useState<AssetCategory[]>([]);
+  const [categoriesOpen, setCategoriesOpen] = useState(false);
+  const [catSaving, setCatSaving] = useState(false);
+  const [catError, setCatError] = useState<string | null>(null);
+  const [catForm, setCatForm] = useState({
+    name: "",
+    description: "",
+    default_useful_life_years: "",
+    default_depreciation_method: "STRAIGHT_LINE",
+    default_asset_account_id: "",
+    default_depreciation_expense_account_id: "",
+    default_accumulated_depreciation_account_id: "",
   });
 
   const currency = org?.base_currency_code;
@@ -114,13 +144,78 @@ export default function FixedAssetsPage() {
     void load();
   }, [load]);
 
-  const rows = register?.items ?? [];
-  const filtered = rows.filter(
-    (row) =>
-      (status === "ALL" || row.status === status) &&
-      (!search ||
-        row.name.toLowerCase().includes(search.toLowerCase()) ||
-        (row.asset_code ?? "").toLowerCase().includes(search.toLowerCase()))
+  /** Chart of accounts, suppliers and categories — everything the forms ask. */
+  const loadConfig = useCallback(async () => {
+    if (!org) return;
+    const supabase = createClient();
+    const [accts, sups] = await Promise.all([
+      supabase
+        .from("accounts")
+        .select("*")
+        .eq("organization_id", org.organization_id)
+        .order("code"),
+      supabase
+        .from("suppliers")
+        .select("name")
+        .eq("organization_id", org.organization_id)
+        .order("name"),
+    ]);
+    if (!accts.error) setAccounts(accts.data ?? []);
+    if (!sups.error) setSuppliers(sups.data ?? []);
+    try {
+      setCategories((await listFixedAssetCategories()).items);
+    } catch {
+      /* the category list is configuration, not data — the register still works */
+    }
+  }, [org]);
+
+  useEffect(() => {
+    void loadConfig();
+  }, [loadConfig]);
+
+  const assetAccountOptions = useMemo(
+    () => accountOptions(accounts, "ASSET"),
+    [accounts]
+  );
+  const expenseAccountOptions = useMemo(
+    () => accountOptions(accounts, "EXPENSE"),
+    [accounts]
+  );
+  /** What a register/depreciation submission would hit — shown BEFORE the 409. */
+  const configNotices = useMemo(() => setupNotices(accounts), [accounts]);
+  const supplierNotice = useMemo(
+    () => unknownSupplierNotice(form.supplier_name, suppliers),
+    [form.supplier_name, suppliers]
+  );
+
+  /**
+   * Would this depreciation charge be refused? The original blocker decides
+   * whether to show the pickers; the live one (including what the user has
+   * just picked) is the message — it clears once the accounts are chosen.
+   */
+  const depNeedsAccounts = depTarget
+    ? depreciationBlocker(depTarget, accounts) !== null
+    : false;
+  const depBlocker =
+    depTarget && depNeedsAccounts
+      ? depreciationBlocker(
+          {
+            ...depTarget,
+            gl_depreciation_expense_account_id:
+              depForm.depreciation_expense_account_id ||
+              depTarget.gl_depreciation_expense_account_id,
+            gl_accumulated_depreciation_account_id:
+              depForm.accumulated_depreciation_account_id ||
+              depTarget.gl_accumulated_depreciation_account_id,
+          },
+          accounts
+        )
+      : null;
+
+  const rows = useMemo(() => register?.items ?? [], [register]);
+  const filtered = useMemo(
+    () => filterAssets(rows, search, status),
+    [rows, search, status]
   );
   const counts = register?.counts ?? {};
   const summary = register?.summary ?? {
@@ -130,9 +225,9 @@ export default function FixedAssetsPage() {
   };
 
   const handleRegister = async () => {
-    const cost = Number(form.purchase_cost);
-    if (form.name.trim().length < 2 || !Number.isFinite(cost) || cost <= 0) {
-      setFormError("An asset name and a positive purchase cost are required.");
+    const blocker = registerBlocker(form);
+    if (blocker) {
+      setFormError(blocker);
       return;
     }
     setSaving(true);
@@ -140,16 +235,22 @@ export default function FixedAssetsPage() {
     try {
       await registerFixedAsset({
         name: form.name.trim(),
-        purchase_cost: cost,
+        purchase_cost: Number(form.purchase_cost),
         purchase_date: form.purchase_date || undefined,
         payment_method: form.payment_method,
         supplier_name: form.supplier_name.trim() || null,
+        asset_account_id: form.asset_account_id || null,
         useful_life_years: form.useful_life_years
           ? Number(form.useful_life_years)
           : null,
         depreciation_method: form.depreciation_method,
         salvage_value: form.salvage_value ? Number(form.salvage_value) : 0,
         description: form.description.trim() || null,
+        category_id: form.category_id || null,
+        depreciation_expense_account_id:
+          form.depreciation_expense_account_id || null,
+        accumulated_depreciation_account_id:
+          form.accumulated_depreciation_account_id || null,
       });
       setRegisterOpen(false);
       setForm(EMPTY_REGISTER);
@@ -161,9 +262,66 @@ export default function FixedAssetsPage() {
     }
   };
 
+  /** A category supplies the policy (life + method) — the register never does. */
+  const handleCategoryChange = (categoryId: string) => {
+    const category = categories.find((c) => c.id === categoryId) ?? null;
+    setForm((prev) => ({
+      ...applyCategoryDefaults(prev, category, {
+        life: "useful_life_years",
+        method: "depreciation_method",
+      }),
+      category_id: categoryId,
+      asset_account_id:
+        category?.default_asset_account_id ?? prev.asset_account_id,
+      depreciation_expense_account_id:
+        category?.default_depreciation_expense_account_id ??
+        prev.depreciation_expense_account_id,
+      accumulated_depreciation_account_id:
+        category?.default_accumulated_depreciation_account_id ??
+        prev.accumulated_depreciation_account_id,
+    }));
+  };
+
+  const handleSaveCategory = async () => {
+    if (catForm.name.trim().length < 2) {
+      setCatError("A category name is required.");
+      return;
+    }
+    setCatSaving(true);
+    setCatError(null);
+    try {
+      await createFixedAssetCategory({
+        name: catForm.name.trim(),
+        description: catForm.description.trim() || null,
+        default_useful_life_years: catForm.default_useful_life_years
+          ? Number(catForm.default_useful_life_years)
+          : null,
+        default_depreciation_method: catForm.default_depreciation_method,
+        default_asset_account_id: catForm.default_asset_account_id || null,
+        default_depreciation_expense_account_id:
+          catForm.default_depreciation_expense_account_id || null,
+        default_accumulated_depreciation_account_id:
+          catForm.default_accumulated_depreciation_account_id || null,
+      });
+      setCategories((await listFixedAssetCategories()).items);
+      setCatForm({ ...catForm, name: "", description: "" });
+    } catch (e) {
+      setCatError(messageOf(e));
+    } finally {
+      setCatSaving(false);
+    }
+  };
+
   const openDepreciate = (asset: FixedAsset) => {
     setFormError(null);
-    setDepForm({ transaction_date: today(), depreciation_amount: "" });
+    setDepForm({
+      transaction_date: today(),
+      depreciation_amount: "",
+      depreciation_expense_account_id:
+        asset.gl_depreciation_expense_account_id ?? "",
+      accumulated_depreciation_account_id:
+        asset.gl_accumulated_depreciation_account_id ?? "",
+    });
     setDepTarget(asset);
   };
 
@@ -177,6 +335,10 @@ export default function FixedAssetsPage() {
         depreciation_amount: depForm.depreciation_amount
           ? Number(depForm.depreciation_amount)
           : null,
+        depreciation_expense_account_id:
+          depForm.depreciation_expense_account_id || null,
+        accumulated_depreciation_account_id:
+          depForm.accumulated_depreciation_account_id || null,
       });
       setDepTarget(null);
       await load();
@@ -224,17 +386,29 @@ export default function FixedAssetsPage() {
         title="Fixed Assets"
         subtitle="The asset register: register an acquisition, charge depreciation, or dispose — each action posts its own journal."
         actions={
-          <button
-            onClick={() => {
-              setForm(EMPTY_REGISTER);
-              setFormError(null);
-              setRegisterOpen(true);
-            }}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 px-3.5 py-2 text-sm font-semibold text-white hover:from-ai-400 transition"
-          >
-            <Plus className="w-4 h-4" />
-            Register asset
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setCatError(null);
+                setCategoriesOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-border-default bg-bg-surface px-3.5 py-2 text-sm font-medium text-text-secondary hover:bg-bg-muted transition-colors"
+            >
+              <FolderCog className="w-4 h-4" />
+              Categories
+            </button>
+            <button
+              onClick={() => {
+                setForm(EMPTY_REGISTER);
+                setFormError(null);
+                setRegisterOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 px-3.5 py-2 text-sm font-semibold text-white hover:from-ai-400 transition"
+            >
+              <Plus className="w-4 h-4" />
+              Register asset
+            </button>
+          </div>
         }
       />
 
@@ -415,6 +589,42 @@ export default function FixedAssetsPage() {
               placeholder="e.g. Delivery Van"
             />
           </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium text-text-secondary">
+                Category
+              </label>
+              <button
+                onClick={() => {
+                  setCatError(null);
+                  setCategoriesOpen(true);
+                }}
+                className="inline-flex items-center gap-1 text-xs font-medium text-ai-600 hover:text-ai-500"
+              >
+                <FolderCog className="w-3.5 h-3.5" />
+                Manage categories
+              </button>
+            </div>
+            <select
+              className={`${inputCls} mt-1.5`}
+              value={form.category_id}
+              onChange={(e) => handleCategoryChange(e.target.value)}
+            >
+              <option value="">No category — set the policy by hand</option>
+              {categories.map((category) => (
+                <option key={category.id} value={category.id}>
+                  {category.name}
+                  {category.default_useful_life_years
+                    ? ` — ${category.default_useful_life_years} yrs`
+                    : ""}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[11px] text-text-muted">
+              The category supplies the useful life, method and GL accounts —
+              the register never invents them.
+            </p>
+          </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="text-xs font-medium text-text-secondary">
@@ -527,6 +737,77 @@ export default function FixedAssetsPage() {
               placeholder="0 — depreciation never goes below this"
             />
           </div>
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Asset account
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={form.asset_account_id}
+                onChange={(e) =>
+                  setForm({ ...form, asset_account_id: e.target.value })
+                }
+              >
+                <option value="">Automatic (name match)</option>
+                {assetAccountOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Depreciation expense
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={form.depreciation_expense_account_id}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    depreciation_expense_account_id: e.target.value,
+                  })
+                }
+              >
+                <option value="">Automatic</option>
+                {expenseAccountOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Accumulated depreciation
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={form.accumulated_depreciation_account_id}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    accumulated_depreciation_account_id: e.target.value,
+                  })
+                }
+              >
+                <option value="">Automatic</option>
+                {assetAccountOptions
+                  .filter((option) =>
+                    option.label
+                      .toLowerCase()
+                      .includes("accumulated depreciation")
+                  )
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          </div>
           <div>
             <label className="text-xs font-medium text-text-secondary">
               Description
@@ -541,6 +822,17 @@ export default function FixedAssetsPage() {
               placeholder="e.g. Toyota Hilux — registration LEB-1234"
             />
           </div>
+          {(supplierNotice
+            ? [supplierNotice, ...configNotices]
+            : configNotices
+          ).map((notice) => (
+            <p
+              key={notice}
+              className="rounded-xl border border-warning-500 bg-warning-50 px-3 py-2 text-xs text-warning-600"
+            >
+              {notice}
+            </p>
+          ))}
           {formError && <p className="text-xs text-error-600">{formError}</p>}
           <div className="flex justify-end gap-2 pt-1">
             <button
@@ -608,6 +900,65 @@ export default function FixedAssetsPage() {
               />
             </div>
           </div>
+          {depNeedsAccounts && (
+            <div className="space-y-3 rounded-xl border border-warning-500 bg-warning-50 p-3">
+              {depBlocker && (
+                <p className="text-xs text-warning-600">{depBlocker}</p>
+              )}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-medium text-text-secondary">
+                    Depreciation expense
+                  </label>
+                  <select
+                    className={`${inputCls} mt-1.5`}
+                    value={depForm.depreciation_expense_account_id}
+                    onChange={(e) =>
+                      setDepForm({
+                        ...depForm,
+                        depreciation_expense_account_id: e.target.value,
+                      })
+                    }
+                  >
+                    <option value="">Automatic</option>
+                    {expenseAccountOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-text-secondary">
+                    Accumulated depreciation
+                  </label>
+                  <select
+                    className={`${inputCls} mt-1.5`}
+                    value={depForm.accumulated_depreciation_account_id}
+                    onChange={(e) =>
+                      setDepForm({
+                        ...depForm,
+                        accumulated_depreciation_account_id: e.target.value,
+                      })
+                    }
+                  >
+                    <option value="">Automatic</option>
+                    {assetAccountOptions
+                      .filter((option) =>
+                        option.label
+                          .toLowerCase()
+                          .includes("accumulated depreciation")
+                      )
+                      .map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
           <p className="text-[11px] text-text-muted">
             Leaving the amount blank posts one month of straight-line
             depreciation — (cost − salvage) ÷ useful life ÷ 12. The charge never
@@ -726,6 +1077,195 @@ export default function FixedAssetsPage() {
           </div>
         </div>
       </Modal>
+
+      <Modal
+        open={categoriesOpen}
+        onClose={() => setCategoriesOpen(false)}
+        title="Asset categories"
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-text-secondary">
+            A category is configuration only: the default useful life, method
+            and GL accounts that prefill the register form. Nothing is posted
+            until an asset is registered against it.
+          </p>
+
+          {categories.length === 0 ? (
+            <p className="rounded-xl border border-border-subtle bg-bg-muted px-3 py-2 text-xs text-text-muted">
+              No categories yet — create the first one below (e.g. Vehicles,
+              5 years, straight line).
+            </p>
+          ) : (
+            <ul className="divide-y divide-border-subtle rounded-xl border border-border-subtle">
+              {categories.map((category) => (
+                <li key={category.id} className="px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium text-text-primary">
+                      {category.name}
+                    </p>
+                    <p className="text-xs text-text-muted">
+                      {category.default_useful_life_years
+                        ? `${category.default_useful_life_years} yrs · `
+                        : ""}
+                      {category.default_depreciation_method.replace(/_/g, " ")}
+                    </p>
+                  </div>
+                  {category.description && (
+                    <p className="mt-0.5 text-xs text-text-muted">
+                      {category.description}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Name *
+              </label>
+              <input
+                className={`${inputCls} mt-1.5`}
+                value={catForm.name}
+                onChange={(e) => setCatForm({ ...catForm, name: e.target.value })}
+                placeholder="e.g. Vehicles"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Default useful life (years)
+              </label>
+              <input
+                className={`${inputCls} mt-1.5`}
+                inputMode="numeric"
+                value={catForm.default_useful_life_years}
+                onChange={(e) =>
+                  setCatForm({
+                    ...catForm,
+                    default_useful_life_years: e.target.value,
+                  })
+                }
+                placeholder="e.g. 5"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Default method
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={catForm.default_depreciation_method}
+                onChange={(e) =>
+                  setCatForm({
+                    ...catForm,
+                    default_depreciation_method: e.target.value,
+                  })
+                }
+              >
+                {DEPRECIATION_METHODS.map((method) => (
+                  <option key={method.value} value={method.value}>
+                    {method.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Asset account
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={catForm.default_asset_account_id}
+                onChange={(e) =>
+                  setCatForm({
+                    ...catForm,
+                    default_asset_account_id: e.target.value,
+                  })
+                }
+              >
+                <option value="">None</option>
+                {assetAccountOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Depreciation expense
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={catForm.default_depreciation_expense_account_id}
+                onChange={(e) =>
+                  setCatForm({
+                    ...catForm,
+                    default_depreciation_expense_account_id: e.target.value,
+                  })
+                }
+              >
+                <option value="">None</option>
+                {expenseAccountOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-text-secondary">
+                Accumulated depreciation
+              </label>
+              <select
+                className={`${inputCls} mt-1.5`}
+                value={catForm.default_accumulated_depreciation_account_id}
+                onChange={(e) =>
+                  setCatForm({
+                    ...catForm,
+                    default_accumulated_depreciation_account_id: e.target.value,
+                  })
+                }
+              >
+                <option value="">None</option>
+                {assetAccountOptions
+                  .filter((option) =>
+                    option.label
+                      .toLowerCase()
+                      .includes("accumulated depreciation")
+                  )
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          </div>
+          {catError && <p className="text-xs text-error-600">{catError}</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              onClick={() => setCategoriesOpen(false)}
+              className="rounded-xl border border-border-default px-3.5 py-2 text-sm font-medium text-text-secondary hover:bg-bg-muted transition-colors"
+            >
+              Close
+            </button>
+            <button
+              onClick={handleSaveCategory}
+              disabled={catSaving}
+              className="rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 px-3.5 py-2 text-sm font-semibold text-white hover:from-ai-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {catSaving ? "Saving..." : "Add category"}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }
+

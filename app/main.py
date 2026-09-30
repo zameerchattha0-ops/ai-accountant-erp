@@ -1387,6 +1387,86 @@ async def list_fixed_assets_endpoint(
     }
 
 
+def _optional_uuid(value: Any) -> Optional[uuid.UUID]:
+    """A client-supplied id: None when blank, 409 when it is not a UUID."""
+    if value in (None, ""):
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=409, detail=f"Unknown id: {value}")
+
+
+# Asset CATEGORIES — configuration only (default life / method / GL accounts).
+# Declared BEFORE the /{asset_id} routes: path segments are matched in order,
+# and "categories" would otherwise be parsed as a UUID and 422.
+@app.get("/api/fixed-assets/categories")
+async def list_fixed_asset_categories_endpoint(
+    auth: AuthContext = Depends(get_current_user),
+):
+    """The organisation's asset categories (what the register form prefills)."""
+    from app.services import fixed_asset_service
+
+    return {"items": await fixed_asset_service.list_asset_categories(auth.organization_id)}
+
+
+@app.post("/api/fixed-assets/categories", status_code=201)
+async def create_fixed_asset_category_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Add a category (e.g. Vehicles: 5 yrs, straight line, PPE accounts)."""
+    from app.services import fixed_asset_service
+
+    try:
+        item = await fixed_asset_service.create_asset_category(
+            auth.organization_id,
+            name=payload.get("name"),
+            description=payload.get("description"),
+            default_useful_life_years=payload.get("default_useful_life_years"),
+            default_depreciation_method=payload.get("default_depreciation_method"),
+            default_asset_account_id=_optional_uuid(
+                payload.get("default_asset_account_id")
+            ),
+            default_depreciation_expense_account_id=_optional_uuid(
+                payload.get("default_depreciation_expense_account_id")
+            ),
+            default_accumulated_depreciation_account_id=_optional_uuid(
+                payload.get("default_accumulated_depreciation_account_id")
+            ),
+        )
+    except ValueError as exc:
+        raise _catalogue_error("asset_categories", exc)
+    return {"item": item}
+
+
+@app.patch("/api/fixed-assets/categories/{category_id}")
+async def update_fixed_asset_category_endpoint(
+    category_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Edit a category's defaults (ownership checked inside the service)."""
+    from app.services import fixed_asset_service
+
+    fields = dict(payload)
+    for key in (
+        "default_asset_account_id",
+        "default_depreciation_expense_account_id",
+        "default_accumulated_depreciation_account_id",
+    ):
+        if key in fields:
+            parsed = _optional_uuid(fields[key])
+            fields[key] = parsed.id if parsed else None
+    try:
+        item = await fixed_asset_service.update_asset_category(
+            auth.organization_id, category_id=category_id, **fields
+        )
+    except ValueError as exc:
+        raise _catalogue_error("asset_categories", exc)
+    return {"item": item}
+
+
 @app.post("/api/fixed-assets", status_code=201)
 async def create_fixed_asset_endpoint(
     payload: Dict[str, Any] = Body(default={}),
@@ -1428,12 +1508,20 @@ async def create_fixed_asset_endpoint(
             ),
             payment_method=str(payload.get("payment_method") or "CASH").upper(),
             supplier_name=payload.get("supplier_name"),
+            asset_account_id=_optional_uuid(payload.get("asset_account_id")),
             useful_life_years=life_years,
             depreciation_method=str(
                 payload.get("depreciation_method") or "STRAIGHT_LINE"
             ).upper(),
             salvage_value=payload.get("salvage_value") or 0,
             description=payload.get("description"),
+            category_id=_optional_uuid(payload.get("category_id")),
+            depreciation_expense_account_id=_optional_uuid(
+                payload.get("depreciation_expense_account_id")
+            ),
+            accumulated_depreciation_account_id=_optional_uuid(
+                payload.get("accumulated_depreciation_account_id")
+            ),
             created_by=auth.user_id,
         )
     except ValueError as exc:
@@ -1485,6 +1573,12 @@ async def record_fixed_asset_depreciation_endpoint(
             asset_id=str(asset_id),
             depreciation_amount=amount,
             transaction_date=payload.get("transaction_date"),
+            depreciation_expense_account_id=_optional_uuid(
+                payload.get("depreciation_expense_account_id")
+            ),
+            accumulated_depreciation_account_id=_optional_uuid(
+                payload.get("accumulated_depreciation_account_id")
+            ),
         )
     except ValueError as exc:
         raise _catalogue_error("fixed_assets", exc)

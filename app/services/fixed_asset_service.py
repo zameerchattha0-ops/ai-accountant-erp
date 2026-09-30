@@ -81,6 +81,136 @@ async def list_assets(
     return await repo.list_assets(organization_id, limit=limit)
 
 
+# ---------------------------------------------------------------------------
+# Asset categories — CONFIGURATION only (default life / method / GL
+# accounts).  A category never posts anything; it prefills the acquisition
+# form so the register never has to invent a policy.
+# ---------------------------------------------------------------------------
+_CATEGORY_METHODS = ("STRAIGHT_LINE", "REDUCING_BALANCE")
+
+
+async def list_asset_categories(
+    organization_id: uuid.UUID,
+) -> List[Dict[str, Any]]:
+    return await repo.list_asset_categories(organization_id)
+
+
+def _category_values(
+    *,
+    name: Any,
+    default_useful_life_years: Any,
+    default_depreciation_method: Any,
+) -> Dict[str, Any]:
+    """Validate + normalise a category payload (shared by create/update)."""
+    clean_name = str(name or "").strip()
+    if len(clean_name) < 2:
+        raise ValueError("A category name is required.")
+    method = str(default_depreciation_method or "STRAIGHT_LINE").upper()
+    if method not in _CATEGORY_METHODS:
+        raise ValueError(
+            "Depreciation method must be STRAIGHT_LINE or REDUCING_BALANCE."
+        )
+    life: Optional[int] = None
+    if str(default_useful_life_years or "").strip():
+        try:
+            life = int(float(default_useful_life_years))
+        except (TypeError, ValueError):
+            raise ValueError("Default useful life must be a whole number of years.")
+        if life <= 0:
+            raise ValueError("Default useful life must be a positive number of years.")
+    return {"name": clean_name, "default_useful_life_years": life,
+            "default_depreciation_method": method}
+
+
+async def create_asset_category(
+    organization_id: uuid.UUID,
+    *,
+    name: Any,
+    description: Optional[str] = None,
+    default_useful_life_years: Any = None,
+    default_depreciation_method: Any = None,
+    default_asset_account_id: Optional[uuid.UUID] = None,
+    default_depreciation_expense_account_id: Optional[uuid.UUID] = None,
+    default_accumulated_depreciation_account_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    values = _category_values(
+        name=name,
+        default_useful_life_years=default_useful_life_years,
+        default_depreciation_method=default_depreciation_method,
+    )
+    existing = await repo.list_asset_categories(organization_id)
+    if any(
+        str(c.get("name") or "").lower() == values["name"].lower()
+        for c in existing
+    ):
+        raise ValueError(f"A category named '{values['name']}' already exists.")
+    return await repo.create_asset_category(
+        organization_id=organization_id,
+        description=(str(description).strip() or None) if description else None,
+        default_asset_account_id=default_asset_account_id,
+        default_depreciation_expense_account_id=default_depreciation_expense_account_id,
+        default_accumulated_depreciation_account_id=default_accumulated_depreciation_account_id,
+        **values,
+    )
+
+
+async def update_asset_category(
+    organization_id: uuid.UUID,
+    *,
+    category_id: uuid.UUID,
+    **fields: Any,
+) -> Dict[str, Any]:
+    current = await repo.get_asset_category(
+        organization_id, category_id=category_id
+    )
+    if not current:
+        raise ValueError("Category not found.")
+
+    allowed = {
+        "name", "description", "default_useful_life_years",
+        "default_depreciation_method", "default_asset_account_id",
+        "default_depreciation_expense_account_id",
+        "default_accumulated_depreciation_account_id",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown category field: {', '.join(sorted(unknown))}."
+        )
+
+    payload: Dict[str, Any] = {}
+    if "name" in fields or "default_useful_life_years" in fields or \
+            "default_depreciation_method" in fields:
+        merged = {
+            "name": fields.get("name", current.get("name")),
+            "default_useful_life_years": fields.get(
+                "default_useful_life_years", current.get("default_useful_life_years")
+            ),
+            "default_depreciation_method": fields.get(
+                "default_depreciation_method", current.get("default_depreciation_method")
+            ),
+        }
+        payload.update(
+            _category_values(
+                name=merged["name"],
+                default_useful_life_years=merged["default_useful_life_years"],
+                default_depreciation_method=merged["default_depreciation_method"],
+            )
+        )
+    if "description" in fields:
+        payload["description"] = (
+            str(fields["description"]).strip() or None
+        )
+    for key in allowed - {"name", "description", "default_useful_life_years",
+                          "default_depreciation_method"}:
+        if key in fields:
+            payload[key] = fields[key]
+
+    updated = await repo.update_asset_category(category_id, fields=payload)
+    return updated or {**current, **payload}
+
+
+
 async def _resolve_asset_by_reference(
     organization_id: uuid.UUID,
     *,
@@ -238,6 +368,9 @@ async def register_asset(
     depreciation_method: str = "STRAIGHT_LINE",
     salvage_value: float = 0.0,
     description: Optional[str] = None,
+    category_id: Optional[uuid.UUID] = None,
+    depreciation_expense_account_id: Optional[uuid.UUID] = None,
+    accumulated_depreciation_account_id: Optional[uuid.UUID] = None,
     created_by: Optional[uuid.UUID] = None,
     **kw,
 ) -> Dict[str, Any]:
@@ -280,6 +413,23 @@ async def register_asset(
     if supplier_name and not supplier:
         raise ValueError(f"Supplier not found: {supplier_name}")
 
+    # DEPRECIATION ACCOUNTS — resolved BEST-EFFORT at registration and stored
+    # on the asset row.  Storing them is what makes the later depreciation
+    # charge work without another configuration hunt; their absence never
+    # blocks the acquisition (the acquisition journal does not need them).
+    dep_expense_account = await _resolve_gl_account(
+        organization_id,
+        account_type="EXPENSE",
+        keywords=("depreciation",),
+        explicit_id=depreciation_expense_account_id,
+    )
+    acc_dep_account = await _resolve_gl_account(
+        organization_id,
+        account_type="ASSET",
+        keywords=("accumulated depreciation",),
+        explicit_id=accumulated_depreciation_account_id,
+    )
+
     is_credit = payment_method == "CREDIT"
     if is_credit and not supplier:
         raise ValueError(
@@ -299,6 +449,13 @@ async def register_asset(
         depreciation_method=depreciation_method,
         supplier_id=uuid.UUID(supplier["id"]) if supplier else None,
         gl_asset_account_id=uuid.UUID(asset_account["id"]),
+        gl_depreciation_expense_account_id=(
+            uuid.UUID(dep_expense_account["id"]) if dep_expense_account else None
+        ),
+        gl_accumulated_depreciation_account_id=(
+            uuid.UUID(acc_dep_account["id"]) if acc_dep_account else None
+        ),
+        category_id=category_id,
         description=description,
         created_by=created_by,
     )
@@ -475,6 +632,8 @@ async def record_depreciation(
     asset_name: Optional[str] = None,
     depreciation_amount: Optional[float] = None,
     transaction_date: Optional[str] = None,
+    depreciation_expense_account_id: Optional[uuid.UUID] = None,
+    accumulated_depreciation_account_id: Optional[uuid.UUID] = None,
     **kw,
 ) -> Dict[str, Any]:
     """Record depreciation for an asset.
@@ -525,14 +684,19 @@ async def record_depreciation(
 
     txn_date = transaction_date or date.today().isoformat()
 
-    # GL accounts: asset-configured column → deterministic name match.
+    # GL accounts: caller's explicit choice (the UI's pickers) → the asset's
+    # own stored column (resolved once at registration) → deterministic name
+    # match.  The refusal below is the only remaining configuration gap.
     dep_expense = await _resolve_gl_account(
         organization_id,
         account_type="EXPENSE",
         keywords=("depreciation",),
         explicit_id=(
-            uuid.UUID(asset["gl_depreciation_expense_account_id"])
-            if asset.get("gl_depreciation_expense_account_id") else None
+            depreciation_expense_account_id
+            or (
+                uuid.UUID(asset["gl_depreciation_expense_account_id"])
+                if asset.get("gl_depreciation_expense_account_id") else None
+            )
         ),
     )
     acc_dep_account = await _resolve_gl_account(
@@ -540,8 +704,11 @@ async def record_depreciation(
         account_type="ASSET",
         keywords=("accumulated depreciation",),
         explicit_id=(
-            uuid.UUID(asset["gl_accumulated_depreciation_account_id"])
-            if asset.get("gl_accumulated_depreciation_account_id") else None
+            accumulated_depreciation_account_id
+            or (
+                uuid.UUID(asset["gl_accumulated_depreciation_account_id"])
+                if asset.get("gl_accumulated_depreciation_account_id") else None
+            )
         ),
     )
     if not dep_expense or not acc_dep_account:
