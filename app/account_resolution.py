@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import structlog
 
@@ -107,6 +107,61 @@ _ITEM_CATEGORY_RULES: Tuple[Tuple[str, str], ...] = (
     (r"jewel|gold|silver|investment|shares|deposit",
      "Other Non-Current Assets"),
 )
+
+
+# ---------------------------------------------------------------------------
+# STATEMENT-SECTION INVARIANT for category-ledger parents.
+#
+# "Accounts Receivable" is an ASSET, so a type-only parent check happily
+# parented a newly created "Vehicles" ledger UNDER it (production
+# 2026-09-30: create_parent_name = Accounts Receivable).  A category ledger
+# belongs to the same SECTION as its heading, so current-asset / receivable /
+# settlement / tax / contra accounts are never acceptable parents for a
+# PPE-style category, however well the type matches.
+# ---------------------------------------------------------------------------
+_NON_CATEGORY_PARENT_PATTERNS: Tuple[str, ...] = (
+    "receivab",
+    "payable",
+    "cash",
+    "bank",
+    "inventor",
+    "stock",
+    "prepaid",
+    "advance",
+    "vat",
+    "tax",
+    "accumulated depreciation",
+    "contra",
+)
+
+
+def is_category_parent(
+    account: Optional[Mapping[str, Any]], *, nature: str
+) -> bool:
+    """May *account* parent a category ledger of *nature*?
+
+    Two conditions, both necessary:
+
+    * the SAME statement section as the nature's shape (``account_type``);
+    * for ASSET natures, the account must not sit in a current-asset /
+      receivable / settlement / tax / contra section.
+
+    An unknown treatment never certifies a section, and a missing account is
+    never a parent — the caller then creates the ledger top-level instead of
+    guessing (a parent is never invented).
+    """
+    if not account:
+        return False
+    try:
+        expected_type = account_shape(nature)[0]
+    except InvalidAccountingNature:
+        return False
+    if str(account.get("account_type") or "").upper() != expected_type:
+        return False
+    if expected_type != "ASSET":
+        return True
+    name = str(account.get("name") or "").strip().lower()
+    return not any(pattern in name for pattern in _NON_CATEGORY_PARENT_PATTERNS)
 
 
 def category_for_item(text: Any) -> str:

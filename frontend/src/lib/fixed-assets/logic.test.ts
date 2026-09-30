@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   accountOptions,
   applyCategoryDefaults,
+  assetAccountAutoMatch,
+  assetAccountBlocker,
+  automaticAssetAccountLabel,
   depreciationBlocker,
   filterAssets,
   messageOf,
@@ -278,3 +281,63 @@ describe("applyCategoryDefaults (categories supply the policy)", () => {
   });
 });
 
+
+
+describe("asset-account resolution (the picker's 'Automatic' promise)", () => {
+  // one keyword match + a contra account that must never be chosen
+  const vehicleOnly = [
+    acct("acc-9", "1500", "Motor Vehicles", "ASSET"),
+    acct("acc-2", "1210", "Accumulated Depreciation", "ASSET"),
+  ];
+  // TWO keyword matches → the backend refuses, so the user must pick
+  const ambiguous = [
+    acct("acc-1", "1200", "Machinery", "ASSET"),
+    acct("acc-9", "1500", "Motor Vehicles", "ASSET"),
+  ];
+  // asset accounts exist, but none the keyword rule can use
+  const noKeyword = [
+    acct("acc-4", "1100", "Bank", "ASSET"),
+    acct("acc-3", "6100", "Depreciation Expense", "EXPENSE"),
+  ];
+
+  it("finds the single account the backend would resolve", () => {
+    expect(assetAccountAutoMatch(vehicleOnly)?.id).toBe("acc-9");
+  });
+
+  it("never resolves an ambiguous chart, a contra or a non-asset account", () => {
+    expect(assetAccountAutoMatch(ambiguous)).toBeNull();
+    expect(assetAccountAutoMatch(noKeyword)).toBeNull();
+    expect(
+      assetAccountAutoMatch([
+        acct("acc-2", "1210", "Accumulated Depreciation", "ASSET"),
+      ])
+    ).toBeNull();
+  });
+
+  it("labels the Automatic option with what it will resolve to", () => {
+    expect(automaticAssetAccountLabel(vehicleOnly)).toBe(
+      "Automatic — 1500 Motor Vehicles"
+    );
+    expect(automaticAssetAccountLabel(noKeyword)).toMatch(
+      /no unique asset account/
+    );
+  });
+
+  it("blocks a submission the backend would refuse, unless an account is picked", () => {
+    expect(assetAccountBlocker(vehicleOnly, "")).toBeNull();
+    expect(assetAccountBlocker(vehicleOnly, "acc-9")).toBeNull();
+    expect(assetAccountBlocker(noKeyword, "")).toMatch(/refused/);
+    expect(assetAccountBlocker(ambiguous, "")).toMatch(/refused/);
+
+    const form = {
+      name: "Delivery Van",
+      purchase_cost: "4000000",
+      payment_method: "CASH",
+      supplier_name: "",
+    };
+    expect(registerBlocker(form, noKeyword, "")).toMatch(/chart of accounts/);
+    expect(registerBlocker(form, noKeyword, "acc-4")).toBeNull();
+    // without a chart the rule cannot fire (the backend decides)
+    expect(registerBlocker(form)).toBeNull();
+  });
+});

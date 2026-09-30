@@ -234,6 +234,35 @@ async def _party_resolution_question(
     }
 
 
+def _provider_down_summary(failure_reason: Optional[str]) -> str:
+    """Honest wording for a run closed WITHOUT recording anything.
+
+    Two different failures reach this card and must not be conflated:
+
+    * ``empty_answer`` — the provider DID answer, but its hidden reasoning
+      consumed the whole output cap and no usable content arrived
+      (``finish_reason=length``, 0 content chars; see
+      docs/EMPTY_ANSWER_ROOT_CAUSE.md).  Saying "did not answer in time"
+      there is factually wrong and misdirected the user (production
+      2026-09-30);
+    * anything else (timeout, provider outage, budget) — the classic
+      "did not answer in time" wording stays correct.
+    """
+    reason = (failure_reason or "").strip().lower()
+    if reason == "empty_answer":
+        return (
+            "The AI produced no usable answer for this request (an empty "
+            "response, not a slow one), so nothing was recorded. Please "
+            "send your request again — everything you have already told "
+            "me is kept in this conversation."
+        )
+    return (
+        "The AI provider did not answer in time. Nothing was recorded "
+        "yet. Please send your request again — everything you have "
+        "already told me is kept in this conversation."
+    )
+
+
 async def _confirmed_create_args(
     classification: Any,
     organization_id: uuid.UUID,
@@ -257,6 +286,7 @@ async def _confirmed_create_args(
         account_exists,
         account_shape,
         heading_account_id,
+        is_category_parent,
     )
 
     ents = entities or {}
@@ -286,8 +316,12 @@ async def _confirmed_create_args(
                 prow = await account_exists(organization_id, parent_name)
             except Exception:  # noqa: BLE001 - parent lookup is best-effort
                 prow = None
-            if prow and str(prow.get("account_type") or "").upper() == shape[0]:
-                parent_id = str(prow.get("id") or "") or None
+            # SECTION invariant (not just the type): "Accounts Receivable" is
+            # an ASSET, so a type-only check parented a new "Vehicles" ledger
+            # under it — a category ledger never hangs in a receivable,
+            # current-asset, tax or contra section.
+            if is_category_parent(prow, nature=nature):
+                parent_id = str((prow or {}).get("id") or "") or None
     if parent_id:
         args["parent_account_id"] = parent_id
     elif shape[0] == "ASSET":
@@ -3880,20 +3914,25 @@ async def execute(
                 # decided on the books — so the run stops honestly instead, with
                 # nothing recorded and every fact kept for the resend.
                 await _update_status(session_id, ExecutionStatus.FAILED)
+                _fail_reason = str(
+                    getattr(_reasoning, "failure_reason", "") or ""
+                )
                 await _log_step(session_id, "FAILED", {
                     "reason": "provider_unavailable",
                     "stage": "reasoning",
                     "rounds": _reasoning.rounds,
+                    # Distinguishes "no answer was produced" (finish_reason=length,
+                    # empty content) from a genuine timeout/provider outage — the
+                    # user-facing wording keys off it below.
+                    "failure_reason": _fail_reason or "unknown",
                 })
+                # `failure_reason` distinguishes an empty answer from a real
+                # timeout — the wording must not lie about which happened.
+                _summary = _provider_down_summary(_fail_reason)
                 return AgentResponse(
                     status=ExecutionStatus.FAILED,
                     execution_id=session_id,
-                    summary=(
-                        "The AI provider did not answer in time. Nothing was "
-                        "recorded yet. Please send your request again — "
-                        "everything you have already told me is kept in this "
-                        "conversation."
-                    ),
+                    summary=_summary,
                 )
             client = get_client()
             # simple lookup intents that reached
@@ -4183,14 +4222,29 @@ async def execute(
                 intent=execution_plan.intent, calls=planned_tool_calls
             ):
                 _tools = ", ".join(tc.tool_name for tc in planned_tool_calls)
-                _missing = ", ".join(execution_plan.missing_fields or []) or (
-                    "the remaining details"
+                # The user must be told WHAT to answer, in the same words the
+                # questionnaire uses — raw field names told them nothing.
+                from app.planner import human_questions_for_missing
+
+                _missing_fields = list(execution_plan.missing_fields or [])
+                _questions = human_questions_for_missing(
+                    str(execution_plan.intent),
+                    _missing_fields,
+                    getattr(execution_plan, "extracted_entities", None) or {},
+                    limit=3,
                 )
+                _remaining = max(0, len(_missing_fields) - len(_questions))
+                _missing = (
+                    " ".join(
+                        f"{i + 1}) {q}" for i, q in enumerate(_questions)
+                    )
+                    + (f" (and {_remaining} more)" if _remaining else "")
+                ) or "the remaining details"
                 _question = (
                     f"Nothing has been recorded yet. I could not build the "
                     f"{str(execution_plan.intent).replace('_', ' ')} from the details "
                     f"I have, so there is nothing for you to approve. The steps I "
-                    f"could prepare were: {_tools}. Please supply {_missing} — or "
+                    f"could prepare were: {_tools}. Please answer: {_missing} — or "
                     "rephrase the request, and I will try again."
                 )
                 try:

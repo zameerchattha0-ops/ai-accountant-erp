@@ -263,8 +263,17 @@ class QwenClient:
         *,
         prompt: str,
         context: Optional[AgentContext] = None,
+        thinking_off: bool = False,
     ) -> str:
-        """Simple text generation without tool-calling."""
+        """Simple text generation without tool-calling.
+
+        ``thinking_off`` disables hidden reasoning for THIS call (the
+        ``enable_thinking=false`` payload): on a thinking model the shared
+        output cap can fill with reasoning before any answer text is emitted
+        (``finish_reason=length``, 0 content chars — the measured empty-answer
+        failure, docs/EMPTY_ANSWER_ROOT_CAUSE.md).  The caller uses it as ONE
+        bounded retry.
+        """
         content = (
             build_user_content(prompt, context) if context else prompt
         )
@@ -272,7 +281,9 @@ class QwenClient:
             {"role": "system", "content": self._system_instructions},
             {"role": "user", "content": content},
         ]
-        response = await self._chat_completion(messages, None)
+        response = await self._chat_completion(
+            messages, None, thinking_off=thinking_off
+        )
         choice = self._first_choice(response)
         if not choice:
             return ""
@@ -334,6 +345,7 @@ class QwenClient:
         messages: List[Dict[str, Any]],
         tools_payload: Optional[List[Dict[str, Any]]],
         max_output_tokens: Optional[int],
+        thinking_off: bool = False,
     ) -> Dict[str, Any]:
         """Build the request body, honouring this model's known quirks.
 
@@ -354,7 +366,9 @@ class QwenClient:
         }
         if "no_temperature" not in self._param_quirks:
             payload["temperature"] = self.temperature
-        if "thinking_off" in self._param_quirks:
+        # Quirk-discovered OR caller-requested: a thinking model can burn the
+        # whole shared output cap on hidden reasoning and return nothing.
+        if "thinking_off" in self._param_quirks or thinking_off:
             payload["enable_thinking"] = False
         if tools_payload:
             payload["tools"] = tools_payload
@@ -386,8 +400,11 @@ class QwenClient:
         messages: List[Dict[str, Any]],
         tools_payload: Optional[List[Dict[str, Any]]],
         max_output_tokens: Optional[int] = None,
+        thinking_off: bool = False,
     ) -> Dict[str, Any]:
-        payload = self._payload(messages, tools_payload, max_output_tokens)
+        payload = self._payload(
+            messages, tools_payload, max_output_tokens, thinking_off=thinking_off
+        )
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:

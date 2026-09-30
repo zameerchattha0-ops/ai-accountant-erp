@@ -347,6 +347,12 @@ class ReasoningOutcome:
     #: when it has NOT just failed in the same request.
     provider_attempted: bool = False
     rounds: int = 0
+    #: WHY the stage gave up: "timeout" | "provider_error" | "empty_answer" |
+    #: "total_budget".  The user-facing wording keys off it — "did not answer
+    #: in time" is factually WRONG when the provider did answer but produced
+    #: no usable content (finish_reason=length, 0 content chars; see
+    #: docs/EMPTY_ANSWER_ROOT_CAUSE.md).
+    failure_reason: Optional[str] = None
 
     @property
     def usable(self) -> bool:
@@ -1277,16 +1283,25 @@ async def run_reasoning_loop(
     ]
     generate = getattr(orchestrator, "generate_text", None) if orchestrator else None
     chain_supported = False
-    if chain and callable(generate):
+    thinking_off_supported = False
+    if callable(generate):
         try:
             import inspect
 
             params = inspect.signature(generate).parameters
-            chain_supported = "model_chain" in params or any(
+            if chain:
+                chain_supported = "model_chain" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+                )
+            # The empty-answer retry passes `thinking_off` only when the
+            # transport actually takes it (Qwen does; stubs and test doubles
+            # may not).
+            thinking_off_supported = "thinking_off" in params or any(
                 p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
         except (TypeError, ValueError):  # pragma: no cover - exotic callables
             chain_supported = False
+            thinking_off_supported = False
     if not callable(generate) or not facts.user_request.strip():
         return ReasoningOutcome(status=UNSUPPORTED, provider_failed=True)
 
@@ -1348,6 +1363,13 @@ async def run_reasoning_loop(
     violations: List[str] = []
     outcome = ReasoningOutcome(status=UNSUPPORTED)
     rounds_used = 0
+    # ONE bounded retry for the measured empty-answer failure: a thinking model
+    # whose hidden reasoning consumed the whole output cap returned nothing
+    # usable (finish_reason=length, 0 content chars).  The retry runs the SAME
+    # round with thinking disabled — measured to return valid JSON in ~5.7s —
+    # and only when the stage's own deadline still allows it.
+    empty_answer_retry_used = False
+    thinking_off_next = False
     # The whole stage is bounded, not just each round: three slow rounds must
     # never add up to a minute of user-visible waiting.
     deadline = asyncio.get_running_loop().time() + total_budget
@@ -1366,6 +1388,7 @@ async def run_reasoning_loop(
                 provider_attempted=rounds_used > 0,
                 evidence_results=gathered,
                 rounds=rounds_used,
+                failure_reason="total_budget",
             )
         round_budget = min(budget, remaining)
         rounds_used = round_index + 1
@@ -1383,6 +1406,9 @@ async def run_reasoning_loop(
             call_kwargs: Dict[str, Any] = {"prompt": prompt}
             if chain and chain_supported:
                 call_kwargs["model_chain"] = chain
+            if thinking_off_next and thinking_off_supported:
+                # The empty-answer retry: same prompt, no hidden reasoning.
+                call_kwargs["thinking_off"] = True
             raw = await asyncio.wait_for(
                 generate(**call_kwargs), timeout=round_budget
             )
@@ -1399,6 +1425,7 @@ async def run_reasoning_loop(
                 provider_attempted=True,
                 evidence_results=gathered,
                 rounds=rounds_used,
+                failure_reason="timeout",
             )
         except Exception as exc:  # noqa: BLE001 — the stage must never raise
             log.warning(
@@ -1413,10 +1440,27 @@ async def run_reasoning_loop(
                 provider_attempted=True,
                 evidence_results=gathered,
                 rounds=rounds_used,
+                failure_reason="provider_error",
             )
 
         parsed = parse_reasoning_response(raw)
         if not parsed:
+            # The provider ANSWERED but produced nothing parseable.  Retry
+            # once with thinking disabled (measured fix); if the deadline or
+            # the round budget forbids it, fail with the honest reason.
+            if (
+                not empty_answer_retry_used
+                and round_index + 1 < max_rounds
+                and (deadline - asyncio.get_running_loop().time()) > 1.0
+            ):
+                empty_answer_retry_used = True
+                thinking_off_next = True
+                log.info(
+                    "accounting_reasoning.empty_answer_retry",
+                    round=rounds_used,
+                    elapsed_ms=int((time.monotonic() - round_started) * 1000),
+                )
+                continue
             log.info("accounting_reasoning.failed", reason="unparseable_response")
             return ReasoningOutcome(
                 status=UNSUPPORTED,
@@ -1424,6 +1468,7 @@ async def run_reasoning_loop(
                 provider_attempted=True,
                 evidence_results=gathered,
                 rounds=rounds_used,
+                failure_reason="empty_answer",
             )
 
         outcome = _outcome_from_parsed(parsed, rounds=rounds_used)

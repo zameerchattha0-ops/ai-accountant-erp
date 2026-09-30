@@ -42,14 +42,24 @@ export interface RegisterFormValues {
   purchase_cost: string;
   payment_method: string;
   supplier_name: string;
+  /** The asset-account picker's value ("" = Automatic). */
+  asset_account_id?: string | null;
 }
 
 /**
  * Client-side mirror of the register's hard refusals — the page shows these
  * BEFORE the round trip instead of letting the 409 surprise the user.
  * Returns the first problem, or null when the submission is acceptable.
+ *
+ * `accounts` is optional: when the chart is known, an acquisition whose asset
+ * account the backend could not resolve is refused here too (same rule the
+ * service applies), so the form asks for the account instead of failing.
  */
-export function registerBlocker(form: RegisterFormValues): string | null {
+export function registerBlocker(
+  form: RegisterFormValues,
+  accounts?: Account[] | null,
+  assetAccountId?: string | null
+): string | null {
   if (form.name.trim().length < 2) return "An asset name is required.";
   const cost = Number(form.purchase_cost);
   if (!form.purchase_cost.trim() || !Number.isFinite(cost) || cost <= 0) {
@@ -63,6 +73,11 @@ export function registerBlocker(form: RegisterFormValues): string | null {
       "A credit acquisition needs a supplier — Accounts Payable can only be " +
       "credited against one. Pick a supplier or choose another payment method."
     );
+  }
+  if (accounts && accounts.length > 0) {
+    const picked = assetAccountId ?? form.asset_account_id ?? "";
+    const accountProblem = assetAccountBlocker(accounts, picked);
+    if (accountProblem) return accountProblem;
   }
   return null;
 }
@@ -169,6 +184,70 @@ export function unknownSupplierNotice(
     `No supplier named "${supplierName.trim()}" exists yet — an acquisition ` +
       `with that name would be refused. Add it in Suppliers (or fix the ` +
       `spelling) first.`
+  );
+}
+
+/**
+ * Mirror of the backend's `_ASSET_ACCOUNT_KEYWORDS`
+ * (`app/services/fixed_asset_service.py`): the words the register searches for
+ * when the caller does NOT pick an asset account explicitly.  Kept here so the
+ * form can show what "Automatic" will actually resolve to — and refuse to
+ * promise a match the backend cannot make.
+ */
+export const ASSET_ACCOUNT_KEYWORDS: readonly string[] = [
+  "fixed asset",
+  "equipment",
+  "computer",
+  "machinery",
+  "vehicle",
+  "furniture",
+  "fixture",
+];
+
+/** Contra accounts are never the asset-COST account (backend excludes them). */
+export const CONTRA_ASSET_KEYWORD = "accumulated depreciation";
+
+/**
+ * The account the backend's deterministic resolution would pick for the
+ * asset cost: exactly ONE ASSET account whose name contains a keyword and is
+ * not a contra account.  Zero or several matches → null (the backend refuses,
+ * so the form must ask the user to choose).
+ */
+export function assetAccountAutoMatch(accounts: Account[]): Account | null {
+  const key = CONTRA_ASSET_KEYWORD;
+  const matches = accounts.filter((a) => {
+    const name = (a.name ?? "").toLowerCase();
+    if (a.account_type !== "ASSET") return false;
+    if (name.includes(key)) return false;
+    return ASSET_ACCOUNT_KEYWORDS.some((k) => name.includes(k));
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/** The label for the picker's blank/"Automatic" option. */
+export function automaticAssetAccountLabel(accounts: Account[]): string {
+  const match = assetAccountAutoMatch(accounts);
+  return match
+    ? `Automatic — ${`${match.code ?? ""} ${match.name}`.trim()}`
+    : "Automatic (no unique asset account matches)";
+}
+
+/**
+ * Why an acquisition with no explicit asset-account pick would be refused —
+ * or null when the backend can resolve it by itself.
+ */
+export function assetAccountBlocker(
+  accounts: Account[],
+  pickedAccountId?: string | null
+): string | null {
+  if (pickedAccountId) return null;
+  if (assetAccountAutoMatch(accounts)) return null;
+  return (
+    "No asset account can be resolved automatically: your chart of accounts " +
+    "has no single ASSET account whose name matches (fixed asset / equipment / " +
+    "computer / machinery / vehicle / furniture / fixture). Choose the asset " +
+    "account above, or add one in Chart of Accounts — otherwise the " +
+    "acquisition is refused."
   );
 }
 

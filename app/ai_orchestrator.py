@@ -381,6 +381,7 @@ class AIOrchestrator:
         context: Optional[AgentContext] = None,
         model_chain: Optional[List[str]] = None,
         tier_first: bool = False,
+        thinking_off: bool = False,
     ) -> str:
         """Plain text generation across the same capability chain.
 
@@ -415,6 +416,14 @@ class AIOrchestrator:
             model = candidate["model"]
             try:
                 client = candidate["factory"]()
+                # `thinking_off` is an OPTIONAL per-client capability (the Qwen
+                # client honours it; Gemini and others simply do not take it).
+                if thinking_off and "thinking_off" in inspect.signature(
+                    client.generate_text
+                ).parameters:
+                    return await client.generate_text(
+                        prompt=prompt, context=context, thinking_off=True
+                    )
                 return await client.generate_text(prompt=prompt, context=context)
             except Exception as exc:  # noqa: BLE001
                 log.warning(

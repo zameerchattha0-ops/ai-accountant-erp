@@ -81,7 +81,7 @@ Measured: reasoning still ran (8,826 chars) and the JSON came back **truncated
 at 284 chars** — a worse failure mode than an empty answer (partial JSON).
 Any fix built on that parameter would be a silent no-op.
 
-## Fix options (all measured, none applied yet)
+## Fix options (measured) — status
 
 1. **Disable thinking for the reasoning call** — `enable_thinking: false`
    (5.7 s / 224 tokens) or `thinking: {"type": "disabled"}` (1.9 s / 224
@@ -90,11 +90,21 @@ Any fix built on that parameter would be a silent no-op.
    `enable_thinking=False` when the `thinking_off` quirk is set), and the
    Stage-3 two-call runtime already ran Call 1 this way for the identical
    reason. The monolithic reasoning stage never received that treatment.
+   **APPLIED** — `QwenClient.generate_text(..., thinking_off=True)` (and the
+   orchestrator pass-through) now requests it per call.
 2. **Raise the output cap for this stage** (e.g. 8,192): works, but 50.5 s and
    3× the tokens — keeps thinking at the cost of the worst latency.
+   **APPLIED** via env (`QWEN_MAX_OUTPUT_TOKENS=8192`, Vercel production +
+   preview) — belt to option 1's braces.
 3. **One bounded retry on this specific failure** (`finish_reason=length` with
    empty content) using option 1, plus a truthful user message — "the model
    produced no answer" rather than "did not answer in time".
+   **APPLIED** — `run_reasoning_loop` retries ONCE with `thinking_off=True`
+   (only while the stage deadline allows), then fails with
+   `failure_reason="empty_answer"`; `agent._provider_down_summary` renders
+   "The AI produced no usable answer … (an empty response, not a slow one)"
+   for that reason and keeps the old wording for genuine timeouts/outages.
+   Tests: `app/tests/test_empty_answer_retry.py`.
 
 ## Honest caveats
 

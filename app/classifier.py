@@ -671,7 +671,7 @@ async def classify_transaction(
         parent_id = parent_name = None
         _req_parent = str(entities.get("create_parent_name") or "").strip()
         if _req_parent:
-            from app.account_resolution import account_shape
+            from app.account_resolution import account_shape, is_category_parent
 
             try:
                 _prow = await account_exists(organization_id, _req_parent)
@@ -692,6 +692,7 @@ async def classify_transaction(
                 _prow
                 and _expected_type
                 and str(_prow.get("account_type") or "").upper() == _expected_type
+                and is_category_parent(_prow, nature=nature)
             ):
                 parent_id = str(_prow.get("id") or "") or None
                 parent_name = (

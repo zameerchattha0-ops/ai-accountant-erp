@@ -1243,6 +1243,27 @@ def _questions_for_fields(
     return questions
 
 
+def human_questions_for_missing(
+    intent: str,
+    fields: Optional[List[str]],
+    entities: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = 3,
+) -> List[str]:
+    """Human question text for the missing fields — never raw field names.
+
+    The plan-incomplete card used to print ``useful_life_years,
+    depreciation_method, salvage_value`` verbatim, which told the user nothing
+    about what to type.  This reuses the questionnaire's own question bank
+    (the text the user sees everywhere else) and caps the list so the card
+    stays readable; the caller reports how many were left out.
+    """
+    wanted = [str(f) for f in (fields or []) if f]
+    if not wanted:
+        return []
+    return _questions_for_fields(intent, wanted[: max(1, limit)], entities or {})
+
+
 def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     """Return the material fields genuinely missing for *intent*.
 
@@ -1380,25 +1401,25 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 
     # ASSET-ACQUISITION POLICY (never guessed): a capitalised asset needs a
     # depreciation policy — useful life, method and (optionally) salvage —
-    # or an explicit "no schedule" decision.  Asked in the SAME
-    # consolidated round as the rest of the acquisition facts, in
-    # dependency order (life → method → salvage).  A registered asset with
-    # no policy is undisposable later (its book value can never be
-    # corrected), which is why this is material rather than optional.
+    # or an explicit "no schedule" decision.  A registered asset with no
+    # policy is undisposable later (its book value can never be corrected),
+    # which is why this is material rather than optional.
+    #
+    # ALL THREE are asked in ONE round (the whole point of the consolidated
+    # questionnaire): the old ladder asked life, then — after the answer —
+    # method, then salvage, so a single acquisition cost three clarifying
+    # turns.  The answers arrive together (the questionnaire is field-tagged),
+    # and answering "none" to any of them records the DECLINE, which settles
+    # the trio at once.
     if intent == "register_fixed_asset":
         declined = bool(entities.get("depreciation_declined"))
-        life = entities.get("useful_life_years")
-        method = str(entities.get("depreciation_method") or "").upper()
-        if life is None and not declined and not method:
-            missing.append("useful_life_years")
-        elif not method:
-            missing.append("depreciation_method")
-        if (
-            life is not None
-            and method in ("STRAIGHT_LINE", "REDUCING_BALANCE")
-            and entities.get("salvage_value") is None
-        ):
-            missing.append("salvage_value")
+        if not declined:
+            if entities.get("useful_life_years") is None:
+                missing.append("useful_life_years")
+            if not str(entities.get("depreciation_method") or ""):
+                missing.append("depreciation_method")
+            if entities.get("salvage_value") is None:
+                missing.append("salvage_value")
 
 
     if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
@@ -1976,14 +1997,22 @@ def _merge_field_answer(
         return True
 
     if field == "useful_life_years":
-        if low in _DECLINE_WORDS:
+        # Same decline vocabulary as the method question — "(c) NONE for now"
+        # must settle the policy here too, or the answer falls through
+        # unmatched and the question repeats forever.
+        if low in _DECLINE_WORDS or low in ("c", "none for now"):
             merged["depreciation_declined"] = True
             return True
         number = _parse_bare_amount(value)
         if number is not None and 1 <= number <= 60:
             merged["useful_life_years"] = int(number)
-        # A stated-but-unparseable life is re-asked, never guessed.
-        return True
+            return True
+        # Stated-but-unparseable: the field is NOT handled.  Returning False
+        # keeps the contract honest — the keyword chain gets its say and the
+        # gap stays on the planner's list, instead of the answer being
+        # swallowed while the same question comes back forever.
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
 
     if field == "depreciation_method":
         if low in _DECLINE_WORDS or low in ("c", "none for now"):
@@ -1998,6 +2027,10 @@ def _merge_field_answer(
                 if key.lower() in low:
                     merged["depreciation_method"] = method
                     break
+        if not merged.get("depreciation_method"):
+            # Unrecognised method wording → re-asked (never guessed).
+            log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+            return False
         rate = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", low)
         if rate and merged.get("depreciation_method") == "REDUCING_BALANCE":
             try:
@@ -2013,19 +2046,25 @@ def _merge_field_answer(
         number = _parse_bare_amount(value)
         if number is not None and number >= 0:
             merged["salvage_value"] = number
-        return True
+            return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
 
     if field == "amount":
         number = _parse_bare_amount(value)
         if number is not None:
             merged["amount"] = number
-        return True
+            return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
 
     if field == "quantity":
         number = _parse_bare_amount(value)
         if number is not None and number > 0:
             merged["quantity"] = number
-        return True
+            return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
 
     if field in ("payment_type", "payment_method"):
         merged["payment_method"] = _normalize_payment_method(value)

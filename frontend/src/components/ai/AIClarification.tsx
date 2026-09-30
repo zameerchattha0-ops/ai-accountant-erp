@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { MessageCircleQuestion, Send } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
+import { legacyChipOptions } from "@/lib/ai/clarification";
 import type { QuestionOption } from "@/lib/types/api";
 
 interface Props {
@@ -139,16 +140,19 @@ export default function AIClarification({
   // Quick-response buttons are ONLY for genuine answer options (e.g. "CASH",
   // "CREDIT"). A question (text ending in "?") must never be sent back as an
   // answer - that echoed the question to the backend and caused an infinite
-  // clarification loop.
-  const answerOptions = (options ?? []).filter(
-    (opt) => opt.trim().length > 0 && !opt.trim().endsWith("?")
-  );
+  // clarification loop.  `legacyChipOptions` below applies that same filter.
 
   // R3.4: structured chips for a SINGLE question (backend payload or
   // fallback).  Typing remains available below the chips.
   const singleOpts = multi
     ? null
     : optionsForSubQuestion(question, 0, questionOptions);
+
+  // The backend sends the SAME choices in `options` AND `question_options[0]`
+  // (agent.py account-treatment round).  The structured chips win and the
+  // legacy list only contributes choices they do not already carry - rendering
+  // both verbatim duplicated every button.
+  const legacyOptions = legacyChipOptions(options, singleOpts);
 
   const sendMulti = () => {
     if (!allAnswered || disabled) return;
@@ -207,10 +211,11 @@ export default function AIClarification({
         </div>
       )}
 
-      {/* Quick response buttons (genuine answer options only) */}
-      {answerOptions.length > 0 && !multi && (
+      {/* Quick response buttons (legacy `options` list — anything the
+          structured chips above do not already offer) */}
+      {legacyOptions.length > 0 && !multi && (
         <div className="flex flex-wrap gap-2">
-          {answerOptions.map((opt) => (
+          {legacyOptions.map((opt) => (
             <button
               key={opt}
               disabled={disabled}

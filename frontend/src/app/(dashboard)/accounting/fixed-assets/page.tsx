@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Banknote, FolderCog, Plus, Search, Trash2 } from "lucide-react";
+import { Banknote, FolderCog, Pencil, Plus, Search, Trash2 } from "lucide-react";
+import { cn } from "@/lib/utils/cn";
 import { createClient } from "@/lib/supabase/client";
 import {
   createFixedAssetCategory,
@@ -10,6 +11,7 @@ import {
   listFixedAssets,
   recordAssetDepreciation,
   registerFixedAsset,
+  updateFixedAssetCategory,
   type FixedAssetRegister,
 } from "@/lib/api/client";
 import { useOrg } from "@/lib/hooks/useOrg";
@@ -17,6 +19,8 @@ import { formatCurrency } from "@/lib/utils/currency";
 import {
   accountOptions,
   applyCategoryDefaults,
+  automaticAssetAccountLabel,
+  assetAccountBlocker,
   depreciationBlocker,
   filterAssets,
   messageOf,
@@ -112,6 +116,8 @@ export default function FixedAssetsPage() {
   const [categories, setCategories] = useState<AssetCategory[]>([]);
   const [categoriesOpen, setCategoriesOpen] = useState(false);
   const [catSaving, setCatSaving] = useState(false);
+  /** Non-null = the form is editing that category instead of adding one. */
+  const [catEditingId, setCatEditingId] = useState<string | null>(null);
   const [catError, setCatError] = useState<string | null>(null);
   const [catForm, setCatForm] = useState({
     name: "",
@@ -187,6 +193,23 @@ export default function FixedAssetsPage() {
     () => unknownSupplierNotice(form.supplier_name, suppliers),
     [form.supplier_name, suppliers]
   );
+  /**
+   * Everything the register form warns about BEFORE the 409: the supplier
+   * name, the chart gaps, and — when the chart has accounts but none the
+   * backend could choose — the asset account the user must pick.
+   */
+  const registerNotices = useMemo(() => {
+    const notices = [...configNotices];
+    if (supplierNotice) notices.unshift(supplierNotice);
+    if (accounts.length > 0) {
+      const accountNotice = assetAccountBlocker(
+        accounts,
+        form.asset_account_id
+      );
+      if (accountNotice) notices.push(accountNotice);
+    }
+    return notices;
+  }, [accounts, configNotices, supplierNotice, form.asset_account_id]);
 
   /**
    * Would this depreciation charge be refused? The original blocker decides
@@ -225,7 +248,7 @@ export default function FixedAssetsPage() {
   };
 
   const handleRegister = async () => {
-    const blocker = registerBlocker(form);
+    const blocker = registerBlocker(form, accounts, form.asset_account_id);
     if (blocker) {
       setFormError(blocker);
       return;
@@ -289,27 +312,63 @@ export default function FixedAssetsPage() {
     }
     setCatSaving(true);
     setCatError(null);
+    const payload = {
+      name: catForm.name.trim(),
+      description: catForm.description.trim() || null,
+      default_useful_life_years: catForm.default_useful_life_years
+        ? Number(catForm.default_useful_life_years)
+        : null,
+      default_depreciation_method: catForm.default_depreciation_method,
+      default_asset_account_id: catForm.default_asset_account_id || null,
+      default_depreciation_expense_account_id:
+        catForm.default_depreciation_expense_account_id || null,
+      default_accumulated_depreciation_account_id:
+        catForm.default_accumulated_depreciation_account_id || null,
+    };
     try {
-      await createFixedAssetCategory({
-        name: catForm.name.trim(),
-        description: catForm.description.trim() || null,
-        default_useful_life_years: catForm.default_useful_life_years
-          ? Number(catForm.default_useful_life_years)
-          : null,
-        default_depreciation_method: catForm.default_depreciation_method,
-        default_asset_account_id: catForm.default_asset_account_id || null,
-        default_depreciation_expense_account_id:
-          catForm.default_depreciation_expense_account_id || null,
-        default_accumulated_depreciation_account_id:
-          catForm.default_accumulated_depreciation_account_id || null,
-      });
+      if (catEditingId) {
+        await updateFixedAssetCategory(catEditingId, payload);
+      } else {
+        await createFixedAssetCategory(payload);
+      }
       setCategories((await listFixedAssetCategories()).items);
+      setCatEditingId(null);
       setCatForm({ ...catForm, name: "", description: "" });
     } catch (e) {
       setCatError(messageOf(e));
     } finally {
       setCatSaving(false);
     }
+  };
+
+  /** Load a category into the form for editing (same fields, PATCH on save). */
+  const editCategory = (category: AssetCategory) => {
+    setCatError(null);
+    setCatEditingId(category.id);
+    setCatForm({
+      name: category.name,
+      description: category.description ?? "",
+      default_useful_life_years:
+        category.default_useful_life_years != null
+          ? String(category.default_useful_life_years)
+          : "",
+      default_depreciation_method: category.default_depreciation_method,
+      default_asset_account_id: category.default_asset_account_id ?? "",
+      default_depreciation_expense_account_id:
+        category.default_depreciation_expense_account_id ?? "",
+      default_accumulated_depreciation_account_id:
+        category.default_accumulated_depreciation_account_id ?? "",
+    });
+  };
+
+  const cancelCategoryEdit = () => {
+    setCatEditingId(null);
+    setCatError(null);
+    setCatForm({
+      ...catForm,
+      name: "",
+      description: "",
+    });
   };
 
   const openDepreciate = (asset: FixedAsset) => {
@@ -390,6 +449,7 @@ export default function FixedAssetsPage() {
             <button
               onClick={() => {
                 setCatError(null);
+                setCatEditingId(null);
                 setCategoriesOpen(true);
               }}
               className="inline-flex items-center gap-1.5 rounded-xl border border-border-default bg-bg-surface px-3.5 py-2 text-sm font-medium text-text-secondary hover:bg-bg-muted transition-colors"
@@ -597,6 +657,7 @@ export default function FixedAssetsPage() {
               <button
                 onClick={() => {
                   setCatError(null);
+                  setCatEditingId(null);
                   setCategoriesOpen(true);
                 }}
                 className="inline-flex items-center gap-1 text-xs font-medium text-ai-600 hover:text-ai-500"
@@ -749,7 +810,7 @@ export default function FixedAssetsPage() {
                   setForm({ ...form, asset_account_id: e.target.value })
                 }
               >
-                <option value="">Automatic (name match)</option>
+                <option value="">{automaticAssetAccountLabel(accounts)}</option>
                 {assetAccountOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
@@ -822,10 +883,7 @@ export default function FixedAssetsPage() {
               placeholder="e.g. Toyota Hilux — registration LEB-1234"
             />
           </div>
-          {(supplierNotice
-            ? [supplierNotice, ...configNotices]
-            : configNotices
-          ).map((notice) => (
+          {registerNotices.map((notice) => (
             <p
               key={notice}
               className="rounded-xl border border-warning-500 bg-warning-50 px-3 py-2 text-xs text-warning-600"
@@ -1103,12 +1161,25 @@ export default function FixedAssetsPage() {
                     <p className="text-sm font-medium text-text-primary">
                       {category.name}
                     </p>
-                    <p className="text-xs text-text-muted">
-                      {category.default_useful_life_years
-                        ? `${category.default_useful_life_years} yrs · `
-                        : ""}
-                      {category.default_depreciation_method.replace(/_/g, " ")}
-                    </p>
+                    <div className="flex items-center gap-3">
+                      <p className="text-xs text-text-muted">
+                        {category.default_useful_life_years
+                          ? `${category.default_useful_life_years} yrs · `
+                          : ""}
+                        {category.default_depreciation_method.replace(/_/g, " ")}
+                      </p>
+                      <button
+                        onClick={() => editCategory(category)}
+                        className={cn(
+                          "inline-flex items-center gap-1 rounded-lg border border-border-default px-2 py-1 text-[11px] font-medium text-text-secondary transition-colors hover:bg-bg-muted",
+                          catEditingId === category.id &&
+                            "border-ai-300 bg-ai-50 text-ai-700"
+                        )}
+                      >
+                        <Pencil className="w-3 h-3" />
+                        {catEditingId === category.id ? "Editing" : "Edit"}
+                      </button>
+                    </div>
                   </div>
                   {category.description && (
                     <p className="mt-0.5 text-xs text-text-muted">
@@ -1118,6 +1189,14 @@ export default function FixedAssetsPage() {
                 </li>
               ))}
             </ul>
+          )}
+
+          {catEditingId && (
+            <p className="rounded-xl border border-ai-200 bg-ai-50 px-3 py-2 text-xs text-ai-700">
+              Editing “{catForm.name || "this category"}” — Save changes updates
+              its defaults. The register form uses the updated policy from the
+              next asset on.
+            </p>
           )}
 
           <div className="grid grid-cols-2 gap-4">
@@ -1249,6 +1328,14 @@ export default function FixedAssetsPage() {
           </div>
           {catError && <p className="text-xs text-error-600">{catError}</p>}
           <div className="flex justify-end gap-2 pt-1">
+            {catEditingId && (
+              <button
+                onClick={cancelCategoryEdit}
+                className="rounded-xl border border-border-default px-3.5 py-2 text-sm font-medium text-text-secondary hover:bg-bg-muted transition-colors"
+              >
+                Cancel edit
+              </button>
+            )}
             <button
               onClick={() => setCategoriesOpen(false)}
               className="rounded-xl border border-border-default px-3.5 py-2 text-sm font-medium text-text-secondary hover:bg-bg-muted transition-colors"
@@ -1260,7 +1347,11 @@ export default function FixedAssetsPage() {
               disabled={catSaving}
               className="rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 px-3.5 py-2 text-sm font-semibold text-white hover:from-ai-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {catSaving ? "Saving..." : "Add category"}
+              {catSaving
+                ? "Saving..."
+                : catEditingId
+                  ? "Save changes"
+                  : "Add category"}
             </button>
           </div>
         </div>
