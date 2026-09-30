@@ -40,6 +40,28 @@ async def search_assets(
     )
 
 
+async def list_assets(
+    organization_id: uuid.UUID, *, limit: int = 200
+) -> List[Dict[str, Any]]:
+    """The register listing (newest purchase first) for the Fixed Assets page.
+
+    Returns EVERY status — the caller derives the status counts and the
+    register summary from the full list and filters rows for display, so one
+    database round-trip serves the whole page (mirrors the catalogue rule).
+    """
+    return await fetch_many(
+        "fixed_assets",
+        filters={"organization_id": str(organization_id)},
+        select=(
+            "id,asset_code,name,description,purchase_date,purchase_cost,"
+            "salvage_value,useful_life_years,depreciation_method,"
+            "accumulated_depreciation,book_value,status,gl_asset_account_id"
+        ),
+        order="purchase_date.desc",
+        limit=limit,
+    )
+
+
 async def get_asset(
     organization_id: uuid.UUID, *, asset_id: uuid.UUID
 ) -> Optional[Dict[str, Any]]:

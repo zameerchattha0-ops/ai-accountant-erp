@@ -1320,6 +1320,208 @@ async def delete_catalogue_service(
 
 
 # ---------------------------------------------------------------------------
+# FIXED ASSETS — the asset register (list / register / detail / depreciate /
+# dispose).
+#
+# Why this is an API and not a direct browser query (unlike the customers
+# page): registering an asset posts an acquisition JOURNAL, and depreciation /
+# disposal post their own entries — the accounting engine is the authority, so
+# every mutation goes through ``fixed_asset_service``.  The page and the AI
+# agent therefore share ONE implementation, and the register's computed columns
+# (accumulated depreciation, book value, status) can never disagree between the
+# UI and the agent.
+# ---------------------------------------------------------------------------
+_FIXED_ASSET_STATUSES = (
+    "ACTIVE", "FULLY_DEPRECIATED", "DISPOSED", "SOLD", "WRITTEN_OFF",
+)
+
+
+@app.get("/api/fixed-assets")
+async def list_fixed_assets_endpoint(
+    query: str = "",
+    status: str = "ALL",
+    auth: AuthContext = Depends(get_current_user),
+):
+    """The register + status counts + the accounting summary (one DB read).
+
+    Counts and the summary cover EVERY asset (they describe the register, not
+    the current filter); ``query``/``status`` narrow the returned ``items``.
+    """
+    from app.services import fixed_asset_service
+
+    rows = await fixed_asset_service.list_assets(auth.organization_id)
+    counts: Dict[str, int] = {"ALL": len(rows)}
+    for name in _FIXED_ASSET_STATUSES:
+        counts[name] = sum(1 for r in rows if str(r.get("status")) == name)
+
+    totals = {
+        "purchase_cost": 0.0,
+        "accumulated_depreciation": 0.0,
+        "book_value": 0.0,
+    }
+    for row in rows:
+        cost = float(row.get("purchase_cost") or 0)
+        acc = float(row.get("accumulated_depreciation") or 0)
+        book = row.get("book_value")
+        totals["purchase_cost"] += cost
+        totals["accumulated_depreciation"] += acc
+        totals["book_value"] += float(book if book is not None else cost - acc)
+
+    wanted = (status or "ALL").strip().upper() or "ALL"
+    needle = (query or "").strip().lower()
+    items = [
+        row
+        for row in rows
+        if (wanted == "ALL" or str(row.get("status")) == wanted)
+        and (
+            not needle
+            or needle in str(row.get("name") or "").lower()
+            or needle in str(row.get("asset_code") or "").lower()
+        )
+    ]
+    return {
+        "items": items,
+        "counts": counts,
+        "summary": {key: round(value, 2) for key, value in totals.items()},
+        "status": wanted,
+    }
+
+
+@app.post("/api/fixed-assets", status_code=201)
+async def create_fixed_asset_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Register (capitalise) a fixed asset: record + acquisition journal.
+
+    ``asset_code`` is assigned by the database trigger, never by the client.
+    A credit acquisition requires a supplier (the service refuses otherwise).
+    """
+    from app.services import fixed_asset_service
+
+    if not str(payload.get("name") or "").strip():
+        raise HTTPException(status_code=409, detail="Asset name is required.")
+
+    raw_life = payload.get("useful_life_years")
+    life_years: Optional[int] = None
+    if str(raw_life or "").strip():
+        try:
+            life_years = int(float(raw_life))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail="Useful life must be a whole number of years.",
+            )
+        if life_years <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Useful life must be a positive number of years.",
+            )
+
+    try:
+        item = await fixed_asset_service.register_asset(
+            auth.organization_id,
+            name=payload.get("name"),
+            purchase_cost=payload.get("purchase_cost") or 0,
+            transaction_date=(
+                payload.get("purchase_date") or payload.get("transaction_date")
+            ),
+            payment_method=str(payload.get("payment_method") or "CASH").upper(),
+            supplier_name=payload.get("supplier_name"),
+            useful_life_years=life_years,
+            depreciation_method=str(
+                payload.get("depreciation_method") or "STRAIGHT_LINE"
+            ).upper(),
+            salvage_value=payload.get("salvage_value") or 0,
+            description=payload.get("description"),
+            created_by=auth.user_id,
+        )
+    except ValueError as exc:
+        raise _catalogue_error("fixed_assets", exc)
+    return {"item": item}
+
+
+@app.get("/api/fixed-assets/{asset_id}")
+async def get_fixed_asset_endpoint(
+    asset_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """One asset, organisation-scoped."""
+    from app.services import fixed_asset_service
+
+    asset = await fixed_asset_service.get(auth.organization_id, asset_id=asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Fixed asset not found.")
+    return {"item": asset}
+
+
+@app.post("/api/fixed-assets/{asset_id}/depreciation")
+async def record_fixed_asset_depreciation_endpoint(
+    asset_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Post one depreciation charge for an asset.
+
+    With no explicit amount the service applies the asset's OWN policy
+    ((cost − salvage) ÷ life ÷ 12, straight line) and never depreciates below
+    salvage — the policy is configurable, never invented.
+    """
+    from app.services import fixed_asset_service
+
+    raw_amount = payload.get("depreciation_amount")
+    amount: Optional[float] = None
+    if str(raw_amount or "").strip():
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="Depreciation amount must be a number."
+            )
+
+    try:
+        item = await fixed_asset_service.record_depreciation(
+            auth.organization_id,
+            asset_id=str(asset_id),
+            depreciation_amount=amount,
+            transaction_date=payload.get("transaction_date"),
+        )
+    except ValueError as exc:
+        raise _catalogue_error("fixed_assets", exc)
+    return {"item": item}
+
+
+@app.post("/api/fixed-assets/{asset_id}/dispose")
+async def dispose_fixed_asset_endpoint(
+    asset_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Dispose of / sell / write off an asset (posts the disposal journal)."""
+    from app.services import fixed_asset_service
+
+    raw_proceeds = payload.get("disposal_amount")
+    try:
+        proceeds = float(raw_proceeds) if str(raw_proceeds or "").strip() else 0.0
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409, detail="Disposal proceeds must be a number."
+        )
+
+    try:
+        item = await fixed_asset_service.dispose_asset(
+            auth.organization_id,
+            asset_id=str(asset_id),
+            disposal_amount=proceeds,
+            transaction_date=payload.get("transaction_date"),
+            disposal_type=str(payload.get("disposal_type") or "DISPOSAL").upper(),
+        )
+    except ValueError as exc:
+        raise _catalogue_error("fixed_assets", exc)
+    return {"item": item}
+
+
+# ---------------------------------------------------------------------------
 # CREDIT NOTES (sales) — proper endpoints for the Credit Note module
 # (list/detail/create/status).  Journal posting happens deterministically
 # inside the create TOOL (agent path); document creation here mirrors the

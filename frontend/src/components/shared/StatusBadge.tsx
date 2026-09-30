@@ -24,6 +24,11 @@ const STATUS_STYLES: Record<string, string> = {
   CONVERTED: "bg-ai-50 text-ai-700",
   CLOSED: "bg-bg-muted text-text-muted",
   LOCKED: "bg-bg-muted text-text-muted",
+  // Fixed-asset register statuses (asset_status enum).
+  FULLY_DEPRECIATED: "bg-info-50 text-info-700",
+  SOLD: "bg-success-50 text-success-700",
+  DISPOSED: "bg-bg-muted text-text-muted",
+  WRITTEN_OFF: "bg-error-50 text-error-700",
   ACTIVE: "bg-success-50 text-success-700",
   SUSPENDED: "bg-warning-50 text-warning-700",
   REMOVED: "bg-bg-muted text-text-muted",

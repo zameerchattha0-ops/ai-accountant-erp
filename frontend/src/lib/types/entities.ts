@@ -529,3 +529,26 @@ export interface EmployeeAllowance {
   created_at: string;
   updated_at: string;
 }
+
+/**
+ * One registered fixed asset (``public.fixed_assets``).
+ *
+ * ``asset_code`` is assigned by the database trigger and ``book_value`` is a
+ * GENERATED column (purchase_cost − accumulated_depreciation) — neither is
+ * ever written by the client.  ``status`` is the ``asset_status`` enum.
+ */
+export interface FixedAsset {
+  id: string;
+  asset_code: string;
+  name: string;
+  description?: string | null;
+  purchase_date: string;
+  purchase_cost: number;
+  salvage_value: number;
+  useful_life_years: number | null;
+  depreciation_method: string;
+  accumulated_depreciation: number;
+  book_value: number;
+  status: "ACTIVE" | "FULLY_DEPRECIATED" | "DISPOSED" | "SOLD" | "WRITTEN_OFF";
+  gl_asset_account_id?: string | null;
+}

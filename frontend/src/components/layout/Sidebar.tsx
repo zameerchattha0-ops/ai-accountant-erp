@@ -53,6 +53,9 @@ const navItems: NavItem[] = [
       { label: "Journal Entries", href: "/accounting/journal" },
       { label: "General Ledger", href: "/accounting/general-ledger" },
       { label: "Trial Balance", href: "/accounting/trial-balance" },
+      // The asset register: register / depreciate / dispose, all backed by the
+      // same fixed-asset service the AI agent uses.
+      { label: "Fixed Assets", href: "/accounting/fixed-assets" },
     ],
   },
   // The item master both Sales and Purchases consume, so it sits next to them.

@@ -1,4 +1,5 @@
 import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, SessionSummary, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
+import type { FixedAsset } from "@/lib/types/entities";
 
 // Same-origin by default: on Vercel the FastAPI backend is served under
 // /api/* of the same domain (see vercel.json "services"). For local dev set
@@ -488,6 +489,85 @@ export async function aiAnalyzeOrganization(payload: {
   history?: { role: "user" | "assistant"; content: string }[];
 }): Promise<OnboardingAnalysis> {
   return fetchApi<OnboardingAnalysis>("/api/onboarding/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/* ---- Fixed Assets (the asset register) ---- */
+
+export interface FixedAssetSummary {
+  purchase_cost: number;
+  accumulated_depreciation: number;
+  book_value: number;
+}
+
+export interface FixedAssetRegister {
+  items: FixedAsset[];
+  /** Counts per asset_status, plus "ALL" — computed over the whole register. */
+  counts: Record<string, number>;
+  summary: FixedAssetSummary;
+  status: string;
+}
+
+/**
+ * The register. Counts and the summary always cover EVERY asset; `query` and
+ * `status` narrow the returned rows only.
+ */
+export async function listFixedAssets(
+  query = "",
+  status = "ALL"
+): Promise<FixedAssetRegister> {
+  const params = new URLSearchParams({ query, status });
+  return fetchApi<FixedAssetRegister>(`/api/fixed-assets?${params.toString()}`);
+}
+
+export interface RegisterFixedAssetPayload {
+  name: string;
+  purchase_cost: number;
+  purchase_date?: string;
+  payment_method?: string;
+  supplier_name?: string | null;
+  useful_life_years?: number | null;
+  depreciation_method?: string;
+  salvage_value?: number;
+  description?: string | null;
+}
+
+/**
+ * Register (capitalise) an asset. The backend creates the record AND posts
+ * the acquisition journal — the browser never writes a journal itself.
+ */
+export async function registerFixedAsset(
+  payload: RegisterFixedAssetPayload
+): Promise<{ item: FixedAsset }> {
+  return fetchApi<{ item: FixedAsset }>("/api/fixed-assets", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Post one depreciation charge (blank amount = the asset's own policy). */
+export async function recordAssetDepreciation(
+  assetId: string,
+  payload: { depreciation_amount?: number | null; transaction_date?: string }
+): Promise<{ item: FixedAsset }> {
+  return fetchApi<{ item: FixedAsset }>(
+    `/api/fixed-assets/${assetId}/depreciation`,
+    { method: "POST", body: JSON.stringify(payload) }
+  );
+}
+
+/** Dispose of / sell / write off an asset (posts the disposal journal). */
+export async function disposeFixedAsset(
+  assetId: string,
+  payload: {
+    disposal_amount?: number;
+    disposal_type?: string;
+    transaction_date?: string;
+  }
+): Promise<{ item: FixedAsset }> {
+  return fetchApi<{ item: FixedAsset }>(`/api/fixed-assets/${assetId}/dispose`, {
     method: "POST",
     body: JSON.stringify(payload),
   });

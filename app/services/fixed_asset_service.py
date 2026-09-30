@@ -70,6 +70,17 @@ async def get(
     return await repo.get_asset(organization_id, asset_id=asset_id)
 
 
+async def list_assets(
+    organization_id: uuid.UUID, *, limit: int = 200
+) -> List[Dict[str, Any]]:
+    """The whole register (every status) for the Fixed Assets page.
+
+    Read-only: counts, summary and the display filter are derived by the
+    caller from this single list — no journal, no configuration lookup.
+    """
+    return await repo.list_assets(organization_id, limit=limit)
+
+
 async def _resolve_asset_by_reference(
     organization_id: uuid.UUID,
     *,
@@ -227,6 +238,7 @@ async def register_asset(
     depreciation_method: str = "STRAIGHT_LINE",
     salvage_value: float = 0.0,
     description: Optional[str] = None,
+    created_by: Optional[uuid.UUID] = None,
     **kw,
 ) -> Dict[str, Any]:
     """Acquire + capitalize a fixed asset (asset record + journal).
@@ -288,6 +300,7 @@ async def register_asset(
         supplier_id=uuid.UUID(supplier["id"]) if supplier else None,
         gl_asset_account_id=uuid.UUID(asset_account["id"]),
         description=description,
+        created_by=created_by,
     )
 
     # 2. Journal via the accounting engine (source-tied to the asset).
