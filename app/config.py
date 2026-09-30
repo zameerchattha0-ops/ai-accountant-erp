@@ -304,6 +304,40 @@ class Settings(BaseSettings):
     # The deterministic keyword extractor is the FALLBACK: when the provider
     # is disabled, down, slow or returns unparseable output, the stage
     # degrades to exactly the previous keyword behaviour.
+    # ---- BOUNDED UNDERSTANDING CALL (short, output-safe) -----------------
+    # MEASURED 2026-10-01 (scripts/short_understanding_probe.py, real
+    # provider): the understanding call returns a ~158-char JSON in 411
+    # completion tokens with finish_reason=stop at a 600-token cap — thinking
+    # OFF (4.0 s) vs ON (14.7 s).  It is therefore INDEPENDENT of the heavy
+    # stages (semantic/reasoning/classification) and of the presentation
+    # profile: it cannot consume the output cap, because its output is a
+    # dozen short fields, and it never blocks — any failure degrades to the
+    # deterministic pipeline exactly as before.
+    bounded_understanding_enabled: bool = Field(
+        default=True,
+        description=(
+            "ONE short 'what does this request say' call (thinking disabled, "
+            "max_tokens bounded) used ONLY when the deterministic pass cannot "
+            "read a material field from the user's own words — the nature "
+            "(fixed asset / inventory / service / …) or the item. It answers "
+            "from free wording and typos what keyword rules cannot, so those "
+            "questions are not asked."
+        ),
+    )
+    bounded_understanding_max_tokens: int = Field(
+        default=600,
+        description=(
+            "Output cap for the bounded understanding call. Measured need: "
+            "~411 tokens for a full fact JSON — far below any model cap."
+        ),
+    )
+    bounded_understanding_timeout_seconds: float = Field(
+        default=20.0,
+        description=(
+            "Short wall-clock cap: measured 4.0 s with thinking disabled. A "
+            "timeout degrades to the deterministic pipeline, never blocks."
+        ),
+    )
     semantic_llm_enabled: bool = Field(
         default=False,
         description=(

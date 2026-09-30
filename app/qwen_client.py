@@ -264,6 +264,7 @@ class QwenClient:
         prompt: str,
         context: Optional[AgentContext] = None,
         thinking_off: bool = False,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         """Simple text generation without tool-calling.
 
@@ -272,7 +273,10 @@ class QwenClient:
         output cap can fill with reasoning before any answer text is emitted
         (``finish_reason=length``, 0 content chars — the measured empty-answer
         failure, docs/EMPTY_ANSWER_ROOT_CAUSE.md).  The caller uses it as ONE
-        bounded retry.
+        bounded retry / short understanding call.
+
+        ``max_output_tokens`` caps THIS call's output (measured: a full fact
+        JSON needs ~411 tokens), so a bounded call cannot consume the cap.
         """
         content = (
             build_user_content(prompt, context) if context else prompt
@@ -282,7 +286,10 @@ class QwenClient:
             {"role": "user", "content": content},
         ]
         response = await self._chat_completion(
-            messages, None, thinking_off=thinking_off
+            messages,
+            None,
+            max_output_tokens=max_output_tokens,
+            thinking_off=thinking_off,
         )
         choice = self._first_choice(response)
         if not choice:

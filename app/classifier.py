@@ -283,38 +283,48 @@ def rule_based_nature(
 
     Confidence is HIGH for unambiguous rules, LOW for durable goods that
     need configuration or a user decision (nature None).
+
+    Every rule is applied TWICE: exactly (the regex) and then typo-tolerantly
+    (``rule_has_typo_hit``), because a misspelling ("servcies", "invetory
+    stock", "lapotp") is wording, not a reason to misclassify or re-ask.
     """
     text = _classification_text(item_description, entities)
     quantity = entities.get("quantity")
+    from app.reasoning import rule_has_typo_hit
+
+    def _hit(pattern: str) -> bool:
+        if re.search(pattern, text):
+            return True
+        return rule_has_typo_hit(text, pattern)
 
     # 1. Inventory: explicit resale/stock intent wins.
-    if re.search(_INVENTORY_RULES, text):
+    if _hit(_INVENTORY_RULES):
         return INVENTORY, "HIGH"
 
     # 2. Prepayments / advances / deposits.
-    if re.search(_PREPAID_RULES, text):
+    if _hit(_PREPAID_RULES):
         if "rent" in text:
             return PREPAYMENT, "HIGH"
         return DEPOSIT_ADVANCE, "MEDIUM"
 
     # 3. Unambiguous operating-expense categories.
     for pattern, _label in _EXPENSE_RULES:
-        if re.search(pattern, text):
+        if _hit(pattern):
             return OPERATING_EXPENSE, "HIGH"
 
     # 4. Services — use the organisation's service/expense treatment.
-    if re.search(_SERVICE_RULES, text):
+    if _hit(_SERVICE_RULES):
         return SERVICE, "HIGH"
 
     # 5. Consumables — expense treatment, reuse existing supplies accounts.
-    if re.search(_CONSUMABLE_RULES, text):
+    if _hit(_CONSUMABLE_RULES):
         return OPERATING_EXPENSE, "HIGH"
 
     # 6. Durable goods — potentially fixed assets.  Bulk quantities lean
     #    inventory; a single unit is MATERIALLY AMBIGUOUS (fixed asset vs
     #    expense) unless ERP configuration resolves it — the caller checks
     #    the COA before asking the user.
-    if re.search(_DURABLE_GOODS, text):
+    if _hit(_DURABLE_GOODS):
         try:
             if quantity is not None and float(quantity) >= 10:
                 return INVENTORY, "MEDIUM"

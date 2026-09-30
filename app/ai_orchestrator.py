@@ -382,6 +382,7 @@ class AIOrchestrator:
         model_chain: Optional[List[str]] = None,
         tier_first: bool = False,
         thinking_off: bool = False,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         """Plain text generation across the same capability chain.
 
@@ -416,15 +417,16 @@ class AIOrchestrator:
             model = candidate["model"]
             try:
                 client = candidate["factory"]()
-                # `thinking_off` is an OPTIONAL per-client capability (the Qwen
-                # client honours it; Gemini and others simply do not take it).
-                if thinking_off and "thinking_off" in inspect.signature(
-                    client.generate_text
-                ).parameters:
-                    return await client.generate_text(
-                        prompt=prompt, context=context, thinking_off=True
-                    )
-                return await client.generate_text(prompt=prompt, context=context)
+                # `thinking_off` / `max_output_tokens` are OPTIONAL per-client
+                # capabilities (the Qwen client honours them; Gemini and
+                # others simply do not take them).
+                _accepted = inspect.signature(client.generate_text).parameters
+                _kwargs: Dict[str, Any] = {"prompt": prompt, "context": context}
+                if thinking_off and "thinking_off" in _accepted:
+                    _kwargs["thinking_off"] = True
+                if max_output_tokens and "max_output_tokens" in _accepted:
+                    _kwargs["max_output_tokens"] = max_output_tokens
+                return await client.generate_text(**_kwargs)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "orchestrator.text_provider_failed",

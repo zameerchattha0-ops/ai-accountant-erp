@@ -35,7 +35,7 @@ import asyncio
 import json
 import re
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import structlog
 
@@ -347,6 +347,11 @@ async def extract_request_facts(
     user_message: str,
     orchestrator=None,
     today: Optional[date] = None,
+    *,
+    thinking_off: bool = False,
+    max_output_tokens: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+    nature_values: Optional[Sequence[str]] = None,
 ) -> dict:
     """AI-first perception: segregate the user's request into grounded facts.
 
@@ -358,7 +363,9 @@ async def extract_request_facts(
     from app.config import get_settings
 
     settings = get_settings()
-    if not settings.entity_llm_fallback:
+    if not (
+        settings.entity_llm_fallback or settings.bounded_understanding_enabled
+    ):
         return {}
 
     msg = (user_message or "").strip()
@@ -370,17 +377,39 @@ async def extract_request_facts(
         return {}
 
     today = today or date.today()
+    nature_rule = (
+        "transaction_nature must be one of: "
+        + ", ".join(str(v) for v in nature_values)
+        + ". Use it only when the request itself says what this is.\n"
+        if nature_values
+        else ""
+    )
     prompt = (
-        f"{_SYSTEM_PROMPT}\n\n"
+        f"{_SYSTEM_PROMPT}\n\n{nature_rule}"
         f"User request:\n{msg}\n\nToday's date: {today.isoformat()}\n\n"
         "Extract the facts. Copy every text value verbatim from the request; "
-        "omit anything not stated."
+        "omit anything not stated. A misspelling is still the thing it means."
     )
 
+    _timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else settings.entity_llm_timeout_seconds
+    )
+    _bounded_kwargs = (
+        {"thinking_off": True, "max_output_tokens": max_output_tokens}
+        if thinking_off
+        else {}
+    )
     try:
-        raw = await asyncio.wait_for(
-            generate(prompt=prompt), timeout=settings.entity_llm_timeout_seconds
-        )
+        try:
+            raw = await asyncio.wait_for(
+                generate(prompt=prompt, **_bounded_kwargs), timeout=_timeout
+            )
+        except TypeError:
+            # A transport without the bounded-call kwargs still gets the plain
+            # call — the bounded call is an optimisation, never a dependency.
+            raw = await asyncio.wait_for(generate(prompt=prompt), timeout=_timeout)
     except asyncio.TimeoutError:
         log.warning(
             "llm_entity_failed",
@@ -396,6 +425,21 @@ async def extract_request_facts(
     if not parsed:
         log.info("llm_entity_failed", reason="unparseable_response")
         return {}
+
+    if nature_values:
+        _raw_nature = str(parsed.get("transaction_nature") or "").strip().upper()
+        _allowed = {str(v).strip().upper() for v in nature_values}
+        if _raw_nature and _raw_nature not in _allowed:
+            # A nature the route does not accept is DROPPED, never translated
+            # — the deterministic question still owns that decision.
+            log.info(
+                "llm_entity_rejected",
+                field="transaction_nature",
+                reason="outside_intent_family",
+            )
+            parsed = {
+                k: v for k, v in parsed.items() if k != "transaction_nature"
+            }
 
     grounded = _ground_fields(parsed, _norm(msg), msg.lower(), today)
     if grounded:

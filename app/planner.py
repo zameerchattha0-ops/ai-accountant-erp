@@ -46,6 +46,8 @@ from app.reasoning import (
     SETTLEMENT_POSITION_QUESTION,
     capitalization_question_for,
     capitalization_threshold_from_prefs,
+    accepted_nature_values,
+    derive_nature_from_text,
     nature_family_for_intent,
     nature_for_purpose,
     nature_question_for_intent,
@@ -369,6 +371,26 @@ _ITEM_PATTERNS = [
     re.compile(
         r"\b(?:sold|sells?|selling)\s+(?:an?\s+|the\s+|some\s+|\d+\s+)?"
         r"([\w][\w\s-]*?)(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
+        re.IGNORECASE,
+    ),
+    # NOUN phrasing — "create an invoice for 45000 against SALE OF tax
+    # services", "supply of cement to X", "purchase of laptops".  Only the
+    # verb forms above were recognised, so a request that plainly names its
+    # item still got asked "What item or service is being invoiced?".  The
+    # captured item must start with a LETTER, so the amount in
+    # "invoice for 45000 …" can never be mistaken for the item.
+    re.compile(
+        r"\b(?:sale|sales|supply|supplies|purchase|purchases|rendering|"
+        r"provision|delivery|invoice|bill)\s+of\s+"
+        r"([a-zA-Z][\w\s-]*?)"
+        r"(?=\s+(?:to|from|for|on|in|at|via|against)\b|[,.!?;]|\s*$|\s+\d)",
+        re.IGNORECASE,
+    ),
+    # "invoice/bill for <item>" — same noun phrasing with "for".
+    re.compile(
+        r"\b(?:invoice|bill)\s+for\s+"
+        r"([a-zA-Z][\w\s-]*?)"
+        r"(?=\s+(?:to|from|on|in|at|via|against)\b|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
 ]
@@ -807,7 +829,50 @@ def plan(
                     entities["quantity"] = _pv
             continue
         if not entities.get(_pk):
+            if _pk == "transaction_nature":
+                _allowed_natures = accepted_nature_values(intent)
+                if _allowed_natures and str(_pv).strip().upper() not in {
+                    v.upper() for v in _allowed_natures
+                }:
+                    # A reading whose nature is outside this intent's family
+                    # is dropped, never translated: the deterministic
+                    # question still owns that decision.
+                    log.info(
+                        "planner.nature_prefill_rejected",
+                        intent=intent,
+                        value=str(_pv)[:40],
+                    )
+                    continue
             entities[_pk] = _pv
+
+    # 2c. NATURE FROM THE USER'S OWN WORDS (deterministic, typo-tolerant).
+    #     The intent family's keyword rules already existed but were only ever
+    #     used to interpret an ANSWER — so "Create an Invoice for 45000
+    #     against sale of tax services to Beta Traders" still asked "what is
+    #     the nature of this sale?" although the user had just said it.
+    #     Applying the SAME rules to the request answers it instead of
+    #     re-asking, and an explicit statement beats a learned preference
+    #     (which is why this sits BEFORE the preference block below).
+    if not entities.get("transaction_nature"):
+        _nature_text = " ".join(
+            str(x)
+            for x in (
+                entities.get("item_description"),
+                entities.get("description"),
+                msg,
+            )
+            if x
+        )
+        _derived_nature = derive_nature_from_text(intent, _nature_text)
+        if _derived_nature:
+            entities["transaction_nature"] = _derived_nature
+            # Audit trail: the nature came from the user's own wording.
+            nature_source = "TEXT_INFERENCE"
+            log.info(
+                "planner.nature_derived_from_text",
+                intent=intent,
+                nature=_derived_nature,
+            )
 
     # 3a. ORG PREFERENCES - learned defaults are treated as
     #     answered-for entities; an explicit user value ALWAYS wins (the
@@ -1241,6 +1306,39 @@ def _questions_for_fields(
         else:
             questions.append(_FIELD_QUESTION[f])
     return questions
+
+
+def intent_for_message(user_message: str) -> str:
+    """The planner's own intent reading (public, for the understanding gate)."""
+    return _identify_intent((user_message or "").lower())
+
+
+def text_understanding_gaps(user_message: str) -> List[str]:
+    """Material fields the WORDS of *user_message* do not decide.
+
+    Pure and cheap (regex only).  ``[]`` means the deterministic pipeline
+    already read everything the request says, so the bounded understanding
+    call is NOT made at all — the call exists for wording it cannot read,
+    never as a toll on every turn.
+    """
+    intent = intent_for_message(user_message)
+    if not intent or intent == "unknown":
+        return []
+    gaps: List[str] = []
+    if nature_family_for_intent(intent) and not derive_nature_from_text(
+        intent, user_message
+    ):
+        gaps.append("transaction_nature")
+    if intent in _ITEM_REQUIRED_INTENTS and not _extract_item(user_message):
+        gaps.append("item_description")
+    return gaps
+
+
+_ITEM_REQUIRED_INTENTS = frozenset({
+    "create_invoice", "record_sale", "record_cash_sale", "record_credit_sale",
+    "record_purchase", "record_cash_purchase", "record_credit_purchase",
+    "create_quotation",
+})
 
 
 def human_questions_for_missing(
@@ -2233,7 +2331,21 @@ def _extract_item(msg: str) -> Optional[str]:
     for pat in _ITEM_PATTERNS:
         m = pat.search(msg)
         if m:
-            item = m.group(1).strip()
+            # Leading prepositions are captured with the noun phrasing
+            # ("purchase OF laptops", "invoice for inventory stock OF 50000")
+            # and trailing ones too — neither is part of the item name.
+            item = re.sub(
+                r"^(?:of|for|on|in|at|to|from|by|with)\s+",
+                "",
+                m.group(1).strip(),
+                flags=re.IGNORECASE,
+            )
+            item = re.sub(
+                r"\s+(?:of|for|on|in|at|to|from|by|with)$",
+                "",
+                item,
+                flags=re.IGNORECASE,
+            )
             if item and item.lower() not in ("it", "something", "goods", "items", "stuff"):
                 return item
     return None

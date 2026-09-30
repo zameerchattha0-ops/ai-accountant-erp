@@ -165,14 +165,25 @@ def is_category_parent(
 
 
 def category_for_item(text: Any) -> str:
-    """The CATEGORY ledger an item belongs to (never the item's own name)."""
+    """The CATEGORY ledger an item belongs to (never the item's own name).
+
+    Matched exactly first, then by the GENERAL nearest-vocabulary rule
+    (``best_class_match``): "vhecle"/"vehical"/"lapotp" land on the category
+    they are nearest to, so a misspelling — any misspelling — never silently
+    moves an item into the generic bucket.
+    """
     low = str(text or "").strip().lower()
     if not low:
         return "Other Equipment & Fixtures"
     for pattern, category in _ITEM_CATEGORY_RULES:
         if re.search(pattern, low):
             return category
-    return "Other Equipment & Fixtures"
+    from app.reasoning import best_class_match
+
+    matched = best_class_match(
+        low, {category: pattern for pattern, category in _ITEM_CATEGORY_RULES}
+    )
+    return matched or "Other Equipment & Fixtures"
 
 
 async def heading_account_id(

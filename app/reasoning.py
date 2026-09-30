@@ -30,6 +30,7 @@ Design principles enforced here (ERP Agent Constitution-compatible):
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -343,6 +344,208 @@ def resolve_nature_answer(question: str, answer: str) -> Optional[str]:
     for pattern, value in spec["keywords"]:
         if re.search(pattern, token):
             return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# NATURE FROM THE USER'S OWN WORDS (request-time inference)
+# ---------------------------------------------------------------------------
+# The family keyword rules above were written for ANSWERS
+# (`resolve_nature_answer`).  Nothing applied them to the REQUEST, so
+# "Create an Invoice for 45000 against sale of tax services to Beta Traders"
+# still asked "What is the nature of this sale?" — the user had already said
+# it.  These helpers apply the SAME rules (one source of truth, no second
+# vocabulary) to the request text, and tolerate typos the way a human reader
+# would: a misspelled "servcies"/"invetory"/"vehcile" still names its nature.
+
+#: A one-letter-off word is only accepted from this length up, so short words
+#: ("to", "good") cannot collide with something unrelated.
+_FUZZY_MIN_WORD = 5
+#: Similarity floor and the margin over the runner-up (a tie is NOT a match:
+#: an ambiguous word must leave the nature unanswered rather than guess).
+_FUZZY_RATIO = 0.78
+_FUZZY_MARGIN = 0.06
+
+
+def vocabulary_from_pattern(pattern: str) -> Tuple[str, ...]:
+    """Every word of a rule pattern long enough to match fuzzily."""
+    return tuple(
+        dict.fromkeys(
+            word.lower()
+            for word in re.findall(r"[a-zA-Z]{%d,}" % _FUZZY_MIN_WORD, pattern)
+        )
+    )
+
+
+def nature_keyword_vocabulary(intent: str) -> Tuple[str, ...]:
+    """Every word the intent family's keyword rules are built from."""
+    family = nature_family_for_intent(intent or "")
+    spec = _NATURE_MATRIX.get(family) if family else None
+    if not spec:
+        return ()
+    words: List[str] = []
+    for pattern, _value in spec["keywords"]:
+        words.extend(vocabulary_from_pattern(pattern))
+    return tuple(dict.fromkeys(words))
+
+
+def fuzzy_word_match(word: str, vocabulary: Sequence[str]) -> Optional[str]:
+    """The vocabulary word *word* most likely is (``None`` when unclear).
+
+    Deterministic string similarity only — no model, no guessing: a word is
+    accepted solely when it clears the ratio floor AND beats the runner-up by
+    the margin, so "services"/"servcies" resolve while an unrelated near-word
+    leaves the decision open.
+
+    Two comparisons are considered, because the everyday typos are
+    transpositions and doubled letters, which plain sequence similarity
+    under-scores:
+
+    * sequence similarity ("servcies" ≈ "service");
+    * character-signature similarity, i.e. the sorted letters ("lapotps" ≈
+      "laptop", "vehcile" ≈ "vehicle").
+    """
+    if len(word) < _FUZZY_MIN_WORD or not vocabulary:
+        return None
+    signature = "".join(sorted(word))
+
+    def similarity(candidate: str) -> float:
+        return max(
+            difflib.SequenceMatcher(None, word, candidate).ratio(),
+            difflib.SequenceMatcher(
+                None, signature, "".join(sorted(candidate))
+            ).ratio(),
+        )
+
+    scored: List[Tuple[float, str]] = sorted(
+        ((similarity(candidate), candidate) for candidate in vocabulary),
+        reverse=True,
+    )
+    best_ratio, best_word = scored[0]
+    second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+    if best_ratio < _FUZZY_RATIO:
+        return None
+    if best_ratio - second_ratio < _FUZZY_MARGIN:
+        return None
+    return best_word
+
+
+def best_class_match(
+    text: str, candidates: "Dict[str, str]"
+) -> Optional[str]:
+    """The class whose vocabulary best explains *text* — or ``None``.
+
+    GENERAL rule, no per-word typo table: every token of the text is compared
+    with every word of every candidate's vocabulary (sequence OR
+    character-signature similarity), the best pair wins, and the answer is
+    accepted only when it clears the ratio floor and beats the runner-up by
+    the margin.  Any wording or spelling is therefore scored on its own
+    merits: "vhecle", "vehical", "vehicale" all land on the same class as
+    "vehicle" because they are nearest to it, without anyone listing them.
+    """
+    tokens = re.findall(r"[a-zA-Z]{%d,}" % _FUZZY_MIN_WORD, str(text or "").lower())
+    if not tokens or not candidates:
+        return None
+    scored: List[Tuple[float, str]] = []
+    for label, pattern in candidates.items():
+        vocabulary = vocabulary_from_pattern(pattern)
+        if not vocabulary:
+            continue
+        best = max(
+            (
+                max(
+                    difflib.SequenceMatcher(None, token, word).ratio(),
+                    difflib.SequenceMatcher(
+                        None, "".join(sorted(token)), "".join(sorted(word))
+                    ).ratio(),
+                )
+                for token in tokens
+                for word in vocabulary
+            ),
+            default=0.0,
+        )
+        scored.append((best, label))
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    best_ratio, best_label = scored[0]
+    second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+    if best_ratio < _FUZZY_RATIO or (best_ratio - second_ratio) < _FUZZY_MARGIN:
+        return None
+    return best_label
+
+
+def rule_has_typo_hit(text: str, pattern: str) -> bool:
+    """True when *text* plausibly contains one of *pattern*'s words.
+
+    Used by the rule vocabularies that decide nature/category, so a
+    misspelling ("servcies", "invetory", "vehcile") never pushes an item into
+    a wrong bucket or an unnecessary question.
+    """
+    vocabulary = vocabulary_from_pattern(pattern)
+    if not vocabulary:
+        return False
+    return any(
+        fuzzy_word_match(token, vocabulary)
+        for token in re.findall(r"[a-zA-Z]{%d,}" % _FUZZY_MIN_WORD, str(text or ""))
+    )
+
+
+def accepted_nature_values(intent: str) -> Tuple[str, ...]:
+    """The nature values THIS intent's question offers (its family's own)."""
+    family = nature_family_for_intent(intent or "")
+    spec = _NATURE_MATRIX.get(family) if family else None
+    if not spec:
+        return ()
+    return tuple(str(v) for v in spec["values"])
+
+
+def derive_nature_from_text(intent: str, text: str) -> Optional[str]:
+    """The nature the intent family's OWN rules imply for free text.
+
+    Returns the family's canonical value (e.g. ``SERVICE`` for a sale,
+    ``INVENTORY`` for a purchase) or ``None`` when the words do not say —
+    in which case the question is still asked, never guessed.
+    """
+    family = nature_family_for_intent(intent or "")
+    spec = _NATURE_MATRIX.get(family) if family else None
+    if not spec:
+        return None
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return None
+    token = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    if not token:
+        return None
+
+    # 1. The family's own keyword rules, in their declared order (most
+    #    specific first), exactly as the answer path applies them.
+    for pattern, value in spec["keywords"]:
+        if re.search(pattern, token):
+            return value
+
+    # 2. A canonical value named verbatim ("fixed asset", "other income",
+    #    "service", "inventory — resale stock").
+    for value in spec["values"]:
+        canon = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+        if canon and re.search(rf"\b{re.escape(canon)}\b", token):
+            return value
+
+    # 3. TYPO TOLERANCE — the user's words still name the nature.
+    vocabulary = nature_keyword_vocabulary(intent)
+    if not vocabulary:
+        return None
+    matches: List[str] = []
+    for word in token.split():
+        matched = fuzzy_word_match(word, vocabulary)
+        if matched and matched not in matches:
+            matches.append(matched)
+    if not matches:
+        return None
+    for pattern, value in spec["keywords"]:
+        for word in matches:
+            if re.search(rf"\b{re.escape(word)}\w*", pattern):
+                return value
     return None
 
 

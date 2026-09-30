@@ -3060,6 +3060,56 @@ async def execute(
                     "ambiguous": bool(_semantic.get("ambiguous")),
                     "source": "semantic_llm",
                 })
+        # BOUNDED UNDERSTANDING (measured output-safe: thinking off, ~411
+        # output tokens, finish_reason=stop at a 600-token cap — see
+        # scripts/short_understanding_probe.py).  ONE short call, made ONLY
+        # when the deterministic pass cannot read a material field from the
+        # user's own words, so free wording and typos ("sale of tax servcies")
+        # answer the nature/item instead of triggering those questions.
+        if (
+            not _ai_prefill
+            and not _provider_down
+            and bool(getattr(_settings, "bounded_understanding_enabled", False))
+        ):
+            try:
+                from app.planner import intent_for_message, text_understanding_gaps
+                from app.reasoning import accepted_nature_values
+
+                _gaps = text_understanding_gaps(user_message)
+                if _gaps:
+                    from app.entity_segregation import extract_request_facts
+
+                    _facts = await extract_request_facts(
+                        user_message,
+                        orchestrator=get_client(),
+                        thinking_off=True,
+                        max_output_tokens=int(
+                            getattr(_settings, "bounded_understanding_max_tokens", 600)
+                        ),
+                        timeout_seconds=float(
+                            getattr(
+                                _settings, "bounded_understanding_timeout_seconds", 20.0
+                            )
+                        ),
+                        nature_values=accepted_nature_values(
+                            intent_for_message(user_message)
+                        )
+                        or None,
+                    )
+                    if _facts:
+                        _ai_prefill = {**_ai_prefill, **_facts}
+                        await _log_step(session_id, "AI_PERCEPTION", {
+                            "facts": sorted(_facts.keys()),
+                            "intent": None,
+                            "ambiguous": False,
+                            "gaps": _gaps,
+                            "source": "bounded_understanding",
+                        })
+            except Exception as exc:  # noqa: BLE001 — reading is best-effort
+                log.warning(
+                    "agent.bounded_understanding_failed", error=str(exc)[:200]
+                )
+
         execution_plan = run_planner(
             user_message,
             clarification_history=prior_qa,
