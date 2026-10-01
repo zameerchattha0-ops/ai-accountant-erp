@@ -256,8 +256,12 @@ class TestLookupOnlyPlanContinuation:
         async def fake_execute_planned(calls, executor):
             for call in calls:
                 executed.append(call.tool_name)
+            # Production contract (app/tool_execution.py): PLAIN DICTS aligned
+            # with the calls — never ToolResults.  This stub used to return
+            # ToolResult objects, which hid the AttributeError that killed
+            # session b64467c0 in production.
             return [
-                ToolResult(tool_name=c.tool_name, success=True, data=[{"id": "a1"}])
+                {"success": True, "error": None, "data": [{"id": "a1"}]}
                 for c in calls
             ]
 
@@ -300,6 +304,8 @@ class TestLookupOnlyPlanContinuation:
         assert client.kwargs["executor"] is None
         assert client.kwargs["thinking_off"] is True
         assert len(evidence) == 2
+        assert evidence[0]["records"] == [{"id": "a1"}]
+        assert evidence[0]["error"] is None
 
     @pytest.mark.asyncio
     async def test_a_plan_with_a_mutation_is_left_alone(self):
@@ -336,6 +342,118 @@ class TestLookupOnlyPlanContinuation:
             excluded_tools=set(),
         )
         assert calls is None
+
+    @pytest.mark.asyncio
+    async def test_the_real_executor_returns_dicts_and_never_crashes(
+        self, monkeypatch
+    ):
+        """Regression: production 2026-10-01, plant session b64467c0.
+
+        The REAL execute_planned_tool_calls returns plain dicts, but the
+        evidence loop read ``result.data`` / ``r.tool_name`` as if they were
+        ToolResults — every lookup-only plan died with
+        ``AttributeError: 'dict' object has no attribute 'data'`` before
+        LOOKUP_PREP was ever logged.  This runs the gate through the real
+        executor (only route_tool_call is faked) so the dict contract cannot
+        drift away from production again.
+        """
+        import app.tool_execution as tool_exec
+
+        async def fake_route(call, **kwargs):
+            return ToolResult(
+                tool_name=call.tool_name,
+                success=True,
+                data=[{"id": "acc-1", "code": "1200", "name": "Plant"}],
+            )
+
+        monkeypatch.setattr(agent_mod, "route_tool_call", fake_route)
+        monkeypatch.setattr(tool_exec, "is_read_only_tool", lambda name: True)
+
+        logged = []
+
+        async def fake_log_step(session_id, step_type, data):
+            logged.append((step_type, data))
+
+        monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+        client = _StubClient([
+            ToolCall(tool_name="register_fixed_asset", arguments={"name": "Plant"})
+        ])
+        context = AgentContext(organization={}, user={})
+
+        calls, _text, evidence = await agent_mod._continue_lookup_only_plan(
+            client=client,
+            session_id=uuid.uuid4(),
+            execution_plan=_plan_with_intent("register_fixed_asset"),
+            planned_tool_calls=[
+                ToolCall(tool_name="search_account", arguments={"query": "plant"}),
+                ToolCall(tool_name="get_chart_of_accounts", arguments={}),
+            ],
+            context=context,
+            user_message="We Buy a Plant for 6,700,000 on cash, yesterday",
+            organization_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            auth=None,
+            excluded_tools=set(),
+        )
+
+        # the plan was finished by the model instead of bounced to the user
+        assert calls and calls[0].tool_name == "register_fixed_asset"
+        assert len(evidence) == 2
+        assert evidence[0]["kind"] == "search_account"
+        assert evidence[0]["records"] == [
+            {"id": "acc-1", "code": "1200", "name": "Plant"}
+        ]
+        assert evidence[0]["error"] is None
+        assert context.live_evidence
+        # the pre-gate lookups are visible in the trail
+        prep = [d for s, d in logged if s == "LOOKUP_PREP"]
+        assert prep and prep[0]["succeeded"] == [
+            "search_account",
+            "get_chart_of_accounts",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_reports_its_error_as_evidence(self, monkeypatch):
+        """A refused lookup is evidence TOO — it must not crash the gate."""
+        import app.tool_execution as tool_exec
+
+        async def fake_execute_planned(calls, executor):
+            return [{"success": False, "error": "connection refused"} for c in calls]
+
+        monkeypatch.setattr(tool_exec, "is_read_only_tool", lambda name: True)
+        monkeypatch.setattr(
+            tool_exec, "execute_planned_tool_calls", fake_execute_planned
+        )
+
+        async def fake_log_step(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+        client = _StubClient([
+            ToolCall(tool_name="register_fixed_asset", arguments={})
+        ])
+        context = AgentContext(organization={}, user={})
+
+        calls, _text, evidence = await agent_mod._continue_lookup_only_plan(
+            client=client,
+            session_id=uuid.uuid4(),
+            execution_plan=_plan_with_intent("register_fixed_asset"),
+            planned_tool_calls=[
+                ToolCall(tool_name="search_account", arguments={"query": "plant"}),
+            ],
+            context=context,
+            user_message="x",
+            organization_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            auth=None,
+            excluded_tools=set(),
+        )
+
+        assert evidence[0]["records"] == []
+        assert evidence[0]["error"] == "connection refused"
+        assert calls is not None  # the model still got its bounded round
 
 
 # --------------------------------------------------------------------------

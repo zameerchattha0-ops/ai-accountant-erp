@@ -6265,24 +6265,49 @@ async def _continue_lookup_only_plan(
         list(planned_tool_calls), _read_only_executor
     )
 
+    # execute_planned_tool_calls returns PLAIN DICTS aligned by index with
+    # the calls ({"success": …, "error": …, data merged in}), NEVER
+    # ToolResult objects — see its contract in app/tool_execution.py.  The
+    # loop below used to read result.data / r.tool_name as if they were
+    # ToolResults; the real executor therefore crashed every lookup-only
+    # continuation with AttributeError ('dict' object has no attribute
+    # 'data') and the run closed FAILED before a single lookup was reported
+    # (production 2026-10-01, plant session b64467c0: "We Buy a Plant for
+    # 6,700,000 on cash" planned search_account x2 + get_chart_of_accounts,
+    # then died at this line with no LOOKUP_PREP step ever written).
     evidence: List[Dict[str, Any]] = []
+    succeeded: List[str] = []
     for call, result in zip(planned_tool_calls, results):
-        records = result.data
+        payload: Dict[str, Any] = result if isinstance(result, dict) else {
+            "success": bool(getattr(result, "success", False)),
+            "error": getattr(result, "error", None),
+            "data": getattr(result, "data", None),
+        }
+        ok = bool(payload.get("success", True))
+        if "data" in payload:
+            records = payload.get("data")
+        else:
+            # the executor merges a dict result's keys into the payload
+            records = {
+                k: v for k, v in payload.items() if k not in ("success", "error")
+            }
         if isinstance(records, dict):
             records = records.get("records") or records.get("rows") or records
         if isinstance(records, list):
             records = records[:25]
+        if ok:
+            succeeded.append(call.tool_name)
         evidence.append(
             {
                 "kind": call.tool_name,
-                "records": records if result.success else [],
-                "error": None if result.success else (result.error or "lookup failed"),
+                "records": records if ok else [],
+                "error": None if ok else (payload.get("error") or "lookup failed"),
             }
         )
     await _log_step(session_id, "LOOKUP_PREP", {
         "intent": execution_plan.intent,
         "tools": [tc.tool_name for tc in planned_tool_calls],
-        "succeeded": [r.tool_name for r in results if r.success],
+        "succeeded": succeeded,
     })
 
     try:
