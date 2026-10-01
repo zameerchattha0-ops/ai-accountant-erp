@@ -635,6 +635,15 @@ async def seed_clarification_history(
     row.  Copying the answered Q&A into that new session keeps
     ``get_clarification_history`` complete across rounds, so a question
     answered in round 1 is never re-asked in round 2+.
+
+    ``required_information`` is copied VERBATIM (production 2026-10-01,
+    building session 6b78909c): writing ``[]`` here threw away the positional
+    field tags (`_tag_numbered_answers` zips a typed "1) 8 / 2) STRAIGHT_LINE"
+    answer with them), so the life/method/salvage answers merged on the turn
+    they were typed and then VANISHED on the next resume — the same three
+    questions came back every round until the user gave up.  A field-shaped
+    row (``question`` IS the field name) stores its field as required
+    information too, so both routes survive a round trip.
     """
     if not history:
         return
@@ -649,7 +658,10 @@ async def seed_clarification_history(
                 "execution_session_id": str(session_id),
                 "question": str(qa.get("question") or ""),
                 "user_response": str(qa.get("answer") or ""),
-                "required_information": [],
+                "required_information": (
+                    list(qa.get("required_information") or [])
+                    or ([str(qa.get("field"))] if qa.get("field") else [])
+                ),
                 "options": [],
                 "status": "COMPLETED",
                 "answered_at": answered_at,

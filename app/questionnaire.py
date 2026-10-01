@@ -204,6 +204,23 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         answer_hint="A number, e.g. 50000 — or 0",
         why="Depreciation stops at the salvage value.",
     ),
+    # --- Projects --------------------------------------------------------
+    "project_name": QuestionSpec(
+        field="project_name", kind=KIND_TEXT,
+        question="What is the project called?",
+        answer_hint="Project name, e.g. 'Mobile App'",
+        why="The project record is identified by its name.",
+    ),
+    "project_code": QuestionSpec(
+        field="project_code", kind=KIND_TEXT,
+        question=(
+            "Which project code should I use? (a short code, e.g. MOB-001 — "
+            "reply NONE and I will generate one)"
+        ),
+        options=(("NONE", "Generate one for me"),),
+        answer_hint="A short code, or NONE",
+        why="The project ledger is keyed by its code.",
+    ),
 }
 
 

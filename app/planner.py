@@ -229,6 +229,17 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("register_fixed_asset", [r"fixed asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset", r"new.*(?:machinery|generator|delivery van|forklift)"]),
     ("create_product", [r"add.*product", r"create.*product", r"new product", r"register.*product"]),
     ("create_service", [r"add.*service", r"create.*service", r"new service", r"register.*service"]),
+    # PROJECT SETUP — non-financial, but it needs its own intent: without one
+    # the request fell to intent=unknown (no keyword route, no field ladder,
+    # no context) and the model invented the call until the DB refused
+    # project_code (production 2026-10-01, "Set up a project called Mobile App
+    # for XYZ Client with a budget of Rs. 2,000,000", sessions 500d0aa4 /
+    # 03221efb).  An ACTION verb (or "new project") is required so query
+    # phrasings ("show the project budget") are never dragged into a mutation.
+    ("create_project", [
+        r"(?:set\s*up|create|start|open|register|add|make|launch)\b[^.\n]*\bprojects?\b",
+        r"\bnew\s+project\b",
+    ]),
     # "we BUY a car …" (production 2026-09-30, session f2166d3f): the ladder
     # had purchase/bought/purchased but NOT "buy", so even after four
     # clarified answers (amount, CASH, FIXED_ASSET, account "Vehicle - Car")
@@ -768,6 +779,19 @@ def plan(
         )
         if m:
             entities["asset_name"] = m.group(1).strip()
+
+    # Project setup: the name after "called"/"named" IS the project name
+    # ("Set up a project called Mobile App for XYZ Client…").
+    if intent == "create_project" and not entities.get("project_name"):
+        m = re.search(
+            r"\b(?:called|named)\s+"
+            r"([A-Za-z][\w&.\-]*(?:\s+[A-Za-z][\w&.\-]*)*?)"
+            r"(?=\s+(?:for|with|and|at|by|budget|worth)\b|[,.!?;]|\s*$|\s+\d)",
+            msg,
+            re.IGNORECASE,
+        )
+        if m and m.group(1).strip():
+            entities["project_name"] = m.group(1).strip()
 
     # 3. Merge answers from prior clarification rounds (never re-ask)
     nature_source: Optional[str] = None
@@ -1553,6 +1577,12 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     if intent == "register_fixed_asset" and not entities.get("payment_method"):
         missing.append("payment_type")
 
+    if intent == "create_project" and not entities.get("project_name"):
+        # The project CODE is deliberately NOT asked: projects.project_code is
+        # NOT NULL, yet no natural-language request names one — the repository
+        # derives <STEM>-### when it is absent.
+        missing.append("project_name")
+
     # ASSET-ACQUISITION POLICY (never guessed): a capitalised asset needs a
     # depreciation policy — useful life, method and (optionally) salvage —
     # or an explicit "no schedule" decision.  A registered asset with no
@@ -1654,6 +1684,19 @@ def _explode_multi_answers(
                 exploded.append({"question": sq, "answer": part})
         elif (
             len(sub_questions) >= 2
+            and len(parts) == len(sub_questions) - 1
+            and not sub_questions[0].rstrip().endswith("?")
+        ):
+            # A leading PREAMBLE is not a question ("To record this transaction
+            # I need a few things:\n1. …\n2. …\n3. …").  Dropping it makes the
+            # counts line up so each numbered answer still reaches its own
+            # field — without this, the whole consolidated answer fell through
+            # as one blob and the depreciation trio repeated forever
+            # (production 2026-10-01, building session 6b78909c).
+            for sq, part in zip(sub_questions[1:], parts):
+                exploded.append({"question": sq, "answer": part})
+        elif (
+            len(sub_questions) >= 2
             and len(parts) == len(sub_questions) + 1
             and re.match(r"supplier\s*:", parts[-1], re.IGNORECASE)
         ):
@@ -1752,6 +1795,115 @@ def _party_name_candidate(answer: str) -> Optional[str]:
     return candidate
 
 
+#: Words that identify a depreciation-policy round (the consolidated
+#: "useful life / method / salvage" question and each of its parts).
+_DEPRECIATION_QUESTION_HINTS = (
+    "useful life", "depreciation method", "salvage", "residual",
+)
+_DEPRECIATION_FIELDS = frozenset(
+    {"useful_life_years", "depreciation_method", "salvage_value", "residual_value"}
+)
+
+
+def _merge_depreciation_policy_answer(
+    merged: Dict[str, Any], question: str, answer: str
+) -> bool:
+    """Fold a depreciation-policy answer into the entity set — however phrased.
+
+    The questionnaire asks useful life, method and salvage in ONE round, and
+    users answer that round in one line ("1) 8 / 2) STRAIGHT_LINE / 3) 500,000"
+    or "8 years, straight line, 1,000,000 salvage value").  Every shape of
+    that round — the natural-language question, its numbered parts, and the
+    persisted field-shaped rows — must land in the same three entities, or the
+    round repeats forever (production 2026-10-01, building session 6b78909c:
+    the user answered the trio three times and nothing was ever recorded).
+
+    Each part is parsed only when ITS question is being answered, so a
+    single-part round ("Which DEPRECIATION METHOD…?" → "STRAIGHT_LINE") never
+    invents the other two.  Returns True when at least one field was set.
+    """
+    text = str(question or "").strip()
+    if not text:
+        return False
+    bare = text.lower()
+    if bare in _DEPRECIATION_FIELDS:
+        return _merge_field_answer(merged, bare, answer)
+
+    low_q = text.lower()
+    hints = {h for h in _DEPRECIATION_QUESTION_HINTS if h in low_q}
+    if not hints:
+        return False
+    # Collapse the hints to the FIELDS they point at: "RESIDUAL / SALVAGE
+    # value" is ONE field answered by ONE value, not a consolidated round.
+    _field_for_hint = {
+        "useful life": "useful_life_years",
+        "depreciation method": "depreciation_method",
+        "salvage": "salvage_value",
+        "residual": "salvage_value",
+    }
+    fields_for_hints = {_field_for_hint[h] for h in hints}
+
+    raw = str(answer or "").strip()
+    if not raw:
+        return False
+    low = raw.lower().strip(" .)'\"")
+    # A typed numbered answer keeps its list marker through the newline/comma
+    # split ("1) 8") — strip it before parsing the value.
+    low = re.sub(r"^\d{1,2}\s*[.):\-]\s*", "", low).strip()
+    if low in _DECLINE_WORDS or low in ("c", "none for now"):
+        # The round's own decline vocabulary: "reply NONE if you do not want a
+        # depreciation schedule yet" settles the whole trio at once.
+        merged["depreciation_declined"] = True
+        return True
+
+    # ONE-PART ROUND (a sub-question of the consolidated ask, or a single
+    # field): route to that field's own parser — one source of truth.
+    if len(fields_for_hints) == 1:
+        return _merge_field_answer(merged, next(iter(fields_for_hints)), low)
+
+    # CONSOLIDATED ROUND answered in one line: every part must be
+    # independently recognisable, so a part is never inferred from a number
+    # that belongs to another part.
+    before = (
+        merged.get("useful_life_years"),
+        merged.get("depreciation_method"),
+        merged.get("salvage_value"),
+    )
+
+    _merge_field_answer(merged, "depreciation_method", low)
+
+    years = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", low)
+    if years and 1 <= int(years.group(1)) <= 60:
+        merged["useful_life_years"] = int(years.group(1))
+
+    adjacent = re.search(
+        r"([\d][\d,]*(?:\.\d+)?)\s*(?:rs\.?|pkr)?\s*(?:salvage|residual)", low
+    )
+    if adjacent:
+        number = _parse_bare_amount(adjacent.group(1))
+        if number is not None:
+            merged["salvage_value"] = number
+    elif re.search(r"\b(?:salvage|residual)\b[^\d]{0,20}\b(?:zero|nil|0)\b", low):
+        merged["salvage_value"] = 0.0
+
+    after = (
+        merged.get("useful_life_years"),
+        merged.get("depreciation_method"),
+        merged.get("salvage_value"),
+    )
+    handled = before != after
+    if handled:
+        log.info(
+            "planner.depreciation_policy_merged",
+            fields=[
+                f
+                for f in ("useful_life_years", "depreciation_method", "salvage_value")
+                if merged.get(f) is not None
+            ],
+        )
+    return handled
+
+
 def _merge_clarification_answers(
     entities: Dict[str, Any],
     qa_history: List[Dict[str, str]],
@@ -1788,6 +1940,26 @@ def _merge_clarification_answers(
         # chain below (never guessed).
         field_tag = str(qa.get("field") or "").strip()
         if field_tag and _merge_field_answer(merged, field_tag, answer):
+            continue
+
+        # BARE FIELD-NAME QUESTION: a field-shaped answer survives a resumed
+        # round as ``question = <field name>`` (that is how positional and
+        # tap answers are persisted — see seed_clarification_history).  Route
+        # it through the SAME field router the live turn used: the keyword
+        # chain below can never recognise "useful_life_years" (production
+        # 2026-10-01, building session 6b78909c: the life/method/salvage
+        # answers were merged on the turn they were typed and then re-asked
+        # every round because this route did not exist).
+        _bare = (qa.get("question") or "").strip()
+        if re.fullmatch(r"[a-z][a-z0-9_]{2,40}", _bare):
+            if _merge_field_answer(merged, _bare, answer):
+                continue
+
+        # DEPRECIATION-POLICY ROUND: the consolidated "useful life / method /
+        # salvage" question, answered in ONE line — fill every part of the
+        # trio from that answer instead of losing it (the numbered split can
+        # only pair parts with sub-questions when the counts line up).
+        if _merge_depreciation_policy_answer(merged, qa.get("question") or "", answer):
             continue
 
         # the
@@ -2357,6 +2529,20 @@ def _merge_field_answer_tail(
             merged["capitalization_decision"] = "EXPENSE"
         return True
 
+    if field == "project_code":
+        # A stated code is honoured; NONE/decline leaves it unset so the
+        # repository derives <STEM>-### itself (never a blocking question).
+        if low in _DECLINE_WORDS:
+            return True
+        merged["project_code"] = value.strip().upper()
+        return True
+
+    if field == "project_name":
+        if low in _DECLINE_WORDS:
+            return True
+        merged["project_name"] = value
+        return True
+
     return False
 
 
@@ -2809,6 +2995,7 @@ def _tools_for_intent(intent: str) -> List[str]:
         "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
         "create_product": ["search_product", "create_product"],
         "create_service": ["search_service", "create_service"],
+        "create_project": ["search_customer", "create_project"],
         "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
         "supplier_balance": ["search_supplier", "get_supplier", "get_supplier_ledger"],
         "generate_trial_balance": ["get_trial_balance"],
@@ -2849,6 +3036,7 @@ def _context_for_intent(intent: str) -> List[str]:
         "run_payroll": ["employee_master", "chart_of_accounts", "bank_accounts", "accounting_periods"],
         "create_product": ["chart_of_accounts"],
         "create_service": ["chart_of_accounts"],
+        "create_project": ["projects", "customer_master"],
         "create_bank_account": ["chart_of_accounts"],
         "list_bank_accounts": ["bank_accounts"],
         "customer_balance": ["customer_master", "customer_ledger", "invoices", "receipts"],
@@ -2884,6 +3072,7 @@ def _outcome(intent: str) -> str:
         "run_payroll": "Payroll run recorded with journal entry",
         "create_product": "Product added to the catalog",
         "create_service": "Service added to the catalog",
+        "create_project": "Project created",
         "create_bank_account": "Bank account created with linked GL account",
         "list_bank_accounts": "Bank account list retrieved",
         "customer_balance": "Customer outstanding balance calculated",

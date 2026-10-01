@@ -159,6 +159,10 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "create_invoice", "create_quotation", "convert_quotation",
         "create_credit_note", "create_purchase_return", "create_purchase_bill",
         "create_bank_account", "create_product", "create_service",
+        # Project setup — non-financial, but it is a first-class operation
+        # with its own intent, field ladder and tool (production 2026-10-01:
+        # "Set up a project …" had no intent at all).
+        "create_project",
         "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
         "run_payroll",
         "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",

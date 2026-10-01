@@ -3491,6 +3491,11 @@ async def execute(
                 intent=execution_plan.intent,
                 entity_hints=entity_hints,
                 clarification_history=prior_qa,
+                # The PLANNER owns which evidence this intent needs; the DB
+                # rules table only covers a handful of intents, so passing the
+                # plan's own sources is what keeps the Phase-4 model from
+                # planning blind (see context_manager: required_slugs union).
+                required_context=list(execution_plan.required_context or []),
                 # P1-⑦ (forensic latency report ⑦): org preferences were
                 # already loaded this turn — pass them through (kills the
                 # duplicate query) — and skip the seven domain fetches when a
@@ -3527,6 +3532,11 @@ async def execute(
             "suppliers": len(context.relevant_suppliers),
             "accounts": len(context.relevant_accounts),
             "live_evidence": len(context.live_evidence),
+            # Why a count is zero must be recoverable from the trail: the
+            # sources the planner asked for vs. what came back.
+            "required_sources": list(
+                execution_plan.required_context or []
+            ),
         })
 
         _phase_elapsed("context.built")
@@ -3952,6 +3962,10 @@ async def execute(
         _phase_elapsed("deterministic.done", fast=deterministic_calls is not None)
         llm_text = ""
         planned_tool_calls: List[ToolCall] = []
+        # The provider client exists only on the MODEL path (the deterministic
+        # fast path never talks to a provider).  Declared here so the Phase-5
+        # lookup-continuation round can safely check for it.
+        client: Optional[Any] = None
         if deterministic_calls is not None:
             planned_tool_calls = deterministic_calls
             await _log_step(session_id, "DETERMINISTIC_EXECUTION", {
@@ -4040,6 +4054,16 @@ async def execute(
             _phase_elapsed("llm_call.done")
             llm_text = planning_result.get("text", "")
             planned_tool_calls = planning_result.get("tool_calls", [])
+            # The planning RESULT was previously invisible in the trail (only
+            # the pre-call marker was logged), so a read-only-only plan looked
+            # like a mystery (production 2026-10-01, building session
+            # 6b78909c).  Record the tools and a slice of the model's text.
+            await _log_step(session_id, "PLANNING", {
+                "source": "llm_planning_result",
+                "intent": execution_plan.intent,
+                "tools": [tc.tool_name for tc in planned_tool_calls],
+                "text": str(llm_text or "")[:400],
+            })
 
         # ---- PHASE 4b: Model-driven clarification gate ---------------------
         # The model may respond with a TEXT-ONLY question (no tool calls)
@@ -4279,16 +4303,52 @@ async def execute(
             if _plan_performs_no_financial_mutation(
                 intent=execution_plan.intent, calls=planned_tool_calls
             ):
+                # A LOOKUP-ONLY plan is not impossible — it is UNFINISHED.
+                # Read-only calls mutate nothing, so run them and give the
+                # model one bounded round to finish the plan with what it
+                # found, instead of bouncing the user with a question about
+                # fields that have nothing to do with the real blocker
+                # (production 2026-10-01, building session 6b78909c).
+                _c_calls, _c_text, _c_evidence = await _continue_lookup_only_plan(
+                    client=client,
+                    session_id=session_id,
+                    execution_plan=execution_plan,
+                    planned_tool_calls=planned_tool_calls,
+                    context=context,
+                    user_message=user_message,
+                    organization_id=organization_id,
+                    user_id=user_id,
+                    auth=auth,
+                    excluded_tools=excluded_tools,
+                )
+                if _c_calls is not None:
+                    planned_tool_calls = _c_calls
+                    llm_text = _c_text or llm_text
+                _continuation_text = _c_text
+                _continuation_evidence = _c_evidence
+            if _plan_performs_no_financial_mutation(
+                intent=execution_plan.intent, calls=planned_tool_calls
+            ):
                 _tools = ", ".join(tc.tool_name for tc in planned_tool_calls)
                 # The user must be told WHAT to answer, in the same words the
                 # questionnaire uses — raw field names told them nothing.
                 from app.planner import human_questions_for_missing
 
-                _missing_fields = list(execution_plan.missing_fields or [])
+                _ents_now = dict(
+                    getattr(execution_plan, "extracted_entities", None) or {}
+                )
+                # NEVER re-ask a value the plan already carries: the
+                # life/method/salvage trio came back three rounds in a row
+                # because this list was used as-is.
+                _missing_fields = [
+                    f
+                    for f in list(execution_plan.missing_fields or [])
+                    if _ents_now.get(f) in (None, "", [], {})
+                ]
                 _questions = human_questions_for_missing(
                     str(execution_plan.intent),
                     _missing_fields,
-                    getattr(execution_plan, "extracted_entities", None) or {},
+                    _ents_now,
                     limit=3,
                 )
                 _remaining = max(0, len(_missing_fields) - len(_questions))
@@ -4298,12 +4358,34 @@ async def execute(
                     )
                     + (f" (and {_remaining} more)" if _remaining else "")
                 ) or "the remaining details"
-                _question = (
+                # The lookups I just ran are part of the answer: say what they
+                # found (or that they found nothing) instead of pretending the
+                # plan was never started.
+                _lookup_note = ""
+                if _continuation_evidence:
+                    _empty = all(
+                        not item.get("records") for item in _continuation_evidence
+                    )
+                    _lookup_note = (
+                        " I checked your own records first "
+                        f"({_tools}): "
+                        + (
+                            "nothing matched, so nothing can reference it yet."
+                            if _empty
+                            else "here is what I found."
+                        )
+                    )
+                _model_question = (
+                    _usable_question(_continuation_text)
+                    if _continuation_text
+                    else None
+                )
+                _question = _model_question or (
                     f"Nothing has been recorded yet. I could not build the "
                     f"{str(execution_plan.intent).replace('_', ' ')} from the details "
                     f"I have, so there is nothing for you to approve. The steps I "
-                    f"could prepare were: {_tools}. Please answer: {_missing} — or "
-                    "rephrase the request, and I will try again."
+                    f"could prepare were: {_tools}.{_lookup_note} Please answer: "
+                    f"{_missing} — or rephrase the request, and I will try again."
                 )
                 try:
                     _clarification = await create_clarification(
@@ -4914,6 +4996,14 @@ async def execute(
                         requires_user_input=True,
                     )
             await _update_status(session_id, ExecutionStatus.COMPLETED)
+            # Terminal marker for an INFORMATIONAL run: nothing was recorded,
+            # so without this step the session looked "OPEN"/crashed in the
+            # trail (production 2026-10-01, employee session 514fdddb).
+            await _log_step(session_id, "COMPLETED", {
+                "stage": "informational",
+                "mutations": 0,
+                "tools": [tr.tool_name for tr in tool_results],
+            })
             await create_execution_result(
                 session_id=session_id,
                 result_data={
@@ -5202,6 +5292,41 @@ async def execute(
                         for tr in failed_results
                     ],
                 })
+                # ...UNLESS the refusal explicitly demands a value only the
+                # USER can give (a NOT NULL / contract field with no default).
+                # Closing such a run silently is how "Set up a project …"
+                # failed with project_code missing and nobody was ever asked
+                # (production 2026-10-01, project session 03221efb).
+                _input_question = _user_input_required_question(failed_results)
+                if (
+                    _input_question
+                    and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+                ):
+                    try:
+                        _clar = await create_clarification(
+                            session_id=session_id,
+                            question=_input_question,
+                            required_fields=["missing_details"],
+                        )
+                        _input_question = _clar.get("question", _input_question)
+                    except Exception as exc:  # noqa: BLE001 — asking is not optional
+                        log.warning(
+                            "agent.value_clarification_write_failed",
+                            session_id=str(session_id),
+                            error=str(exc)[:200],
+                        )
+                    await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                        "source": "tool_required_value",
+                        "failed_tools": [tr.tool_name for tr in failed_results],
+                        "question": _input_question[:300],
+                    })
+                    return AgentResponse(
+                        status=ExecutionStatus.AWAITING_CLARIFICATION,
+                        execution_id=session_id,
+                        question=_input_question,
+                        required_information=["missing_details"],
+                        requires_user_input=True,
+                    )
 
         # ---- PHASE 8: VERIFICATION ---------------------------------------
         # VERIFIED means the ERP operation actually executed and its
@@ -5241,6 +5366,17 @@ async def execute(
         # ---- PHASE 9: COMPLETED ------------------------------------------
         status = ExecutionStatus.COMPLETED if verified else ExecutionStatus.FAILED
         await _update_status(session_id, status)
+        # EVERY run leaves a TERMINAL step.  Without it a session whose status
+        # was set (COMPLETED via the API) still looks "OPEN" in the trail —
+        # indistinguishable from a crashed run, which is exactly how the
+        # 2026-10-01 project and employee sessions appeared during the
+        # post-mortem.
+        await _log_step(session_id, str(status.value), {
+            "stage": "terminal",
+            "verified": verified,
+            "intent": execution_plan.intent,
+            "tools": [tr.tool_name for tr in tool_results],
+        })
 
         # Build canonical affected entities + accounting impact.
         # Contracts are defined in app/entity_contract.py and mirrored in
@@ -6051,6 +6187,167 @@ def _plan_performs_no_financial_mutation(
     if not _intent_tool_names(intent):
         return False
     return not any(tc.tool_name in FINANCIAL_WRITE_TOOLS for tc in calls or ())
+
+
+async def _continue_lookup_only_plan(
+    *,
+    client: Optional[Any],
+    session_id: uuid.UUID,
+    execution_plan: Any,
+    planned_tool_calls: List[ToolCall],
+    context: Any,
+    user_message: str,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    auth: Optional[AuthContext],
+    excluded_tools: Optional[set],
+) -> Tuple[Optional[List[ToolCall]], str, List[Dict[str, Any]]]:
+    """Finish a LOOKUP-ONLY plan instead of asking the user a blind question.
+
+    Phase 4 plans WITHOUT an executor: a cautious model therefore returns its
+    read-only calls first ("search the chart for a suitable PPE ledger, check
+    whether the asset already exists") and never receives the results.  The
+    Phase-5 completeness gate then refused such a plan and asked the user a
+    question that had nothing to do with the real blocker (production
+    2026-10-01, building session 6b78909c: the org had 40+ accounts and a full
+    PPE ledger, but the model saw an EMPTY context and planned
+    ``search_account, search_account, search_fixed_asset`` — the run parked on
+    the same life/salvage questions until the user gave up).
+
+    Read-only calls mutate nothing, so they are safe to run BEFORE the
+    confirmation gate.  Their results are attached to the context as live
+    evidence and ONE bounded planning round gives the model the chance to
+    finish the plan with what it found.
+
+    Returns ``(tool_calls | None, text, evidence)``: ``None`` calls means the
+    continuation could not run (deterministic plan, mixed plan, provider
+    stall) and the caller keeps its behaviour.
+    """
+    from app.tool_execution import (
+        execute_planned_tool_calls,
+        is_read_only_tool,
+    )
+
+    if client is None or not planned_tool_calls:
+        return None, "", []
+    if any(not is_read_only_tool(tc.tool_name) for tc in planned_tool_calls):
+        return None, "", []
+
+    async def _read_only_executor(tool_name: str, args: dict) -> dict:
+        if tool_name in (excluded_tools or set()):
+            return excluded_tool_refusal(tool_name, execution_plan.intent)
+        if not is_read_only_tool(tool_name):
+            return {
+                "success": False,
+                "error": (
+                    "Only read-only lookups may run before the user approves "
+                    "this transaction."
+                ),
+            }
+        result = await route_tool_call(
+            ToolCall(tool_name=tool_name, arguments=args),
+            organization_id=organization_id,
+            user_id=user_id,
+            session_id=session_id,
+            auth=auth,
+        )
+        payload: Dict[str, Any] = {
+            "success": result.success,
+            "error": result.error,
+        }
+        if isinstance(result.data, dict):
+            payload.update(result.data)
+        elif result.data is not None:
+            payload["data"] = result.data
+        return payload
+
+    results = await execute_planned_tool_calls(
+        list(planned_tool_calls), _read_only_executor
+    )
+
+    evidence: List[Dict[str, Any]] = []
+    for call, result in zip(planned_tool_calls, results):
+        records = result.data
+        if isinstance(records, dict):
+            records = records.get("records") or records.get("rows") or records
+        if isinstance(records, list):
+            records = records[:25]
+        evidence.append(
+            {
+                "kind": call.tool_name,
+                "records": records if result.success else [],
+                "error": None if result.success else (result.error or "lookup failed"),
+            }
+        )
+    await _log_step(session_id, "LOOKUP_PREP", {
+        "intent": execution_plan.intent,
+        "tools": [tc.tool_name for tc in planned_tool_calls],
+        "succeeded": [r.tool_name for r in results if r.success],
+    })
+
+    try:
+        context.live_evidence = list(getattr(context, "live_evidence", None) or []) + evidence
+    except Exception:  # noqa: BLE001 — evidence is best-effort
+        log.warning("agent.lookup_evidence_attach_failed", session_id=str(session_id))
+
+    _light = execution_plan.intent in _LIGHT_BUDGET_INTENTS
+    result, stall = await _bounded_provider_call(
+        client.generate_with_tools(
+            user_message=user_message,
+            context=context,
+            executor=None,
+            excluded_tools=excluded_tools or set(),
+            light_budget=_light,
+            thinking_off=True,
+        ),
+        budget=_LLM_PLANNING_BUDGET_SECONDS,
+        stage="lookup_continuation",
+    )
+    if result is None:
+        await _log_step(session_id, "FAILED", {
+            "reason": stall,
+            "stage": "lookup_continuation",
+            "controlled": True,
+        })
+        return None, "", evidence
+
+    calls = list(result.get("tool_calls", []) or [])
+    text = str(result.get("text", "") or "")
+    await _log_step(session_id, "PLANNING", {
+        "source": "lookup_continuation_result",
+        "intent": execution_plan.intent,
+        "tools": [c.tool_name for c in calls],
+        "text": text[:400],
+    })
+    return calls, text, evidence
+
+
+#: A tool failure that says the VALUE ITSELF has to come from the user
+#: (NOT NULL / contract refusal — the error_normalizer wording).
+_REQUIRED_VALUE_ERROR_RE = re.compile(
+    r"must be supplied by the user|required .* field '.*' is missing",
+    re.IGNORECASE,
+)
+
+
+def _user_input_required_question(
+    failed: Sequence[ToolResult],
+) -> Optional[str]:
+    """A clarification question for a failure that needs a USER-supplied value.
+
+    Returns None when no failure demands user input (a genuine lookup failure or
+    an infrastructure error is reported, never turned into a question).
+    """
+    for tr in failed or ():
+        text = str(tr.error or "").strip()
+        if not text or not _REQUIRED_VALUE_ERROR_RE.search(text):
+            continue
+        return (
+            "I could not record this yet — the records refused it and said the "
+            f"value has to come from you: {text[:400]} Give me that value and I "
+            "will continue from where I stopped (nothing else was recorded)."
+        )
+    return None
 
 
 def _execution_failure_summary(

@@ -103,6 +103,12 @@ _INTENT_TOOLS: dict[str, set[str]] = {
     },
     "create_product": {"create_product"},
     "create_service": {"create_service"},
+    # Projects: a non-financial record, so no journal helper and no
+    # confirmation gate — but it needs its OWN intent, otherwise the request
+    # fell through to intent=unknown, no field ladder existed, and the model
+    # invented the call until the DB refused `project_code` (production
+    # 2026-10-01, project sessions 500d0aa4 / 03221efb).
+    "create_project": {"create_project"},
 }
 
 

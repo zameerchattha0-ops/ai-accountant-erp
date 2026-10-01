@@ -31,6 +31,40 @@ from app.services import preference_service
 log = structlog.get_logger(__name__)
 
 
+def _context_slugs(
+    ctx_info: Dict[str, Any],
+    planner_sources: Optional[List[str]],
+) -> List[str]:
+    """The evidence sources for this turn: DB rule ∪ planner-declared.
+
+    The ``ai_context_rules`` table covers only a handful of intents; without
+    the planner's own ``required_context`` every other intent ran with an
+    EMPTY source list, so the Phase-4 planning prompt rendered no chart of
+    accounts at all and the model planned read-only lookups it could never
+    complete (production 2026-10-01, building session 6b78909c — the org had
+    40+ active accounts, including a full PPE ledger, and the model saw none
+    of them).  The DB rule stays authoritative for its intents; this only ever
+    ADDS sources, never narrows.
+    """
+    slugs: List[str] = []
+    rule = (ctx_info or {}).get("rule")
+    if rule:
+        for slug in rule.get("required_sources") or []:
+            slug = str(slug or "").strip()
+            if slug and slug not in slugs:
+                slugs.append(slug)
+    for slug in planner_sources or []:
+        slug = str(slug or "").strip()
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    if not rule:
+        log.info(
+            "context_manager.rule_missing",
+            planner_sources=list(planner_sources or []),
+        )
+    return slugs
+
+
 async def build_context(
     *,
     organization_id: uuid.UUID,
@@ -40,6 +74,7 @@ async def build_context(
     clarification_history: Optional[List[Dict[str, Any]]] = None,
     org_preferences: Optional[Dict[str, Any]] = None,
     domain_fetches: bool = True,
+    required_context: Optional[List[str]] = None,
     organization: Optional[Dict[str, Any]] = None,
     financial_year: Optional[Dict[str, Any]] = None,
     accounting_period: Optional[Dict[str, Any]] = None,
@@ -146,8 +181,7 @@ async def build_context(
         # P1-⑦ warm path: rules known SYNCHRONOUSLY → organisation, period,
         # domain fetches and preferences all start in ONE gather wave.
         ctx_info = cached_rules
-        if ctx_info.get("rule"):
-            required_slugs = ctx_info["rule"].get("required_sources") or []
+        required_slugs = _context_slugs(ctx_info, required_context)
         (org, fy, period), domain, resolved_prefs = await asyncio.gather(
             _org_sources(),
             _domain_fetches(),
@@ -160,11 +194,15 @@ async def build_context(
             _org_sources(),
             _isolated("context_rules", lambda: get_context_sources_for_intent(intent), {}),
         )
-        if ctx_info.get("rule"):
-            required_slugs = ctx_info["rule"].get("required_sources") or []
+        required_slugs = _context_slugs(ctx_info, required_context)
         domain, resolved_prefs = await asyncio.gather(
             _domain_fetches(), _resolved_prefs()
         )
+    # PLANNER-DECLARED SOURCES are already unioned by _context_slugs (above),
+    # BEFORE the fetches run — the DB rules table only covers a handful of
+    # intents, so for everything else the planner's own required_context is
+    # what keeps the Phase-4 model from planning blind (production 2026-10-01,
+    # building session 6b78909c: accounts=0 in context while the org had 40+).
     org_data = _safe_dict(org)
     (
         customers,
