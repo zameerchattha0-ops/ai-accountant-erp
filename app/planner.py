@@ -147,8 +147,33 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     # invoice" also matches the generic quotation pattern below.
     ("convert_quotation", [r"convert.*(?:quotation|quote)", r"(?:quotation|quote).*invoice", r"accept.*(?:quotation|quote).*invoice"]),
     ("create_quotation", [r"quotation", r"quote", r"price\s*quote", r"create.*quote", r"send.*quotation"]),
-    ("create_credit_note", [r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit"]),
-    ("create_purchase_return", [r"purchase\s*return", r"return.*goods.*supplier", r"return.*to.*supplier", r"send.*back.*supplier"]),
+    # RETURNS — the SIDE is decided by who sent the goods back:
+    #   "<party> returned X"          → they returned goods to us → SALE return
+    #                                   (credit note against their invoice)
+    #   "we returned X" / "…to <supplier>" → we sent goods back → PURCHASE return
+    # create_purchase_return MUST precede create_credit_note: both now
+    # recognise the bare verb, so the "we"/supplier phrasings have to be
+    # claimed first.  Production 2026-09-30 (session 387b7cb8): "Alpha
+    # Associates Returned Chairs amounting to 34000" matched NOTHING — the
+    # old patterns demanded the literal words "goods"+"customer" — so intent
+    # stayed unknown, every deterministic gate (party check, questionnaire,
+    # confirmation) was skipped and the run fell into the generic LLM tool
+    # loop and died at the 120s execution budget.
+    ("create_purchase_return", [
+        r"purchase\s*return",
+        r"return.*goods.*supplier",
+        r"return.*to.*supplier",
+        r"send.*back.*supplier",
+        r"\bsent\b[^.]*\bback\b",
+        r"\bwe\s+return(?:ed|s|ing)?\b",
+    ]),
+    ("create_credit_note", [
+        r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit",
+        # "<party> returned/returns/refunded …" and "return of <items>".
+        r"\breturned\b",
+        r"\breturn\s+of\b",
+        r"\breturns?\s+(?:the\s+)?(?:goods|items?|stock|merchandise|units?)\b",
+    ]),
     # Payroll (Employees Phase 2).  An ACTION verb is required — a bare
     # "payroll" keyword would swallow query phrasings ("show payroll") and
     # drag them into a mutation's confirmation ladder.  A plan that names the
@@ -204,7 +229,14 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("register_fixed_asset", [r"fixed asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset", r"new.*(?:machinery|generator|delivery van|forklift)"]),
     ("create_product", [r"add.*product", r"create.*product", r"new product", r"register.*product"]),
     ("create_service", [r"add.*service", r"create.*service", r"new service", r"register.*service"]),
-    ("record_purchase", [r"purchase", r"bought", r"purchased"]),
+    # "we BUY a car …" (production 2026-09-30, session f2166d3f): the ladder
+    # had purchase/bought/purchased but NOT "buy", so even after four
+    # clarified answers (amount, CASH, FIXED_ASSET, account "Vehicle - Car")
+    # the final turn still ran intent=unknown → no deterministic gate → the
+    # LLM tool loop → 120s timeout.  The generic purchase intent is the
+    # right home: the nature ladder decides fixed-asset vs inventory vs
+    # expense, and the payment method refines it to cash/credit.
+    ("record_purchase", [r"purchase", r"bought", r"purchased", r"\bbuy(?:s|ing)?\b"]),
     ("record_sale", [r"sold", r"sale"]),
 ]
 
@@ -330,7 +362,10 @@ def _is_plausible_party(value: str) -> bool:
     words = text.split()
     if not words:
         return False
-    if text.lower() in ("the", "a", "an", "it", "us", "me", "him", "her", "them"):
+    if text.lower() in (
+        "the", "a", "an", "it", "us", "we", "you", "they", "i",
+        "me", "him", "her", "them", "our", "your", "their",
+    ):
         return False
     return words[0].strip(",.").lower() not in _NON_PARTY_WORDS
 
@@ -359,6 +394,13 @@ _CUSTOMER_PATTERNS = [
         r"\b([A-Z][a-z&.]*|[A-Z]{2,})(?:\s+(?:[A-Z][a-z&.]*|[A-Z]{2,}))+"
         r"\s+(?:owes?|ledger|receivable|balance)\b"
     ),
+    # "<Party> returned/returns/refunded <items>" — the customer sent the
+    # goods back to us, so the name ending at the return verb IS the
+    # customer ("Alpha Associates Returned Chairs amounting to 34000").
+    # The returned item itself is captured by _ITEM_PATTERNS; the side of
+    # the return is decided by _INTENT_PATTERNS ("we returned" = purchase
+    # return, so the "we" capture is rejected as a party below).
+    re.compile(r"\b" + _NAME + r"\s+(?:returned|returns|refunded)\b", re.IGNORECASE),
 ]
 
 _ITEM_PATTERNS = [
@@ -381,9 +423,10 @@ _ITEM_PATTERNS = [
     # "invoice for 45000 …" can never be mistaken for the item.
     re.compile(
         r"\b(?:sale|sales|supply|supplies|purchase|purchases|rendering|"
-        r"provision|delivery|invoice|bill)\s+of\s+"
+        r"provision|delivery|invoice|bill|return(?:s)?)\s+of\s+"
         r"([a-zA-Z][\w\s-]*?)"
-        r"(?=\s+(?:to|from|for|on|in|at|via|against)\b|[,.!?;]|\s*$|\s+\d)",
+        r"(?=\s+(?:to|from|for|on|in|at|via|against|amounting|worth|total)\b"
+        r"|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
     # "invoice/bill for <item>" — same noun phrasing with "for".
@@ -391,6 +434,19 @@ _ITEM_PATTERNS = [
         r"\b(?:invoice|bill)\s+for\s+"
         r"([a-zA-Z][\w\s-]*?)"
         r"(?=\s+(?:to|from|on|in|at|via|against)\b|[,.!?;]|\s*$|\s+\d)",
+        re.IGNORECASE,
+    ),
+    # "<party> returned <items>" — the goods that came back, so a return can
+    # be anchored to an item instead of being swallowed by the party capture
+    # ("Alpha Associates Returned Chairs amounting to 34000" → "chairs").
+    # `amounting|worth|total` end the capture, so the item is never
+    # "chairs amounting".
+    re.compile(
+        r"\b(?:returned|returns|refunded)\s+"
+        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+        r"([a-zA-Z][\w\s-]*?)"
+        r"(?=\s+(?:amounting|worth|total|for|on|in|at|via|to|from|against)\b"
+        r"|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
 ]
@@ -2727,8 +2783,12 @@ def _tools_for_intent(intent: str) -> List[str]:
     mapping = {
         "create_quotation": ["search_customer", "get_customer", "create_quotation"],
         "convert_quotation": ["search_customer", "get_customer", "get_invoice", "convert_quotation", "prepare_journal", "validate_journal"],
-        "create_credit_note": ["search_customer", "get_customer", "create_credit_note", "prepare_journal", "post_journal"],
-        "create_purchase_return": ["search_supplier", "get_supplier", "create_purchase_return", "prepare_journal", "post_journal"],
+        # The CA flow for a return: READ the party's open invoices/ledger
+        # first, identify the sale being returned, then create the note
+        # against it.  `invoice_id` is optional in the service, but the model
+        # can only anchor the note when the readers are offered.
+        "create_credit_note": ["search_customer", "get_customer", "get_customer_ledger", "get_invoice", "create_credit_note", "prepare_journal", "post_journal"],
+        "create_purchase_return": ["search_supplier", "get_supplier", "get_supplier_ledger", "create_purchase_return", "prepare_journal", "post_journal"],
         "record_expense_payment": ["search_supplier", "record_expense_payment", "prepare_journal", "post_journal"],
         "create_invoice": ["search_customer", "get_customer", "create_invoice", "prepare_journal", "validate_journal"],
         "record_credit_purchase": ["search_supplier", "get_supplier", "create_supplier", "search_account", "create_purchase_bill", "prepare_journal", "validate_journal", "post_journal"],
@@ -2768,8 +2828,11 @@ def _context_for_intent(intent: str) -> List[str]:
     mapping = {
         "create_quotation": ["customer_master"],
         "convert_quotation": ["customer_master", "chart_of_accounts", "accounting_periods"],
-        "create_credit_note": ["customer_master", "chart_of_accounts", "accounting_periods"],
-        "create_purchase_return": ["supplier_master", "chart_of_accounts", "accounting_periods"],
+        # A return is identified FROM the party's records: the invoices and
+        # the party ledger are what let the agent find the sale/purchase
+        # being reversed (never invented from the request alone).
+        "create_credit_note": ["customer_master", "invoices", "customer_ledger", "chart_of_accounts", "accounting_periods"],
+        "create_purchase_return": ["supplier_master", "purchase_bills", "supplier_ledger", "chart_of_accounts", "accounting_periods"],
         "record_expense_payment": ["supplier_master", "bank_accounts", "accounting_periods"],
         "create_invoice": ["customer_master", "chart_of_accounts", "accounting_periods"],
         "record_credit_purchase": ["supplier_master", "chart_of_accounts", "accounting_periods"],

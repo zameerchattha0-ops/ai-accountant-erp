@@ -263,6 +263,7 @@ class AIOrchestrator:
         requires_vision: bool = False,
         excluded_tools: Optional[set] = None,
         light_budget: bool = False,
+        thinking_off: bool = False,
     ) -> Dict[str, Any]:
         """Same contract as GeminiClient.generate_with_tools, with a
         multi-model fallback chain.
@@ -278,6 +279,14 @@ class AIOrchestrator:
         request gets a reduced max_output_tokens — used for simple lookup
         intents that still need the model (e.g. ambiguous phrasing) after
         the deterministic fast-path did not apply.
+
+        ``thinking_off``: forwarded to the client when it supports it (the
+        Qwen TRANSPORT does, and Token Harbor reuses that transport with its
+        own base URL — so the thinking DeepSeek primary honours it too;
+        Gemini does not take it and is skipped).  Used by the agent's
+        iterative EXECUTION loop, which must fit several round-trips inside a
+        fixed wall-clock budget and therefore asks for speed, not hidden
+        reasoning.
         """
         tool_executed = {"any": False}
 
@@ -317,6 +326,21 @@ class AIOrchestrator:
                     # Tiered routing: simple lookups that still need the
                     # model get a reduced output budget.
                     extra_kwargs["max_output_tokens"] = _LIGHT_OUTPUT_BUDGET_TOKENS
+                if thinking_off:
+                    # OPTIONAL per-client capability — passed ONLY when the
+                    # client's signature accepts it (Qwen/Harbor do, Gemini
+                    # does not), mirroring generate_text's contract.
+                    try:
+                        _accepted = inspect.signature(
+                            client.generate_with_tools
+                        ).parameters
+                    except (TypeError, ValueError):  # pragma: no cover
+                        _accepted = {}
+                    if "thinking_off" in _accepted or any(
+                        p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in _accepted.values()
+                    ):
+                        extra_kwargs["thinking_off"] = True
                 result = await client.generate_with_tools(
                     user_message=user_message,
                     context=context,

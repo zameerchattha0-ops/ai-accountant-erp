@@ -4786,6 +4786,18 @@ async def execute(
                     executor=_executor,
                     excluded_tools=excluded_tools,
                     light_budget=light_budget,
+                    # THINKING OFF for the tool loop.  The chain leads with the
+                    # Token Harbor primary — a THINKING model whose hidden
+                    # reasoning measured 20.4s / 0 answer chars on a
+                    # mechanical prompt (ai_orchestrator._candidate_providers)
+                    # — and this loop makes up to MAX_TOOL_ITERATIONS round
+                    # trips inside _LLM_EXECUTION_BUDGET_SECONDS (120s).
+                    # Production 2026-09-30 (sessions 387b7cb8 "…Returned
+                    # Chairs…" and f2166d3f "we buy a car …") both expired
+                    # this budget mid-loop.  The tool selection is already
+                    # shaped by the deterministic plan + confirmation, so the
+                    # loop needs speed, not reasoning.
+                    thinking_off=True,
                 ),
                 budget=_LLM_EXECUTION_BUDGET_SECONDS,
                 stage="execution",

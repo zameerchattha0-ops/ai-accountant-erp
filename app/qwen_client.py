@@ -112,6 +112,7 @@ class QwenClient:
         executor: Optional[Any] = None,
         excluded_tools: Optional[set] = None,
         max_output_tokens: Optional[int] = None,
+        thinking_off: bool = False,
     ) -> Dict[str, Any]:
         """Send a message to Qwen with tool-calling support.
 
@@ -127,6 +128,18 @@ class QwenClient:
 
         ``max_output_tokens`` overrides the client default for THIS request
 .
+
+        ``thinking_off`` disables hidden reasoning for the WHOLE tool loop
+        (every iteration's `_chat_completion`).  The iterative executor loop
+        runs up to ``max_tool_iterations`` model round-trips inside a fixed
+        wall-clock budget (agent._LLM_EXECUTION_BUDGET_SECONDS), and the
+        Token Harbor primary is a thinking model: measured live, its hidden
+        reasoning alone can consume the entire output budget (finish_reason
+        ``length``, 0 answer chars, 20.4s) — and a single thinking round-trip
+        costs tens of seconds.  Tool selection is already shaped by the
+        deterministic plan, so the execution loop asks for speed, not
+        reasoning (production 2026-09-30: sessions 387b7cb8 / f2166d3f both
+        died at exactly the 120s execution budget inside this loop).
 
         Returns ``{"text": str, "tool_calls": [ToolCall, ...],
         "tool_results": [ToolResult, ...], "iteration_count": int}``.
@@ -160,7 +173,10 @@ class QwenClient:
         while iteration < max_tool_iterations:
             iteration += 1
             response = await self._chat_completion(
-                messages, _active_tools(), max_output_tokens=max_output_tokens
+                messages,
+                _active_tools(),
+                max_output_tokens=max_output_tokens,
+                thinking_off=thinking_off,
             )
             choice = self._first_choice(response)
             if choice is None:
@@ -438,7 +454,10 @@ class QwenClient:
                     quirk=quirk,
                 )
                 return await self._chat_completion(
-                    messages, tools_payload, max_output_tokens
+                    messages,
+                    tools_payload,
+                    max_output_tokens,
+                    thinking_off=thinking_off,
                 )
 
         if resp.status_code != 200:
