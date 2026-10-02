@@ -426,20 +426,33 @@ describe("depreciationExpenseAccountOptions", () => {
 
 describe("suggestedAssetAccountName / nextAccountCode", () => {
   it("suggests a CATEGORY-level ledger, never the single item", () => {
-    expect(suggestedAssetAccountName("plant")).toBe("Plant and Machinery");
+    expect(suggestedAssetAccountName("plant")).toBe("Plant & Machinery");
     expect(suggestedAssetAccountName("office chairs")).toBe(
-      "Furniture and Fixtures"
+      "Furniture & Fixtures"
     );
     expect(suggestedAssetAccountName("laptop")).toBe("Computer Equipment");
     expect(suggestedAssetAccountName("delivery van")).toBe("Vehicles");
-    expect(suggestedAssetAccountName("warehouse")).toBe("Buildings");
-    expect(suggestedAssetAccountName("")).toBe("Plant and Machinery");
+    expect(suggestedAssetAccountName("warehouse")).toBe("Buildings & Land");
+    expect(suggestedAssetAccountName("")).toBe("Plant & Machinery");
+  });
+
+  it("mirrors the backend for make/model names and equipment", () => {
+    // The exact production case: a Honda Civic got "Other Equipment &
+    // Fixtures" from the backend because only the generic words matched.
+    expect(suggestedAssetAccountName("Honda Civic Today")).toBe("Vehicles");
+    expect(suggestedAssetAccountName("Toyota Corolla")).toBe("Vehicles");
+    // brand-agnostic: a branded generator is machinery, not a vehicle
+    expect(suggestedAssetAccountName("Honda generator")).toBe(
+      "Plant & Machinery"
+    );
   });
 
   it("falls back to the typed name when nothing matches (never a guess)", () => {
     // A brand/model name carries no category keyword — the typed name is
     // offered as-is for the user to correct in the dialog.
-    expect(suggestedAssetAccountName("Toyota Hilux")).toBe("Toyota Hilux");
+    expect(suggestedAssetAccountName("Wonder Widget 3000")).toBe(
+      "Wonder Widget 3000"
+    );
   });
 
   it("suggests the next free 15xx code", () => {

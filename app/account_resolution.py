@@ -97,11 +97,30 @@ _ITEM_CATEGORY_RULES: Tuple[Tuple[str, str], ...] = (
     (r"laptop|desktop|computer|printer|scanner|monitor|server|router|"
      r"\bups\b|it equipment|keyboard|mouse",
      "Computer Equipment"),
-    (r"vehicle|car\b|motorcycle|\bbike\b|truck|van\b|delivery vehicle",
-     "Vehicles"),
+    # Equipment words come BEFORE the vehicle brand names below, so a
+    # "Honda generator" stays machinery instead of becoming a vehicle.
     (r"generator|solar|air conditioner|\bac\b|inverter|boiler|pump|"
-     r"machinery|\bmachine\b|industrial equipment",
+     r"machinery|\bmachine\b|industrial equipment|compressor|\bcnc\b|"
+     r"forklift|tractor|sewing machine|weighing scale|\bplant\b",
      "Plant & Machinery"),
+    # Vehicles — MAKE and MODEL names included: an SME buys "Honda Civic",
+    # not "a vehicle".  Production 2026-10-02 created the prerequisite ledger
+    # for a Honda Civic as "Other Equipment & Fixtures" because only the
+    # generic words matched (the old `car\b` even missed the plural "cars").
+    (r"vehicle|vehicl|automobile|\bcars?\b|\bbikes?\b|motorcycle|scooter|"
+     r"\bvans?\b|\bbuses?\b|\btrucks?\b|lorry|pickup|\bsuv\b|jeep|"
+     r"toyota|honda|suzuki|\bkia\b|hyundai|nissan|mitsubishi|mazda|isuzu|"
+     r"hino|mercedes|benz|\bbmw\b|audi|ford|chevrolet|renault|peugeot|"
+     r"volkswagen|\bvw\b|proton|changan|haval|\bjac\b|foton|dfsk|"
+     r"corolla|civic|hilux|fortuner|prado|land cruiser|sportage|tucson|"
+     r"hiace|cultus|mehran|baleno|picanto|elantra|sonata|accord|prius|"
+     r"aqua|vitz|yaris|wagon r|yamaha",
+     "Vehicles"),
+    # Property is PPE too — "office building" used to fall into the generic
+    # bucket (production 2026-10-02, the 1,200,000 building purchase).
+    (r"building|warehouse|godown|factory|premises|showroom|\bland\b|"
+     r"\bplot\b|real estate",
+     "Buildings & Land"),
     (r"license|licence|software|subscription|patent|trademark|copyright",
      "Intangible Assets"),
     (r"jewel|gold|silver|investment|shares|deposit",

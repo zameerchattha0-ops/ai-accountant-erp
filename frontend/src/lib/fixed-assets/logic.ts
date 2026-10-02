@@ -224,22 +224,52 @@ export function depreciationExpenseAccountOptions(
   );
 }
 
-/** A suggested name for a NEW PPE ledger, from the asset the user typed. */
+/** A suggested name for a NEW PPE ledger, from the asset the user typed.
+ *
+ * ORDER and NAMES mirror the backend's `_ITEM_CATEGORY_RULES`
+ * (app/account_resolution.py): a ledger is a CATEGORY, and the name suggested
+ * here must be the ledger the BACKEND would open for the same asset — a
+ * "Honda Civic" is Vehicles on both sides (production 2026-10-02 created
+ * "Other Equipment & Fixtures" for one, because only generic words matched).
+ */
 export function suggestedAssetAccountName(rawName: string): string {
   const name = (rawName ?? "").trim();
-  if (!name) return "Plant and Machinery";
-  // Category-level heading (a ledger is a category, not one item): the
-  // backend's `category_for_item` already does this for proposals.
+  if (!name) return "Plant & Machinery";
   const lower = name.toLowerCase();
-  if (/chair|table|desk|sofa|bed|shelf|cabinet|furniture/.test(lower))
-    return "Furniture and Fixtures";
-  if (/computer|laptop|printer|server|monitor|router|ups/.test(lower))
+  if (
+    /bed|sofa|couch|chair|table|desk|cabinet|shelf|cupboard|wardrobe|furnitur/.test(
+      lower
+    )
+  )
+    return "Furniture & Fixtures";
+  if (/fitting|fixture|partition|flooring|racking/.test(lower))
+    return "Fixtures & Fittings";
+  if (
+    /laptop|desktop|computer|printer|scanner|monitor|server|router|\bups\b|keyboard|mouse/.test(
+      lower
+    )
+  )
     return "Computer Equipment";
-  if (/car|truck|van|bike|motorcycle|vehicle|lorry|bus|pickup/.test(lower))
+  // Equipment words BEFORE the vehicle makes, so a "Honda generator" stays
+  // machinery — never a vehicle.
+  if (
+    /generator|solar|air conditioner|\bac\b|inverter|boiler|pump|machinery|\bmachine\b|equipment|compressor|cnc|forklift|tractor|\bplant\b/.test(
+      lower
+    )
+  )
+    return "Plant & Machinery";
+  if (
+    /vehicle|automobile|\bcars?\b|\bbikes?\b|motorcycle|scooter|\bvans?\b|\bbuses?\b|\btrucks?\b|lorry|pickup|\bsuv\b|jeep|toyota|honda|suzuki|\bkia\b|hyundai|nissan|mitsubishi|mazda|isuzu|hino|mercedes|benz|\bbmw\b|audi|ford|chevrolet|corolla|civic|hilux|fortuner|prado|sportage|tucson|hiace|cultus|mehran|alto|baleno|picanto|elantra|sonata|accord|prius|vitz|yaris|wagon r|yamaha/.test(
+      lower
+    )
+  )
     return "Vehicles";
-  if (/building|warehouse|office\b|land/.test(lower)) return "Buildings";
-  if (/machin|plant|equipment|generator|boiler|cnc/.test(lower))
-    return "Plant and Machinery";
+  if (
+    /building|warehouse|godown|factory|premises|showroom|\bland\b|\bplot\b|real estate/.test(
+      lower
+    )
+  )
+    return "Buildings & Land";
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 

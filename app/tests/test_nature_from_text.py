@@ -145,6 +145,21 @@ class TestCategoryAndClassifierTypoParity:
             ("a new vehicle", "Vehicles"),
             ("3 lapotps", "Computer Equipment"),
             ("office chari", "Furniture & Fixtures"),
+            # Production 2026-10-02: the prerequisite ledger for a Honda Civic
+            # was created as "Other Equipment & Fixtures" — make/model names
+            # (and the plural "cars") must land on Vehicles.
+            ("Honda Civic Today", "Vehicles"),
+            ("Honda Civic", "Vehicles"),
+            ("cars", "Vehicles"),
+            ("2 cars", "Vehicles"),
+            ("Suzuki Alto", "Vehicles"),
+            ("Toyota Corolla", "Vehicles"),
+            # brand-agnostic: a branded GENERATOR is machinery, not a vehicle
+            ("Honda generator", "Plant & Machinery"),
+            ("plant", "Plant & Machinery"),
+            # property is PPE — it used to fall into the generic bucket
+            ("office building", "Buildings & Land"),
+            ("warehouse", "Buildings & Land"),
         ],
     )
     def test_category_survives_the_typo(self, text, expected):
