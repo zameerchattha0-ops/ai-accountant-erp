@@ -6425,19 +6425,30 @@ def _prerequisite_gap_for_plan(
     """The ledger this plan cannot run without, or ``None``.
 
     ``register_fixed_asset`` cannot post without an unambiguous PPE ledger, so
-    a ``fixed_asset_nature`` gap is a PREREQUISITE, not a configuration
-    question: it is created first (dedup by exact name inside the
-    ``create_account`` tool) and only then does the acquisition run.
+    a ``fixed_asset_nature`` gap with NO existing candidates is a
+    PREREQUISITE, not a configuration question: it is created first (dedup by
+    exact name inside the ``create_account`` tool) and only then does the
+    acquisition run.
+
+    A gap that already lists CANDIDATES (the chart HAS PPE ledgers, but the
+    service's keyword match is ambiguous) is a CHOICE among EXISTING accounts,
+    never a missing prerequisite — auto-creating there would add a semantically
+    duplicate ledger (e.g. a third PPE account while "Vehicle - Car" already
+    exists), which is exactly what "no duplication of an already existed COA"
+    forbids.  Those gaps keep their ask-the-user path with the candidates.
     """
     names = {getattr(tc, "tool_name", "") for tc in planned or ()}
     for planned_tool, gap_source in _PREREQUISITE_GAP_SOURCES.items():
         if planned_tool not in names and intent != planned_tool:
             continue
         for gap in gaps or ():
-            if str(getattr(gap, "source", "")) == gap_source and str(
-                getattr(gap, "name", "") or ""
-            ).strip():
-                return gap
+            if str(getattr(gap, "source", "")) != gap_source:
+                continue
+            if not str(getattr(gap, "name", "") or "").strip():
+                continue
+            if list(getattr(gap, "candidates", None) or ()):
+                return None  # existing ledgers to choose from — ask instead
+            return gap
     return None
 
 

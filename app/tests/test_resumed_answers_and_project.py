@@ -658,6 +658,21 @@ class TestPrerequisiteAccountResolution:
             is None
         )
 
+    def test_a_gap_with_candidates_is_a_choice_not_a_missing_ledger(self):
+        # The chart HAS PPE ledgers ("Computer Equipment", "Vehicle - Car") but
+        # the service's keyword match is ambiguous, so the gap carries existing
+        # candidates.  Auto-creating there would add a SEMANTIC duplicate — a
+        # third PPE account — so this gap stays on the ask-the-user path.
+        gap = self._gap(candidates=["Computer Equipment", "Vehicle - Car"])
+        assert (
+            agent_mod._prerequisite_gap_for_plan(
+                gaps=[gap],
+                planned=[ToolCall(tool_name="register_fixed_asset", arguments={})],
+                intent="register_fixed_asset",
+            )
+            is None
+        )
+
     @pytest.mark.asyncio
     async def test_the_create_args_come_from_the_gap_shape(self):
         args = await agent_mod._prerequisite_create_args(self._gap())
