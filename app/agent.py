@@ -1716,6 +1716,34 @@ def excluded_tool_refusal(tool_name: str, intent: str) -> Dict[str, str]:
     }
 
 
+def sync_excluded_with_plan(
+    planned: Sequence[Any], excluded_tools: Optional[set]
+) -> Optional[set]:
+    """A tool the PLAN carries must be EXECUTABLE on this turn.
+
+    ``excluded_for_intent`` re-derives the exclusion set on EVERY ``execute()``
+    turn, but ``create_account`` can enter the plan through the user's APPROVED
+    confirmation: the prerequisite-ledger injection is frozen into the snapshot
+    (``APPROVED_PLAN_REUSED: [create_account, register_fixed_asset]``) and the
+    approval turn SKIPS the nature probes (``include_nature_probes=False``), so
+    the injection never re-runs and its ``discard`` never happens — the
+    executor then refused the very call the user approved (production
+    2026-10-02, session a6dae819, 8m42s after a5795dd deployed:
+    ``BUSINESS_RULE_VIOLATION: create_account is not part of the
+    'register_fixed_asset' transaction's permitted toolset``).
+
+    Plan-driven and deliberately narrow: only ``create_account`` is
+    un-excluded, and only when the plan actually carries it — a plan-driven
+    tool is by definition part of THIS transaction's toolset.
+    """
+    if excluded_tools is None:
+        return None
+    for call in planned or ():
+        if getattr(call, "tool_name", "") == "create_account":
+            excluded_tools.discard("create_account")
+    return excluded_tools
+
+
 def plan_conflict_tools(
     *,
     planned_names: Sequence[str],
@@ -4733,6 +4761,14 @@ async def execute(
 
         # Build an executor closure that routes through the full
         # security + validation + handler stack.
+        # A tool the PLAN carries is executable on THIS turn: the exclusion
+        # set is re-derived per turn, so the create_account the user approved
+        # (frozen into the confirmation) must be un-excluded here — otherwise
+        # the executor refuses the user's own plan (production 2026-10-02,
+        # session a6dae819).
+        sync_excluded_with_plan(planned_tool_calls, excluded_tools)
+
+
         async def _executor(tool_name: str, args: dict) -> dict:
             # GENERIC negative-reasoning gate: refuse any tool the economic
             # event profile PROHIBITS (cash ⇒ party-ledger creation; SERVICE

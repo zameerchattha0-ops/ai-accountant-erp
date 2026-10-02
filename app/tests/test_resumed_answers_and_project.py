@@ -687,7 +687,58 @@ class TestPrerequisiteAccountResolution:
 
 
 # --------------------------------------------------------------------------
-# 8. The lookup-continuation tells the model its lookups ALREADY RAN
+# 10. An APPROVED plan's create_account must stay executable (regression)
+# --------------------------------------------------------------------------
+
+
+class TestApprovedPlanExclusionSync:
+    """Production 2026-10-02, session a6dae819 (8m42s after a5795dd deployed).
+
+    The prerequisite-ledger injection put `create_account` in the plan, the
+    user approved it (APPROVED_PLAN_REUSED: [create_account,
+    register_fixed_asset]), and the APPROVAL turn re-derived the exclusion set
+    (create_account is not in register_fixed_asset's shortlist).  Because the
+    approval turn skips the nature probes, the injection never re-ran and its
+    discard never happened — so the executor refused the tool the user had just
+    approved:
+
+        BUSINESS_RULE_VIOLATION: create_account is not part of the
+        'register_fixed_asset' transaction's permitted toolset
+    """
+
+    def test_a_planned_create_account_is_un_excluded(self):
+        planned = [
+            ToolCall(tool_name="create_account", arguments={"name": "Vehicles"}),
+            ToolCall(tool_name="register_fixed_asset", arguments={}),
+        ]
+        excluded = {"create_account", "create_supplier"}
+        synced = agent_mod.sync_excluded_with_plan(planned, excluded)
+        assert synced is excluded
+        assert "create_account" not in excluded
+        # everything else stays excluded — the sync is deliberately narrow
+        assert "create_supplier" in excluded
+
+    def test_a_plan_without_create_account_changes_nothing(self):
+        excluded = {"create_account"}
+        agent_mod.sync_excluded_with_plan(
+            [ToolCall(tool_name="register_fixed_asset", arguments={})], excluded
+        )
+        assert excluded == {"create_account"}
+
+    def test_a_missing_exclusion_set_is_tolerated(self):
+        assert (
+            agent_mod.sync_excluded_with_plan(
+                [ToolCall(tool_name="create_account", arguments={})], None
+            )
+            is None
+        )
+        assert agent_mod.sync_excluded_with_plan([], {"create_account"}) == {
+            "create_account"
+        }
+
+
+# --------------------------------------------------------------------------
+# 11. The lookup-continuation tells the model its lookups ALREADY RAN
 # --------------------------------------------------------------------------
 
 
