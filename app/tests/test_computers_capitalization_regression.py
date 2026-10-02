@@ -325,7 +325,13 @@ async def test_approved_turn_rescues_the_poisoned_confirmation(monkeypatch):
     # The plan RAN (the incident: FAILED + "duplicate party" refusal).
     assert response.status == ExecutionStatus.COMPLETED, response.summary
     assert "APPROVED_PLAN_REUSED" in step_names
-    assert [t for t, _ in rec["tool_runs"]] == ["register_fixed_asset"]
+    # NEW LEDGER CONTRACT: the test chart has no fitting PPE ledger, so the
+    # run CREATES it first (pinned by name) and only then registers — the
+    # acquisition can actually post instead of dying at execution with
+    # "No fixed-asset account could be determined".
+    assert [t for t, _ in rec["tool_runs"]] == [
+        "create_account", "register_fixed_asset",
+    ]
 
     # FIX-5: the intent was reconciled with the planned tools...
     planning_steps = [s[2] for s in rec["steps"] if s[1] == "PLANNING"]

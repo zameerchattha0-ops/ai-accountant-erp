@@ -426,9 +426,14 @@ def collect_account_refs(tool_calls: Optional[Sequence[Any]]) -> List[str]:
 # Nature probes: would the domain service find ITS account today?
 # ---------------------------------------------------------------------------
 def _has_explicit_account_id(tool_calls: Optional[Sequence[Any]]) -> bool:
-    """A planned call pins the account by id → the service resolves it itself."""
+    """A planned call pins the account (by id OR by name) → resolved itself."""
     for tc in tool_calls or []:
         args = getattr(tc, "arguments", None) or {}
+        if args.get("asset_account_name"):
+            # Pinned by exact name: the service resolves the ledger by name
+            # (it will exist — this plan creates it or the user confirmed it),
+            # so no nature probe may propose a DIFFERENT ledger on top.
+            return True
         for key, value in args.items():
             if key.endswith("account_id") and value:
                 return True
@@ -499,6 +504,226 @@ async def fixed_asset_account_gap(
     )
     gap = gap_for_nature(name, "FIXED_ASSET", "fixed_asset_nature")
     gap.candidates = candidates
+    return gap
+
+
+# ---------------------------------------------------------------------------
+# FIXED-ASSET LEDGER INTELLIGENCE (plan time — deterministic)
+# ---------------------------------------------------------------------------
+# Production 2026-10-03, "Record a purchase of Building @ Model Town for
+# 35,000,000 on Cash": the plan carried NO account, the tool's keyword match
+# was ambiguous ("Computer Equipment" + "Vehicle - Car"), the approved turn
+# skipped the probes and the ladder was exhausted — the run died with "No
+# fixed-asset account could be determined for this acquisition."  The fix is
+# DECISION, not rescue: read the fixed-asset ledgers ONCE at plan time and
+# pin the call — reuse a fitting ledger, segregate a unique asset into its
+# OWN ledger, create the missing category, or (only when several existing
+# ledgers fit equally) ask.
+
+#: Categories where every asset is unique (property): each parcel gets its
+#: OWN ledger with a segregating identifier — "Building - Model Town", later
+#: "Building - Johar Town" — so separate buildings are recorded separately.
+_SEGREGATED_CATEGORIES = frozenset({"Buildings & Land"})
+
+#: "Building @ Model Town" | "Building - Johar Town" | "Land: Block C" …
+#: Intra-word hyphens ("Sialkot-Multan") are NOT separators — the head must
+#: be a clean category word for the name to read correctly.
+_LEDGER_SEP = re.compile(r"\s*(?:[@|:—–]|(?<!\w)-(?!\w))\s*")
+
+
+def segregated_asset_ledger_name(asset_name: Any, category: str = "") -> Optional[str]:
+    """``"Building @ Model Town"`` → ``"Building - Model Town"``.
+
+    Returns ``None`` when the name carries no identifier after a separator
+    ("warehouse", "office chairs") — the caller then falls back to the plain
+    category ledger.
+    """
+    text = " ".join(str(asset_name or "").split())
+    if not text:
+        return None
+    parts = _LEDGER_SEP.split(text, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    head, identifier = parts[0].strip(), parts[1].strip()
+    if not head or not identifier:
+        return None
+    # The head must LOOK like the category it will prefix — never prefix a
+    # ledger with a price or a date fragment.
+    if len(head) < 3 or head.replace(".", "").isdigit():
+        return None
+    if category and category in _SEGREGATED_CATEGORIES:
+        head_word = head.lower().rstrip("s")
+        cat_head = category.split("&")[0].strip().lower().rstrip("s")
+        if head_word and cat_head and head_word != cat_head and not (
+            cat_head.startswith(head_word) or head_word.startswith(cat_head)
+        ):
+            return None
+    return f"{head} - {identifier}"
+
+
+@dataclass
+class AssetLedgerDecision:
+    """What the plan must do about the PPE ledger of ONE acquisition."""
+
+    mode: str = "unresolved"  # reuse | create | ask | unresolved
+    category: str = ""
+    account_id: Optional[str] = None
+    name: Optional[str] = None  # ledger to pin / create / offer
+    candidates: List[str] = field(default_factory=list)
+
+
+def _bucket_category() -> str:
+    """The catch-all category — fits-scanning it would match Cash/Bank."""
+    return category_for_item("zzz unknown item")
+
+
+async def decide_fixed_asset_ledger(
+    organization_id: uuid.UUID, *, asset_name: Any
+) -> AssetLedgerDecision:
+    """Reuse → segregate → create → ask, from ONE reading of the chart.
+
+    Deterministic (the fast path never reaches an LLM): an existing ledger of
+    the SAME category is reused — never a second COA entry — a unique asset
+    (a building identified by its location) is segregated into its own
+    ``<Head> - <Identifier>`` ledger, a missing category is proposed for
+    creation, and only a genuine TIE between two fitting existing ledgers
+    becomes an ask.
+    """
+    name = str(asset_name or "").strip()
+    if not name:
+        return AssetLedgerDecision(mode="unresolved")
+    category = category_for_item(name)
+    try:
+        from app.repositories import account_repository as a_repo
+
+        chart = await a_repo.get_chart_of_accounts(
+            organization_id, account_type="ASSET", limit=100
+        )
+    except Exception as exc:  # noqa: BLE001 — fail open: old paths remain
+        log.warning("account_resolution.ledger_decision_chart_failed",
+                    error=str(exc)[:200])
+        return AssetLedgerDecision(mode="unresolved", category=category)
+
+    def _key(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    rows = [
+        a for a in chart or []
+        if "accumulated depreciation" not in _key(a.get("name"))
+    ]
+
+    def _exact(ledger_name: str) -> Optional[Dict[str, Any]]:
+        wanted = _key(ledger_name)
+        for row in rows:
+            if _key(row.get("name")) == wanted:
+                return row
+        return None
+
+    def _reuse(row: Dict[str, Any]) -> AssetLedgerDecision:
+        return AssetLedgerDecision(
+            mode="reuse", category=category,
+            account_id=str(row.get("id") or "") or None,
+            name=str(row.get("name") or ""),
+        )
+
+    # 1) This exact asset already has its own ledger → reuse it (a repeat
+    #    purchase for the same building posts to the SAME ledger).
+    segregated = segregated_asset_ledger_name(name, category)
+    if segregated:
+        row = _exact(segregated)
+        if row:
+            return _reuse(row)
+
+    # 2) Unique categories: EVERY parcel keeps its own ledger.
+    if category in _SEGREGATED_CATEGORIES:
+        target = segregated or category
+        row = _exact(target)
+        if row:
+            return _reuse(row)
+        return AssetLedgerDecision(mode="create", category=category, name=target)
+
+    # 3) The category ledger itself already exists → reuse it.
+    row = _exact(category)
+    if row:
+        return _reuse(row)
+
+    # 4) Same-category ledgers under other names: exactly one fits → reuse
+    #    it; several fit → the user must choose (never guess); none → create.
+    if category != _bucket_category():
+        fits = [
+            a for a in rows
+            if str(a.get("name") or "").strip()
+            and category_for_item(a.get("name")) == category
+        ]
+        if len(fits) == 1:
+            return _reuse(fits[0])
+        if len(fits) > 1:
+            return AssetLedgerDecision(
+                mode="ask", category=category, name=category,
+                candidates=[str(a.get("name")) for a in fits[:4]],
+            )
+
+    # 5) Nothing fits → the category ledger must be created first.
+    return AssetLedgerDecision(mode="create", category=category, name=category)
+
+
+async def pin_planned_asset_accounts(
+    organization_id: uuid.UUID,
+    *,
+    tool_calls: Optional[Sequence[Any]],
+    entities: Optional[Mapping[str, Any]] = None,
+) -> Optional[AccountGap]:
+    """Pin every planned ``register_fixed_asset`` call to a decided ledger.
+
+    The call gets EXACTLY ONE of:
+
+    * ``asset_account_id``   — a fitting existing ledger was found;
+    * ``asset_account_name`` — a ledger will exist by execution time (this
+      plan creates it, or the user confirmed a name).
+
+    Returns the creation/choice GAP the prerequisite/ask flow must handle,
+    or ``None`` when the plan is already executable.  Runs on EVERY path —
+    deterministic fast path, model plan and approved-plan replay — before
+    the confirmation snapshot, so the user never approves a transaction
+    that cannot post.
+    """
+    ents = dict(entities or {})
+    confirmed = str(
+        ents.get("create_account") or ents.get("account_name") or ""
+    ).strip()
+    gap: Optional[AccountGap] = None
+    for tc in tool_calls or ():
+        if str(getattr(tc, "tool_name", "")) != "register_fixed_asset":
+            continue
+        args = getattr(tc, "arguments", None)
+        if not isinstance(args, dict):
+            continue
+        if args.get("asset_account_id") or args.get("asset_account_name"):
+            continue  # already pinned (by the model or a previous turn)
+        asset_name = str(
+            args.get("name") or ents.get("asset_name") or ""
+        ).strip()
+        if confirmed:
+            # The user's own answer is ground truth (merge contract): pin it
+            # and let the planner's confirmed create_account run first.
+            args["asset_account_name"] = confirmed
+            continue
+        decision = await decide_fixed_asset_ledger(
+            organization_id, asset_name=asset_name
+        )
+        if decision.mode == "reuse" and decision.account_id:
+            args["asset_account_id"] = decision.account_id
+        elif decision.mode in ("create", "ask") and decision.name:
+            if decision.mode == "create":
+                args["asset_account_name"] = decision.name
+            proposed = gap_for_nature(
+                decision.name, "FIXED_ASSET", "fixed_asset_nature"
+            )
+            if proposed is not None:
+                proposed.candidates = list(decision.candidates)
+                gap = gap or proposed
+        # unresolved → leave the call alone; the service's own resolution
+        # and the existing ask/rescue paths behave exactly as before.
     return gap
 
 

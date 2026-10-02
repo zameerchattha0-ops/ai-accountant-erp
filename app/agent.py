@@ -4312,12 +4312,68 @@ async def execute(
                 ensure_create_account_first,
                 gap_already_asked,
                 options_for_gap,
+                pin_planned_asset_accounts,
                 preflight_account_gaps,
                 question_for_gap,
             )
 
             _ents = execution_plan.extracted_entities or {}
             _confirmed_acct = str(_ents.get("create_account") or "").strip()
+            # ---- PLAN-TIME LEDGER PINNING (every path) --------------------
+            # Production 2026-10-03 ("Building @ Model Town" → "No fixed-asset
+            # account could be determined"): the plan carried NO account, the
+            # tool's keyword match was ambiguous and the rescue ladder was
+            # exhausted.  Every register_fixed_asset call is now PINNED to a
+            # decided ledger BEFORE the confirmation snapshot — reuse a
+            # fitting existing ledger, or pin the ledger the plan creates
+            # ("Building - Model Town") by name.  The gap it returns feeds
+            # the same prerequisite-create / ask-the-user flows below.
+            #
+            # FAIL-CLOSED FIRST (FIX-6): never rescue a plan whose recording
+            # tool is itself prohibited for this event — the injected
+            # create_account would make the doomed plan "partial" and skip
+            # the conflict gate (computers incident B: the confirmation bomb
+            # fired).  The accounting-treatment question outranks the ledger.
+            _pin_ok = "register_fixed_asset" not in plan_conflict_tools(
+                planned_names=[tc.tool_name for tc in planned_tool_calls],
+                prohibited_actions=execution_plan.prohibited_actions,
+                unpermitted=_unpermitted,
+                batch=bool(execution_plan.batch_items),
+            )
+            _pinned_gap = None
+            if _pin_ok:
+                try:
+                    _pinned_gap = await pin_planned_asset_accounts(
+                        organization_id,
+                        tool_calls=planned_tool_calls,
+                        entities=_ents,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never break a run
+                    log.warning("agent.asset_ledger_pin_failed",
+                                session_id=str(session_id), error=str(exc)[:200])
+            _pinned = [
+                {
+                    "name": _args.get("name"),
+                    "asset_account_id": _args.get("asset_account_id"),
+                    "asset_account_name": _args.get("asset_account_name"),
+                }
+                for tc in planned_tool_calls
+                if str(getattr(tc, "tool_name", "")) == "register_fixed_asset"
+                and isinstance(_args := (getattr(tc, "arguments", None) or {}), dict)
+                and (
+                    _args.get("asset_account_id")
+                    or _args.get("asset_account_name")
+                )
+            ]
+            if _pinned:
+                await _log_step(session_id, "ASSET_LEDGER_PINNED", {
+                    "assets": _pinned,
+                    "gap": (
+                        {"name": _pinned_gap.name,
+                         "candidates": list(_pinned_gap.candidates)}
+                        if _pinned_gap is not None else None
+                    ),
+                })
             try:
                 _gaps = await preflight_account_gaps(
                     organization_id,
@@ -4336,9 +4392,25 @@ async def execute(
                 log.warning("agent.account_preflight_failed",
                             session_id=str(session_id), error=str(exc)[:200])
                 _gaps = []
+            if _pinned_gap is not None:
+                # The pinning decision is authoritative for the asset ledger:
+                # drop any probe-derived duplicate of the same source and use
+                # ITS name/candidates (segregated name, fit-based candidates).
+                _gaps = [
+                    g for g in _gaps
+                    if getattr(g, "source", "") != "fixed_asset_nature"
+                ]
+                _gaps.insert(0, _pinned_gap)
             if _confirmed_acct:
                 _gaps = [g for g in _gaps
                          if (g.name or "").strip().lower() != _confirmed_acct.lower()]
+            if not _pin_ok:
+                # The FIX-6 treatment conflict outranks the ledger: a
+                # prohibited recording tool must never be rescued (injected
+                # with create_account) or parked behind an account question —
+                # the conflict gate below asks THE real question.
+                _gaps = [g for g in _gaps
+                         if getattr(g, "source", "") != "fixed_asset_nature"]
             # ---- PREREQUISITE ACCOUNT RESOLUTION (execution time) ----------
             # A planned MUTATION must not die at execution because a ledger it
             # needs is absent ("No fixed-asset account could be determined").
@@ -4347,7 +4419,7 @@ async def execute(
             # create_account tool reuses an EXACT name match and resolves a
             # free code in the series, so an existing COA is never duplicated.
             # Anything the plan does not require still asks the user below.
-            if _gaps and not _confirmed_acct:
+            if _gaps and not _confirmed_acct and _pin_ok:
                 _prereq = _prerequisite_gap_for_plan(
                     gaps=_gaps,
                     planned=planned_tool_calls,

@@ -266,12 +266,15 @@ async def _resolve_gl_account(
     keywords: tuple,
     explicit_id: Optional[uuid.UUID],
     exclude_keywords: tuple = (),
+    explicit_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Deterministic GL account resolution (unique keyword match only).
 
-    ``exclude_keywords`` removes structural non-candidates (e.g. contra
-    accounts such as 'Accumulated Depreciation - X' must never be chosen
-    as the ASSET-COST account for an acquisition).
+    ``explicit_id`` wins; then ``explicit_name`` — the EXACT ledger the plan
+    pinned ("Building - Model Town" created moments earlier in the same
+    plan).  ``exclude_keywords`` removes structural non-candidates (e.g.
+    contra accounts such as 'Accumulated Depreciation - X' must never be
+    chosen as the ASSET-COST account for an acquisition).
     """
     if explicit_id:
         acct = await account_repo.get_account(
@@ -285,6 +288,12 @@ async def _resolve_gl_account(
     accounts = await account_repo.get_chart_of_accounts(
         organization_id, account_type=account_type, limit=100
     )
+    if explicit_name:
+        wanted = str(explicit_name).strip().lower()
+        for acct in accounts or []:
+            if str(acct.get("name") or "").strip().lower() == wanted:
+                return acct
+        return None  # caller reports WHICH ledger is missing
     matches = [
         a for a in accounts or []
         if any(k in str(a.get("name", "")).lower() for k in keywords)
@@ -363,6 +372,7 @@ async def register_asset(
     supplier_id: Optional[str] = None,
     supplier_name: Optional[str] = None,
     asset_account_id: Optional[uuid.UUID] = None,
+    asset_account_name: Optional[str] = None,
     payment_account_id: Optional[uuid.UUID] = None,
     useful_life_years: Optional[int] = None,
     depreciation_method: str = "STRAIGHT_LINE",
@@ -397,7 +407,14 @@ async def register_asset(
         keywords=_ASSET_ACCOUNT_KEYWORDS,
         explicit_id=asset_account_id,
         exclude_keywords=("accumulated depreciation",),
+        explicit_name=str(asset_account_name or "").strip() or None,
     )
+    if not asset_account and asset_account_name:
+        raise ValueError(
+            f"The ledger '{str(asset_account_name).strip()}' does not exist in "
+            "the chart of accounts. Create it first (create_account) or pin "
+            "an existing ledger with asset_account_id."
+        )
     if not asset_account:
         raise ValueError(
             "No fixed-asset account could be determined for this "
