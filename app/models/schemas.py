@@ -364,6 +364,15 @@ class AgentContext(BaseModel):
     # rather than overwriting it with a keyword route.
     preliminary_extraction: Dict[str, Any] = Field(default_factory=dict)
     live_evidence: List[Dict[str, Any]] = Field(default_factory=list)
+    # READ-ONLY LOOKUPS THAT ALREADY RAN for this request (the Phase-5
+    # lookup-continuation gate executes a lookup-only plan before the model
+    # gets its bounded finishing round).  Rendered under its own label with an
+    # explicit "do NOT repeat these — emit the write now" instruction:
+    # production 2026-10-02, the model re-planned the SAME read-only calls in
+    # the continuation round (search_account x3 + get_chart_of_accounts for a
+    # fully-specified plant purchase) and the run parked on a question even
+    # though nothing was missing.
+    pre_executed_lookups: List[Dict[str, Any]] = Field(default_factory=list)
     accounting_reasoning: Optional[Dict[str, Any]] = None
 
 

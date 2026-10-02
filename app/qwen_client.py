@@ -29,7 +29,12 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.models.schemas import AgentContext, ToolCall, ToolResult
 from app.prompts import build_system_instructions, build_user_content, load_constitution
@@ -46,6 +51,72 @@ class ProviderError(Exception):
     Business/validation errors are NOT ProviderError — they travel inside
     ToolResult and must never trigger a provider fallback.
     """
+
+
+class ProviderRateLimited(ProviderError):
+    """The provider REFUSED the call because of a rate limit / quota cap.
+
+    A SUBCLASS, so every existing ``except ProviderError`` caller keeps
+    working, while the retry policy and the orchestrator can tell "the
+    provider is BUSY" (HTTP 429, free-tier daily cap) from "the provider is
+    BROKEN" (5xx, network):
+
+    * the retry policy STOPS IMMEDIATELY — no backoff — see
+      ``retry=retry_if_not_exception_type(ProviderRateLimited)`` on the two
+      decorated entry points below.  A DAILY cap cannot clear inside a
+      backoff window (the free-tier 429 is documented in production
+      2026-09-28, test_contract_primed_prompt), so retrying it spends the
+      whole request budget and the fallback provider is NEVER reached:
+      measured worst case PER CANDIDATE was 9 HTTP calls and ~20 s of sleeps
+      (3 outer attempts × 3 inner attempts, wait_exponential min=2 max=10)
+      against the agent's 75 s planning budget;
+    * the orchestrator therefore moves to the NEXT provider within the same
+      request (Token Harbor → Qwen chain → Gemini), so the plan is still
+      produced for the user.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        retry_after: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+#: Body markers that mean "you are being THROTTLED", not "your request is bad".
+#: A gateway may report quota exhaustion as 403/400/402 rather than 429, so the
+#: wording is matched as well as the status code.
+_RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+    "quota",
+    "throttl",
+    "daily limit",
+    "free tier",
+    "insufficient balance",
+    "exceeded your current",
+)
+
+
+def is_rate_limited_error(status_code: Optional[int], body: Optional[str]) -> bool:
+    """True when an HTTP error means RATE LIMITED / quota exhausted.
+
+    HTTP 429 is unambiguous; the quota-bearing 4xx statuses are matched on
+    the markers above.  Exported so every provider transport (Gemini's SDK
+    errors included) classifies throttling the same way.
+    """
+    if status_code == 429:
+        return True
+    if status_code in (400, 402, 403):
+        low = (body or "").lower()
+        return any(marker in low for marker in _RATE_LIMIT_MARKERS)
+    return False
 
 
 class QwenClient:
@@ -102,6 +173,11 @@ class QwenClient:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
+        # A rate limit is the provider being BUSY, not broken: retrying a
+        # daily/free-tier cap only burns the request budget (see
+        # ProviderRateLimited).  Fail fast so the orchestrator can move to the
+        # next provider.
+        retry=retry_if_not_exception_type(ProviderRateLimited),
     )
     async def generate_with_tools(
         self,
@@ -417,6 +493,11 @@ class QwenClient:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
+        # No retry storm on a rate limit — see ProviderRateLimited.  Without
+        # this the two stacked decorators multiplied into 9 HTTP calls and
+        # ~20 s of sleeps per candidate, so the fallback provider timed out
+        # before it was ever tried.
+        retry=retry_if_not_exception_type(ProviderRateLimited),
     )
     async def _chat_completion(
         self,
@@ -461,6 +542,25 @@ class QwenClient:
                 )
 
         if resp.status_code != 200:
+            if is_rate_limited_error(resp.status_code, resp.text):
+                # BUSY, not broken: no retry above (3 outer × 3 inner attempts
+                # of a daily cap waste the whole request).  Raised as its own
+                # type so the orchestrator falls through to the next provider
+                # immediately and still produces a plan.
+                retry_after = resp.headers.get("retry-after")
+                log.warning(
+                    "qwen_client.rate_limited",
+                    model=self.model_name,
+                    status=resp.status_code,
+                    retry_after=retry_after,
+                    body=resp.text[:200],
+                )
+                raise ProviderRateLimited(
+                    f"Qwen API rate limit HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}",
+                    status=resp.status_code,
+                    retry_after=retry_after,
+                )
             log.warning(
                 "qwen_client.http_error",
                 status=resp.status_code,

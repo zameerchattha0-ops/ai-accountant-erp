@@ -24,12 +24,26 @@ from typing import Any, Dict, List, Optional
 import structlog
 from google.genai import Client
 from google.genai import types
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.config import get_settings
 from app.database import get_gemini_api_key
 from app.models.schemas import AgentContext, ToolCall, ToolResult
 from app.prompts import build_system_instructions, build_user_content, load_constitution
+# The provider-error family (and its rate-limit subclass) lives in
+# qwen_client — the orchestrator documents it as the shared contract.  The
+# SDK's own throttling errors are normalised into it so EVERY transport is
+# classified the same way (see _provider_error_from_sdk).
+from app.qwen_client import (
+    ProviderError,
+    ProviderRateLimited,
+    is_rate_limited_error,
+)
 from app.tool_execution import execute_planned_tool_calls
 from app.tool_router import get_gemini_tool_definitions
 
@@ -37,6 +51,35 @@ log = structlog.get_logger(__name__)
 
 # Module-level singleton
 _client: Optional["GeminiClient"] = None
+
+
+def _provider_error_from_sdk(exc: Exception) -> Exception:
+    """Classify a google-genai SDK error.
+
+    Returns a ``ProviderRateLimited`` when the SDK error is a RATE LIMIT /
+    quota cap (HTTP 429 / RESOURCE_EXHAUSTED, or a quota body) so the
+    orchestrator can fall through to the next provider instead of retrying a
+    cap that cannot clear (see qwen_client.ProviderRateLimited).  Any other
+    exception is returned UNCHANGED — the caller re-raises it, so existing
+    error behaviour is byte-identical.
+    """
+    code = getattr(exc, "code", None)
+    try:
+        code_int: Optional[int] = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_int = None
+    text = str(exc)
+    low = text.lower()
+    if (
+        is_rate_limited_error(code_int, text)
+        or "resource_exhausted" in low
+        or "429" in text
+    ):
+        return ProviderRateLimited(
+            f"Gemini rate limit: {text[:200]}",
+            status=code_int or 429,
+        )
+    return exc
 
 
 class GeminiClient:
@@ -72,6 +115,10 @@ class GeminiClient:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+        # Fail fast on throttling so the request budget is not spent retrying a
+        # quota cap that cannot clear (see qwen_client.ProviderRateLimited).
+        retry=retry_if_not_exception_type(ProviderRateLimited),
     )
     async def generate_with_tools(
         self,
@@ -128,13 +175,16 @@ class GeminiClient:
         )
 
         # Create chat session
-        chat = self._gclient.chats.create(
-            model=self.model_name,
-            config=config,
-        )
+        try:
+            chat = self._gclient.chats.create(
+                model=self.model_name,
+                config=config,
+            )
 
-        # Send message
-        response = chat.send_message(message=user_content)
+            # Send message
+            response = chat.send_message(message=user_content)
+        except Exception as exc:  # noqa: BLE001 — classify SDK throttling
+            raise _provider_error_from_sdk(exc) from exc
 
         # Process response — handle tool calls iteratively
         all_tool_calls: List[ToolCall] = []
@@ -214,7 +264,10 @@ class GeminiClient:
                         )
 
                     # Send function responses back to Gemini
-                    response = chat.send_message(message=function_responses)
+                    try:
+                        response = chat.send_message(message=function_responses)
+                    except Exception as exc:  # noqa: BLE001 — classify throttling
+                        raise _provider_error_from_sdk(exc) from exc
                     continue  # Process the next response
 
                 if not has_function_call:

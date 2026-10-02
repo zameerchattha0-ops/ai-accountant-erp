@@ -59,6 +59,47 @@ _LIGHT_OUTPUT_BUDGET_TOKENS = 600
 _orchestrator: Optional["AIOrchestrator"] = None
 
 
+class AllProvidersRateLimited(RuntimeError):
+    """EVERY provider that was actually called refused: it is RATE LIMITED.
+
+    Raised instead of the generic "All AI providers failed" RuntimeError when
+    throttling is the whole story, so the agent can report the REAL reason
+    (the AI is rate limited / busy, nothing was recorded) instead of the
+    timeout or empty-answer wording, which sends the user hunting for a
+    problem that does not exist (production 2026-09-28 documented the primary
+    free-tier daily cap; 2026-10-02 the plant purchase parked on an unanswerable
+    question while the provider was throttled).
+
+    A RuntimeError subclass, so every existing handler keeps working.
+    """
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """True when *exc* means the provider was THROTTLED (busy), not broken.
+
+    Recognises the shared ``ProviderRateLimited`` type, a status/code attribute
+    of 429 or a quota-bearing 4xx, and the wording the gateways actually send —
+    so the classification does not depend on which transport raised it.
+    """
+    from app.qwen_client import ProviderRateLimited, is_rate_limited_error
+
+    if isinstance(exc, ProviderRateLimited):
+        return True
+    status = getattr(exc, "status", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if is_rate_limited_error(status, str(exc)):
+        return True
+    low = str(exc).lower()
+    return "429" in str(exc) or "resource_exhausted" in low or "rate limit" in low
+
+
 class AIOrchestrator:
     """Dispatches agent LLM calls across an ordered, capability-aware
     provider chain: Token Harbor (DeepSeek/Mimo, primary) → Qwen → Gemini."""
@@ -298,7 +339,12 @@ class AIOrchestrator:
 
         candidates = self._candidate_providers(requires_vision=requires_vision)
         provider_errors: List[str] = []
-
+        # Distinguishes "the provider is BUSY" (rate limited) from "the
+        # provider is BROKEN": when EVERY provider that was actually called
+        # refused on throttling, the honest reason is reported (see
+        # AllProvidersRateLimited) instead of a generic outage.
+        attempted: List[str] = []
+        rate_limited: List[str] = []
         for candidate in candidates:
             name = candidate["provider"]
             model = candidate["model"]
@@ -378,14 +424,29 @@ class AIOrchestrator:
                     ) from exc
 
                 provider_errors.append(f"{name}/{model}: {exc}")
-                log.warning(
-                    "orchestrator.provider_failed_falling_back",
-                    provider=name,
-                    model=model,
-                    attempt=len(provider_errors),
-                    elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
-                    fallback_reason=str(exc)[:200],
-                )
+                attempted.append(f"{name}/{model}")
+                if _is_rate_limited(exc):
+                    # BUSY, not broken.  The transports no longer retry a rate
+                    # limit, so the NEXT provider is reached within the request
+                    # budget and a plan is still produced.
+                    rate_limited.append(f"{name}/{model}")
+                    log.warning(
+                        "orchestrator.provider_rate_limited_falling_back",
+                        provider=name,
+                        model=model,
+                        attempt=len(provider_errors),
+                        elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
+                        detail=str(exc)[:200],
+                    )
+                else:
+                    log.warning(
+                        "orchestrator.provider_failed_falling_back",
+                        provider=name,
+                        model=model,
+                        attempt=len(provider_errors),
+                        elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
+                        fallback_reason=str(exc)[:200],
+                    )
                 # Invalidate the cached client for the failed candidate so
                 # the next call rebuilds it (bad model config, etc.).
                 if name == "qwen" and model:
@@ -393,6 +454,13 @@ class AIOrchestrator:
                 else:
                     self._gemini = None
 
+        if attempted and len(rate_limited) == len(attempted):
+            # Nothing was recorded and no provider was broken — every provider
+            # that answered said "too many requests".  Say exactly that.
+            raise AllProvidersRateLimited(
+                "Every AI provider is rate limited right now "
+                f"({', '.join(rate_limited)}). Nothing was recorded; retry shortly."
+            )
         raise RuntimeError(
             "All AI providers failed. "
             + "; ".join(provider_errors)
@@ -436,6 +504,8 @@ class AIOrchestrator:
             candidates = self._candidate_providers(
                 requires_vision=False, tier_first=tier_first
             )
+        attempted: List[str] = []
+        rate_limited: List[str] = []
         for candidate in candidates:
             name = candidate["provider"]
             model = candidate["model"]
@@ -452,16 +522,37 @@ class AIOrchestrator:
                     _kwargs["max_output_tokens"] = max_output_tokens
                 return await client.generate_text(**_kwargs)
             except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "orchestrator.text_provider_failed",
-                    provider=name,
-                    model=model,
-                    fallback_reason=str(exc)[:200],
-                )
+                attempted.append(f"{name}/{model}")
+                if _is_rate_limited(exc):
+                    # BUSY, not broken: never retried, never reported as an
+                    # outage.  The next provider is tried immediately.
+                    rate_limited.append(f"{name}/{model}")
+                    log.warning(
+                        "orchestrator.text_provider_rate_limited",
+                        provider=name,
+                        model=model,
+                        detail=str(exc)[:200],
+                    )
+                else:
+                    log.warning(
+                        "orchestrator.text_provider_failed",
+                        provider=name,
+                        model=model,
+                        fallback_reason=str(exc)[:200],
+                    )
                 if name == "qwen" and model:
                     self._qwen_clients.pop(model, None)
                 else:
                     self._gemini = None
+        if attempted and len(rate_limited) == len(attempted):
+            # Returning "" here would be read as an EMPTY ANSWER (the
+            # documented empty-answer wording blames the model's reasoning
+            # budget), sending the user after a problem that does not exist.
+            # Say what actually happened instead.
+            raise AllProvidersRateLimited(
+                "Every AI provider is rate limited right now "
+                f"({', '.join(rate_limited)}). Nothing was recorded; retry shortly."
+            )
         return ""
 
     async def generate_text_light(

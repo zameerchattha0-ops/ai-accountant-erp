@@ -492,3 +492,202 @@ class TestPlannerDeclaredContextSources:
         assert [a["name"] for a in context.relevant_accounts] == [
             "Computer Equipment"
         ]
+
+
+# --------------------------------------------------------------------------
+# 7. A resolved fixed-asset acquisition is planned WITHOUT the model (R5)
+# --------------------------------------------------------------------------
+
+
+#: The entities the production plant request resolved to (session 5939bf30).
+PLANT_ENTITIES = {
+    "amount": 6700000.0,
+    "transaction_date": "2026-10-01",
+    "item_description": "Plant",
+    "asset_name": "Plant",
+    "transaction_nature": "FIXED_ASSET",
+    "payment_method": "CASH",
+    "useful_life_years": 4,
+    "depreciation_method": "STRAIGHT_LINE",
+    "salvage_value": 2300000.0,
+    "capitalization_threshold": 50000.0,
+}
+
+
+def _fixed_asset_plan(entities):
+    return SimpleNamespace(
+        intent="register_fixed_asset",
+        batch_items=[],
+        extracted_entities=dict(entities),
+    )
+
+
+class TestFixedAssetAcquisitionFastPath:
+    """Production 2026-10-01/02 (sessions 5939bf30 / f3609d50 / 0debc91f).
+
+    "We Buy a Plant for 6,700,000 on cash, yesterday" carried EVERY value
+    register_fixed_asset needs, yet the model planned only read-only lookups
+    in BOTH the plan round and the lookup-continuation round, so the
+    completeness gate parked the run on a question although nothing was
+    missing.  A fully-resolved acquisition is now built in Python (the tool
+    resolves the asset/depreciation/cash-bank accounts itself), so the model
+    round-trip — and that stall — cannot happen for it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_plant_request_is_planned_without_the_model(self):
+        calls = await agent_mod._deterministic_mutation_calls(
+            organization_id=uuid.uuid4(),
+            execution_plan=_fixed_asset_plan(PLANT_ENTITIES),
+            classification=None,
+        )
+        assert calls and len(calls) == 1
+        args = calls[0].arguments
+        assert calls[0].tool_name == "register_fixed_asset"
+        assert args["name"] == "Plant"
+        assert args["purchase_cost"] == 6700000.0
+        assert args["transaction_date"] == "2026-10-01"
+        assert args["payment_method"] == "CASH"
+        # the depreciation answers the user already gave ride along
+        assert args["useful_life_years"] == 4
+        assert args["salvage_value"] == 2300000.0
+        assert args["depreciation_method"] == "STRAIGHT_LINE"
+        # the plan now CONTAINS a financial mutation, so the completeness gate
+        # can never bounce it back to the user as "unfinished"
+        assert not agent_mod._plan_performs_no_financial_mutation(
+            intent="register_fixed_asset", calls=calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unstated_payment_treatment_is_never_assumed_cash(self):
+        entities = dict(PLANT_ENTITIES)
+        entities.pop("payment_method")
+        assert (
+            await agent_mod._deterministic_mutation_calls(
+                organization_id=uuid.uuid4(),
+                execution_plan=_fixed_asset_plan(entities),
+                classification=None,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_inferred_nature_is_never_capitalised(self):
+        entities = dict(PLANT_ENTITIES, transaction_nature="OPERATING_EXPENSE")
+        assert (
+            await agent_mod._deterministic_mutation_calls(
+                organization_id=uuid.uuid4(),
+                execution_plan=_fixed_asset_plan(entities),
+                classification=None,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_credit_acquisition_without_a_supplier_waits_for_the_model(self):
+        entities = dict(PLANT_ENTITIES, payment_method="CREDIT")
+        assert (
+            await agent_mod._deterministic_mutation_calls(
+                organization_id=uuid.uuid4(),
+                execution_plan=_fixed_asset_plan(entities),
+                classification=None,
+            )
+            is None
+        )
+        entities["supplier_name"] = "Plant World"
+        calls = await agent_mod._deterministic_mutation_calls(
+            organization_id=uuid.uuid4(),
+            execution_plan=_fixed_asset_plan(entities),
+            classification=None,
+        )
+        assert calls and calls[0].arguments["payment_method"] == "CREDIT"
+        assert calls[0].arguments["supplier_name"] == "Plant World"
+
+
+# --------------------------------------------------------------------------
+# 8. The lookup-continuation tells the model its lookups ALREADY RAN
+# --------------------------------------------------------------------------
+
+
+class TestLookupContinuationAnnouncesTheCompletedLookups:
+    """The continuation is a PLANNING call (executor=None), and the planner's
+    own rules ("search before creating", "search → create → document") made it
+    re-plan the SAME read-only calls — production 2026-10-02 (plant session
+    5939bf30) returned ``search_account, search_account, search_account,
+    get_chart_of_accounts`` again instead of the write.  The context now names
+    the completed calls so the model finishes the plan instead of looping."""
+
+    @pytest.mark.asyncio
+    async def test_the_completed_lookups_are_recorded_on_the_context(
+        self, monkeypatch
+    ):
+        import app.tool_execution as tool_exec
+
+        async def fake_execute_planned(calls, executor):
+            return [
+                {"success": True, "error": None, "data": [{"id": "a1"}]}
+                for c in calls
+            ]
+
+        monkeypatch.setattr(tool_exec, "is_read_only_tool", lambda name: True)
+        monkeypatch.setattr(
+            tool_exec, "execute_planned_tool_calls", fake_execute_planned
+        )
+
+        async def fake_log_step(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+        client = _StubClient([
+            ToolCall(tool_name="register_fixed_asset", arguments={"name": "Plant"})
+        ])
+        context = AgentContext(organization={}, user={})
+
+        await agent_mod._continue_lookup_only_plan(
+            client=client,
+            session_id=uuid.uuid4(),
+            execution_plan=_plan_with_intent("register_fixed_asset"),
+            planned_tool_calls=[
+                ToolCall(tool_name="search_account", arguments={"query": "plant"}),
+                ToolCall(tool_name="get_chart_of_accounts", arguments={}),
+            ],
+            context=context,
+            user_message="We Buy a Plant for 6,700,000 on cash, yesterday",
+            organization_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            auth=None,
+            excluded_tools=set(),
+        )
+
+        # every completed call is named, with what it returned
+        assert [item["tool"] for item in context.pre_executed_lookups] == [
+            "search_account",
+            "get_chart_of_accounts",
+        ]
+        assert context.pre_executed_lookups[0]["records"] == [{"id": "a1"}]
+        assert context.pre_executed_lookups[0]["error"] is None
+
+    def test_the_prompt_forbids_repeating_them_and_asks_for_the_write(self):
+        from app.prompts import build_user_content
+
+        context = AgentContext(organization={}, user={})
+        context.pre_executed_lookups = [
+            {"tool": "search_account", "records": [{"id": "a1"}], "error": None},
+            {"tool": "get_chart_of_accounts", "records": None, "error": "denied"},
+        ]
+        content = build_user_content("We Buy a Plant", context)
+        assert "READ-ONLY CALLS ALREADY EXECUTED" in content
+        assert "search_account: returned 1 row(s)" in content
+        assert "get_chart_of_accounts: FAILED" in content
+        assert "Do NOT call any of these again" in content
+        # the model is told to finish with the WRITE call, not another lookup
+        assert "emit the WRITE tool" in content
+
+    def test_a_run_without_lookups_renders_nothing_extra(self):
+        from app.prompts import build_user_content
+
+        content = build_user_content(
+            "We Buy a Plant", AgentContext(organization={}, user={})
+        )
+        assert "READ-ONLY CALLS ALREADY EXECUTED" not in content

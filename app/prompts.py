@@ -353,6 +353,37 @@ def build_user_content(message: str, context: AgentContext) -> str:
             rendered = str(item.get("records"))[:1200]
             parts.append(f"  - {kind} ({len(item.get('records') or [])} row(s)): {rendered}")
 
+    # READ-ONLY CALLS ALREADY EXECUTED for this request.  The Phase-5
+    # lookup-continuation gate ran the model's OWN read-only plan and gives it
+    # ONE bounded round to finish with what came back — so it must not re-plan
+    # the calls that already ran (production 2026-10-02: the continuation
+    # returned the same search_account x3 + get_chart_of_accounts instead of
+    # the write, and the run parked on a question nothing was missing for).
+    pre_executed = getattr(context, "pre_executed_lookups", None)
+    if pre_executed:
+        parts.append("")
+        parts.append(
+            "READ-ONLY CALLS ALREADY EXECUTED (their results are the LIVE "
+            "BOOKS EVIDENCE above — these calls are DONE):"
+        )
+        for item in pre_executed[:12]:
+            if not isinstance(item, dict):
+                continue
+            tool = item.get("tool", "lookup")
+            if item.get("error"):
+                parts.append(f"  - {tool}: FAILED — {item.get('error')}")
+                continue
+            rows = item.get("records")
+            count = len(rows) if isinstance(rows, (list, dict)) else 0
+            parts.append(f"  - {tool}: returned {count} row(s)")
+        parts.append(
+            "  → Do NOT call any of these again — a lookup that already ran "
+            "returns nothing new. Finish the plan NOW: emit the WRITE tool "
+            "call(s) that record the user's transaction, taking every value "
+            "from EXTRACTED ENTITIES above. Only if a write genuinely cannot "
+            "be formed, state exactly which value is missing."
+        )
+
     # the model's own prior accounting reasoning for this
     # request (interpretation + proposed treatment), so the planning stage
     # reassesses instead of silently replacing it with a keyword route.

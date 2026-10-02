@@ -47,6 +47,22 @@ Ceiling history (measured, never silent):
   it existed ONLY in that enum — no intent, tool, service or definition
   anywhere — so the model could never answer it canonically (AUDIT_REPORT
   §12.8).  Shrink only; ceilings unchanged.
+ * 2026-10-02: base=14,076 (unchanged) / primed=18,216 (+405 chars, ~+101
+   input tokens, +2.3%) from the TWO contracts added to the fixed-asset
+   lifecycle tools (dispose_fixed_asset, record_asset_depreciation were
+   registered WITHOUT `contract=`, so the contract block never advertised
+   them — Copilot code review 2026-10-02).  PRIMED ceiling 18,200 → 18,400
+   WITH the required generation-latency measurement: 17,844 ms for this exact
+   18.2 KB shape (finish_reason=stop, 2,783 answer chars) inside the same
+   30 s/round timeout — produced by scripts/measure_primed_prompt_latency.py.
+   Input-side only, static head, prefix-cached after round 1 — same shape as
+   every earlier raise.  HONEST GAP: the measurement could NOT be taken on
+   the configured primary (qwen3.6-plus answered HTTP 403
+   `AccessDenied.Unpurchased` on 2026-10-02 — the model is not eligible on
+   this workspace), so the number above comes from the Token Harbor fallback
+   that actually served the request; the primary entitlement is a separate
+   operator action item.
+
 """
 
 import json
@@ -72,10 +88,12 @@ BASE_CEILING = 14_500  # measured 14,076 on 2026-09-28 (Wave A observation
 # contract-primed 17.8 KB prompt inside the same 30 s/round timeout (6-25 s),
 # so a 14.1 KB base stays inside the measured envelope.  Raise only with a
 # fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 18_200  # measured 17,811 on 2026-09-28 (Wave A, ~2.1%
-# headroom) — the Wave A observation block on top of the payroll tool
-# contracts (migration 086); generation-latency re-measurement is an A→B gate
-# item recorded in E:\Qoder\AUDIT_REPORT.md §8.
+PRIMED_CEILING = 18_400  # measured 18,216 on 2026-10-02 (+405 from the two
+# fixed-asset contracts added that day — see the ceiling history above) and
+# GENERATED in 17,844 ms (finish_reason=stop) inside the 30 s/round timeout,
+# measured by scripts/measure_primed_prompt_latency.py.  The previous raise:
+# 17,811 on 2026-09-28 (Wave A, ~2.1% headroom); its latency re-measurement
+# remains an A→B gate item recorded in E:\Qoder\AUDIT_REPORT.md §8.
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

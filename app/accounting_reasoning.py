@@ -1428,9 +1428,16 @@ async def run_reasoning_loop(
                 failure_reason="timeout",
             )
         except Exception as exc:  # noqa: BLE001 — the stage must never raise
+            # BUSY vs BROKEN: an orchestrator that exhausted every provider on
+            # throttling raises AllProvidersRateLimited, and the run must report
+            # "rate limited" instead of a generic outage (the user would
+            # otherwise be told the AI "did not answer in time").
+            from app.ai_orchestrator import _is_rate_limited
+
+            _reason = "rate_limited" if _is_rate_limited(exc) else "provider_error"
             log.warning(
                 "accounting_reasoning.failed",
-                reason="provider_error",
+                reason=_reason,
                 detail=str(exc)[:200],
                 round=rounds_used,
             )
@@ -1440,7 +1447,7 @@ async def run_reasoning_loop(
                 provider_attempted=True,
                 evidence_results=gathered,
                 rounds=rounds_used,
-                failure_reason="provider_error",
+                failure_reason=_reason,
             )
 
         parsed = parse_reasoning_response(raw)

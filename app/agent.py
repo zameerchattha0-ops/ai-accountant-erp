@@ -76,6 +76,7 @@ _FAST_PATH_INTENTS = {
     "record_bank_transfer",     # R4.5: named bank-to-bank transfer
     "create_invoice",           # R4.7: resolved single-line invoice
     "record_credit_sale",       # R4.7: resolved credit sale -> invoice
+    "register_fixed_asset",     # R5: resolved fixed-asset acquisition
 }
 
 
@@ -150,10 +151,30 @@ async def _bounded_provider_call(coro, *, budget: float, stage: str):
             f"{int(budget)}s)."
         )
     except Exception as exc:  # noqa: BLE001 — a provider error is data here
+        if _is_rate_limited_error(exc):
+            # BUSY, not broken — keep the cause so the run can report it
+            # honestly instead of blaming a timeout (see
+            # _provider_down_summary).
+            log.warning(
+                "agent.provider_rate_limited", stage=stage, detail=str(exc)[:300]
+            )
+            return None, "rate_limited"
         log.warning(
             "agent.provider_failed", stage=stage, detail=str(exc)[:300]
         )
         return None, f"The AI provider could not be reached ({stage})."
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    """True when a provider exception means RATE LIMITED (throttled).
+
+    Thin wrapper over the orchestrator's classifier so the agent, the
+    orchestrator and the transports all agree on what "too many requests"
+    looks like (HTTP 429, quota bodies, ``ProviderRateLimited``).
+    """
+    from app.ai_orchestrator import _is_rate_limited
+
+    return _is_rate_limited(exc)
 
 
 async def _party_resolution_question(
@@ -234,6 +255,19 @@ async def _party_resolution_question(
     }
 
 
+def _provider_stall_summary(reason: Optional[str]) -> str:
+    """User-facing wording for a bounded provider stall (a call that returned
+    nothing).  A RATE LIMIT is reported as such — the generic timeout wording
+    would send the user hunting for a problem that does not exist.
+    """
+    if (reason or "").strip().lower() == "rate_limited":
+        return _provider_down_summary("rate_limited")
+    return (
+        f"{reason} Nothing was recorded yet. Please send your request again — "
+        "everything you have already told me is kept in this conversation."
+    )
+
+
 def _provider_down_summary(failure_reason: Optional[str]) -> str:
     """Honest wording for a run closed WITHOUT recording anything.
 
@@ -255,6 +289,17 @@ def _provider_down_summary(failure_reason: Optional[str]) -> str:
             "response, not a slow one), so nothing was recorded. Please "
             "send your request again — everything you have already told "
             "me is kept in this conversation."
+        )
+    if reason == "rate_limited":
+        # BUSY, not broken: every provider that answered said "too many
+        # requests".  The timeout wording would send the user hunting for a
+        # problem that does not exist, and inviting them to resend only works
+        # once the cap clears — say that explicitly.
+        return (
+            "The AI provider is rate limited right now (too many requests), "
+            "so nothing was recorded. Please wait a moment and send your "
+            "request again — everything you have already told me is kept in "
+            "this conversation."
         )
     return (
         "The AI provider did not answer in time. Nothing was recorded "
@@ -698,6 +743,84 @@ def _cash_sale_fast_path_call(
     return [ToolCall(tool_name="record_cash_sale", arguments=params)]
 
 
+def _fixed_asset_fast_path_call(
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """R5 fixed-asset acquisition fast path — build ``register_fixed_asset``
+    WITHOUT any LLM round-trip, or None when anything is unresolved (the model
+    path then handles it exactly as before).
+
+    ``fixed_asset_service.register_asset`` resolves the asset account, the
+    depreciation accounts and the cash/bank account itself, so the only values
+    Python must hold are the ones ONLY the user can supply: the asset name, its
+    cost, the transaction date and the payment treatment.  Never guessed:
+
+    * the nature must be a CONFIRMED ``FIXED_ASSET`` — an inferred one completes
+      the question ladder first (capitalising is the user's decision);
+    * the payment treatment must be STATED — cash/bank settles immediately,
+      CREDIT posts a payable and REQUIRES the named supplier (the service
+      refuses without one), so a missing treatment is never defaulted to cash;
+    * name + cost + date must all be present.
+
+    Production 2026-10-02 (sessions 5939bf30 / f3609d50 / 0debc91f): "We Buy a
+    Plant for 6,700,000 on cash, yesterday" carried EVERYTHING the tool needs,
+    yet the model planned ``search_account, search_account, search_account,
+    get_chart_of_accounts`` in both the plan round and the lookup-continuation
+    round — no mutation was ever proposed, so the completeness gate parked the
+    run on "Please answer: the remaining details" when NOTHING was missing.
+    """
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    name = str(
+        entities.get("asset_name") or entities.get("item_description") or ""
+    ).strip()
+    if amount is None or not txn_date or not name:
+        return None
+    if str(entities.get("transaction_nature") or "").upper() != "FIXED_ASSET":
+        return None
+
+    treatment = str(entities.get("payment_method") or "").upper()
+    if treatment in ("CREDIT", "ON_CREDIT", "CREDIT_PURCHASE"):
+        supplier_name = str(entities.get("supplier_name") or "").strip()
+        if not supplier_name:
+            # A credit acquisition needs the party — the model path asks.
+            return None
+        payment_out = "CREDIT"
+    elif treatment in ("CASH", "BANK", "BANK_TRANSFER"):
+        payment_out = "CASH" if treatment == "CASH" else "BANK"
+    else:
+        return None
+
+    params: Dict[str, Any] = {
+        "name": name,
+        "purchase_cost": float(amount),
+        "transaction_date": str(txn_date),
+        "payment_method": payment_out,
+    }
+    # The depreciation answers the user already gave ride along; their absence
+    # never blocks the acquisition (register_asset defaults them).
+    for key, cast in (
+        ("useful_life_years", int),
+        ("salvage_value", float),
+    ):
+        value = entities.get(key)
+        if value in (None, "", [], {}):
+            continue
+        try:
+            params[key] = cast(float(value))
+        except (TypeError, ValueError):
+            continue
+    method = str(entities.get("depreciation_method") or "").strip()
+    if method:
+        params["depreciation_method"] = method
+    description = str(entities.get("description") or "").strip()
+    if description:
+        params["description"] = description
+    if payment_out == "CREDIT":
+        params["supplier_name"] = str(entities.get("supplier_name") or "").strip()
+    return [ToolCall(tool_name="register_fixed_asset", arguments=params)]
+
+
 def _transfer_fast_path_call(
     entities: Dict[str, Any],
 ) -> Optional[List[ToolCall]]:
@@ -990,6 +1113,11 @@ async def _deterministic_mutation_calls(
         return _cash_sale_fast_path_call(entities)
     if execution_plan.intent == "record_bank_transfer":
         return _transfer_fast_path_call(entities)
+    if execution_plan.intent == "register_fixed_asset":
+        # R5: the fixed-asset acquisition fast path (CONFIRMED FIXED_ASSET
+        # nature + asset name + cost + date + stated payment treatment) —
+        # the tool resolves the asset/depreciation/cash-bank accounts itself.
+        return _fixed_asset_fast_path_call(entities)
     if execution_plan.intent in ("create_invoice", "record_credit_sale"):
         # R4.7: the invoice fast path (nature goods/service + customer +
         # amount + date resolved) — builds the invoice tool call without
@@ -4045,11 +4173,7 @@ async def execute(
                 return AgentResponse(
                     status=ExecutionStatus.FAILED,
                     execution_id=session_id,
-                    summary=(
-                        f"{provider_stall} Nothing was recorded yet. "
-                        "Please send your request again — everything you have "
-                        "already told me is kept in this conversation."
-                    ),
+                    summary=_provider_stall_summary(provider_stall),
                 )
             _phase_elapsed("llm_call.done")
             llm_text = planning_result.get("text", "")
@@ -4357,7 +4481,7 @@ async def execute(
                         f"{i + 1}) {q}" for i, q in enumerate(_questions)
                     )
                     + (f" (and {_remaining} more)" if _remaining else "")
-                ) or "the remaining details"
+                )
                 # The lookups I just ran are part of the answer: say what they
                 # found (or that they found nothing) instead of pretending the
                 # plan was never started.
@@ -4384,8 +4508,22 @@ async def execute(
                     f"Nothing has been recorded yet. I could not build the "
                     f"{str(execution_plan.intent).replace('_', ' ')} from the details "
                     f"I have, so there is nothing for you to approve. The steps I "
-                    f"could prepare were: {_tools}.{_lookup_note} Please answer: "
-                    f"{_missing} — or rephrase the request, and I will try again."
+                    f"could prepare were: {_tools}.{_lookup_note} "
+                    + (
+                        f"Please answer: {_missing} — or rephrase the request, "
+                        "and I will try again."
+                        if _missing
+                        else
+                        # NOTHING is missing: the plan simply never contained the
+                        # write step.  Asking for "the remaining details" is a
+                        # dead end the user cannot answer (production 2026-10-02,
+                        # plant session 5939bf30: every value was known and
+                        # REQUIREMENT_ANALYSIS reported open_questions=[], yet the
+                        # run asked for details that did not exist).
+                        "Nothing in your request is missing, so there is no "
+                        "value for you to supply — please resend it, or tell me "
+                        "in your own words how to record it, and I will do that."
+                    )
                 )
                 try:
                     _clarification = await create_clarification(
@@ -6312,6 +6450,21 @@ async def _continue_lookup_only_plan(
 
     try:
         context.live_evidence = list(getattr(context, "live_evidence", None) or []) + evidence
+        # The model must be TOLD these calls already ran: this is a PLANNING
+        # call (no executor), and the planner's own rules ("search before
+        # creating", "search → create → document") otherwise make it re-plan
+        # the SAME read-only calls.  Production 2026-10-02 (plant purchase):
+        # the continuation returned search_account x3 + get_chart_of_accounts
+        # again — no write was ever proposed, so the gate parked the run on a
+        # question even though nothing was missing.
+        context.pre_executed_lookups = [
+            {
+                "tool": call.tool_name,
+                "records": item.get("records"),
+                "error": item.get("error"),
+            }
+            for call, item in zip(planned_tool_calls, evidence)
+        ]
     except Exception:  # noqa: BLE001 — evidence is best-effort
         log.warning("agent.lookup_evidence_attach_failed", session_id=str(session_id))
 
