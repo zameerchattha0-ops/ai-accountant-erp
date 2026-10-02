@@ -207,6 +207,23 @@ class Settings(BaseSettings):
         default="deepseek-v4.1-flash:free",
         description="PRIMARY text/tool model — DeepSeek V4.1 flash (free tier)",
     )
+    # 2026-10-02 operator direction: DeepSeek PRIMARY with thinking OFF, then
+    # Mimo 2.6, then Mimo 2.5 — and the Qwen chain demoted to LAST (every
+    # model on that workspace answers HTTP 403 AccessDenied.Unpurchased).
+    th_text_model_chain: str = Field(
+        default=(
+            "deepseek-v4.1-flash:free,mimo-v2.6-flash:free,mimo-v2.5:free"
+        ),
+        description="Ordered Token Harbor text/tool chain: DeepSeek V4.1 -> "
+        "Mimo 2.6 -> Mimo 2.5 (all free tier)",
+    )
+    th_thinking_off: bool = Field(
+        default=True,
+        description="Run the Token Harbor text chain with thinking OFF. The "
+        "DeepSeek primary is a THINKING model: measured 2026-09-29 it spent "
+        "20.4s on hidden reasoning and returned 0 answer chars "
+        "(finish_reason=length) on a mechanical prompt.",
+    )
     th_vision_model_chain: str = Field(
         default="mimo-v2.5:free,deepseek-v4.1-flash:free",
         description=(
@@ -661,6 +678,20 @@ class Settings(BaseSettings):
             if m and m not in seen:
                 seen.append(m)
         return seen
+
+    @property
+    def th_text_chain_list(self) -> List[str]:
+        """Ordered Token Harbor TEXT/tool chain (DeepSeek → Mimo 2.6 → Mimo 2.5).
+
+        Falls back to the single ``th_text_model`` when the chain is empty, so
+        a blank env can never leave the primary slot without a model.
+        """
+        seen: List[str] = []
+        for m in (self.th_text_model_chain or "").split(","):
+            m = m.strip()
+            if m and m not in seen:
+                seen.append(m)
+        return seen or [self.th_text_model]
 
     @property
     def qwen_banned_set(self) -> set:

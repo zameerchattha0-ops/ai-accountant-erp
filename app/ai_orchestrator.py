@@ -100,6 +100,31 @@ def _is_rate_limited(exc: Exception) -> bool:
     return "429" in str(exc) or "resource_exhausted" in low or "rate limit" in low
 
 
+def _is_unentitled(exc: Exception) -> bool:
+    """True when the provider says the KEY/ACCOUNT may not use this model.
+
+    Permanent (unlike throttling): the model is never retried and is dropped
+    from the candidate list for the life of the process.
+    """
+    from app.qwen_client import ProviderNotEntitled, is_entitlement_error
+
+    if isinstance(exc, ProviderNotEntitled):
+        return True
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if is_entitlement_error(status, str(exc)):
+        return True
+    low = str(exc).lower()
+    return (
+        "accessdenied.unpurchased" in low
+        or "access to model denied" in low
+        or "not eligible for using the model" in low
+    )
+
+
 class AIOrchestrator:
     """Dispatches agent LLM calls across an ordered, capability-aware
     provider chain: Token Harbor (DeepSeek/Mimo, primary) → Qwen → Gemini."""
@@ -108,6 +133,10 @@ class AIOrchestrator:
         self._qwen_clients: Dict[str, Any] = {}  # model -> QwenClient
         self._harbor_clients: Dict[str, Any] = {}  # model -> QwenClient (Token Harbor)
         self._harbor_unavailable: Dict[str, str] = {}  # model -> cached reason
+        # (provider, model) pairs that answered HTTP 403 AccessDenied — dead
+        # for the life of this process, never offered again (measured
+        # 2026-10-02: every Qwen model on the workspace).
+        self._unentitled_models: set = set()
         self._gemini: Optional[Any] = None
         self._health_cache: Dict[str, Any] = {}
         self._health_cached_at: float = 0.0
@@ -255,40 +284,73 @@ class AIOrchestrator:
             # does not accept image parts. Document requests must be handled
             # by the verified vision-capable chain.
         else:
-            # Token Harbor / DeepSeek V4.1 — PRIMARY for every text/tool turn
-            # (all model tiers: the tier chains below become the ordered
-            # fallback behind it).  `tier_first=True` is the documented
-            # opt-out for callers that explicitly requested a tier chain: the
-            # requested chain leads instead of the primary, so a thinking
-            # model never fronts a mechanical call.  Default is unchanged.
-            if not (tier_first and text_chain):
-                candidates.append(
-                    {
-                        "provider": "token-harbor",
-                        "model": settings.th_text_model,
-                        "capability": "text_tools",
-                        "factory": (lambda m=settings.th_text_model: self._get_harbor(m)),
-                    }
-                )
-            chain = [m for m in (text_chain or []) if m] or settings.qwen_chain_list
-            for model in chain:
-                candidates.append(
-                    {
-                        "provider": "qwen",
-                        "model": model,
-                        "capability": "text_tools",
-                        "factory": (lambda m=model: self._get_qwen(m)),
-                    }
-                )
-            candidates.append(
-                {
-                    "provider": "gemini",
-                    "model": None,
-                    "capability": "text_tools",
-                    "factory": self._get_gemini,
-                }
-            )
+            # ORDER (2026-10-02 operator direction, backed by measurement):
+            #   1. Token Harbor — DeepSeek V4.1 PRIMARY (thinking OFF) ->
+            #      Mimo 2.6 -> Mimo 2.5 (all free tier, all ANSWERING);
+            #   2. Gemini;
+            #   3. Qwen LAST — every model on that workspace answers HTTP 403
+            #      AccessDenied.Unpurchased (measured 2026-10-02), so it must
+            #      never sit ahead of a provider that works.
+            requested = [m for m in (text_chain or []) if m]
+            # ONE order for every mode.  `tier_first` used to SKIP the Token
+            # Harbor primary because it wasted the budget on hidden reasoning;
+            # that is now solved at the source (th_thinking_off runs the
+            # Harbor chain with thinking OFF), so the requested tier chain no
+            # longer has to lead — and it must NOT lead, because it names Qwen
+            # models that answer 403 AccessDenied.Unpurchased.
+            for model in settings.th_text_chain_list:
+                self._offer(candidates, self._harbor_candidate(model))
+            self._offer(candidates, self._gemini_candidate())
+            # Qwen LAST (operator direction 2026-10-02) — dedup against
+            # anything already offered and skip anything known unentitled.
+            for model in (requested or settings.qwen_chain_list):
+                self._offer(candidates, self._qwen_candidate(model))
         return candidates
+
+    # -------------------------------------------------------------------
+    # Candidate builders (single source of truth for the order above)
+    # -------------------------------------------------------------------
+
+    def _harbor_candidate(self, model: str) -> Dict[str, Any]:
+        return {
+            "provider": "token-harbor",
+            "model": model,
+            "capability": "text_tools",
+            "factory": (lambda m=model: self._get_harbor(m)),
+        }
+
+    def _qwen_candidate(self, model: str) -> Dict[str, Any]:
+        return {
+            "provider": "qwen",
+            "model": model,
+            "capability": "text_tools",
+            "factory": (lambda m=model: self._get_qwen(m)),
+        }
+
+    def _gemini_candidate(self) -> Dict[str, Any]:
+        return {
+            "provider": "gemini",
+            "model": None,
+            "capability": "text_tools",
+            "factory": self._get_gemini,
+        }
+
+    def _offer(
+        self, candidates: List[Dict[str, Any]], cand: Dict[str, Any]
+    ) -> None:
+        """Append *cand* unless already offered or known UNENTITLED.
+
+        A model that answered HTTP 403 ``AccessDenied.Unpurchased`` is dead
+        for the life of the process, so it is never offered again (measured
+        2026-10-02: EVERY Qwen model on that workspace).  Duplicate keys are
+        dropped so a requested tier chain can overlap the standard chain.
+        """
+        key = (cand["provider"], cand["model"])
+        if key in self._unentitled_models:
+            return
+        if any((c["provider"], c["model"]) == key for c in candidates):
+            return
+        candidates.append(cand)
 
     # -------------------------------------------------------------------
     # Core dispatch
@@ -372,7 +434,15 @@ class AIOrchestrator:
                     # Tiered routing: simple lookups that still need the
                     # model get a reduced output budget.
                     extra_kwargs["max_output_tokens"] = _LIGHT_OUTPUT_BUDGET_TOKENS
-                if thinking_off:
+                # THINKING OFF for the Token Harbor chain by default
+                # (operator direction 2026-10-02): the DeepSeek primary is a
+                # THINKING model — measured 2026-09-29 it burned 20.4s of
+                # hidden reasoning and returned 0 answer chars
+                # (finish_reason=length) on a mechanical prompt.
+                _want_thinking_off = thinking_off or (
+                    name == "token-harbor" and get_settings().th_thinking_off
+                )
+                if _want_thinking_off:
                     # OPTIONAL per-client capability — passed ONLY when the
                     # client's signature accepts it (Qwen/Harbor do, Gemini
                     # does not), mirroring generate_text's contract.
@@ -425,7 +495,18 @@ class AIOrchestrator:
 
                 provider_errors.append(f"{name}/{model}: {exc}")
                 attempted.append(f"{name}/{model}")
-                if _is_rate_limited(exc):
+                if _is_unentitled(exc):
+                    # PERMANENT: the account may not use this model.  Remember
+                    # it so _offer() never proposes it again this process, and
+                    # never retry it within this call either.
+                    self._unentitled_models.add((name, model))
+                    log.error(
+                        "orchestrator.provider_not_entitled_skipping",
+                        provider=name,
+                        model=model,
+                        detail=str(exc)[:200],
+                    )
+                elif _is_rate_limited(exc):
                     # BUSY, not broken.  The transports no longer retry a rate
                     # limit, so the NEXT provider is reached within the request
                     # budget and a plan is still produced.
@@ -516,14 +597,25 @@ class AIOrchestrator:
                 # others simply do not take them).
                 _accepted = inspect.signature(client.generate_text).parameters
                 _kwargs: Dict[str, Any] = {"prompt": prompt, "context": context}
-                if thinking_off and "thinking_off" in _accepted:
+                if (
+                    thinking_off
+                    or (name == "token-harbor" and get_settings().th_thinking_off)
+                ) and "thinking_off" in _accepted:
                     _kwargs["thinking_off"] = True
                 if max_output_tokens and "max_output_tokens" in _accepted:
                     _kwargs["max_output_tokens"] = max_output_tokens
                 return await client.generate_text(**_kwargs)
             except Exception as exc:  # noqa: BLE001
                 attempted.append(f"{name}/{model}")
-                if _is_rate_limited(exc):
+                if _is_unentitled(exc):
+                    self._unentitled_models.add((name, model))
+                    log.error(
+                        "orchestrator.text_provider_not_entitled_skipping",
+                        provider=name,
+                        model=model,
+                        detail=str(exc)[:200],
+                    )
+                elif _is_rate_limited(exc):
                     # BUSY, not broken: never retried, never reported as an
                     # outage.  The next provider is tried immediately.
                     rate_limited.append(f"{name}/{model}")

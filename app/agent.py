@@ -4311,6 +4311,51 @@ async def execute(
             if _confirmed_acct:
                 _gaps = [g for g in _gaps
                          if (g.name or "").strip().lower() != _confirmed_acct.lower()]
+            # ---- PREREQUISITE ACCOUNT RESOLUTION (execution time) ----------
+            # A planned MUTATION must not die at execution because a ledger it
+            # needs is absent ("No fixed-asset account could be determined").
+            # When the missing ledger is a PREREQUISITE of the planned write
+            # and the gap carries its determined shape, create it FIRST — the
+            # create_account tool reuses an EXACT name match and resolves a
+            # free code in the series, so an existing COA is never duplicated.
+            # Anything the plan does not require still asks the user below.
+            if _gaps and not _confirmed_acct:
+                _prereq = _prerequisite_gap_for_plan(
+                    gaps=_gaps,
+                    planned=planned_tool_calls,
+                    intent=str(execution_plan.intent or ""),
+                )
+                if _prereq is not None:
+                    _create_args = await _prerequisite_create_args(_prereq)
+                    _already = None
+                    if _create_args:
+                        try:
+                            _already = await account_exists(
+                                organization_id, _create_args["name"]
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best effort
+                            log.warning(
+                                "agent.prereq_account_probe_failed",
+                                session_id=str(session_id),
+                                error=str(exc)[:200],
+                            )
+                    if _create_args and _already is None:
+                        planned_tool_calls = ensure_create_account_first(
+                            planned_tool_calls, arguments=_create_args
+                        )
+                        excluded_tools.discard("create_account")
+                        _gaps = [g for g in _gaps if g is not _prereq]
+                        await _log_step(
+                            session_id, "PREREQUISITE_ACCOUNT_RESOLVED", {
+                                "account": _create_args["name"],
+                                "account_type": _create_args["account_type"],
+                                "code_seed": _create_args["code"],
+                                "gap_source": getattr(_prereq, "source", ""),
+                                "tools": [
+                                    tc.tool_name for tc in planned_tool_calls
+                                ],
+                            },
+                        )
             # Gate ORDER is contractual: a confirmation-pending plan must
             # reach PHASE 5 first (reconcile/approval tests pin it).  The ask
             # is deferred there — explicit-ref gaps are asked on the approved
@@ -6325,6 +6370,65 @@ def _plan_performs_no_financial_mutation(
     if not _intent_tool_names(intent):
         return False
     return not any(tc.tool_name in FINANCIAL_WRITE_TOOLS for tc in calls or ())
+
+
+#: Planned MUTATIONS and the account-gap SOURCE that is a hard prerequisite
+#: for them.  Only these gaps may be auto-created at execution time; every
+#: other gap keeps its ask-the-user path.
+_PREREQUISITE_GAP_SOURCES = {
+    "register_fixed_asset": "fixed_asset_nature",
+}
+
+
+def _prerequisite_gap_for_plan(
+    *,
+    gaps: Sequence[Any],
+    planned: Sequence[Any],
+    intent: str,
+):
+    """The ledger this plan cannot run without, or ``None``.
+
+    ``register_fixed_asset`` cannot post without an unambiguous PPE ledger, so
+    a ``fixed_asset_nature`` gap is a PREREQUISITE, not a configuration
+    question: it is created first (dedup by exact name inside the
+    ``create_account`` tool) and only then does the acquisition run.
+    """
+    names = {getattr(tc, "tool_name", "") for tc in planned or ()}
+    for planned_tool, gap_source in _PREREQUISITE_GAP_SOURCES.items():
+        if planned_tool not in names and intent != planned_tool:
+            continue
+        for gap in gaps or ():
+            if str(getattr(gap, "source", "")) == gap_source and str(
+                getattr(gap, "name", "") or ""
+            ).strip():
+                return gap
+    return None
+
+
+async def _prerequisite_create_args(gap: Any) -> Optional[Dict[str, Any]]:
+    """Arguments for the prerequisites' ``create_account`` call, or None.
+
+    The gap already carries the determined SHAPE (account_type, normal_balance
+    and the code series), so nothing is invented here.  ``code`` is only a
+    SEED: the tool resolves the next free code in that series and reuses an
+    existing ledger with the same name, so an existing COA is never
+    duplicated.
+    """
+    name = str(getattr(gap, "name", "") or "").strip()
+    account_type = str(getattr(gap, "account_type", "") or "").strip()
+    normal_balance = str(getattr(gap, "normal_balance", "") or "").strip()
+    if not name or not account_type or not normal_balance:
+        return None
+    return {
+        "name": name,
+        "code": str(getattr(gap, "base_code", "") or ""),
+        "account_type": account_type,
+        "normal_balance": normal_balance,
+        "description": (
+            "Created automatically as a prerequisite ledger for this "
+            "transaction."
+        ),
+    }
 
 
 async def _continue_lookup_only_plan(

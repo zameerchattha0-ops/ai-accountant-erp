@@ -21,11 +21,16 @@ import {
   applyCategoryDefaults,
   automaticAssetAccountLabel,
   assetAccountBlocker,
+  contraAssetAccountOptions,
   depreciationBlocker,
+  depreciationExpenseAccountOptions,
   filterAssets,
   messageOf,
+  nextAccountCode,
+  ppeAssetAccountOptions,
   registerBlocker,
   setupNotices,
+  suggestedAssetAccountName,
   unknownSupplierNotice,
 } from "@/lib/fixed-assets/logic";
 import Modal from "@/components/shared/Modal";
@@ -47,6 +52,12 @@ const STATUS_FILTERS = [
 ];
 /** A disposed or written-off asset can be neither depreciated nor disposed again. */
 const OPEN_STATUSES = new Set(["ACTIVE", "FULLY_DEPRECIATED"]);
+
+/**
+ * Sentinel for the "create the ledger you need" entry appended to the
+ * asset-account pickers (selects only carry strings).
+ */
+const CREATE_ACCOUNT = "__create_account__";
 
 const today = () => new Date().toISOString().slice(0, 10);
 
@@ -87,6 +98,8 @@ export default function FixedAssetsPage() {
   const { org, loading: orgLoading } = useOrg();
   const [register, setRegister] = useState<FixedAssetRegister | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Success feedback (e.g. an inline COA creation) — never an error style. */
+  const [notice, setNotice] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("ALL");
 
@@ -179,14 +192,103 @@ export default function FixedAssetsPage() {
     void loadConfig();
   }, [loadConfig]);
 
+  // PPE ledgers ONLY for the asset-cost pickers.  Listing every ASSET account
+  // (Bank, Cash, AR, the 1100-000x sub-ledgers, Prepaid) made choosing an
+  // asset account a minefield — production screenshot 2026-10-02.
   const assetAccountOptions = useMemo(
-    () => accountOptions(accounts, "ASSET"),
+    () => ppeAssetAccountOptions(accounts),
+    [accounts]
+  );
+  const contraAccountOptions = useMemo(
+    () => contraAssetAccountOptions(accounts),
     [accounts]
   );
   const expenseAccountOptions = useMemo(
-    () => accountOptions(accounts, "EXPENSE"),
+    () => depreciationExpenseAccountOptions(accounts),
     [accounts]
   );
+  // INLINE COA CREATION.  When the chart has no PPE ledger (or none the user
+  // wants), the register form must not dead-end: create the account here and
+  // select it.  The name suggestion is CATEGORY-level ("Plant and Machinery",
+  // never one item) and the code is the next free 15xx — and an exact name or
+  // code already in the chart is REUSED, never duplicated.
+  const [newAcct, setNewAcct] = useState<{
+    open: boolean;
+    name: string;
+    code: string;
+    target: "register" | "category";
+  }>({ open: false, name: "", code: "", target: "register" });
+  const [newAcctSaving, setNewAcctSaving] = useState(false);
+  const [newAcctError, setNewAcctError] = useState<string | null>(null);
+
+  /** Point the form that asked for the account at the new ledger. */
+  const applyNewAccount = useCallback(
+    (id: string, name: string) => {
+      if (newAcct.target === "category") {
+        setCatForm((prev) => ({ ...prev, default_asset_account_id: id }));
+      } else {
+        setForm((prev) => ({ ...prev, asset_account_id: id }));
+      }
+      setNotice(`"${name}" was added to the chart of accounts and selected.`);
+    },
+    [newAcct.target, setCatForm, setForm]
+  );
+
+  const openNewAccount = useCallback(
+    (target: "register" | "category", rawName: string) => {
+      setNewAcctError(null);
+      setNewAcct({
+        open: true,
+        target,
+        name: suggestedAssetAccountName(rawName),
+        code: nextAccountCode(accounts),
+      });
+    },
+    [accounts]
+  );
+
+  const saveNewAccount = useCallback(async () => {
+    if (!org) return;
+    const name = newAcct.name.trim();
+    const code = newAcct.code.trim();
+    if (!name || !code) {
+      setNewAcctError("Name and code are required");
+      return;
+    }
+    const existing = accounts.find(
+      (a) =>
+        a.name.trim().toLowerCase() === name.toLowerCase() ||
+        String(a.code).trim() === code
+    );
+    if (existing) {
+      setNewAcct((prev) => ({ ...prev, open: false }));
+      applyNewAccount(existing.id, existing.name);
+      return;
+    }
+    setNewAcctSaving(true);
+    const supabase = createClient();
+    const { data, error: insertError } = await supabase
+      .from("accounts")
+      .insert({
+        organization_id: org.organization_id,
+        code,
+        name,
+        account_type: "ASSET",
+        normal_balance: "DEBIT",
+        description: "Created from the fixed-asset register.",
+      })
+      .select()
+      .single();
+    setNewAcctSaving(false);
+    if (insertError) {
+      setNewAcctError(insertError.message);
+      return;
+    }
+    setNewAcct((prev) => ({ ...prev, open: false }));
+    await loadConfig();
+    if (data?.id) applyNewAccount(data.id, data.name ?? name);
+  }, [org, newAcct, accounts, loadConfig, applyNewAccount]);
+
   /** What a register/depreciation submission would hit — shown BEFORE the 409. */
   const configNotices = useMemo(() => setupNotices(accounts), [accounts]);
   const supplierNotice = useMemo(
@@ -521,6 +623,18 @@ export default function FixedAssetsPage() {
         </select>
       </div>
 
+      {notice && (
+        <div className="rounded-xl border border-ai-200 bg-ai-50 px-4 py-3 text-sm text-text-primary flex items-start justify-between gap-3">
+          <span>{notice}</span>
+          <button
+            onClick={() => setNotice(null)}
+            className="text-text-muted hover:text-text-primary text-xs"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {orgLoading || (!register && !error) ? (
         <TableSkeleton cols={7} />
       ) : error ? (
@@ -807,7 +921,9 @@ export default function FixedAssetsPage() {
                 className={`${inputCls} mt-1.5`}
                 value={form.asset_account_id}
                 onChange={(e) =>
-                  setForm({ ...form, asset_account_id: e.target.value })
+                  e.target.value === CREATE_ACCOUNT
+                    ? openNewAccount("register", form.name)
+                    : setForm({ ...form, asset_account_id: e.target.value })
                 }
               >
                 <option value="">{automaticAssetAccountLabel(accounts)}</option>
@@ -816,7 +932,16 @@ export default function FixedAssetsPage() {
                     {option.label}
                   </option>
                 ))}
+                <option value={CREATE_ACCOUNT}>
+                  + Create a new asset account…
+                </option>
               </select>
+              {assetAccountOptions.length === 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  No fixed-asset ledger in the chart yet — choose
+                  &quot;+ Create a new asset account…&quot; above.
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs font-medium text-text-secondary">
@@ -855,13 +980,7 @@ export default function FixedAssetsPage() {
                 }
               >
                 <option value="">Automatic</option>
-                {assetAccountOptions
-                  .filter((option) =>
-                    option.label
-                      .toLowerCase()
-                      .includes("accumulated depreciation")
-                  )
-                  .map((option) => (
+                {contraAccountOptions.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -1001,13 +1120,7 @@ export default function FixedAssetsPage() {
                     }
                   >
                     <option value="">Automatic</option>
-                    {assetAccountOptions
-                      .filter((option) =>
-                        option.label
-                          .toLowerCase()
-                          .includes("accumulated depreciation")
-                      )
-                      .map((option) => (
+                    {contraAccountOptions.map((option) => (
                         <option key={option.value} value={option.value}>
                           {option.label}
                         </option>
@@ -1259,10 +1372,12 @@ export default function FixedAssetsPage() {
                 className={`${inputCls} mt-1.5`}
                 value={catForm.default_asset_account_id}
                 onChange={(e) =>
-                  setCatForm({
-                    ...catForm,
-                    default_asset_account_id: e.target.value,
-                  })
+                  e.target.value === CREATE_ACCOUNT
+                    ? openNewAccount("category", catForm.name)
+                    : setCatForm({
+                        ...catForm,
+                        default_asset_account_id: e.target.value,
+                      })
                 }
               >
                 <option value="">None</option>
@@ -1271,6 +1386,9 @@ export default function FixedAssetsPage() {
                     {option.label}
                   </option>
                 ))}
+                <option value={CREATE_ACCOUNT}>
+                  + Create a new asset account…
+                </option>
               </select>
             </div>
           </div>
@@ -1312,13 +1430,7 @@ export default function FixedAssetsPage() {
                 }
               >
                 <option value="">None</option>
-                {assetAccountOptions
-                  .filter((option) =>
-                    option.label
-                      .toLowerCase()
-                      .includes("accumulated depreciation")
-                  )
-                  .map((option) => (
+                {contraAccountOptions.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -1352,6 +1464,70 @@ export default function FixedAssetsPage() {
                 : catEditingId
                   ? "Save changes"
                   : "Add category"}
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={newAcct.open}
+        onClose={() => setNewAcct((prev) => ({ ...prev, open: false }))}
+        title="Create asset account"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-text-secondary">
+            A fixed-asset ledger is a CATEGORY, not one item — &quot;Plant and
+            Machinery&quot; holds every machine, &quot;Vehicles&quot; every
+            vehicle. It is created as an ASSET (debit) account and selected for
+            you straight away. If a ledger with the same name or code already
+            exists, that one is reused instead of creating a duplicate.
+          </p>
+          <div>
+            <label className="text-xs font-medium text-text-secondary">
+              Name *
+            </label>
+            <input
+              className={`${inputCls} mt-1.5`}
+              value={newAcct.name}
+              onChange={(e) =>
+                setNewAcct((prev) => ({ ...prev, name: e.target.value }))
+              }
+              placeholder="Plant and Machinery"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-text-secondary">
+              Code *
+            </label>
+            <input
+              className={`${inputCls} mt-1.5`}
+              value={newAcct.code}
+              onChange={(e) =>
+                setNewAcct((prev) => ({ ...prev, code: e.target.value }))
+              }
+              placeholder="1500"
+            />
+            <p className="mt-1 text-xs text-text-muted">
+              Suggested: the next free code in the 15xx (non-current asset)
+              series.
+            </p>
+          </div>
+          {newAcctError && (
+            <p className="text-xs text-danger-600">{newAcctError}</p>
+          )}
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              onClick={() => setNewAcct((prev) => ({ ...prev, open: false }))}
+              className="px-4 py-2 rounded-xl border border-border-default text-sm text-text-secondary hover:bg-bg-secondary transition-colors"
+            >
+              Close
+            </button>
+            <button
+              onClick={() => void saveNewAccount()}
+              disabled={newAcctSaving}
+              className="px-4 py-2 rounded-xl bg-ai-500 hover:bg-ai-600 disabled:opacity-60 text-white text-sm font-medium transition-colors"
+            >
+              {newAcctSaving ? "Creating…" : "Create account"}
             </button>
           </div>
         </div>

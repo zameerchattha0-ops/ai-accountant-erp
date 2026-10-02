@@ -6,11 +6,17 @@ import {
   assetAccountAutoMatch,
   assetAccountBlocker,
   automaticAssetAccountLabel,
+  contraAssetAccountOptions,
   depreciationBlocker,
+  depreciationExpenseAccountOptions,
   filterAssets,
+  isPpeAccount,
   messageOf,
+  nextAccountCode,
+  ppeAssetAccountOptions,
   registerBlocker,
   setupNotices,
+  suggestedAssetAccountName,
   uniqueNameMatch,
   unknownSupplierNotice,
 } from "@/lib/fixed-assets/logic";
@@ -341,3 +347,109 @@ describe("asset-account resolution (the picker's 'Automatic' promise)", () => {
     expect(registerBlocker(form)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// PPE-only account pickers (production screenshot 2026-10-02)
+// ---------------------------------------------------------------------------
+
+describe("ppeAssetAccountOptions", () => {
+  // The exact chart from the screenshot: current assets, control sub-ledgers
+  // and PPE mixed together under account_type ASSET.
+  const chart: Account[] = [
+    acct("a1", "1010", "Bank", "ASSET"),
+    acct("a2", "1020", "Cash", "ASSET"),
+    acct("a3", "1100", "Accounts Receivable", "ASSET"),
+    { ...acct("a4", "1100-0001", "abc technologies", "ASSET"), parent_account_id: "a3" },
+    acct("a5", "1300", "Prepaid Expenses", "ASSET"),
+    acct("a6", "1500", "Computer Equipment", "ASSET"),
+    acct("a7", "1510", "Accumulated Depreciation - Computer Equipment", "ASSET"),
+    acct("a8", "1520", "Vehicle - Car", "ASSET"),
+    acct("a9", "1530", "Building", "ASSET"),
+    acct("a10", "6100", "Depreciation Expense", "EXPENSE"),
+  ];
+
+  it("keeps ONLY the PPE ledgers", () => {
+    expect(ppeAssetAccountOptions(chart).map((o) => o.label)).toEqual([
+      "1500 Computer Equipment",
+      "1520 Vehicle - Car",
+      "1530 Building",
+    ]);
+  });
+
+  it("never offers a current asset, a contra account or a sub-ledger", () => {
+    const labels = ppeAssetAccountOptions(chart).map((o) => o.label);
+    expect(labels.some((l) => /bank|cash|receivable|prepaid/i.test(l))).toBe(false);
+    expect(labels.some((l) => /accumulated/i.test(l))).toBe(false);
+    expect(labels.some((l) => /abc technologies/i.test(l))).toBe(false);
+  });
+
+  it("excludes control accounts even when the name looks like PPE", () => {
+    const control = { ...acct("c1", "1590", "Equipment Control", "ASSET"), is_control_account: true };
+    expect(isPpeAccount(control)).toBe(false);
+  });
+
+  it("is empty (and therefore prompts creation) on a chart with no PPE", () => {
+    expect(
+      ppeAssetAccountOptions([acct("x", "1010", "Bank", "ASSET")])
+    ).toEqual([]);
+  });
+});
+
+describe("contraAssetAccountOptions", () => {
+  it("returns only the accumulated-depreciation ledgers", () => {
+    const chart = [
+      acct("a1", "1010", "Bank", "ASSET"),
+      acct("a2", "1510", "Accumulated Depreciation - Vehicle", "ASSET"),
+    ];
+    expect(contraAssetAccountOptions(chart).map((o) => o.label)).toEqual([
+      "1510 Accumulated Depreciation - Vehicle",
+    ]);
+  });
+});
+
+describe("depreciationExpenseAccountOptions", () => {
+  it("prefers the depreciation expense ledgers", () => {
+    const chart = [
+      acct("a1", "6100", "Depreciation Expense", "EXPENSE"),
+      acct("a2", "6200", "Salaries Expense", "EXPENSE"),
+    ];
+    expect(depreciationExpenseAccountOptions(chart).map((o) => o.label)).toEqual([
+      "6100 Depreciation Expense",
+    ]);
+  });
+
+  it("falls back to the whole expense chart when none is named", () => {
+    const chart = [acct("a1", "6200", "Salaries Expense", "EXPENSE")];
+    expect(depreciationExpenseAccountOptions(chart)).toHaveLength(1);
+  });
+});
+
+describe("suggestedAssetAccountName / nextAccountCode", () => {
+  it("suggests a CATEGORY-level ledger, never the single item", () => {
+    expect(suggestedAssetAccountName("plant")).toBe("Plant and Machinery");
+    expect(suggestedAssetAccountName("office chairs")).toBe(
+      "Furniture and Fixtures"
+    );
+    expect(suggestedAssetAccountName("laptop")).toBe("Computer Equipment");
+    expect(suggestedAssetAccountName("delivery van")).toBe("Vehicles");
+    expect(suggestedAssetAccountName("warehouse")).toBe("Buildings");
+    expect(suggestedAssetAccountName("")).toBe("Plant and Machinery");
+  });
+
+  it("falls back to the typed name when nothing matches (never a guess)", () => {
+    // A brand/model name carries no category keyword — the typed name is
+    // offered as-is for the user to correct in the dialog.
+    expect(suggestedAssetAccountName("Toyota Hilux")).toBe("Toyota Hilux");
+  });
+
+  it("suggests the next free 15xx code", () => {
+    const chart = [
+      acct("a1", "1500", "Computer Equipment", "ASSET"),
+      acct("a2", "1520", "Vehicle - Car", "ASSET"),
+      acct("a3", "6100", "Depreciation Expense", "EXPENSE"),
+    ];
+    expect(nextAccountCode(chart)).toBe("1530");
+    expect(nextAccountCode([])).toBe("1500");
+  });
+});
+

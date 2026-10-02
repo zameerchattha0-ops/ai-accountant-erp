@@ -104,6 +104,42 @@ _RATE_LIMIT_MARKERS = (
 )
 
 
+class ProviderNotEntitled(ProviderError):
+    """The provider does not have this model ENTITLED (HTTP 403
+    ``AccessDenied.Unpurchased`` / 401 auth).
+
+    Like a rate limit this is BUSY-not-broken in the worst sense: it is
+    PERMANENT for the lifetime of the account.  Production 2026-10-02 measured
+    EVERY Qwen model on this workspace answering ``AccessDenied.Unpurchased``
+    (qwen3.6-plus, qwen-max, qwen3.5-plus, qwen3.8-flash, qwen-flash, ...),
+    while the shipped chain defaults to four of them — so each provider call
+    burned 4 models x 3 retried attempts x ~2 s before Gemini was reached.
+    Never retried (see retry_if_not_exception_type below), and the
+    orchestrator remembers the model and SKIPS it for the rest of the process.
+    """
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def is_entitlement_error(status_code: Optional[int], body: Optional[str]) -> bool:
+    """True when the provider says the KEY/ACCOUNT may not use this model."""
+    if status_code == 401:
+        return True
+    if status_code != 403:
+        return False
+    low = (body or "").lower()
+    return (
+        "unpurchased" in low
+        or "not entitled" in low
+        or "not eligible" in low
+        or "access to model denied" in low
+        or "permission" in low
+        or "denied" in low
+    )
+
+
 def is_rate_limited_error(status_code: Optional[int], body: Optional[str]) -> bool:
     """True when an HTTP error means RATE LIMITED / quota exhausted.
 
@@ -177,7 +213,7 @@ class QwenClient:
         # daily/free-tier cap only burns the request budget (see
         # ProviderRateLimited).  Fail fast so the orchestrator can move to the
         # next provider.
-        retry=retry_if_not_exception_type(ProviderRateLimited),
+        retry=retry_if_not_exception_type((ProviderRateLimited, ProviderNotEntitled)),
     )
     async def generate_with_tools(
         self,
@@ -497,7 +533,7 @@ class QwenClient:
         # this the two stacked decorators multiplied into 9 HTTP calls and
         # ~20 s of sleeps per candidate, so the fallback provider timed out
         # before it was ever tried.
-        retry=retry_if_not_exception_type(ProviderRateLimited),
+        retry=retry_if_not_exception_type((ProviderRateLimited, ProviderNotEntitled)),
     )
     async def _chat_completion(
         self,
@@ -542,6 +578,22 @@ class QwenClient:
                 )
 
         if resp.status_code != 200:
+            if is_entitlement_error(resp.status_code, resp.text):
+                # PERMANENT: the account may not use this model (measured
+                # 2026-10-02: EVERY model on the workspace answered 403
+                # AccessDenied.Unpurchased).  Never retried, and the
+                # orchestrator drops the model from its candidate list.
+                log.error(
+                    "qwen_client.not_entitled",
+                    model=self.model_name,
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+                raise ProviderNotEntitled(
+                    f"Qwen model not entitled HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}",
+                    status=resp.status_code,
+                )
             if is_rate_limited_error(resp.status_code, resp.text):
                 # BUSY, not broken: no retry above (3 outer × 3 inner attempts
                 # of a daily cap waste the whole request).  Raised as its own

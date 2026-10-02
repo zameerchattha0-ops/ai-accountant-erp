@@ -605,6 +605,88 @@ class TestFixedAssetAcquisitionFastPath:
 
 
 # --------------------------------------------------------------------------
+# 9. Execution-time PREREQUISITE account resolution (create first, never dup)
+# --------------------------------------------------------------------------
+
+
+class TestPrerequisiteAccountResolution:
+    """`register_fixed_asset` cannot post without a PPE ledger.  When the chart
+    has none, the gap is a PREREQUISITE — the ledger is created FIRST (the
+    `create_account` tool reuses an exact name match and resolves a free code,
+    so an existing COA is never duplicated) instead of failing at execution."""
+
+    @staticmethod
+    def _gap(**kw):
+        base = dict(
+            name="Plant and Machinery",
+            account_type="ASSET",
+            normal_balance="DEBIT",
+            base_code="1500",
+            source="fixed_asset_nature",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_a_fixed_asset_gap_is_a_prerequisite_of_the_planned_write(self):
+        gap = self._gap()
+        found = agent_mod._prerequisite_gap_for_plan(
+            gaps=[gap],
+            planned=[ToolCall(tool_name="register_fixed_asset", arguments={})],
+            intent="register_fixed_asset",
+        )
+        assert found is gap
+
+    def test_a_gap_for_an_unplanned_write_is_left_to_the_user(self):
+        gap = self._gap()
+        assert (
+            agent_mod._prerequisite_gap_for_plan(
+                gaps=[gap],
+                planned=[ToolCall(tool_name="create_expense", arguments={})],
+                intent="record_expense",
+            )
+            is None
+        )
+
+    def test_an_explicit_reference_gap_is_not_auto_created(self):
+        gap = self._gap(source="explicit_reference")
+        assert (
+            agent_mod._prerequisite_gap_for_plan(
+                gaps=[gap],
+                planned=[ToolCall(tool_name="register_fixed_asset", arguments={})],
+                intent="register_fixed_asset",
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_create_args_come_from_the_gap_shape(self):
+        args = await agent_mod._prerequisite_create_args(self._gap())
+        assert args == {
+            "name": "Plant and Machinery",
+            "code": "1500",
+            "account_type": "ASSET",
+            "normal_balance": "DEBIT",
+            "description": (
+                "Created automatically as a prerequisite ledger for this "
+                "transaction."
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_shape_is_never_invented(self):
+        assert (
+            await agent_mod._prerequisite_create_args(
+                self._gap(account_type="", normal_balance="")
+            )
+            is None
+        )
+        assert (
+            await agent_mod._prerequisite_create_args(self._gap(name="  "))
+            is None
+        )
+
+
+# --------------------------------------------------------------------------
 # 8. The lookup-continuation tells the model its lookups ALREADY RAN
 # --------------------------------------------------------------------------
 

@@ -141,6 +141,127 @@ export function accountOptions(
 }
 
 /**
+ * Names that make an ASSET account a CURRENT asset (or a control/sub-ledger),
+ * never a PPE ledger.  Mirrors the category rules in
+ * `database/migrations/039_backfill_account_categories.sql` (BANK, CASH,
+ * RECEIVABLE, PREPAID, INVENTORY) plus the tax/control accounts.
+ */
+const NON_PPE_ASSET_KEYWORDS: readonly string[] = [
+  "accumulated depreciation",
+  "cash",
+  "bank",
+  "receivable",
+  "payable",
+  "prepaid",
+  "advance",
+  "inventory",
+  "stock",
+  "vat",
+  "tax",
+  "drawer",
+  "savings",
+  "petty",
+  "deposit",
+];
+
+/** True when the account can be a FIXED-ASSET (PPE) ledger. */
+export function isPpeAccount(account: Account): boolean {
+  if (account.account_type !== "ASSET") return false;
+  // Control accounts (and their sub-ledgers, e.g. the 1100-0001 party rows)
+  // are never a PPE heading.
+  if (account.is_control_account) return false;
+  if (account.parent_account_id) return false;
+  const name = (account.name ?? "").toLowerCase();
+  return !NON_PPE_ASSET_KEYWORDS.some((k) => name.includes(k));
+}
+
+/**
+ * The asset-COST picker: PPE ledgers ONLY.
+ *
+ * Production 2026-10-02 (fixed-assets screenshot): the picker listed every
+ * ASSET account — 1010 Bank, 1020 Cash, 1100 Accounts Receivable, the
+ * 1100-000x party sub-ledgers, 1300 Prepaid Expenses — so picking an asset
+ * account was a minefield.  A PPE acquisition can only ever post to a
+ * non-current asset ledger, so the rest is filtered out.
+ */
+export function ppeAssetAccountOptions(
+  accounts: Account[]
+): { value: string; label: string }[] {
+  return accountOptions(accounts.filter(isPpeAccount), "ASSET");
+}
+
+/** The accumulated-depreciation picker: ASSET contra accounts only. */
+export function contraAssetAccountOptions(
+  accounts: Account[]
+): { value: string; label: string }[] {
+  return accountOptions(
+    accounts.filter(
+      (a) =>
+        a.account_type === "ASSET" &&
+        (a.name ?? "").toLowerCase().includes("accumulated depreciation")
+    ),
+    "ASSET"
+  );
+}
+
+/**
+ * The depreciation-expense picker: depreciation EXPENSE accounts first; when
+ * the chart has none, every expense account (the backend resolves
+ * deterministically and refuses only on ambiguity, so hiding the chart would
+ * be worse than showing it).
+ */
+export function depreciationExpenseAccountOptions(
+  accounts: Account[]
+): { value: string; label: string }[] {
+  const depreciation = accounts.filter(
+    (a) =>
+      a.account_type === "EXPENSE" &&
+      (a.name ?? "").toLowerCase().includes("depreciation")
+  );
+  return accountOptions(
+    depreciation.length ? depreciation : accounts,
+    "EXPENSE"
+  );
+}
+
+/** A suggested name for a NEW PPE ledger, from the asset the user typed. */
+export function suggestedAssetAccountName(rawName: string): string {
+  const name = (rawName ?? "").trim();
+  if (!name) return "Plant and Machinery";
+  // Category-level heading (a ledger is a category, not one item): the
+  // backend's `category_for_item` already does this for proposals.
+  const lower = name.toLowerCase();
+  if (/chair|table|desk|sofa|bed|shelf|cabinet|furniture/.test(lower))
+    return "Furniture and Fixtures";
+  if (/computer|laptop|printer|server|monitor|router|ups/.test(lower))
+    return "Computer Equipment";
+  if (/car|truck|van|bike|motorcycle|vehicle|lorry|bus|pickup/.test(lower))
+    return "Vehicles";
+  if (/building|warehouse|office\b|land/.test(lower)) return "Buildings";
+  if (/machin|plant|equipment|generator|boiler|cnc/.test(lower))
+    return "Plant and Machinery";
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/** The next free code in a series (e.g. "1500", "1510" -> "1520").
+ *
+ * Only codes inside the SEED BAND count (seed .. seed+99): a 6100 expense code
+ * must never push the next PPE code to 6110.
+ */
+export function nextAccountCode(
+  accounts: Account[],
+  seed = "1500",
+  step = 10
+): string {
+  const base = Number(seed);
+  const band = accounts
+    .map((a) => Number.parseInt(String(a.code ?? ""), 10))
+    .filter((n) => Number.isFinite(n) && n >= base && n < base + 100);
+  const highest = band.length ? Math.max(...band) : base - step;
+  return String(highest + step);
+}
+
+/**
  * Preflight for one depreciation charge: null when it CAN post (an explicit
  * account on the asset/form, or a unique chart match), otherwise the missing
  * pieces — so the modal can offer the pickers instead of a raw 409.
