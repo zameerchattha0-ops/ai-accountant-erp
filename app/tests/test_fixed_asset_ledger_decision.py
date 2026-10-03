@@ -8,6 +8,7 @@ because the plan carried NO account.  These tests pin the three decisions
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 
 import pytest
 
@@ -21,12 +22,15 @@ from app.models.schemas import ToolCall
 ORG = uuid.uuid4()
 
 
-def _acct(name: str, code: str = "1500") -> dict:
+def _acct(name: str, code: str = "1500", parent: Optional[str] = None) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "name": name,
         "code": code,
         "account_type": "ASSET",
+        # Party sub-ledgers hang under their control account; a PPE ledger may
+        # hang under a PPE heading — or nothing at all.
+        "parent_account_id": parent,
     }
 
 
@@ -253,4 +257,144 @@ def test_rule_23_tells_the_model_check_first_then_propose_only_if_missing():
     assert "existence check only" in text
     assert "Building - Model Town" in text
     assert "EXACTLY ONE of asset_account_id" in text
+
+
+# ---------------------------------------------------------------------------
+# PRODUCTION REGRESSION 2026-10-03 (session 169a88e0) — non-PPE ASSET rows are
+# NEVER ledger candidates.
+#
+# "We Buy Today Honda Civic for 3,450,000 on cash today" died with
+# "No fixed-asset account could be determined for this acquisition."
+# because the fits scan classified EVERY ASSET row: the AR control "Accounts
+# Receivable" and the customer sub-ledger "alpha associates" landed on
+# "Vehicles" via category_for_item's nearest-vocabulary fallback, and with the
+# real "Vehicle - Car" also matching the decision became a phantom
+# mode="ask" — so the plan carried NO ledger and the acquisition could not post.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+class TestNonPpeLedgersAreNeverCandidates:
+    async def test_party_subledgers_do_not_fake_a_vehicle_tie(self, monkeypatch):
+        ar = _acct("Accounts Receivable", code="1100")
+        _patch_chart(monkeypatch, [
+            ar,
+            _acct("alpha associates", code="1100-0007", parent=ar["id"]),
+            _acct("ABC Furnitures", code="1100-0005", parent=ar["id"]),
+            _acct("Computer Equipment", code="1500"),
+            _acct("Vehicle - Car", code="1520"),
+        ])
+        decision = await decide_fixed_asset_ledger(
+            ORG, asset_name="Today Honda Civic"
+        )
+        # exactly ONE fitting ledger → reuse it; never an ask
+        assert decision.mode == "reuse"
+        assert decision.name == "Vehicle - Car"
+        assert decision.candidates == []
+
+    async def test_a_customer_named_like_furniture_is_not_the_furniture_ledger(
+        self, monkeypatch
+    ):
+        ar = _acct("Accounts Receivable", code="1100")
+        _patch_chart(monkeypatch, [
+            ar, _acct("ABC Furnitures", code="1100-0005", parent=ar["id"]),
+        ])
+        decision = await decide_fixed_asset_ledger(ORG, asset_name="office chairs")
+        # a receivable sub-ledger must never receive an asset acquisition
+        assert decision.mode == "create"
+        assert decision.name == "Furniture & Fixtures"
+
+    async def test_a_real_ppe_ledger_under_a_ppe_heading_is_still_reused(
+        self, monkeypatch
+    ):
+        heading = _acct("Property, Plant & Equipment", code="1500")
+        furniture = _acct("Furniture & Fixtures", code="1530", parent=heading["id"])
+        _patch_chart(monkeypatch, [heading, furniture])
+        decision = await decide_fixed_asset_ledger(ORG, asset_name="office chairs")
+        assert decision.mode == "reuse"
+        assert decision.account_id == furniture["id"]
+
+    async def test_the_production_request_pins_the_vehicle_ledger(self, monkeypatch):
+        ar = _acct("Accounts Receivable", code="1100")
+        vehicle = _acct("Vehicle - Car", code="1520")
+        _patch_chart(monkeypatch, [
+            ar,
+            _acct("alpha associates", code="1100-0007", parent=ar["id"]),
+            _acct("Computer Equipment", code="1500"),
+            vehicle,
+        ])
+        call = ToolCall(
+            tool_name="register_fixed_asset",
+            arguments={"name": "Today Honda Civic", "purchase_cost": 3_450_000.0},
+        )
+        gap = await pin_planned_asset_accounts(ORG, tool_calls=[call])
+        assert gap is None                       # the plan IS executable
+        assert call.arguments["asset_account_id"] == vehicle["id"]
+        assert "asset_account_name" not in call.arguments
+
+
+# ---------------------------------------------------------------------------
+# The SERVICE's keyword fallback excludes non-PPE accounts too, so one real
+# PPE ledger still resolves uniquely for callers that omit the account
+# (the REST endpoint relies on exactly this).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+class TestServiceKeywordSearchExcludesNonPpe:
+    async def _service(self, monkeypatch):
+        from app.services import fixed_asset_service as fas
+
+        ar = _acct("Accounts Receivable", code="1100")
+        rows = [
+            ar,
+            _acct("ABC Furnitures", code="1100-0005", parent=ar["id"]),
+            _acct("Vehicle - Car", code="1520"),
+        ]
+
+        async def fake_chart(org_id, *, account_type="ASSET", limit=100, **kw):
+            return list(rows)
+
+        monkeypatch.setattr(fas.account_repo, "get_chart_of_accounts", fake_chart)
+        return fas
+
+    async def test_without_the_flag_the_customer_ledger_still_poisons_it(
+        self, monkeypatch
+    ):
+        fas = await self._service(monkeypatch)
+        found = await fas._resolve_gl_account(
+            ORG,
+            account_type="ASSET",
+            keywords=fas._ASSET_ACCOUNT_KEYWORDS,
+            explicit_id=None,
+            exclude_keywords=("accumulated depreciation",),
+        )
+        assert found is None  # ambiguous: 'ABC Furnitures' + 'Vehicle - Car'
+
+    async def test_with_the_flag_the_one_real_ppe_ledger_resolves(self, monkeypatch):
+        fas = await self._service(monkeypatch)
+        found = await fas._resolve_gl_account(
+            ORG,
+            account_type="ASSET",
+            keywords=fas._ASSET_ACCOUNT_KEYWORDS,
+            explicit_id=None,
+            exclude_keywords=("accumulated depreciation",),
+            exclude_non_ppe=True,
+        )
+        assert found is not None and found["name"] == "Vehicle - Car"
+
+    async def test_a_named_non_ppe_ledger_is_refused_with_a_precise_reason(
+        self, monkeypatch
+    ):
+        """'missing' would be a lie: the ledger exists, it just cannot hold
+        an acquisition.  Say which one it is."""
+        fas = await self._service(monkeypatch)
+        with pytest.raises(ValueError) as excinfo:
+            await fas._resolve_gl_account(
+                ORG,
+                account_type="ASSET",
+                keywords=fas._ASSET_ACCOUNT_KEYWORDS,
+                explicit_id=None,
+                explicit_name="ABC Furnitures",
+                exclude_non_ppe=True,
+            )
+        message = str(excinfo.value)
+        assert "ABC Furnitures" in message
+        assert "not a property, plant & equipment ledger" in message
 

@@ -267,6 +267,7 @@ async def _resolve_gl_account(
     explicit_id: Optional[uuid.UUID],
     exclude_keywords: tuple = (),
     explicit_name: Optional[str] = None,
+    exclude_non_ppe: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Deterministic GL account resolution (unique keyword match only).
 
@@ -275,6 +276,13 @@ async def _resolve_gl_account(
     plan).  ``exclude_keywords`` removes structural non-candidates (e.g.
     contra accounts such as 'Accumulated Depreciation - X' must never be
     chosen as the ASSET-COST account for an acquisition).
+
+    ``exclude_non_ppe`` (ASSET-cost lookups only) additionally drops accounts
+    that cannot be a PPE ledger at all — receivables/payables, cash/bank,
+    prepaid/tax/contra accounts, and PARTY SUB-LEDGERS hanging under such a
+    control account.  Without it, a customer ledger named "ABC Furnitures"
+    matched the PPE keyword "furniture" and made the sole asset-cost
+    resolution AMBIGUOUS (production 2026-10-03).
     """
     if explicit_id:
         acct = await account_repo.get_account(
@@ -288,11 +296,32 @@ async def _resolve_gl_account(
     accounts = await account_repo.get_chart_of_accounts(
         organization_id, account_type=account_type, limit=100
     )
+    unfiltered = list(accounts or [])
+    if exclude_non_ppe and str(account_type or "").upper() == "ASSET":
+        from app.account_resolution import is_ppe_ledger_candidate
+
+        chart_by_id = {str(a.get("id") or ""): a for a in unfiltered}
+        accounts = [
+            a for a in unfiltered
+            if is_ppe_ledger_candidate(a, by_id=chart_by_id)
+        ]
     if explicit_name:
         wanted = str(explicit_name).strip().lower()
         for acct in accounts or []:
             if str(acct.get("name") or "").strip().lower() == wanted:
                 return acct
+        if exclude_non_ppe:
+            # The ledger may EXIST but be structurally unable to hold an
+            # acquisition (a receivable/cash/contra account).  That is not
+            # "missing" — name it, so the caller is told what is actually wrong.
+            for acct in unfiltered:
+                if str(acct.get("name") or "").strip().lower() == wanted:
+                    raise ValueError(
+                        f"'{acct.get('name')}' is not a property, plant & "
+                        "equipment ledger, so it cannot receive an asset "
+                        "acquisition. Pin a PPE ledger (e.g. 'Computer "
+                        "Equipment') or create one first."
+                    )
         return None  # caller reports WHICH ledger is missing
     matches = [
         a for a in accounts or []
@@ -408,6 +437,8 @@ async def register_asset(
         explicit_id=asset_account_id,
         exclude_keywords=("accumulated depreciation",),
         explicit_name=str(asset_account_name or "").strip() or None,
+        # Party sub-ledgers / current-asset accounts are never PPE ledgers.
+        exclude_non_ppe=True,
     )
     if not asset_account and asset_account_name:
         raise ValueError(
@@ -865,6 +896,8 @@ async def dispose_asset(
             if asset.get("gl_asset_account_id") else None
         ),
         exclude_keywords=("accumulated depreciation",),
+        # Party sub-ledgers / current-asset accounts are never PPE ledgers.
+        exclude_non_ppe=True,
     )
     acc_dep_account = await _resolve_gl_account(
         organization_id,

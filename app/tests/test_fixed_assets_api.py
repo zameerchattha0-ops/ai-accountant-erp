@@ -465,6 +465,37 @@ class TestRegisterCarriesConfiguration:
         assert seen["created_by"] is not None
 
     @pytest.mark.asyncio
+    async def test_register_forwards_the_pinned_ledger_name(self, monkeypatch):
+        """A caller that NAMES the asset ledger must not lose it.
+
+        This endpoint used to drop ``asset_account_name`` silently, so a
+        caller pinning 'Building - Model Town' (the ledger created first in
+        the same run) fell back to the ambiguous keyword search and died with
+        "No fixed-asset account could be determined for this acquisition"
+        (production 2026-10-03).
+        """
+        from app import main as main_mod
+        from app.services import fixed_asset_service
+
+        seen: dict = {}
+
+        async def fake_register(org_id, **kw):
+            seen.update(kw)
+            return {"id": "a1"}
+
+        monkeypatch.setattr(fixed_asset_service, "register_asset", fake_register)
+        await main_mod.create_fixed_asset_endpoint(
+            {
+                "name": "Building @ Model Town",
+                "purchase_cost": 35_000_000,
+                "asset_account_name": "Building - Model Town",
+            },
+            auth=_auth(),
+        )
+        assert seen["asset_account_name"] == "Building - Model Town"
+        assert seen["asset_account_id"] is None
+
+    @pytest.mark.asyncio
     async def test_non_uuid_ids_are_409_not_500(self):
         from app import main as main_mod
         from fastapi import HTTPException

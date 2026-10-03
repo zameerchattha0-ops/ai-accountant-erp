@@ -1509,6 +1509,12 @@ async def create_fixed_asset_endpoint(
             payment_method=str(payload.get("payment_method") or "CASH").upper(),
             supplier_name=payload.get("supplier_name"),
             asset_account_id=_optional_uuid(payload.get("asset_account_id")),
+            # The plan/service pin the ASSET-COST ledger by NAME too (e.g.
+            # 'Building - Model Town' created first in the same run).  This
+            # endpoint used to DROP the name silently, so a caller that named
+            # the ledger fell back to the ambiguous keyword search and died
+            # with "No fixed-asset account could be determined".
+            asset_account_name=payload.get("asset_account_name"),
             useful_life_years=life_years,
             depreciation_method=str(
                 payload.get("depreciation_method") or "STRAIGHT_LINE"

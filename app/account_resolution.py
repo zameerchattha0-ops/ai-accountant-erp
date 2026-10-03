@@ -183,6 +183,73 @@ def is_category_parent(
     return not any(pattern in name for pattern in _NON_CATEGORY_PARENT_PATTERNS)
 
 
+# ---------------------------------------------------------------------------
+# LEDGER CANDIDACY — the same section contract, applied to CHOOSING a ledger.
+#
+# A receivable / payable / cash / bank / prepaid / advance / tax / contra
+# account is never the PPE ledger of an acquisition, however well its NAME
+# matches, and a PARTY sub-ledger hangs UNDER such a control account, so it
+# inherits its parent's section.
+#
+# Production 2026-10-03 (session 169a88e0, "Honda Civic"): the fits scan
+# classified EVERY ASSET row, so the customer ledger "alpha associates" and
+# the AR control "Accounts Receivable" landed on "Vehicles" (via
+# category_for_item's nearest-vocabulary fallback) while the real
+# "Vehicle - Car" also matched — a phantom multi-way TIE → mode="ask" → the
+# plan carried NO ledger → "No fixed-asset account could be determined".
+# The same customer-sub-ledger pollution made the service's own keyword match
+# ambiguous ("ABC Furnitures" matched the PPE word "furniture").
+# ---------------------------------------------------------------------------
+_NON_PPE_SECTION_PATTERNS: Tuple[str, ...] = _NON_CATEGORY_PARENT_PATTERNS
+
+
+def _in_non_ppe_section(name: Any) -> bool:
+    low = str(name or "").strip().lower()
+    return any(pattern in low for pattern in _NON_PPE_SECTION_PATTERNS)
+
+
+def is_ppe_ledger_candidate(
+    account: Optional[Mapping[str, Any]],
+    *,
+    by_id: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> bool:
+    """May *account* serve as the ASSET-COST ledger of a PPE acquisition?
+
+    Structural, not merely lexical: the account must not itself sit in a
+    current-asset / receivable / payable / settlement / tax / contra section,
+    and a party sub-ledger (a child of such a control account) inherits that
+    section — so it is never a PPE candidate.  A genuine PPE ledger parented
+    under a PPE heading is still a candidate.
+    """
+    if not account:
+        return False
+    if _in_non_ppe_section(account.get("name")):
+        return False
+    parent_id = str(account.get("parent_account_id") or "").strip()
+    if parent_id and by_id:
+        parent = by_id.get(parent_id)
+        if parent is not None and _in_non_ppe_section(parent.get("name")):
+            return False
+    return True
+
+
+def _category_regex_only(text: Any) -> Optional[str]:
+    """The category a name LITERALLY matches — never the fuzzy fallback.
+
+    Ledger CANDIDACY must be literal.  ``category_for_item``'s
+    nearest-vocabulary fallback exists for the user's ITEM wording
+    ("vhecle" → Vehicles); applied to ACCOUNT NAMES it mapped
+    "accounts receivable" and "alpha associates" onto "Vehicles".
+    """
+    low = str(text or "").strip().lower()
+    if not low:
+        return None
+    for pattern, category in _ITEM_CATEGORY_RULES:
+        if re.search(pattern, low):
+            return category
+    return None
+
+
 def category_for_item(text: Any) -> str:
     """The CATEGORY ledger an item belongs to (never the item's own name).
 
@@ -607,9 +674,15 @@ async def decide_fixed_asset_ledger(
     def _key(value: Any) -> str:
         return str(value or "").strip().lower()
 
+    # Only genuine PPE-candidate ledgers may be reused or counted as a TIE.
+    # Party sub-ledgers (children of a receivable/payable control account) and
+    # current-asset / settlement / tax / contra accounts are structurally
+    # excluded — never a lexical guess, and never by name alone.
+    chart_rows = list(chart or [])
+    by_id = {str(a.get("id") or ""): a for a in chart_rows}
     rows = [
-        a for a in chart or []
-        if "accumulated depreciation" not in _key(a.get("name"))
+        a for a in chart_rows
+        if is_ppe_ledger_candidate(a, by_id=by_id)
     ]
 
     def _exact(ledger_name: str) -> Optional[Dict[str, Any]]:
@@ -650,10 +723,13 @@ async def decide_fixed_asset_ledger(
     # 4) Same-category ledgers under other names: exactly one fits → reuse
     #    it; several fit → the user must choose (never guess); none → create.
     if category != _bucket_category():
+        # LITERAL match only: the fuzzy nearest-vocabulary fallback is for the
+        # user's ITEM wording ("vhecle" → Vehicles).  Applied to ACCOUNT NAMES
+        # it made "accounts receivable" / "alpha associates" fit "Vehicles",
+        # inventing a multi-way tie that left the plan with no ledger.
         fits = [
             a for a in rows
-            if str(a.get("name") or "").strip()
-            and category_for_item(a.get("name")) == category
+            if _category_regex_only(a.get("name")) == category
         ]
         if len(fits) == 1:
             return _reuse(fits[0])
