@@ -1914,6 +1914,74 @@ def _confirmation_summary(plan) -> str:
     return "Pending confirmation — " + "; ".join(bits) + "."
 
 
+async def _depreciation_policy_gate(
+    *, session_id: uuid.UUID, execution_plan
+) -> Optional[AgentResponse]:
+    """ASSET-ACQUISITION POLICY (material, never guessed) — asked BEFORE PHASE 5.
+
+    ``plan_incomplete`` only fires for plans with NO financial mutation, so a
+    RESOLVED ``register_fixed_asset`` (the R5 fast path) used to reach the
+    confirmation snapshot with useful life / method / salvage unanswered:
+    ``register_asset`` then silently applied its own defaults (STRAIGHT_LINE,
+    no schedule) and the user never saw a depreciation question.  A registered
+    asset with no policy is undisposable later — its book value can never be
+    corrected — so the policy is material and is asked BEFORE the plan is
+    snapshotted, as ONE consolidated round (``planner._missing_fields`` has
+    already computed what is missing; an explicit decline settles it too).
+
+    Returns ``None`` when the policy is complete, declined, or the plan is
+    not an acquisition — then PHASE 5 continues unchanged.
+    """
+    if str(getattr(execution_plan, "intent", "") or "") != "register_fixed_asset":
+        return None
+    ents = getattr(execution_plan, "extracted_entities", None) or {}
+    if ents.get("depreciation_declined"):
+        return None
+    missing = [
+        f
+        for f in (getattr(execution_plan, "missing_fields", None) or [])
+        if f in ("useful_life_years", "depreciation_method", "salvage_value")
+    ]
+    if not missing:
+        return None
+
+    from app.planner import human_questions_for_missing
+
+    lines = human_questions_for_missing(
+        "register_fixed_asset", missing, ents, limit=3
+    )
+    question = " ".join(f"{i + 1}) {q}" for i, q in enumerate(lines))
+    try:
+        clar = await create_clarification(
+            session_id=session_id,
+            question=question,
+            required_fields=list(missing),
+        )
+        question = clar.get("question", question)
+    except Exception as exc:  # noqa: BLE001 — asking is not optional
+        log.warning(
+            "agent.depreciation_policy_clarification_failed",
+            session_id=str(session_id),
+            error=str(exc)[:200],
+        )
+    await _log_step(
+        session_id,
+        "AWAITING_CLARIFICATION",
+        {
+            "source": "asset_depreciation_policy",
+            "fields": list(missing),
+            "question": question[:300],
+        },
+    )
+    return AgentResponse(
+        status=ExecutionStatus.AWAITING_CLARIFICATION,
+        execution_id=session_id,
+        question=question,
+        required_information=list(missing),
+        requires_user_input=True,
+    )
+
+
 async def _account_rescue_question(
     *,
     session_id: uuid.UUID,
@@ -4564,6 +4632,17 @@ async def execute(
             and planned_tool_calls
             and not confirmation_granted
         ):
+            # ---- ASSET-ACQUISITION POLICY (material, never guessed) --------
+            # Asked HERE, before the plan is snapshotted: the completeness card
+            # below only fires for plans with NO financial mutation, so a
+            # RESOLVED register_fixed_asset (the R5 fast path) used to reach
+            # confirmation with useful life / method / salvage unanswered.
+            _policy_gate = await _depreciation_policy_gate(
+                session_id=session_id,
+                execution_plan=execution_plan,
+            )
+            if _policy_gate is not None:
+                return _policy_gate
             # ---- PLAN COMPLETENESS: fail closed BEFORE the user approves ----
             # An approved plan that performs no financial mutation cannot deliver
             # the operation the user asked for.  Refuse to snapshot it: ask
