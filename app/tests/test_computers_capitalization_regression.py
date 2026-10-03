@@ -34,6 +34,7 @@ import pytest
 
 import app.agent as agent_mod
 from app.agent import execute, resume_with_confirmation
+from app.repositories import account_repository
 from app.models.schemas import (
     ExecutionPlan,
     ExecutionStatus,
@@ -254,6 +255,17 @@ def _install(monkeypatch, session, s: dict):
     monkeypatch.setattr(agent_mod, "_log_step", s["log_step"])
     monkeypatch.setattr(agent_mod, "log_tool_call", s["log_tool_call"])
     monkeypatch.setattr(agent_mod, "flush_step_logs", _AM())
+    # THE LEDGER PIN reads the chart through account_repository →
+    # app.database.fetch_many — NOT agent_mod.fetch_many (stubbed above).
+    # Left live, the whole asset-ledger decision depended on a REAL Supabase
+    # round-trip: a successful read returns [] for this random org
+    # (→ mode="create" → create_account runs FIRST), while a timeout/5xx is
+    # caught and yields mode="unresolved" (→ no gap → NO create_account), so
+    # the exact tool-run assertion below failed intermittently.  Hermetic now.
+    monkeypatch.setattr(
+        account_repository, "get_chart_of_accounts", _AM(return_value=[])
+    )
+    monkeypatch.setattr(account_repository, "search_accounts", _AM(return_value=[]))
     monkeypatch.setattr(
         agent_mod, "create_clarification", s["create_clarification"],
     )
