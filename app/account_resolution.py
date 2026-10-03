@@ -184,28 +184,83 @@ def is_category_parent(
 
 
 # ---------------------------------------------------------------------------
-# LEDGER CANDIDACY — the same section contract, applied to CHOOSING a ledger.
+# MAIN ACCOUNTING HEADS — the balance-sheet structure every fixed-asset
+# decision is scoped to.
 #
-# A receivable / payable / cash / bank / prepaid / advance / tax / contra
-# account is never the PPE ledger of an acquisition, however well its NAME
-# matches, and a PARTY sub-ledger hangs UNDER such a control account, so it
-# inherits its parent's section.
+#   Assets      → Fixed Assets (non-current) , then Current Assets
+#   Liabilities → Non-current Liabilities    , then Current Liabilities
+#   Capital     → Equity
 #
-# Production 2026-10-03 (session 169a88e0, "Honda Civic"): the fits scan
-# classified EVERY ASSET row, so the customer ledger "alpha associates" and
-# the AR control "Accounts Receivable" landed on "Vehicles" (via
-# category_for_item's nearest-vocabulary fallback) while the real
-# "Vehicle - Car" also matched — a phantom multi-way TIE → mode="ask" → the
-# plan carried NO ledger → "No fixed-asset account could be determined".
-# The same customer-sub-ledger pollution made the service's own keyword match
-# ambiguous ("ABC Furnitures" matched the PPE word "furniture").
+# REQUIREMENT (2026-10-03): when a request is identified as a FIXED-ASSET
+# query, ONLY the Fixed Assets head may be analysed — never Current Assets
+# (Receivables, Bank, Cash, Prepaid …) and never a contra account.
+#
+# The head is derived STRUCTURALLY: a party sub-ledger hangs UNDER its
+# control account, so it inherits that account's head, however well its NAME
+# matches a PPE category.  Production 2026-10-03 (session 169a88e0): the
+# customer ledger "alpha associates" and the AR control "Accounts Receivable"
+# both landed on "Vehicles" through category_for_item's nearest-vocabulary
+# fallback while "ABC Furnitures" matched the PPE keyword "furniture" — a
+# phantom tie that left the plan with no ledger and killed the acquisition
+# with "No fixed-asset account could be determined".
 # ---------------------------------------------------------------------------
+HEAD_FIXED_ASSETS = "FIXED_ASSETS"
+HEAD_CURRENT_ASSETS = "CURRENT_ASSETS"
+HEAD_CONTRA = "CONTRA"
+
+#: The CURRENT-ASSETS head: never a PPE ledger, never a fixed-asset
+#: candidate, however descriptive its name.
+_CURRENT_ASSET_SECTION_PATTERNS: Tuple[str, ...] = (
+    "receivab", "payable", "cash", "bank", "inventor", "stock", "prepaid",
+    "advance", "vat", "tax",
+)
+
+#: Contra accounts sit on the fixed-asset side of the sheet but never
+#: receive a capitalised cost.
+_CONTRA_SECTION_PATTERNS: Tuple[str, ...] = ("accumulated depreciation", "contra")
+
+#: Union of both — the single "not a PPE ledger" test (the same pattern list
+#: already backs the heading guard ``is_category_parent``).
 _NON_PPE_SECTION_PATTERNS: Tuple[str, ...] = _NON_CATEGORY_PARENT_PATTERNS
 
 
-def _in_non_ppe_section(name: Any) -> bool:
+def _section_of_name(name: Any) -> Optional[str]:
+    """Head implied by an account's NAME alone, or ``None`` when undecided."""
     low = str(name or "").strip().lower()
-    return any(pattern in low for pattern in _NON_PPE_SECTION_PATTERNS)
+    if any(p in low for p in _CONTRA_SECTION_PATTERNS):
+        return HEAD_CONTRA
+    if any(p in low for p in _CURRENT_ASSET_SECTION_PATTERNS):
+        return HEAD_CURRENT_ASSETS
+    return None
+
+
+def account_head(
+    account: Optional[Mapping[str, Any]],
+    *,
+    by_id: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Optional[str]:
+    """The MAIN head an ASSET account belongs to.
+
+    ``FIXED_ASSETS`` | ``CURRENT_ASSETS`` | ``CONTRA`` (``None`` only for an
+    absent row, which is never a candidate).
+
+    Order: the account's own name, then its PARENT (a party sub-ledger
+    inherits its control account's head — this is what keeps
+    "alpha associates" out of Fixed Assets), then the conservative default:
+    an ASSET that is neither current nor contra is FIXED_ASSETS, so an oddly
+    named PPE ledger is never silently dropped from its own acquisition.
+    """
+    if not account:
+        return None
+    head = _section_of_name(account.get("name"))
+    if head is not None:
+        return head
+    parent_id = str(account.get("parent_account_id") or "").strip()
+    if parent_id and by_id:
+        parent = by_id.get(parent_id)
+        if parent is not None:
+            return account_head(parent, by_id=by_id)
+    return HEAD_FIXED_ASSETS
 
 
 def is_ppe_ledger_candidate(
@@ -215,22 +270,74 @@ def is_ppe_ledger_candidate(
 ) -> bool:
     """May *account* serve as the ASSET-COST ledger of a PPE acquisition?
 
-    Structural, not merely lexical: the account must not itself sit in a
-    current-asset / receivable / payable / settlement / tax / contra section,
-    and a party sub-ledger (a child of such a control account) inherits that
-    section — so it is never a PPE candidate.  A genuine PPE ledger parented
-    under a PPE heading is still a candidate.
+    Exactly "is this account in the FIXED_ASSETS head?" — current-asset
+    accounts, contra accounts and party sub-ledgers (which inherit their
+    control account's head) are all excluded.  A genuine PPE ledger parented
+    under a PPE heading stays a candidate.
     """
     if not account:
         return False
-    if _in_non_ppe_section(account.get("name")):
-        return False
-    parent_id = str(account.get("parent_account_id") or "").strip()
-    if parent_id and by_id:
-        parent = by_id.get(parent_id)
-        if parent is not None and _in_non_ppe_section(parent.get("name")):
-            return False
-    return True
+    return account_head(account, by_id=by_id) == HEAD_FIXED_ASSETS
+
+
+# ---------------------------------------------------------------------------
+# DESCRIPTIVE KEYWORD MATCH — how well a ledger's name explains the
+# ACQUISITION being recorded.  Used ONLY to break a genuine tie between 2+
+# ledgers of the SAME category, and only above the 75% floor: below that a
+# "choice" would be a guess, so a unique ledger is created instead.
+# ---------------------------------------------------------------------------
+#: Strictly GREATER than this share of the acquisition's descriptive
+#: keywords must be carried by the winning ledger's name.
+_TIE_KEYWORD_FLOOR = 0.75
+
+#: Words describing the DEAL, not the ASSET — they can never identify a
+#: ledger ("We buy today Honda Civic for 3,450,000 on cash" → {honda, civic}).
+_DESCRIPTIVE_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by",
+    "is", "was", "its", "this", "that", "we", "our", "my", "it", "as",
+    "new", "old", "used", "bought", "buy", "buying", "purchase", "purchased",
+    "purchases", "acquired", "acquire", "from", "with", "some", "unit",
+    "units", "pcs", "pc", "nos", "set", "sets", "one", "two", "three",
+    "four", "five", "amount", "worth", "paid", "cash", "credit", "today",
+    "yesterday", "tomorrow", "daily", "total", "cost", "price", "pkr", "usd",
+})
+
+
+def descriptive_keywords(text: Any) -> List[str]:
+    """Significant, folded words that DESCRIBE *text* (its identity)."""
+    words: List[str] = []
+    for raw in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        if len(raw) < 3 or raw in _DESCRIPTIVE_STOPWORDS:
+            continue
+        folded = raw[:-1] if len(raw) > 3 and raw.endswith("s") else raw
+        if folded and folded not in words:
+            words.append(folded)
+    return words
+
+
+def descriptive_keyword_match(asset_name: Any, ledger_name: Any) -> float:
+    """Share (0..1) of the ASSET's descriptive keywords the LEDGER carries.
+
+    Plural-insensitive and prefix-tolerant ("vehicle" ~ "vehicles"),
+    deterministic, no model: ``0.0`` means the ledger's name explains
+    nothing about this acquisition.
+    """
+    wanted = descriptive_keywords(asset_name)
+    if not wanted:
+        return 0.0
+    have = set(descriptive_keywords(ledger_name))
+    if not have:
+        return 0.0
+    hits = 0
+    for w in wanted:
+        for h in have:
+            if w == h or (
+                len(w) >= 4 and len(h) >= 4
+                and (w.startswith(h) or h.startswith(w))
+            ):
+                hits += 1
+                break
+    return hits / len(wanted)
 
 
 def _category_regex_only(text: Any) -> Optional[str]:
@@ -721,7 +828,9 @@ async def decide_fixed_asset_ledger(
         return _reuse(row)
 
     # 4) Same-category ledgers under other names: exactly one fits → reuse
-    #    it; several fit → the user must choose (never guess); none → create.
+    #    it; several fit → only a descriptive match STRICTLY better than 75%
+    #    may choose between them, otherwise a UNIQUE ledger is created in this
+    #    category; none fit → create.
     if category != _bucket_category():
         # LITERAL match only: the fuzzy nearest-vocabulary fallback is for the
         # user's ITEM wording ("vhecle" → Vehicles).  Applied to ACCOUNT NAMES
@@ -734,10 +843,23 @@ async def decide_fixed_asset_ledger(
         if len(fits) == 1:
             return _reuse(fits[0])
         if len(fits) > 1:
-            return AssetLedgerDecision(
-                mode="ask", category=category, name=category,
-                candidates=[str(a.get("name")) for a in fits[:4]],
+            # 2+ PPE ledgers in the SAME category.  The acquisition's own
+            # descriptive keywords must EXPLAIN a ledger (>75% of them) —
+            # otherwise choosing one would be a guess.
+            best_score, best = max(
+                (
+                    (descriptive_keyword_match(name, a.get("name")), a)
+                    for a in fits
+                ),
+                key=lambda pair: pair[0],
             )
+            if best_score > _TIE_KEYWORD_FLOOR:
+                return _reuse(best)
+            # Nothing explains this acquisition well enough → create a UNIQUE
+            # ledger in this category.  Step 3 proved no ledger is named
+            # exactly `category`, so the new one cannot collide, and every
+            # later acquisition in the category then reuses it.
+            return AssetLedgerDecision(mode="create", category=category, name=category)
 
     # 5) Nothing fits → the category ledger must be created first.
     return AssetLedgerDecision(mode="create", category=category, name=category)

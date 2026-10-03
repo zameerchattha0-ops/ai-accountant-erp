@@ -501,6 +501,26 @@ async def _search_account_by_nature(
     # "Services Revenue" and a purchase would credit-side revenue).
     expense_nature = nature in (OPERATING_EXPENSE, CONSUMABLE, SERVICE)
 
+    # FIXED-ASSET queries analyse the FIXED ASSETS head ONLY — never Current
+    # Assets (Receivables, Bank, Cash, Prepaid …) and never a party
+    # sub-ledger, however descriptive its name.  The parent map lets a party
+    # sub-ledger be recognised by INHERITANCE; best-effort, so a failed chart
+    # read degrades to name-based classification instead of failing the hint.
+    fixed_asset_nature = nature == FIXED_ASSET
+    head_by_id: Dict[str, Dict[str, Any]] = {}
+    if fixed_asset_nature:
+        from app.account_resolution import account_head  # noqa: F811
+
+        try:
+            _chart = await a_repo.get_chart_of_accounts(organization_id, limit=500)
+            head_by_id = {
+                str(a.get("id") or ""): a for a in _chart or [] if a.get("id")
+            }
+        except Exception as exc:  # noqa: BLE001 — scope is best-effort
+            log.warning(
+                "classifier.fixed_asset_head_scope_failed", error=str(exc)[:200]
+            )
+
     # For expense natures a generic category match must be tied to the
     # item by a deterministic rule — otherwise whichever category account
     # the search hits first (e.g. Utilities) would capture every unmapped
@@ -517,6 +537,12 @@ async def _search_account_by_nature(
             return False
         if expense_nature and acc.get("account_type") not in (None, "EXPENSE"):
             return False
+        if fixed_asset_nature:
+            # Only a ledger of the FIXED ASSETS head may answer.
+            if acc.get("account_type") not in (None, "ASSET"):
+                return False
+            if account_head(acc, by_id=head_by_id) != "FIXED_ASSETS":
+                return False
         return True
 
     for term in _ACCOUNT_SEARCH_TERMS.get(nature, []):

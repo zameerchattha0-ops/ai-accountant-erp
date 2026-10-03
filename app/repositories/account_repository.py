@@ -21,7 +21,8 @@ async def search_accounts(
         column="name",
         value=query,
         organization_id=organization_id,
-        select="id,code,name,account_type,normal_balance,is_active,is_control_account",
+        select=("id,code,name,account_type,normal_balance,is_active,"
+                "is_control_account,parent_account_id"),
         limit=limit,
     )
     by_code = await search_ilike(
@@ -29,7 +30,8 @@ async def search_accounts(
         column="code",
         value=query,
         organization_id=organization_id,
-        select="id,code,name,account_type,normal_balance,is_active,is_control_account",
+        select=("id,code,name,account_type,normal_balance,is_active,"
+                "is_control_account,parent_account_id"),
         limit=limit,
     )
     # De-duplicate by id

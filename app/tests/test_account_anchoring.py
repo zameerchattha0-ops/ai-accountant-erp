@@ -111,6 +111,64 @@ class TestAnchoredAcceptance:
         ) is None
 
 
+# ---------------------------------------------------------------------------
+# FIXED-ASSET SCOPE (2026-10-03): a PPE is NEVER a child of Current Assets.
+# A purchase on credit sets up a Payable and a credit sale a Receivable — but
+# the ASSET itself stays under Fixed Assets, so a FIXED_ASSET query may only
+# ever be anchored by the FIXED ASSETS head.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+class TestFixedAssetQueriesOnlyAnalyseFixedAssets:
+    @staticmethod
+    def _install(monkeypatch, rows):
+        from app.repositories import account_repository as a_repo
+
+        async def fake_search(org, *, query, limit=50):
+            q = (query or "").lower()
+            return [
+                a for a in rows
+                if q in (a.get("name") or "").lower()
+                or q in (a.get("code") or "")
+            ]
+
+        async def fake_chart(org, *, account_type=None, is_active=True, limit=500):
+            return [
+                a for a in rows
+                if account_type is None or a.get("account_type") == account_type
+            ]
+
+        monkeypatch.setattr(a_repo, "search_accounts", fake_search)
+        monkeypatch.setattr(a_repo, "get_chart_of_accounts", fake_chart)
+
+    async def test_a_party_ledger_under_receivables_never_answers(self, monkeypatch):
+        """The term "furniture" also matches the CUSTOMER sub-ledger "ABC
+        Furnitures" (child of 1100 Accounts Receivable).  A fixed-asset query
+        must never anchor to a Current-Asset head."""
+        ar = {"id": "ar", "code": "1100", "name": "Accounts Receivable",
+              "account_type": "ASSET", "is_active": True}
+        party = {"id": "pc", "code": "1100-0005", "name": "ABC Furnitures",
+                 "account_type": "ASSET", "is_active": True,
+                 "parent_account_id": "ar"}
+        self._install(monkeypatch, [*CHART, ar, party])
+
+        found = await clf._search_account_by_nature(ORG, "FIXED_ASSET", "furniture")
+        assert found is None, (found or {}).get("name")
+
+    async def test_a_real_ppe_ledger_still_answers(self, monkeypatch):
+        """The scope must not over-block: a genuine PPE ledger still anchors."""
+        ar = {"id": "ar", "code": "1100", "name": "Accounts Receivable",
+              "account_type": "ASSET", "is_active": True}
+        party = {"id": "pc", "code": "1100-0005", "name": "ABC Furnitures",
+                 "account_type": "ASSET", "is_active": True,
+                 "parent_account_id": "ar"}
+        ppe = {"id": "ff", "code": "1530", "name": "Furniture & Fixtures",
+               "account_type": "ASSET", "is_active": True}
+        self._install(monkeypatch, [*CHART, ar, party, ppe])
+
+        found = await clf._search_account_by_nature(ORG, "FIXED_ASSET", "furniture")
+        assert found is not None and found["name"] == "Furniture & Fixtures"
+
+
 class TestClassifierEscalates:
     @pytest.mark.asyncio
     async def test_user_stated_fixed_asset_without_anchor_asks(self):

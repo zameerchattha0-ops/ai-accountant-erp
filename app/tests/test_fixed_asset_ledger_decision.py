@@ -125,12 +125,43 @@ class TestLedgerDecision:
         assert decision.mode == "create"
         assert decision.name == "Buildings & Land"
 
-    async def test_genuine_tie_between_two_fitting_ledgers_asks(self, monkeypatch):
+    async def test_a_tie_with_no_descriptive_match_creates_a_unique_ledger(
+        self, monkeypatch
+    ):
+        """2+ PPE ledgers in one category, neither explains this acquisition
+        (>75% required) → create a UNIQUE ledger in that category instead of
+        guessing between them or parking the run with an ask."""
         _patch_chart(monkeypatch, [_acct("Cars"), _acct("Motor Vehicles")])
         decision = await decide_fixed_asset_ledger(ORG, asset_name="Toyota Hilux")
-        assert decision.mode == "ask"
+        assert decision.mode == "create"
         assert decision.name == "Vehicles"
-        assert sorted(decision.candidates) == ["Cars", "Motor Vehicles"]
+        assert decision.candidates == []
+
+    async def test_a_tie_is_broken_only_by_a_descriptive_match_above_75pct(
+        self, monkeypatch
+    ):
+        # {toyota, hilux, truck} are ALL carried by "Toyota Hilux Trucks" → 100%
+        _patch_chart(monkeypatch, [
+            _acct("Toyota Hilux Trucks"), _acct("Motor Vehicles"),
+        ])
+        decision = await decide_fixed_asset_ledger(
+            ORG, asset_name="Toyota Hilux Truck"
+        )
+        assert decision.mode == "reuse"
+        assert decision.name == "Toyota Hilux Trucks"
+
+    async def test_exactly_75_percent_is_still_too_weak_to_choose(
+        self, monkeypatch
+    ):
+        """Only STRICTLY better than 75% may pick: 3 of 4 keywords = 75%."""
+        _patch_chart(monkeypatch, [
+            _acct("Toyota Hilux Trucks"), _acct("Motor Vehicles"),
+        ])
+        decision = await decide_fixed_asset_ledger(
+            ORG, asset_name="Toyota Hilux Fire Truck"
+        )
+        assert decision.mode == "create"
+        assert decision.name == "Vehicles"
 
     async def test_unknown_item_proposes_the_category_not_a_guess(self, monkeypatch):
         _patch_chart(monkeypatch, [_acct("Computer Equipment")])
@@ -397,4 +428,99 @@ class TestServiceKeywordSearchExcludesNonPpe:
         message = str(excinfo.value)
         assert "ABC Furnitures" in message
         assert "not a property, plant & equipment ledger" in message
+
+
+# ---------------------------------------------------------------------------
+# MAIN ACCOUNTING HEADS — "PPE, Furniture, Land … are NEVER children of
+# Current Assets" (2026-10-03).  A purchase on credit sets up a Payable and a
+# credit sale a Receivable — but the ASSET itself stays under Fixed Assets,
+# and a party sub-ledger never inherits Fixed Assets.
+# ---------------------------------------------------------------------------
+def test_receivables_bank_and_cash_are_the_current_assets_head():
+    from app.account_resolution import HEAD_CURRENT_ASSETS, account_head
+
+    for name in (
+        "Accounts Receivable", "Bank", "Cash", "Prepaid Expenses",
+        "Inventory", "Output VAT", "Supplier Advances",
+    ):
+        assert account_head({"name": name}) == HEAD_CURRENT_ASSETS, name
+
+
+def test_a_party_sub_ledger_inherits_the_receivable_head_not_fixed_assets():
+    from app.account_resolution import HEAD_CURRENT_ASSETS, account_head
+
+    ar = {"id": "ar", "name": "Accounts Receivable"}
+    by_id = {"ar": ar}
+    # including a party whose NAME looks like PPE — the parent decides
+    for name in ("alpha associates", "ABC Furnitures", "Honda Motors"):
+        row = {"id": "p", "name": name, "parent_account_id": "ar"}
+        assert account_head(row, by_id=by_id) == HEAD_CURRENT_ASSETS, name
+
+
+def test_a_ppe_ledger_is_the_fixed_assets_head_top_level_or_under_a_ppe_heading():
+    from app.account_resolution import HEAD_FIXED_ASSETS, account_head
+
+    assert account_head({"name": "Furniture & Fixtures"}) == HEAD_FIXED_ASSETS
+    assert account_head({"name": "Land"}) == HEAD_FIXED_ASSETS
+    assert account_head({"name": "Vehicles"}) == HEAD_FIXED_ASSETS
+    heading = {"id": "ppe", "name": "Property, Plant & Equipment"}
+    row = {"id": "f", "name": "Furniture & Fixtures", "parent_account_id": "ppe"}
+    assert account_head(row, by_id={"ppe": heading}) == HEAD_FIXED_ASSETS
+
+
+def test_accumulated_depreciation_is_a_contra_never_a_cost_ledger():
+    from app.account_resolution import (
+        HEAD_CONTRA,
+        account_head,
+        is_ppe_ledger_candidate,
+    )
+
+    contra = {"name": "Accumulated Depreciation - Computer Equipment"}
+    assert account_head(contra) == HEAD_CONTRA
+    assert is_ppe_ledger_candidate(contra) is False
+
+
+@pytest.mark.asyncio
+async def test_a_fixed_asset_is_never_handed_a_current_asset_heading(
+    monkeypatch,
+):
+    """heading_account_id(ASSET) must never parent a PPE ledger under
+    Receivables/Bank/Cash — the invariant, pinned at the creation path."""
+    from app.account_resolution import heading_account_id
+    from app.repositories import account_repository as a_repo
+
+    ar = {"id": "ar", "name": "Accounts Receivable"}
+    bank = {"id": "bank", "name": "Bank"}
+
+    async def fake_chart(org, *, account_type=None, is_active=True, limit=500):
+        return [ar, bank]
+
+    async def fake_grouping(org):
+        return {"ar", "bank"}
+
+    monkeypatch.setattr(a_repo, "get_chart_of_accounts", fake_chart)
+    monkeypatch.setattr(a_repo, "get_grouping_account_ids", fake_grouping)
+    # no PPE heading exists → top-level, NEVER a current-asset parent
+    assert await heading_account_id(ORG, nature="ASSET") is None
+
+
+@pytest.mark.asyncio
+async def test_a_fixed_asset_prefers_the_ppe_heading_when_one_exists(
+    monkeypatch,
+):
+    from app.account_resolution import heading_account_id
+    from app.repositories import account_repository as a_repo
+
+    ppe = {"id": "ppe", "name": "Property, Plant & Equipment"}
+    ar = {"id": "ar", "name": "Accounts Receivable"}
+
+    async def fake_chart(org, *, account_type=None, is_active=True, limit=500):
+        return [ar, ppe]
+
+    async def fake_grouping(org):
+        return {"ar", "ppe"}
+
+    monkeypatch.setattr(a_repo, "get_chart_of_accounts", fake_chart)
+    monkeypatch.setattr(a_repo, "get_grouping_account_ids", fake_grouping)
+    assert await heading_account_id(ORG, nature="ASSET") == "ppe"
 
