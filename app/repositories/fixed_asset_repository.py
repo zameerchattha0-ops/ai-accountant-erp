@@ -16,6 +16,7 @@ The database contract is authoritative:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.database import fetch_many, fetch_one, insert_one, search_ilike, update_one
@@ -230,6 +231,70 @@ async def record_asset_transaction(
     })
 
 
+async def get_schedule_row_for_date(
+    *,
+    organization_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    depreciation_date: str,
+) -> Optional[Dict[str, Any]]:
+    """The schedule row for ONE ``(asset, date)`` — the lookup behind the
+    table's ``unique (asset_id, depreciation_date)``.
+
+    Registration seeds a 0-value row on the PURCHASE date, so this is how a
+    first charge dated the same day finds the row it must update instead of
+    colliding with it (production 2026-10-03: a same-day charge posted its
+    journal and then died on the unique key, returning 500).
+    """
+    return await fetch_one(
+        "asset_depreciation_schedules",
+        filters={
+            "organization_id": str(organization_id),
+            "asset_id": str(asset_id),
+            "depreciation_date": depreciation_date,
+        },
+    )
+
+
+async def get_depreciation_trail(
+    organization_id: uuid.UUID, *, asset_id: uuid.UUID
+) -> Dict[str, Any]:
+    """The posted CHARGE trail for one asset.
+
+    ``last_charged_date`` — the most recent date a NON-ZERO charge was posted
+    (``None`` when nothing has been charged yet); that date — or the purchase
+    date — is where the next charge's period STARTS (IAS 16: acquisition →
+    charge date on the first run, the latest charge → charge date afterwards).
+
+    ``charged_total`` — the sum of the charges in the trail, so the service can
+    notice a charge that was posted but never reached the schedule: production
+    2026-10-03 posted 54,333.33 and moved the asset's accumulated depreciation
+    while the schedule write died on the unique key — the trail is incomplete
+    and the next charge would silently overlap it.
+    """
+    rows = await fetch_many(
+        "asset_depreciation_schedules",
+        filters={
+            "organization_id": str(organization_id),
+            "asset_id": str(asset_id),
+        },
+        select="depreciation_date, depreciation_amount",
+        order="depreciation_date.desc",
+        limit=200,
+    )
+    last_charged: Optional[str] = None
+    charged_total = 0.0
+    for row in rows:
+        amount = float(row.get("depreciation_amount") or 0)
+        charged_total += amount
+        if amount > 0 and last_charged is None:
+            last_charged = str(row.get("depreciation_date"))
+    return {
+        "last_charged_date": last_charged,
+        "charged_total": round(charged_total, 2),
+        "rows": len(rows),
+    }
+
+
 async def record_depreciation_schedule(
     *,
     organization_id: uuid.UUID,
@@ -241,8 +306,16 @@ async def record_depreciation_schedule(
     journal_entry_id: Optional[uuid.UUID] = None,
     accounting_period_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
-    """Insert a posted depreciation schedule row."""
-    return await insert_one("asset_depreciation_schedules", data={
+    """Write the posted schedule row for the charge.
+
+    Insert, except when ``unique (asset_id, depreciation_date)`` already has a
+    row for that day — the registration seed row (0 charged so far, purchase
+    date).  That row is UPDATED in place, so a first charge dated the purchase
+    date still lands instead of raising after the journal was posted.  A row
+    that already carries a real charge is rejected BEFORE posting by the
+    service, so an update here can never silently swallow an earlier charge.
+    """
+    data: Dict[str, Any] = {
         "organization_id": str(organization_id),
         "asset_id": str(asset_id),
         "accounting_period_id": (
@@ -254,7 +327,28 @@ async def record_depreciation_schedule(
         "closing_book_value": closing_book_value,
         "is_posted": True,
         "journal_entry_id": str(journal_entry_id) if journal_entry_id else None,
-    })
+    }
+    try:
+        return await insert_one("asset_depreciation_schedules", data=data)
+    except Exception:
+        existing = await get_schedule_row_for_date(
+            organization_id=organization_id,
+            asset_id=asset_id,
+            depreciation_date=depreciation_date,
+        )
+        if not existing:
+            raise
+        updates = {
+            key: value
+            for key, value in data.items()
+            if key not in ("organization_id", "asset_id", "depreciation_date")
+        }
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return await update_one(
+            "asset_depreciation_schedules",
+            row_id=uuid.UUID(str(existing["id"])),
+            data=updates,
+        ) or existing
 
 
 async def get_asset_transactions(

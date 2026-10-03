@@ -155,6 +155,9 @@ class TestRegisterAsset:
                 "purchase_cost": "4000000",
                 "purchase_date": "2026-09-01",
                 "payment_method": "cash",
+                # The settlement ledger: forwarded, never dropped (the form's
+                # bank/cash picker would otherwise be silently ignored).
+                "payment_account_id": "99999999-9999-9999-9999-999999999999",
                 "useful_life_years": "5",
                 "salvage_value": "0",
             },
@@ -164,6 +167,7 @@ class TestRegisterAsset:
         assert out["item"]["asset_code"] == "FA-000001"
         assert captured["org"] == ORG
         assert captured["payment_method"] == "CASH"
+        assert str(captured["payment_account_id"]) == "99999999-9999-9999-9999-999999999999"
         assert captured["useful_life_years"] == 5
         assert captured["depreciation_method"] == "STRAIGHT_LINE"
         assert captured["created_by"] == auth.user_id

@@ -354,15 +354,64 @@ async def _resolve_supplier(
     return None
 
 
+#: Ledger wording that IS cash-on-hand.  Matched UNIQUELY against ASSET
+#: ledgers — never a bank, a card clearing account or a party control account.
+_CASH_LEDGER_KEYWORDS: tuple = (
+    "cash on hand", "cash in hand", "petty cash", "cash",
+)
+_CASH_LEDGER_EXCLUDE: tuple = (
+    "bank", "credit", "card", "receivable", "payable",
+)
+
+
+async def _resolve_cash_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """The organisation's cash-on-hand ledger (unique name match only).
+
+    ``payment_method == "CASH"`` means physical cash left the business, so the
+    acquisition must CREDIT cash-on-hand — not the default bank account
+    (production 2026-10-03: "We Purchased a Car On Cash" credited 1010 Bank
+    because the settlement resolver ignored the treatment entirely).
+
+    Zero or several candidates → ``None``: the caller keeps the historical
+    bank default rather than guessing which ledger was meant.
+    """
+    accounts = await account_repo.get_chart_of_accounts(
+        organization_id, account_type="ASSET", limit=100
+    )
+    matches = [
+        a
+        for a in accounts or []
+        if any(
+            k in str(a.get("name") or "").lower()
+            for k in _CASH_LEDGER_KEYWORDS
+        )
+        and not any(
+            x in str(a.get("name") or "").lower()
+            for x in _CASH_LEDGER_EXCLUDE
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 async def _resolve_settlement_account(
     organization_id: uuid.UUID,
     *,
-    payment_account_id: Optional[uuid.UUID],
+    payment_account_id: Optional[uuid.UUID] = None,
+    payment_method: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Resolve the cash/bank settlement account deterministically:
-    explicit id → default configured bank account's GL account → the
-    accounting engine's verified cash default (ASSET, CURRENT_ASSET
-    fallback).  Reuses the engine primitive — no duplicated logic."""
+
+    explicit id → the CASH ledger when the treatment is cash → the default
+    configured bank account's GL account → the accounting engine's verified
+    cash default (ASSET, CURRENT_ASSET fallback).  Reuses the engine primitive
+    — no duplicated logic.
+
+    ``payment_method`` is the SEGREGATION key: CASH settles against
+    cash-on-hand (1020 Cash), BANK/BANK_TRANSFER/CHEQUE/CARD against the bank
+    account.  Passing no treatment keeps the previous behaviour (bank default).
+    """
     from app.accounting_engine import _resolve_default_account
 
     if payment_account_id:
@@ -374,6 +423,15 @@ async def _resolve_settlement_account(
                 f"Account {payment_account_id} does not exist."
             )
         return acct
+
+    method = str(payment_method or "").strip().upper()
+    if method in ("CASH", "CASH_ON_HAND", "PETTY_CASH"):
+        cash = await _resolve_cash_account(organization_id)
+        if cash:
+            return cash
+        # No unique cash ledger — fall through to the bank default rather
+        # than inventing a configuration gap for an acquisition that has
+        # always settled this way.
 
     from app.repositories import organization_repository
 
@@ -550,7 +608,11 @@ async def register_asset(
             )
         else:
             counter_account = await _resolve_settlement_account(
-                organization_id, payment_account_id=payment_account_id
+                organization_id,
+                payment_account_id=payment_account_id,
+                # Segregation: "on cash" credits cash-on-hand, bank
+                # treatments credit the configured bank account.
+                payment_method=payment_method,
             )
             if not counter_account:
                 raise ValueError(
@@ -686,10 +748,13 @@ async def record_depreciation(
 ) -> Dict[str, Any]:
     """Record depreciation for an asset.
 
-    Deterministic amount: (cost − salvage) ÷ useful_life_years ÷ 12 for a
-    monthly straight-line charge when no explicit amount is given.  The
-    depreciation policy itself is NEVER invented — it comes from the
-    asset's own configuration or the user's explicit amount.
+    PERIOD (IAS 16 practice) — a charge is NEVER a blind "one month":
+    the first charge runs from the ACQUISITION date to the charge date, every
+    later charge from the LAST date a charge was posted to the charge date.
+    The default amount is straight-line for exactly that period,
+    (cost − salvage) × days ÷ (useful life × 365); an explicit amount always
+    wins.  The policy itself is NEVER invented — it comes from the asset's own
+    configuration or the user's explicit amount.
     """
     asset = await _resolve_asset_by_reference(
         organization_id, asset_id=asset_id, asset_name=asset_name
@@ -705,6 +770,68 @@ async def record_depreciation(
     salvage = float(asset.get("salvage_value") or 0)
     book_value = float(asset.get("book_value") if asset.get("book_value") is not None else cost - acc_dep)
 
+    txn_date = transaction_date or date.today().isoformat()
+
+    # ---- WHICH PERIOD does this charge cover? -----------------------------
+    # First charge: acquisition date → charge date.  Later charges: the latest
+    # posted charge → charge date (the register's schedule rows are the trail).
+    purchase_date = str(asset.get("purchase_date") or txn_date)[:10]
+    trail = await repo.get_depreciation_trail(
+        organization_id, asset_id=uuid.UUID(str(asset["id"]))
+    )
+    period_start = str(trail.get("last_charged_date") or purchase_date)[:10]
+
+    # A charge that was POSTED but never reached the schedule (the 2026-10-03
+    # failure: the journal and the asset totals landed, the schedule write died)
+    # leaves the trail short of the asset's accumulated depreciation — the next
+    # charge's period would silently overlap it. Surface that, never hide it.
+    trail_gap = round(acc_dep - float(trail.get("charged_total") or 0.0), 2)
+    trail_warning: Optional[str] = None
+    if trail_gap > 0.01:
+        trail_warning = (
+            f"The asset's accumulated depreciation ({acc_dep:,.2f}) exceeds the "
+            f"total in its depreciation trail ({float(trail.get('charged_total') or 0.0):,.2f}) "
+            f"by {trail_gap:,.2f} — a charge was posted without a schedule row "
+            "(an earlier failed write), so this charge's period may overlap it. "
+            "Reverse and repost that entry to rebuild the trail."
+        )
+        log.warning(
+            "fixed_asset.depreciation_trail_incomplete",
+            asset_id=asset["id"],
+            accumulated_depreciation=acc_dep,
+            trail_total=trail.get("charged_total"),
+            gap=trail_gap,
+        )
+    try:
+        start_d = date.fromisoformat(period_start)
+        end_d = date.fromisoformat(str(txn_date)[:10])
+    except ValueError:
+        raise ValueError(
+            f"Invalid depreciation date: {txn_date!r} (expected YYYY-MM-DD)."
+        )
+    if end_d < start_d:
+        raise ValueError(
+            f"Depreciation cannot be dated {end_d.isoformat()} — the asset is "
+            f"already depreciated through {period_start}. Choose a later date."
+        )
+    days = (end_d - start_d).days
+    txn_date = end_d.isoformat()
+
+    # A SECOND charge on an already-charged date would charge the same period
+    # twice (and collide with unique (asset_id, depreciation_date)) — refuse it
+    # BEFORE anything is posted, so no journal is ever left half-done.
+    same_day = await repo.get_schedule_row_for_date(
+        organization_id=organization_id,
+        asset_id=uuid.UUID(str(asset["id"])),
+        depreciation_date=txn_date,
+    )
+    if same_day is not None and float(same_day.get("depreciation_amount") or 0) > 0:
+        raise ValueError(
+            f"Depreciation has already been posted for {txn_date}. A new "
+            f"charge would cover {period_start} to {txn_date} — pick a later "
+            "date (or reverse the earlier entry first)."
+        )
+
     if depreciation_amount is not None:
         amount = round(float(depreciation_amount), 2)
         if amount <= 0:
@@ -716,7 +843,17 @@ async def record_depreciation(
                 f"Asset '{asset.get('name')}' has no useful life configured "
                 "and no explicit depreciation amount was provided."
             )
-        amount = round(max(cost - salvage, 0.0) / (int(life) * 12.0), 2)
+        if days <= 0:
+            raise ValueError(
+                f"No depreciation period has elapsed: the asset was acquired "
+                f"(or last depreciated) on {period_start}, so a charge dated "
+                f"{txn_date} would be zero. Choose a later date, or enter an "
+                "explicit amount."
+            )
+        # Straight line for the ACTUAL period — days ÷ 365 of the annual charge.
+        amount = round(
+            max(cost - salvage, 0.0) / float(int(life)) * days / 365.0, 2
+        )
         if amount <= 0:
             raise ValueError(
                 "Computed straight-line depreciation is zero — the asset "
@@ -729,8 +866,6 @@ async def record_depreciation(
         raise ValueError(
             f"Asset '{asset.get('name')}' is already fully depreciated."
         )
-
-    txn_date = transaction_date or date.today().isoformat()
 
     # GL accounts: caller's explicit choice (the UI's pickers) → the asset's
     # own stored column (resolved once at registration) → deterministic name
@@ -798,37 +933,90 @@ async def record_depreciation(
     # sufficient and writing book_value directly is forbidden (428C9).
     new_acc = round(acc_dep + amount, 2)
     new_book = round(cost - new_acc, 2)
-    await repo.update_asset_by_id(
-        uuid.UUID(asset["id"]),
-        fields={
-            "accumulated_depreciation": new_acc,
-            **({"status": "FULLY_DEPRECIATED"} if new_book <= salvage else {}),
-        },
-    )
+    try:
+        await repo.update_asset_by_id(
+            uuid.UUID(asset["id"]),
+            fields={
+                "accumulated_depreciation": new_acc,
+                **({"status": "FULLY_DEPRECIATED"} if new_book <= salvage else {}),
+            },
+        )
+    except Exception as exc:
+        # The journal is ALREADY POSTED.  Say exactly that (and how to fix the
+        # register) instead of surfacing a bare 500 that reads as "nothing
+        # happened" while the GL carries the charge.
+        posted_ref = str(entry.get("reference") or "").strip()
+        posted_label = f"{txn_date}" + (f" ({posted_ref})" if posted_ref else "")
+        raise ValueError(
+            f"The depreciation journal for {posted_label} WAS POSTED, but "
+            f"updating the asset's accumulated depreciation failed: {exc}. "
+            f"Set the asset's accumulated depreciation to {new_acc} — do NOT "
+            "repost the journal."
+        ) from exc
+
+    # AUDIT-TRAIL writes.  The posted journal and the asset's book value are
+    # the accounting truth; a sub-ledger row that cannot be written must never
+    # turn a successfully posted entry into a 500 (production 2026-10-03 did
+    # exactly that on the schedule's unique(asset_id, depreciation_date) key).
+    audit_warnings: List[str] = []
     if journal_id:
-        await repo.record_depreciation_schedule(
-            organization_id=organization_id,
-            asset_id=uuid.UUID(asset["id"]),
-            depreciation_date=txn_date,
-            opening_book_value=round(book_value, 2),
-            depreciation_amount=amount,
-            closing_book_value=new_book,
-            journal_entry_id=uuid.UUID(str(journal_id)),
-        )
-        await repo.record_asset_transaction(
-            organization_id=organization_id,
-            asset_id=uuid.UUID(asset["id"]),
-            transaction_type="DEPRECIATION",
-            transaction_date=txn_date,
-            amount=amount,
-            journal_entry_id=uuid.UUID(str(journal_id)),
-            details={"accumulated_depreciation": new_acc},
-        )
+        try:
+            await repo.record_depreciation_schedule(
+                organization_id=organization_id,
+                asset_id=uuid.UUID(asset["id"]),
+                depreciation_date=txn_date,
+                opening_book_value=round(book_value, 2),
+                depreciation_amount=amount,
+                closing_book_value=new_book,
+                journal_entry_id=uuid.UUID(str(journal_id)),
+            )
+        except Exception as exc:  # noqa: BLE001 — warning, never a failure
+            log.error(
+                "fixed_asset.schedule_write_failed",
+                asset_id=asset["id"],
+                depreciation_date=txn_date,
+                journal_entry_id=str(journal_id),
+                error=str(exc),
+            )
+            audit_warnings.append(
+                f"the depreciation schedule row for {txn_date} could not be "
+                f"written ({exc})"
+            )
+        try:
+            await repo.record_asset_transaction(
+                organization_id=organization_id,
+                asset_id=uuid.UUID(asset["id"]),
+                transaction_type="DEPRECIATION",
+                transaction_date=txn_date,
+                amount=amount,
+                journal_entry_id=uuid.UUID(str(journal_id)),
+                details={
+                    "accumulated_depreciation": new_acc,
+                    "period_from": period_start,
+                    "period_to": txn_date,
+                    "period_days": days,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — warning, never a failure
+            log.error(
+                "fixed_asset.transaction_write_failed",
+                asset_id=asset["id"],
+                transaction_date=txn_date,
+                journal_entry_id=str(journal_id),
+                error=str(exc),
+            )
+            audit_warnings.append(
+                f"the asset transaction audit row for {txn_date} could not be "
+                f"written ({exc})"
+            )
 
     log.info(
         "fixed_asset.depreciation_recorded",
         asset_id=asset["id"],
         amount=amount,
+        period_from=period_start,
+        period_to=txn_date,
+        period_days=days,
         journal_entry_id=str(journal_id),
     )
     return {
@@ -836,6 +1024,25 @@ async def record_depreciation(
         "accumulated_depreciation": new_acc,
         "book_value": new_book,
         "depreciation_amount": amount,
+        # Which period the charge covers — the answer to "for how long was it
+        # calculated?" without opening the schedule table.
+        "depreciation_period": {
+            "from": period_start,
+            "to": txn_date,
+            "days": days,
+            "basis": (
+                "explicit_amount" if depreciation_amount is not None
+                else "prorated_straight_line"
+            ),
+        },
+        "posting_date": txn_date,
+        # The schedule trail is short of accumulated depreciation (an earlier
+        # charge never reached it) — an overlap warning, not a failure.
+        "trail_warning": trail_warning,
+        "bookkeeping_warning": (
+            "Journal posted, but " + " and ".join(audit_warnings) + "."
+            if audit_warnings else None
+        ),
         "journal_entry": entry,
     }
 

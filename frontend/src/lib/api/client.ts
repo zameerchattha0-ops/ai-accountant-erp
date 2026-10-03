@@ -527,6 +527,12 @@ export interface RegisterFixedAssetPayload {
   purchase_cost: number;
   purchase_date?: string;
   payment_method?: string;
+  /**
+   * Explicit settlement ledger (the cash/bank picker). When omitted the
+   * backend follows `payment_method`: CASH credits cash-on-hand, every other
+   * treatment credits the configured bank account.
+   */
+  payment_account_id?: string | null;
   supplier_name?: string | null;
   /** Explicit ASSET account pick (the form's picker); omitted = name match. */
   asset_account_id?: string | null;
@@ -557,7 +563,7 @@ export async function registerFixedAsset(
   });
 }
 
-/** Post one depreciation charge (blank amount = the asset's own policy). */
+/** Post one depreciation charge (blank amount = the period's own pro-rata). */
 export async function recordAssetDepreciation(
   assetId: string,
   payload: {
@@ -567,7 +573,31 @@ export async function recordAssetDepreciation(
     depreciation_expense_account_id?: string | null;
     accumulated_depreciation_account_id?: string | null;
   }
-): Promise<{ item: FixedAsset }> {
+): Promise<{
+  item: FixedAsset & {
+    /**
+     * The period the charge covered: acquisition (or the last charge) → the
+     * charge date, computed by the backend.
+     */
+    depreciation_period?: {
+      from: string;
+      to: string;
+      days: number;
+      basis: string;
+    };
+    /**
+     * The journal IS posted and the book value IS updated; this is set only
+     * when a sub-ledger row (schedule / audit trail) could not be written.
+     */
+    bookkeeping_warning?: string | null;
+    /**
+     * The asset's accumulated depreciation exceeds the total in its
+     * depreciation trail (a charge posted without a schedule row) — this
+     * charge's period may overlap that earlier one.
+     */
+    trail_warning?: string | null;
+  };
+}> {
   return fetchApi<{ item: FixedAsset }>(
     `/api/fixed-assets/${assetId}/depreciation`,
     { method: "POST", body: JSON.stringify(payload) }

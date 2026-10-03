@@ -1515,6 +1515,10 @@ async def create_fixed_asset_endpoint(
             # the ledger fell back to the ambiguous keyword search and died
             # with "No fixed-asset account could be determined".
             asset_account_name=payload.get("asset_account_name"),
+            # The settlement ledger picker: forwarded so a bank-funded
+            # acquisition stops silently crediting the wrong account.  The
+            # service maps payment_method → cash-on-hand vs bank.
+            payment_account_id=_optional_uuid(payload.get("payment_account_id")),
             useful_life_years=life_years,
             depreciation_method=str(
                 payload.get("depreciation_method") or "STRAIGHT_LINE"

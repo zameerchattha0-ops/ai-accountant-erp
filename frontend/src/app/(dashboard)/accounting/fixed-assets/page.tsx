@@ -491,7 +491,7 @@ export default function FixedAssetsPage() {
     setSaving(true);
     setFormError(null);
     try {
-      await recordAssetDepreciation(depTarget.id, {
+      const { item } = await recordAssetDepreciation(depTarget.id, {
         transaction_date: depForm.transaction_date || undefined,
         depreciation_amount: depForm.depreciation_amount
           ? Number(depForm.depreciation_amount)
@@ -501,8 +501,16 @@ export default function FixedAssetsPage() {
         accumulated_depreciation_account_id:
           depForm.accumulated_depreciation_account_id || null,
       });
-      setDepTarget(null);
       await load();
+      const warning = item.bookkeeping_warning ?? item.trail_warning;
+      if (warning) {
+        // The journal IS posted and the book value IS updated — the warning is
+        // about the sub-ledger trail. Show it instead of pretending all is
+        // clean (and never the other way round: no 500 for a posted entry).
+        setFormError(String(warning));
+        return;
+      }
+      setDepTarget(null);
     } catch (e) {
       setFormError(messageOf(e));
     } finally {
@@ -1131,9 +1139,11 @@ export default function FixedAssetsPage() {
             </div>
           )}
           <p className="text-[11px] text-text-muted">
-            Leaving the amount blank posts one month of straight-line
-            depreciation — (cost − salvage) ÷ useful life ÷ 12. The charge never
-            takes the book value below the salvage value.
+            Leaving the amount blank posts straight-line depreciation for the
+            period this charge covers — from the purchase date (or from the last
+            depreciation charge) up to this date: (cost − salvage) × days ÷
+            (useful life × 365). The charge never takes the book value below the
+            salvage value.
           </p>
           {formError && <p className="text-xs text-error-600">{formError}</p>}
           <div className="flex justify-end gap-2 pt-1">
