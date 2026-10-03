@@ -61,6 +61,17 @@ _ASSET_PLAN = [{
 }]
 
 
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_org_lookups):
+    """The acquisition flow reads the fiscal year / organisation — keep offline.
+
+    See app/tests/conftest.py::_no_live_database: the asset-ledger pin used to
+    read the live chart, and a timeout turned into a DIFFERENT, swallowed
+    decision (that is the flake this suite now forbids).
+    """
+    return None
+
+
 class _NoLLM:
     """Any provider call in these tests is a regression (they are all
     deterministic paths — reasoning is the PATCHED loop, never a provider)."""

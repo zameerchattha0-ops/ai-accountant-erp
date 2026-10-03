@@ -18,6 +18,15 @@ import pytest
 
 from app.account_resolution import is_category_parent
 
+
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_account_lookups):
+    """The classifier's account lookup must not query the live chart.
+
+    See app/tests/conftest.py::_no_live_database.
+    """
+    return None
+
 AR = {
     "id": "55555555-5555-5555-5555-555555555555",
     "code": "1200",

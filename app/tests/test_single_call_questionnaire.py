@@ -41,6 +41,15 @@ from app.models.schemas import ExecutionStatus
 from test_computers_capitalization_regression import ORG, USER, MSG, _world
 
 
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_org_lookups):
+    """The agent run below reads the fiscal year / organisation — keep offline.
+
+    See app/tests/conftest.py::_no_live_database.
+    """
+    return None
+
+
 def test_contract_demands_questions_in_the_same_response():
     # one output: understanding + missing facts + questions
     assert "ONE output; question-writing is" in _RESPONSE_SHAPE

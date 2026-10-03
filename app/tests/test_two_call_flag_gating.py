@@ -47,6 +47,17 @@ async def _forbidden(*a, **k):
     raise AssertionError("the monolithic path must not run while the flag is ON")
 
 
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_org_lookups):
+    """Every agent run here reads the fiscal year / organisation — keep offline.
+
+    See app/tests/conftest.py::_no_live_database: these reads were fail-open
+    live-DB calls (54 of them in this file alone), so a slow round-trip could
+    silently change what the assertions proved.
+    """
+    return None
+
+
 # ---------------------------------------------------------------------------
 # §1 — the flag itself: default OFF, separate from the observation flag
 # ---------------------------------------------------------------------------

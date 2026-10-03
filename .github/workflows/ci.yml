@@ -1,9 +1,11 @@
 ﻿name: CI
 
 # Verifies every push and pull request before it can reach production:
-# the backend must import cleanly and the frontend must type-check, lint and
-# build.  The workflow is hermetic - placeholder credentials only, nothing here
-# may touch a live project.
+# the backend must import cleanly AND pass its test suite, and the frontend
+# must type-check, lint and build.  The workflow is hermetic - placeholder
+# credentials only, nothing here may touch a live project.  The backend suite
+# enforces that itself: app/tests/conftest.py blocks real database access
+# (an integration test must opt in with @pytest.mark.allows_db).
 
 on:
   push:
@@ -42,6 +44,9 @@ jobs:
 
       - name: Import the application
         run: python -c "import app.main; print('app.main imported')"
+
+      - name: Test
+        run: python -m pytest app/tests -q
 
   frontend:
     name: Frontend (typecheck, lint, build)

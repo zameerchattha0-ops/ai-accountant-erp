@@ -26,6 +26,17 @@ from app.config import get_settings
 
 ORG = uuid.UUID("33333333-3333-3333-3333-333333333333")
 
+
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_account_lookups):
+    """The classifier's account searches must not query the live chart.
+
+    See app/tests/conftest.py::_no_live_database: these lookups are best-effort
+    and swallow failures, so a real round-trip (or its timeout) silently chose
+    which branch of the classifier ran.
+    """
+    return None
+
 CE_ID = str(uuid.uuid4())       # 1500 Computer Equipment (ASSET)
 VEH_ID = str(uuid.uuid4())      # 1530 Vehicles (ASSET)
 UTIL_ID = str(uuid.uuid4())     # 6100 Utilities Expense (EXPENSE)

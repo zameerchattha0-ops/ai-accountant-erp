@@ -36,6 +36,16 @@ USER = uuid.UUID("22222222-2222-2222-2222-222222222222")
 MSG = "create invoice for ABC Furnitures for 2 chairs amounting to 25000"
 
 
+@pytest.fixture(autouse=True)
+def _offline_repositories(offline_org_lookups):
+    """Approved-turn flows read the fiscal year / organisation — keep offline.
+
+    See app/tests/conftest.py::_no_live_database: these reads were fail-open
+    live-DB calls, so a slow round-trip silently changed the run's behaviour.
+    """
+    return None
+
+
 class _NoLLM:
     """Any provider call on an approved turn is a P0-① regression."""
 
