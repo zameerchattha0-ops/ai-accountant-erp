@@ -8,20 +8,24 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { Fraunces, Cormorant_Garamond } from "next/font/google";
+import localFont from "next/font/local";
 import { ArrowRight, Mail, MessageCircle } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 
-const fraunces = Fraunces({
-  subsets: ["latin"],
-  style: ["normal", "italic"],
+const fraunces = localFont({
+  src: [
+    { path: '../../app/fonts/Fraunces-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../../app/fonts/Fraunces-400-italic.ttf', weight: '400', style: 'italic' },
+  ],
   variable: "--font-fraunces",
   display: "swap",
   preload: false,
 });
-const cormorant = Cormorant_Garamond({
-  subsets: ["latin"],
-  style: ["normal", "italic"],
+const cormorant = localFont({
+  src: [
+    { path: '../../app/fonts/Cormorant-Garamond-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../../app/fonts/Cormorant-Garamond-400-italic.ttf', weight: '400', style: 'italic' },
+  ],
   variable: "--font-cormorant",
   display: "swap",
   preload: false,

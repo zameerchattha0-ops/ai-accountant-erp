@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { Cinzel, Cormorant_Garamond, Fraunces, DM_Serif_Display, Antic_Didone, Bodoni_Moda } from "next/font/google";
+import localFont from "next/font/local";
 import {
   Brain, BarChart3, Building2, BookOpen, Search, ShieldCheck,
   ArrowRight, MessageSquareText, HelpCircle, Zap, Workflow,
@@ -27,10 +27,17 @@ const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"),
 
 /* Premium editorial type: Cinzel = Roman inscriptional display capitals
    (Trajan-style, extended edges) for the hero; Cormorant Garamond italic
-   for the accent word. Body text keeps the app's sans stack. */
-const cinzel = Cinzel({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
+   for the accent word. Body text keeps the app's sans stack.
+   Local, self-hosted fonts → the build never fetches Google Fonts, so CI
+   can't fail on a flaky font CDN. next/font emits @font-face from the
+   downloaded TTFs and keeps the same CSS-variable API (via `variable`). */
+const cinzel = localFont({
+  src: [
+    { path: '../fonts/Cinzel-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../fonts/Cinzel-500-normal.ttf', weight: '500', style: 'normal' },
+    { path: '../fonts/Cinzel-600-normal.ttf', weight: '600', style: 'normal' },
+    { path: '../fonts/Cinzel-700-normal.ttf', weight: '700', style: 'normal' },
+  ],
   variable: "--font-cinzel",
   display: "swap",
   /* Only the hero face is preloaded. Chrome warned "preloaded but not used
@@ -38,44 +45,55 @@ const cinzel = Cinzel({
      further down the page anyway. */
   preload: false,
 });
-const cormorant = Cormorant_Garamond({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
-  style: ["normal", "italic"],
+const cormorant = localFont({
+  src: [
+    { path: '../fonts/Cormorant-Garamond-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../fonts/Cormorant-Garamond-500-normal.ttf', weight: '500', style: 'normal' },
+    { path: '../fonts/Cormorant-Garamond-600-normal.ttf', weight: '600', style: 'normal' },
+    { path: '../fonts/Cormorant-Garamond-400-italic.ttf', weight: '400', style: 'italic' },
+    { path: '../fonts/Cormorant-Garamond-500-italic.ttf', weight: '500', style: 'italic' },
+    { path: '../fonts/Cormorant-Garamond-600-italic.ttf', weight: '600', style: 'italic' },
+  ],
   variable: "--font-cormorant",
   display: "swap",
   preload: false,
 });
 /* Fraunces — soft premium editorial serif (reference headline face) */
-const fraunces = Fraunces({
-  subsets: ["latin"],
-  style: ["normal", "italic"],
+const fraunces = localFont({
+  src: [
+    { path: '../fonts/Fraunces-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../fonts/Fraunces-400-italic.ttf', weight: '400', style: 'italic' },
+  ],
   variable: "--font-fraunces",
   display: "swap",
   preload: false,
 });
 /* Tagline faces: DM Serif Display (italic didone elegance) + Antic Didone
    (rendered bold via synthetic weight for the thick-hairline didone look) */
-const dmSerif = DM_Serif_Display({
-  subsets: ["latin"],
-  weight: "400",
-  style: ["normal", "italic"],
+const dmSerif = localFont({
+  src: [
+    { path: '../fonts/DM-Serif-Display-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../fonts/DM-Serif-Display-400-italic.ttf', weight: '400', style: 'italic' },
+  ],
   variable: "--font-dm-serif",
   display: "swap",
   preload: false,
 });
-const antic = Antic_Didone({
-  subsets: ["latin"],
-  weight: "400",
+const antic = localFont({
+  src: [
+    { path: '../fonts/Antic-Didone-400-normal.ttf', weight: '400', style: 'normal' },
+  ],
   variable: "--font-antic",
   display: "swap",
   preload: false,
 });
 /* Bodoni Moda — the hero headline face (high-contrast didone, variable
    weight incl. bold 700 + italic for the power words). */
-const bodoni = Bodoni_Moda({
-  subsets: ["latin"],
-  style: ["normal", "italic"],
+const bodoni = localFont({
+  src: [
+    { path: '../fonts/Bodoni-Moda-400-normal.ttf', weight: '400', style: 'normal' },
+    { path: '../fonts/Bodoni-Moda-400-italic.ttf', weight: '400', style: 'italic' },
+  ],
   variable: "--font-bodoni",
   display: "swap",
 });
