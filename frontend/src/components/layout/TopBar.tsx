@@ -8,7 +8,7 @@ import {
   clearOrgCache,
   loadOrgContext,
 } from "@/lib/hooks/useOrg";
-import { User, LogOut, Bell, Search } from "lucide-react";
+import { User, LogOut, Search } from "lucide-react";
 import Image from "next/image";
 
 export default function TopBar() {
@@ -79,12 +79,17 @@ export default function TopBar() {
       </div>
 
       <div className="flex items-center gap-1 shrink-0">
-        <button className="p-2 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-muted transition-[color,background-color,transform] duration-150 ease-out hover:scale-110 active:scale-95">
+        {/* Real navigation palette (Ctrl/Cmd+K) — replaces the old
+            non-functional Search button. No notification Bell: there is no
+            notification system, and a red dot that never clears is a lie. */}
+        <button
+          onClick={() => window.dispatchEvent(new Event("app:open-command-menu"))}
+          className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-muted transition-colors"
+          aria-label="Search pages (Ctrl+K)"
+          title="Search pages — Ctrl+K"
+        >
           <Search className="w-4 h-4" />
-        </button>
-        <button className="relative p-2 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-muted transition-[color,background-color,transform] duration-150 ease-out hover:scale-110 active:scale-95">
-          <Bell className="w-4 h-4" />
-          <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-error-500 rounded-full ring-2 ring-bg-surface" />
+          <kbd className="hidden md:inline-block px-1 py-0.5 rounded border border-border-subtle text-[10px] leading-none">Ctrl K</kbd>
         </button>
 
         <div className="relative ml-1">

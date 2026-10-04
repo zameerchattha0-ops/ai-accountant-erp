@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Plus, Search, Pencil } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { ilikeAny } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Customer } from "@/lib/types/entities";
@@ -31,34 +34,44 @@ const EMPTY_FORM: CustomerForm = {
 
 export default function CustomersPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<Customer[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<CustomerForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("customers")
-      .select("*")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org]);
-
-  useEffect(() => { load(); }, [load]);
-
-  const filtered = (rows ?? []).filter((c) =>
-    !search ||
-    c.name.toLowerCase().includes(search.toLowerCase()) ||
-    (c.customer_code ?? "").toLowerCase().includes(search.toLowerCase()) ||
-    (c.email ?? "").toLowerCase().includes(search.toLowerCase())
-  );
+  // SERVER-SIDE LIST: customers grow without bound, so search (name / code /
+  // email / phone / tax number) and paging run in the database — the browser
+  // only ever holds one page of rows. The hook keeps the previous page on
+  // screen while the next query resolves and cancels superseded requests.
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<Customer>({
+    enabled: !!org,
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+      let query = supabase
+        .from("customers")
+        .select(
+          "id, customer_code, name, email, phone, tax_number, payment_terms_days, credit_limit, currency_code, notes, is_active",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      const expr = ilikeAny(
+        ["name", "customer_code", "email", "phone", "tax_number"],
+        search
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return { rows: (data ?? []) as unknown as Customer[], count: total ?? null };
+    },
+  });
 
   const handleSave = async () => {
     if (!org || form.name.trim().length < 2) return;
@@ -80,7 +93,7 @@ export default function CustomersPage() {
     if (insertError) { setFormError(insertError.message); return; }
     setModalOpen(false);
     setForm(EMPTY_FORM);
-    load();
+    refresh();
   };
 
   /* ---- Admin edit flow: review changes → confirm → apply ------------- */
@@ -167,7 +180,7 @@ export default function CustomersPage() {
     setEditOpen(false);
     setEditing(null);
     setEditConfirm(false);
-    load();
+    refresh();
   };
 
   return (
@@ -189,9 +202,10 @@ export default function CustomersPage() {
         <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
         <input
           className={`${inputCls} pl-9`}
-          placeholder="Search customers…"
+          placeholder="Search name, code, email, phone or tax number…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
+          aria-label="Search customers"
         />
       </div>
 
@@ -199,13 +213,13 @@ export default function CustomersPage() {
         <TableSkeleton cols={5} />
       ) : error ? (
         <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+      ) : (rows ?? []).length === 0 ? (
         <EmptyState
           title={search ? "No customers match your search" : "No customers yet"}
           hint={search ? undefined : "Add your first customer, or just tell the AI agent: \"Add customer ABC Technologies\"."}
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -219,7 +233,7 @@ export default function CustomersPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((c) => (
+              {(rows ?? []).map((c) => (
                 <tr key={c.id} className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
                   <td className="px-4 py-3 text-text-secondary tabular-nums">{c.customer_code ?? "-"}</td>
                   <td className="px-4 py-3 font-medium text-text-primary">{c.name}</td>
@@ -245,6 +259,14 @@ export default function CustomersPage() {
           </table>
         </div>
       )}
+
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title="Add Customer">
         <div className="space-y-4">

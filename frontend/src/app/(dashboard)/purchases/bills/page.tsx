@@ -1,18 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Plus, Search, Trash2, Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { documentOrFilter, ilikeAny, sanitizeSearch } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import AccountCombobox from "@/components/shared/AccountCombobox";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import DraftDeleteButton from "@/components/shared/DraftDeleteButton";
 import StatusMenu from "@/components/shared/StatusMenu";
+import PartyCombobox from "@/components/shared/PartyCombobox";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
-import type { PurchaseBill, Supplier, Account } from "@/lib/types/entities";
+import type { PurchaseBill, Account } from "@/lib/types/entities";
 
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
@@ -43,21 +47,17 @@ const addDays = (dateStr: string, days: number) => {
 type BillRow = PurchaseBill & {
   supplier?: { name?: string } | { name?: string }[] | null;
 };
-type SupplierOption = Pick<Supplier, "id" | "name">;
 type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type" | "parent_account_id">;
 
 export default function PurchaseBillsPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<BillRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
 
-  const [suppliers, setSuppliers] = useState<SupplierOption[]>([]);
   const [expenseAccounts, setExpenseAccounts] = useState<AccountOption[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [form, setForm] = useState<BillForm>({
     supplier_id: "",
     bill_date: today(),
@@ -67,30 +67,64 @@ export default function PurchaseBillsPage() {
     lines: [{ description: "", quantity: "1", unit_price: "", expense_account_id: "" }],
   });
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("purchase_bills")
-      .select("*, supplier:suppliers(name)")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org]);
+  // SERVER-SIDE LIST: status + search (bill number, supplier ref, matching
+  // supplier) run in the database; the browser holds one page of rows (§4–§6).
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<BillRow>({
+    enabled: !!org,
+    filters: [statusFilter],
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
 
-  useEffect(() => { load(); }, [load]);
+      let partyIds: string[] = [];
+      if (sanitizeSearch(search)) {
+        const { data: matches } = await supabase
+          .from("suppliers")
+          .select("id")
+          .eq("organization_id", org.organization_id)
+          .or(ilikeAny(["name", "supplier_code"], search))
+          .limit(200)
+          .abortSignal(signal);
+        partyIds = (matches ?? []).map((m) => (m as { id: string }).id);
+      }
+
+      let query = supabase
+        .from("purchase_bills")
+        .select(
+          "id, bill_number, supplier_id, supplier_invoice_ref, status, bill_date, total, amount_paid, currency_code, created_at, supplier:suppliers(name)",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      if (statusFilter !== "ALL") query = query.eq("status", statusFilter);
+      const expr = documentOrFilter(
+        ["bill_number", "supplier_invoice_ref"],
+        "supplier_id",
+        search,
+        partyIds
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return { rows: (data ?? []) as unknown as BillRow[], count: total ?? null };
+    },
+  });
+
+  const shownError = error ?? actionError;
+  const afterMutation = () => {
+    setActionError(null);
+    refresh();
+  };
 
   useEffect(() => {
     if (!org) return;
     const supabase = createClient();
-    supabase
-      .from("suppliers")
-      .select("id, name")
-      .eq("organization_id", org.organization_id)
-      .eq("is_active", true)
-      .order("name")
-      .then(({ data }) => setSuppliers((data as SupplierOption[]) ?? []));
     supabase
       .from("accounts")
       .select("id, code, name, account_type, parent_account_id")
@@ -105,18 +139,6 @@ export default function PurchaseBillsPage() {
     () => form.lines.reduce((s, l) => s + (Number(l.quantity) || 0) * (Number(l.unit_price) || 0), 0),
     [form.lines]
   );
-
-  const filtered = (rows ?? []).filter((bill) => {
-    if (statusFilter !== "ALL" && bill.status !== statusFilter) return false;
-    if (!search) return true;
-    const q = search.toLowerCase();
-    const name = Array.isArray(bill.supplier) ? bill.supplier[0]?.name : bill.supplier?.name;
-    return (
-      bill.bill_number.toLowerCase().includes(q) ||
-      (name ?? "").toLowerCase().includes(q) ||
-      (bill.supplier_invoice_ref ?? "").toLowerCase().includes(q)
-    );
-  });
 
   const setLine = (i: number, patch: Partial<LineDraft>) =>
     setForm((f) => ({
@@ -189,7 +211,7 @@ export default function PurchaseBillsPage() {
       supplier_invoice_ref: "", notes: "",
       lines: [{ description: "", quantity: "1", unit_price: "", expense_account_id: "" }],
     });
-    load();
+    refresh();
   };
 
   return (
@@ -215,27 +237,29 @@ export default function PurchaseBillsPage() {
             placeholder="Search by number or supplier…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search purchase bills"
           />
         </div>
         <select className={`${inputCls} max-w-40`} value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}>
+          onChange={(e) => setStatusFilter(e.target.value)}
+          aria-label="Filter by status">
           {["ALL", "DRAFT", "OPEN", "PARTIALLY_PAID", "PAID", "OVERDUE", "VOIDED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
           ))}
         </select>
       </div>
 
-      {orgLoading || (!rows && !error) ? (
+      {orgLoading || (!rows && !shownError) ? (
         <TableSkeleton cols={6} />
-      ) : error ? (
-        <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+      ) : shownError ? (
+        <ErrorState message={shownError} onRetry={afterMutation} />
+      ) : (rows ?? []).length === 0 ? (
         <EmptyState
           title={search || statusFilter !== "ALL" ? "No bills match your filters" : "No purchase bills yet"}
           hint={search ? undefined : "Record one here, or tell the AI: \"I bought a laptop from ABC Computers for Rs. 150,000 on credit\"."}
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -250,7 +274,7 @@ export default function PurchaseBillsPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((bill) => {
+              {(rows ?? []).map((bill) => {
                 const supplierName = Array.isArray(bill.supplier)
                   ? bill.supplier[0]?.name
                   : bill.supplier?.name;
@@ -276,8 +300,8 @@ export default function PurchaseBillsPage() {
                           DRAFT: ["OPEN"],
                           OPEN: ["VOIDED"],
                         }}
-                        onUpdated={load}
-                        onError={setError}
+                        onUpdated={afterMutation}
+                        onError={setActionError}
                       />
                     </td>
                     <td className="px-4 py-3 text-right">
@@ -286,8 +310,8 @@ export default function PurchaseBillsPage() {
                           table="purchase_bills"
                           documentId={bill.id}
                           label="draft bill"
-                          onDeleted={load}
-                          onError={setError}
+                          onDeleted={afterMutation}
+                          onError={setActionError}
                         />
                       )}
                       <Link
@@ -306,22 +330,31 @@ export default function PurchaseBillsPage() {
         </div>
       )}
 
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
+
       {/* New Bill Modal */}
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title="New Purchase Bill" wide>
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs font-medium text-text-secondary">Supplier *</label>
-              <select className={`${inputCls} mt-1.5`} value={form.supplier_id}
-                onChange={(e) => setForm({ ...form, supplier_id: e.target.value })}>
-                <option value="">Select supplier…</option>
-                {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-              {suppliers.length === 0 && (
-                <p className="text-[11px] text-warning-600 mt-1">
-                  No suppliers yet - add one on the Suppliers page first.
-                </p>
-              )}
+              <label htmlFor="bill-supplier" className="text-xs font-medium text-text-secondary">Supplier *</label>
+              <div className="mt-1.5">
+                <PartyCombobox
+                  kind="supplier"
+                  organizationId={org?.organization_id ?? ""}
+                  value={form.supplier_id}
+                  onChange={(id) => setForm((f) => ({ ...f, supplier_id: id }))}
+                  inputId="bill-supplier"
+                  label="Supplier"
+                  baseCurrency={org?.base_currency_code}
+                />
+              </div>
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div>

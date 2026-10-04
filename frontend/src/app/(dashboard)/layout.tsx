@@ -3,6 +3,7 @@ import Sidebar from "@/components/layout/Sidebar";
 import TopBar from "@/components/layout/TopBar";
 import AmbientAura from "@/components/shared/AmbientAura";
 import AgentRunDock from "@/components/ai/AgentRunDock";
+import CommandMenu from "@/components/shared/CommandMenu";
 import { createServerSupabase } from "@/lib/supabase/server";
 
 /**
@@ -47,6 +48,8 @@ export default async function DashboardLayout({
       {/* Persistent agent status — live on EVERY sidebar tab; the run
           itself continues in agentRunStore regardless of navigation. */}
       <AgentRunDock />
+      {/* Ctrl/Cmd+K page palette — global to the dashboard shell. */}
+      <CommandMenu />
     </div>
   );
 }

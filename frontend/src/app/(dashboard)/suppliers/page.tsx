@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Plus, Search, Pencil } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { ilikeAny } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Supplier } from "@/lib/types/entities";
@@ -31,34 +34,42 @@ const EMPTY_FORM: SupplierForm = {
 
 export default function SuppliersPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<Supplier[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<SupplierForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("suppliers")
-      .select("*")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org]);
-
-  useEffect(() => { load(); }, [load]);
-
-  const filtered = (rows ?? []).filter((s) =>
-    !search ||
-    s.name.toLowerCase().includes(search.toLowerCase()) ||
-    (s.supplier_code ?? "").toLowerCase().includes(search.toLowerCase()) ||
-    (s.email ?? "").toLowerCase().includes(search.toLowerCase())
-  );
+  // SERVER-SIDE LIST: search (name / code / email / phone / tax number) and
+  // paging run in the database; the browser holds one page of rows only.
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<Supplier>({
+    enabled: !!org,
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+      let query = supabase
+        .from("suppliers")
+        .select(
+          "id, supplier_code, name, email, phone, tax_number, payment_terms_days, credit_limit, currency_code, notes, is_active",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      const expr = ilikeAny(
+        ["name", "supplier_code", "email", "phone", "tax_number"],
+        search
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return { rows: (data ?? []) as unknown as Supplier[], count: total ?? null };
+    },
+  });
 
   const handleSave = async () => {
     if (!org || form.name.trim().length < 2) return;
@@ -80,7 +91,7 @@ export default function SuppliersPage() {
     if (insertError) { setFormError(insertError.message); return; }
     setModalOpen(false);
     setForm(EMPTY_FORM);
-    load();
+    refresh();
   };
 
   /* ---- Admin edit flow: review changes → confirm → apply ------------- */
@@ -167,7 +178,7 @@ export default function SuppliersPage() {
     setEditOpen(false);
     setEditing(null);
     setEditConfirm(false);
-    load();
+    refresh();
   };
 
   return (
@@ -189,9 +200,10 @@ export default function SuppliersPage() {
         <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
         <input
           className={`${inputCls} pl-9`}
-          placeholder="Search suppliers…"
+          placeholder="Search name, code, email, phone or tax number…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
+          aria-label="Search suppliers"
         />
       </div>
 
@@ -199,13 +211,13 @@ export default function SuppliersPage() {
         <TableSkeleton cols={5} />
       ) : error ? (
         <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+      ) : (rows ?? []).length === 0 ? (
         <EmptyState
           title={search ? "No suppliers match your search" : "No suppliers yet"}
           hint={search ? undefined : "Add your first supplier, or just tell the AI agent: \"Add supplier ABC Computers\"."}
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -219,7 +231,7 @@ export default function SuppliersPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((s) => (
+              {(rows ?? []).map((s) => (
                 <tr key={s.id} className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
                   <td className="px-4 py-3 text-text-secondary tabular-nums">{s.supplier_code ?? "-"}</td>
                   <td className="px-4 py-3 font-medium text-text-primary">{s.name}</td>
@@ -245,6 +257,14 @@ export default function SuppliersPage() {
           </table>
         </div>
       )}
+
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title="Add Supplier">
         <div className="space-y-4">

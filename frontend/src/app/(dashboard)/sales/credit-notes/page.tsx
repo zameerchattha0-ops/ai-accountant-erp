@@ -5,12 +5,15 @@ import Link from "next/link";
 import { Plus, Search, Trash2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { documentOrFilter, ilikeAny, sanitizeSearch } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import StatusMenu from "@/components/shared/StatusMenu";
+import PartyCombobox from "@/components/shared/PartyCombobox";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
-import type { Customer } from "@/lib/types/entities";
 
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
@@ -37,8 +40,6 @@ const CN_TRANSITIONS: Record<string, string[]> = {
   ISSUED: ["VOIDED"],
 };
 
-type CustomerOption = Pick<Customer, "id" | "name">;
-
 interface CreditNoteRow {
   id: string;
   credit_note_number: string;
@@ -53,17 +54,12 @@ interface CreditNoteRow {
 
 export default function CreditNotesPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<CreditNoteRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
-  const [customers, setCustomers] = useState<CustomerOption[]>([]);
   const [invoices, setInvoices] = useState<{ id: string; invoice_number: string }[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [newCustomerName, setNewCustomerName] = useState("");
-  const [creatingCustomer, setCreatingCustomer] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [form, setForm] = useState<CreditNoteForm>({
     customer_id: "",
     invoice_id: "",
@@ -72,40 +68,68 @@ export default function CreditNotesPage() {
     lines: [{ description: "", quantity: "1", unit_price: "" }],
   });
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("credit_notes")
-      .select("*, customer:customers(name)")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else {
-      setRows(
-        ((data ?? []) as (CreditNoteRow & { customer: { name?: string } | null })[]).map(
-          (r) => ({
-            ...r,
-            customer_name: r.customer?.name ?? "",
-          })
+  // SERVER-SIDE LIST: status + search (note number, reason, matching customer)
+  // run in the database; the browser holds exactly one page of rows (§4–§6).
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<CreditNoteRow>({
+    enabled: !!org,
+    filters: [statusFilter],
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+
+      let partyIds: string[] = [];
+      if (sanitizeSearch(search)) {
+        const { data: matches } = await supabase
+          .from("customers")
+          .select("id")
+          .eq("organization_id", org.organization_id)
+          .or(ilikeAny(["name", "customer_code"], search))
+          .limit(200)
+          .abortSignal(signal);
+        partyIds = (matches ?? []).map((m) => (m as { id: string }).id);
+      }
+
+      let query = supabase
+        .from("credit_notes")
+        .select(
+          "id, credit_note_number, credit_note_date, status, reason, total, customer_id, invoice_id, created_at, customer:customers(name)",
+          { count: "exact" }
         )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      if (statusFilter !== "ALL") query = query.eq("status", statusFilter);
+      const expr = documentOrFilter(
+        ["credit_note_number", "reason"],
+        "customer_id",
+        search,
+        partyIds
       );
-    }
-  }, [org]);
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      const mapped = ((data ?? []) as unknown as (CreditNoteRow & {
+        customer: { name?: string } | { name?: string }[] | null;
+      })[]).map((r) => ({
+        ...r,
+        customer_name: Array.isArray(r.customer)
+          ? r.customer[0]?.name ?? ""
+          : r.customer?.name ?? "",
+      }));
+      return { rows: mapped, count: total ?? null };
+    },
+  });
 
-  useEffect(() => { load(); }, [load]);
-
-  useEffect(() => {
-    if (!org) return;
-    const supabase = createClient();
-    supabase
-      .from("customers")
-      .select("id, name")
-      .eq("organization_id", org.organization_id)
-      .eq("is_active", true)
-      .order("name")
-      .then(({ data }) => setCustomers((data as CustomerOption[]) ?? []));
-  }, [org]);
+  const shownError = error ?? actionError;
+  const afterMutation = () => {
+    setActionError(null);
+    refresh();
+  };
 
   // Invoices of the selected customer — the reference is optional but
   // grounds the credit note against the original sale.
@@ -127,19 +151,6 @@ export default function CreditNotesPage() {
         )
       );
   }, [org, form.customer_id]);
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return (rows ?? []).filter((r) => {
-      if (statusFilter !== "ALL" && r.status !== statusFilter) return false;
-      if (!q) return true;
-      return (
-        r.credit_note_number?.toLowerCase().includes(q) ||
-        (r.customer_name ?? "").toLowerCase().includes(q) ||
-        (r.reason ?? "").toLowerCase().includes(q)
-      );
-    });
-  }, [rows, search, statusFilter]);
 
   const totals = useMemo(() => {
     const subtotal = form.lines.reduce(
@@ -165,32 +176,7 @@ export default function CreditNotesPage() {
       lines: [{ description: "", quantity: "1", unit_price: "" }],
     });
     setFormError(null);
-    setNewCustomerName("");
   };
-
-  // Inline customer creation — never a detour to the Customers page.
-  const handleCreateCustomer = useCallback(async () => {
-    const name = newCustomerName.trim();
-    if (!name || !org || creatingCustomer) return;
-    setCreatingCustomer(true);
-    setFormError(null);
-    const supabase = createClient();
-    const { data, error: insError } = await supabase
-      .from("customers")
-      .insert({ organization_id: org.organization_id, name, is_active: true })
-      .select("id, name")
-      .single();
-    setCreatingCustomer(false);
-    if (insError || !data) {
-      setFormError(insError?.message ?? "Could not create the customer.");
-      return;
-    }
-    setCustomers((c) =>
-      [...c, data as CustomerOption].sort((a, b) => a.name.localeCompare(b.name))
-    );
-    setForm((f) => ({ ...f, customer_id: (data as { id: string }).id, invoice_id: "" }));
-    setNewCustomerName("");
-  }, [newCustomerName, org, creatingCustomer]);
 
   const handleSave = useCallback(async () => {
     if (!org) return;
@@ -263,17 +249,17 @@ export default function CreditNotesPage() {
     }
     setModalOpen(false);
     resetForm();
-    await load();
-  }, [org, form, totals, load]);
+    refresh();
+  }, [org, form, totals, refresh]);
 
-  if (orgLoading || rows === null) {
+  if (orgLoading || (!rows && !shownError)) {
     return (
       <div className="space-y-4">
         <TableSkeleton rows={6} cols={5} />
       </div>
     );
   }
-  if (error) return <ErrorState message={error} onRetry={load} />;
+  if (shownError) return <ErrorState message={shownError} onRetry={afterMutation} />;
 
   return (
     <div className="space-y-4">
@@ -302,12 +288,14 @@ export default function CreditNotesPage() {
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search by note number, customer or reason…"
             className={`${inputCls} pl-9`}
+            aria-label="Search credit notes"
           />
         </div>
         <select
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           className={`${inputCls} sm:w-44`}
+          aria-label="Filter by status"
         >
           <option value="ALL">All statuses</option>
           <option value="DRAFT">Draft</option>
@@ -317,7 +305,7 @@ export default function CreditNotesPage() {
       </div>
 
       {/* Table */}
-      <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden">
+      <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden transition-opacity ${refreshing ? "opacity-60" : ""}`}>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -332,17 +320,25 @@ export default function CreditNotesPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 && (
+              {(rows ?? []).length === 0 && (
                 <tr>
                   <td colSpan={7} className="px-4 py-10">
                     <EmptyState
-                      title="No credit notes yet"
-                      hint="Ask the AI: “Issue a credit note against invoice INV-000001 for Rs. 50,000” — or create one above."
+                      title={
+                        search || statusFilter !== "ALL"
+                          ? "No credit notes match your filters"
+                          : "No credit notes yet"
+                      }
+                      hint={
+                        search || statusFilter !== "ALL"
+                          ? undefined
+                          : "Ask the AI: “Issue a credit note against invoice INV-000001 for Rs. 50,000” — or create one above."
+                      }
                     />
                   </td>
                 </tr>
               )}
-              {filtered.map((r) => (
+              {(rows ?? []).map((r) => (
                 <tr
                   key={r.id}
                   className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/50 transition-colors"
@@ -368,8 +364,8 @@ export default function CreditNotesPage() {
                       documentId={r.id}
                       status={r.status}
                       transitions={CN_TRANSITIONS}
-                      onUpdated={load}
-                      onError={setError}
+                      onUpdated={afterMutation}
+                      onError={setActionError}
                     />
                   </td>
                   <td className="px-4 py-3 text-right">
@@ -387,6 +383,14 @@ export default function CreditNotesPage() {
         </div>
       </div>
 
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
+
       {/* New credit note modal */}
       <Modal
         open={modalOpen}
@@ -399,35 +403,19 @@ export default function CreditNotesPage() {
       >
         <div className="space-y-4">
           <div>
-            <label className="text-xs font-medium text-text-secondary">Customer</label>
-            <select
-              className={`${inputCls} mt-1.5`}
-              value={form.customer_id}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, customer_id: e.target.value, invoice_id: "" }))
-              }
-            >
-              <option value="">Select customer…</option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-            <div className="flex gap-2 mt-2">
-              <input
-                className={inputCls}
-                placeholder="…or create a new customer"
-                value={newCustomerName}
-                onChange={(e) => setNewCustomerName(e.target.value)}
+            <label htmlFor="credit-note-customer" className="text-xs font-medium text-text-secondary">Customer</label>
+            <div className="mt-1.5">
+              <PartyCombobox
+                kind="customer"
+                organizationId={org?.organization_id ?? ""}
+                value={form.customer_id}
+                onChange={(id) =>
+                  setForm((f) => ({ ...f, customer_id: id, invoice_id: "" }))
+                }
+                inputId="credit-note-customer"
+                label="Customer"
+                baseCurrency={org?.base_currency_code}
               />
-              <button
-                onClick={handleCreateCustomer}
-                disabled={creatingCustomer || !newCustomerName.trim()}
-                className="px-3.5 py-2 rounded-xl bg-bg-muted border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors shrink-0"
-              >
-                {creatingCustomer ? "Adding…" : "Add"}
-              </button>
             </div>
           </div>
 

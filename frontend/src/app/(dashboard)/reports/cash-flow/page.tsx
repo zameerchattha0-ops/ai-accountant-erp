@@ -1,12 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import {
+  computeCategoryTotals,
+  fetchCashFlowRows,
+  loadCashFlowSummary,
+  netOf,
+  type CashFlowRow,
+  type CategoryTotals,
+} from "@/lib/reports/cash-flow";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
 import { ErrorState, TableSkeleton, EmptyState } from "@/components/shared/States";
-import type { CashFlowRow } from "@/lib/types/entities";
+
+const inputCls =
+  "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
 
 type Category = "OPERATING" | "INVESTING" | "FINANCING";
 
@@ -21,46 +31,128 @@ export default function CashFlowReportPage() {
   const [rows, setRows] = useState<CashFlowRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<"ALL" | Category>("ALL");
+  // Period scope — defaults to the CURRENT reporting year (shown as editable
+  // date inputs, consistent with the P&L's reporting-year scoping).
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [truncated, setTruncated] = useState(false);
+  // Exact category totals from one SQL aggregate (migration 090); null while
+  // unavailable → see the fallback rules below.
+  const [sqlTotals, setSqlTotals] = useState<CategoryTotals | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
 
-  const load = useCallback(async () => {
+  // Default the range to the current financial year, once it resolves.
+  useEffect(() => {
     if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("v_cash_flow")
-      .select("*")
+    let alive = true;
+    createClient()
+      .from("financial_years")
+      .select("start_date, end_date")
       .eq("organization_id", org.organization_id)
-      .order("transaction_date", { ascending: false })
-      .limit(500);
-    if (dbError) setError(dbError.message);
-    else setRows((data as CashFlowRow[]) ?? []);
+      .eq("is_current", true)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (alive && data) {
+          setFromDate((v) => v || data.start_date);
+          setToDate((v) => v || data.end_date);
+        }
+      });
+    return () => {
+      alive = false;
+    };
   }, [org]);
 
-  useEffect(() => { load(); }, [load]);
-
-  // Compute per-category totals
-  const categoryTotals = useMemo(() => {
-    const totals: Record<Category, number> = { OPERATING: 0, INVESTING: 0, FINANCING: 0 };
-    (rows ?? []).forEach((r) => {
-      totals[r.cash_flow_category] = (totals[r.cash_flow_category] ?? 0) + Number(r.net_amount);
+  // Load the movements (chunked, bounded, ABORTABLE) and the exact SQL totals
+  // in parallel. No silent 500-row cap — the old page summed whatever it had
+  // fetched, which made the statement wrong past 500 rows (audit B3, P0).
+  useEffect(() => {
+    if (!org) return;
+    let alive = true;
+    const controller = new AbortController();
+    const supabase = createClient();
+    const opts = {
+      from: fromDate || null,
+      to: toDate || null,
+      signal: controller.signal,
+    };
+    Promise.allSettled([
+      fetchCashFlowRows(supabase, org.organization_id, opts),
+      loadCashFlowSummary(supabase, org.organization_id, opts),
+    ]).then(([rowsResult, totalsResult]) => {
+      if (!alive) return;
+      if (rowsResult.status === "rejected") {
+        const err = rowsResult.reason as { name?: string; message?: string };
+        if (err?.name === "AbortError") return;
+        setError(err?.message ?? "Couldn't load the cash flow statement");
+        return;
+      }
+      setRows(rowsResult.value.rows);
+      setTruncated(rowsResult.value.truncated);
+      setSqlTotals(totalsResult.status === "fulfilled" ? totalsResult.value : null);
+      setError(null);
     });
-    return totals;
-  }, [rows]);
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, [org, fromDate, toDate, reloadTick]);
 
-  const netCashFlow = categoryTotals.OPERATING + categoryTotals.INVESTING + categoryTotals.FINANCING;
+  // Totals policy: exact SQL aggregate > sum of a COMPLETE load > nothing.
+  // A partial load must never produce a partial number (show "—" instead).
+  const fallbackTotals =
+    rows !== null && !truncated ? computeCategoryTotals(rows) : null;
+  const categoryTotals = sqlTotals ?? fallbackTotals;
+  const netCashFlow = categoryTotals ? netOf(categoryTotals) : null;
+  const totalsResolved = sqlTotals !== null || rows !== null;
 
-  const filtered = activeCategory === "ALL"
-    ? (rows ?? [])
-    : (rows ?? []).filter((r) => r.cash_flow_category === activeCategory);
+  const filtered = useMemo(
+    () =>
+      activeCategory === "ALL"
+        ? (rows ?? [])
+        : (rows ?? []).filter((r) => r.cash_flow_category === activeCategory),
+    [rows, activeCategory]
+  );
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <PageHeader title="Cash Flow Statement" subtitle="Classified by operating, investing, and financing activities" />
 
+      {/* Period scope — defaults to the current reporting year; editable. */}
+      <div className="flex flex-wrap items-end gap-3">
+        <div>
+          <label htmlFor="cf-from" className="text-xs font-medium text-text-secondary">From</label>
+          <input id="cf-from" type="date" className={`${inputCls} w-40 mt-1.5`} value={fromDate}
+            onChange={(e) => setFromDate(e.target.value)} />
+        </div>
+        <div>
+          <label htmlFor="cf-to" className="text-xs font-medium text-text-secondary">To</label>
+          <input id="cf-to" type="date" className={`${inputCls} w-40 mt-1.5`} value={toDate}
+            onChange={(e) => setToDate(e.target.value)} />
+        </div>
+        {(fromDate || toDate) && (
+          <button
+            onClick={() => { setFromDate(""); setToDate(""); }}
+            className="px-3 py-2 rounded-xl text-xs font-medium text-text-secondary hover:text-text-primary border border-border-subtle bg-bg-surface transition-colors mb-0.5"
+          >
+            All time
+          </button>
+        )}
+      </div>
+
+      {truncated && (
+        <div className="rounded-xl bg-warning-50 border border-warning-200 px-4 py-3 text-xs text-warning-700">
+          Showing the most recent {(rows ?? []).length.toLocaleString()} movements in
+          this range{sqlTotals
+            ? " — category totals above are complete."
+            : " — narrow the dates: totals cannot be verified for the whole period until migration 090 is applied."}
+        </div>
+      )}
+
       {/* Category summary cards */}
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
         {(["OPERATING", "INVESTING", "FINANCING"] as Category[]).map((cat) => {
           const meta = CATEGORY_META[cat];
-          const total = categoryTotals[cat];
+          const total = categoryTotals?.[cat] ?? null;
           return (
             <button
               key={cat}
@@ -72,16 +164,27 @@ export default function CashFlowReportPage() {
               }`}
             >
               <p className={`text-[11px] uppercase tracking-wide font-medium ${meta.color}`}>{meta.label}</p>
-              <p className={`text-xl font-semibold tabular-nums mt-1 ${total >= 0 ? "text-text-primary" : "text-error-600"}`}>
-                {formatCurrency(total, org?.base_currency_code)}
+              <p className={`text-xl font-semibold tabular-nums mt-1 ${(total ?? 0) >= 0 ? "text-text-primary" : "text-error-600"}`}>
+                {total !== null
+                  ? formatCurrency(total, org?.base_currency_code)
+                  : totalsResolved
+                    ? "—"
+                    : "…"}
               </p>
             </button>
           );
         })}
         <div className="bg-bg-surface rounded-2xl border border-border-subtle px-5 py-4">
           <p className="text-[11px] uppercase tracking-wide text-text-muted font-medium">Net Cash Flow</p>
-          <p className={`text-xl font-semibold tabular-nums mt-1 ${netCashFlow >= 0 ? "text-success-600" : "text-error-600"}`}>
-            {formatCurrency(netCashFlow, org?.base_currency_code)}
+          <p className={`text-xl font-semibold tabular-nums mt-1 ${(netCashFlow ?? 0) >= 0 ? "text-success-600" : "text-error-600"}`}
+            title={netCashFlow === null && totalsResolved
+              ? "Totals unavailable for this range — narrow the dates or apply migration 090"
+              : undefined}>
+            {netCashFlow !== null
+              ? formatCurrency(netCashFlow, org?.base_currency_code)
+              : totalsResolved
+                ? "—"
+                : "…"}
           </p>
         </div>
       </div>
@@ -119,10 +222,10 @@ export default function CashFlowReportPage() {
       {orgLoading || (!rows && !error) ? (
         <TableSkeleton cols={7} />
       ) : error ? (
-        <ErrorState message={error} />
+        <ErrorState message={error} onRetry={() => setReloadTick((t) => t + 1)} />
       ) : filtered.length === 0 ? (
         <EmptyState
-          title="No cash flow data"
+          title={fromDate || toDate ? "No cash movements in this period" : "No cash flow data"}
           hint="Cash flow entries appear once journal entries involving bank/cash accounts are posted. Record a receipt or payment first."
         />
       ) : (

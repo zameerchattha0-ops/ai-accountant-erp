@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { ilikeAny } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import AccountCombobox from "@/components/shared/AccountCombobox";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Account, GeneralLedgerRow } from "@/lib/types/entities";
 
@@ -20,34 +23,58 @@ type AccountOption = Pick<
 
 export default function GeneralLedgerPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<GeneralLedgerRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
   const [accountFilter, setAccountFilter] = useState("ALL");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
-  const [search, setSearch] = useState("");
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    let query = supabase
-      .from("v_general_ledger")
-      .select("*")
-      .eq("organization_id", org.organization_id)
-      .order("transaction_date", { ascending: true })
-      .order("journal_number", { ascending: true })
-      .order("line_number", { ascending: true });
-    if (accountFilter !== "ALL") query = query.eq("account_id", accountFilter);
-    if (fromDate) query = query.gte("transaction_date", fromDate);
-    if (toDate) query = query.lte("transaction_date", toDate);
-    const { data, error: dbError } = await query;
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org, accountFilter, fromDate, toDate]);
-
-  useEffect(() => { load(); }, [load]);
+  // SERVER-SIDE PAGING: the ledger is unbounded (target: 500k lines), so
+  // account/date/search filters and the page window run in the database —
+  // the browser never receives more than one page of lines (§4–§6).
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<GeneralLedgerRow>({
+    enabled: !!org,
+    filters: [accountFilter, fromDate, toDate],
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+      let query = supabase
+        .from("v_general_ledger")
+        .select(
+          "journal_line_id, transaction_date, journal_number, account_id, account_code, account_name, line_description, entry_description, debit, credit",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("transaction_date", { ascending: true })
+        .order("journal_number", { ascending: true })
+        .order("line_number", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      if (accountFilter !== "ALL") query = query.eq("account_id", accountFilter);
+      if (fromDate) query = query.gte("transaction_date", fromDate);
+      if (toDate) query = query.lte("transaction_date", toDate);
+      const expr = ilikeAny(
+        [
+          "journal_number",
+          "account_code",
+          "account_name",
+          "line_description",
+          "entry_description",
+        ],
+        search
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return {
+        rows: (data ?? []) as unknown as GeneralLedgerRow[],
+        count: total ?? null,
+      };
+    },
+  });
 
   useEffect(() => {
     if (!org) return;
@@ -61,21 +88,21 @@ export default function GeneralLedgerPage() {
       .then(({ data }) => setAccounts((data as AccountOption[]) ?? []));
   }, [org]);
 
-  const filtered = useMemo(() => {
-    if (!search) return rows ?? [];
-    const q = search.toLowerCase();
-    return (rows ?? []).filter(
-      (r) =>
-        r.journal_number.toLowerCase().includes(q) ||
-        r.account_code.toLowerCase().includes(q) ||
-        r.account_name.toLowerCase().includes(q) ||
-        (r.line_description ?? "").toLowerCase().includes(q) ||
-        r.entry_description.toLowerCase().includes(q)
-    );
-  }, [rows, search]);
+  // Search/filters run SERVER-SIDE (see the hook above) — the visible set is
+  // the fetched page exactly as returned.
+  const visible = useMemo(() => rows ?? [], [rows]);
 
-  const totalDebit = filtered.reduce((s, r) => s + r.debit, 0);
-  const totalCredit = filtered.reduce((s, r) => s + r.credit, 0);
+  // Page-scoped totals, honestly labelled: a paged ledger footer cannot claim
+  // to sum rows the browser never received (the Pagination row below carries
+  // the full filtered count).
+  const totalDebit = useMemo(
+    () => visible.reduce((s, r) => s + r.debit, 0),
+    [visible]
+  );
+  const totalCredit = useMemo(
+    () => visible.reduce((s, r) => s + r.credit, 0),
+    [visible]
+  );
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
@@ -112,6 +139,7 @@ export default function GeneralLedgerPage() {
             placeholder="Search description or number…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search ledger lines"
           />
         </div>
       </div>
@@ -119,14 +147,14 @@ export default function GeneralLedgerPage() {
       {orgLoading || (!rows && !error) ? (
         <TableSkeleton rows={10} cols={6} />
       ) : error ? (
-        <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+        <ErrorState message={error} onRetry={refresh} />
+      ) : visible.length === 0 ? (
         <EmptyState
           title="No posted ledger lines match your filters"
           hint="The general ledger only includes POSTED journal entries. Post an entry from the Journal page or via the AI agent."
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -139,7 +167,7 @@ export default function GeneralLedgerPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((r) => (
+              {visible.map((r) => (
                 <tr key={r.journal_line_id} className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
                   <td className="px-4 py-3 text-text-secondary tabular-nums whitespace-nowrap">{r.transaction_date}</td>
                   <td className="px-4 py-3 text-text-primary tabular-nums">{r.journal_number}</td>
@@ -162,7 +190,7 @@ export default function GeneralLedgerPage() {
             <tfoot>
               <tr className="border-t-2 border-border-default bg-bg-muted/50">
                 <td colSpan={4} className="px-4 py-3 font-semibold text-text-primary">
-                  {filtered.length} lines
+                  Page totals — {visible.length} of {count.toLocaleString()} lines
                 </td>
                 <td className="px-4 py-3 text-right font-semibold text-text-primary tabular-nums">
                   {formatCurrency(totalDebit, org?.base_currency_code)}
@@ -175,6 +203,14 @@ export default function GeneralLedgerPage() {
           </table>
         </div>
       )}
+
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
     </div>
   );
 }

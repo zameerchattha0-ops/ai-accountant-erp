@@ -1,14 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Plus, Search, Sparkles, CheckCircle2, AlertCircle } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { ilikeAny } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import { aiExecute, aiClarify, aiConfirm } from "@/lib/api/client";
 import type { AgentResponse } from "@/lib/types/api";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Employee } from "@/lib/types/entities";
@@ -88,9 +91,6 @@ function cardFromResponse(resp: AgentResponse): AiCard {
 
 export default function EmployeesPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<Employee[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<EmployeeForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
@@ -107,29 +107,36 @@ export default function EmployeesPage() {
     text: string;
   } | null>(null);
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("employees")
-      .select("*")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org]);
-
-  useEffect(() => { load(); }, [load]);
-
-  const filtered = (rows ?? []).filter((e) => {
-    const q = search.toLowerCase();
-    return (
-      !search ||
-      e.full_name.toLowerCase().includes(q) ||
-      (e.employee_code ?? "").toLowerCase().includes(q) ||
-      (e.department ?? "").toLowerCase().includes(q) ||
-      (e.designation ?? "").toLowerCase().includes(q)
-    );
+  // SERVER-SIDE LIST: name / code / department / designation / email search
+  // and paging run in the database — one page of rows in the browser.
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<Employee>({
+    enabled: !!org,
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+      let query = supabase
+        .from("employees")
+        .select(
+          "id, employee_code, full_name, date_of_joining, basic_salary, status, designation, department, is_active",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      const expr = ilikeAny(
+        ["full_name", "employee_code", "department", "designation", "email"],
+        search
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return { rows: (data ?? []) as unknown as Employee[], count: total ?? null };
+    },
   });
 
   /** Talk to the agent for the allowance sentence — the MODEL structures it. */
@@ -242,7 +249,7 @@ export default function EmployeesPage() {
       setFormError(insertError.message);
       return;
     }
-    await load();
+    refresh();
     setSaving(false);
     setModalOpen(false);
     setForm(EMPTY_FORM);
@@ -416,15 +423,16 @@ export default function EmployeesPage() {
           className={`${inputCls} pl-9`}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search by name, code, department…"
+          placeholder="Search by name, code, department, designation or email…"
+          aria-label="Search employees"
         />
       </div>
 
-      {orgLoading || rows === null ? (
+      {orgLoading || (!rows && !error) ? (
         <TableSkeleton cols={5} />
       ) : error ? (
         <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+      ) : (rows ?? []).length === 0 ? (
         <EmptyState
           title={search ? "No employees match your search" : "No employees yet"}
           hint={
@@ -434,7 +442,7 @@ export default function EmployeesPage() {
           }
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -446,7 +454,7 @@ export default function EmployeesPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border-subtle">
-              {filtered.map((e) => (
+              {(rows ?? []).map((e) => (
                 <tr key={e.id} className="hover:bg-bg-primary/60 transition-colors">
                   <td className="px-4 py-3">
                     <div className="font-medium text-text-primary">
@@ -476,6 +484,14 @@ export default function EmployeesPage() {
           </table>
         </div>
       )}
+
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title="Add employee">
         <div className="space-y-4">

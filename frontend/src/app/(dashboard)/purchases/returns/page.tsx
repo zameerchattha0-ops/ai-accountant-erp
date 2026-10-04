@@ -5,12 +5,15 @@ import Link from "next/link";
 import { Plus, Search, Trash2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { documentOrFilter, ilikeAny, sanitizeSearch } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import StatusMenu from "@/components/shared/StatusMenu";
+import PartyCombobox from "@/components/shared/PartyCombobox";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
-import type { Supplier } from "@/lib/types/entities";
 
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
@@ -37,8 +40,6 @@ const DN_TRANSITIONS: Record<string, string[]> = {
   OPEN: ["VOIDED"],
 };
 
-type SupplierOption = Pick<Supplier, "id" | "name">;
-
 interface DebitNoteRow {
   id: string;
   return_number: string;
@@ -53,17 +54,12 @@ interface DebitNoteRow {
 
 export default function PurchaseReturnsPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<DebitNoteRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
-  const [suppliers, setSuppliers] = useState<SupplierOption[]>([]);
   const [bills, setBills] = useState<{ id: string; bill_number: string }[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [newSupplierName, setNewSupplierName] = useState("");
-  const [creatingSupplier, setCreatingSupplier] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [form, setForm] = useState<DebitNoteForm>({
     supplier_id: "",
     bill_id: "",
@@ -72,37 +68,68 @@ export default function PurchaseReturnsPage() {
     lines: [{ description: "", quantity: "1", unit_price: "" }],
   });
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("purchase_returns")
-      .select("*, supplier:suppliers(name)")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else {
-      setRows(
-        ((data ?? []) as (DebitNoteRow & { supplier: { name?: string } | null })[]).map(
-          (r) => ({ ...r, supplier_name: r.supplier?.name ?? "" })
+  // SERVER-SIDE LIST: status + search (note number, reason, matching
+  // supplier) run in the database; the browser holds one page of rows (§4–§6).
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<DebitNoteRow>({
+    enabled: !!org,
+    filters: [statusFilter],
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
+
+      let partyIds: string[] = [];
+      if (sanitizeSearch(search)) {
+        const { data: matches } = await supabase
+          .from("suppliers")
+          .select("id")
+          .eq("organization_id", org.organization_id)
+          .or(ilikeAny(["name", "supplier_code"], search))
+          .limit(200)
+          .abortSignal(signal);
+        partyIds = (matches ?? []).map((m) => (m as { id: string }).id);
+      }
+
+      let query = supabase
+        .from("purchase_returns")
+        .select(
+          "id, return_number, return_date, status, reason, total, supplier_id, bill_id, created_at, supplier:suppliers(name)",
+          { count: "exact" }
         )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      if (statusFilter !== "ALL") query = query.eq("status", statusFilter);
+      const expr = documentOrFilter(
+        ["return_number", "reason"],
+        "supplier_id",
+        search,
+        partyIds
       );
-    }
-  }, [org]);
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      const mapped = ((data ?? []) as unknown as (DebitNoteRow & {
+        supplier: { name?: string } | { name?: string }[] | null;
+      })[]).map((r) => ({
+        ...r,
+        supplier_name: Array.isArray(r.supplier)
+          ? r.supplier[0]?.name ?? ""
+          : r.supplier?.name ?? "",
+      }));
+      return { rows: mapped, count: total ?? null };
+    },
+  });
 
-  useEffect(() => { load(); }, [load]);
-
-  useEffect(() => {
-    if (!org) return;
-    const supabase = createClient();
-    supabase
-      .from("suppliers")
-      .select("id, name")
-      .eq("organization_id", org.organization_id)
-      .eq("is_active", true)
-      .order("name")
-      .then(({ data }) => setSuppliers((data as SupplierOption[]) ?? []));
-  }, [org]);
+  const shownError = error ?? actionError;
+  const afterMutation = () => {
+    setActionError(null);
+    refresh();
+  };
 
   // Bills of the selected supplier — the reference is optional but grounds
   // the debit note against the original purchase.
@@ -122,19 +149,6 @@ export default function PurchaseReturnsPage() {
         setBills((data as { id: string; bill_number: string }[]) ?? [])
       );
   }, [org, form.supplier_id]);
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return (rows ?? []).filter((r) => {
-      if (statusFilter !== "ALL" && r.status !== statusFilter) return false;
-      if (!q) return true;
-      return (
-        r.return_number?.toLowerCase().includes(q) ||
-        (r.supplier_name ?? "").toLowerCase().includes(q) ||
-        (r.reason ?? "").toLowerCase().includes(q)
-      );
-    });
-  }, [rows, search, statusFilter]);
 
   const totals = useMemo(() => {
     const subtotal = form.lines.reduce(
@@ -160,32 +174,7 @@ export default function PurchaseReturnsPage() {
       lines: [{ description: "", quantity: "1", unit_price: "" }],
     });
     setFormError(null);
-    setNewSupplierName("");
   };
-
-  // Inline supplier creation — never a detour to the Suppliers page.
-  const handleCreateSupplier = useCallback(async () => {
-    const name = newSupplierName.trim();
-    if (!name || !org || creatingSupplier) return;
-    setCreatingSupplier(true);
-    setFormError(null);
-    const supabase = createClient();
-    const { data, error: insError } = await supabase
-      .from("suppliers")
-      .insert({ organization_id: org.organization_id, name, is_active: true })
-      .select("id, name")
-      .single();
-    setCreatingSupplier(false);
-    if (insError || !data) {
-      setFormError(insError?.message ?? "Could not create the supplier.");
-      return;
-    }
-    setSuppliers((s) =>
-      [...s, data as SupplierOption].sort((a, b) => a.name.localeCompare(b.name))
-    );
-    setForm((f) => ({ ...f, supplier_id: (data as { id: string }).id, bill_id: "" }));
-    setNewSupplierName("");
-  }, [newSupplierName, org, creatingSupplier]);
 
   const handleSave = useCallback(async () => {
     if (!org) return;
@@ -257,17 +246,17 @@ export default function PurchaseReturnsPage() {
     }
     setModalOpen(false);
     resetForm();
-    await load();
-  }, [org, form, totals, load]);
+    refresh();
+  }, [org, form, totals, refresh]);
 
-  if (orgLoading || rows === null) {
+  if (orgLoading || (!rows && !shownError)) {
     return (
       <div className="space-y-4">
         <TableSkeleton rows={6} cols={5} />
       </div>
     );
   }
-  if (error) return <ErrorState message={error} onRetry={load} />;
+  if (shownError) return <ErrorState message={shownError} onRetry={afterMutation} />;
 
   return (
     <div className="space-y-4">
@@ -296,12 +285,14 @@ export default function PurchaseReturnsPage() {
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search by note number, supplier or reason…"
             className={`${inputCls} pl-9`}
+            aria-label="Search debit notes"
           />
         </div>
         <select
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           className={`${inputCls} sm:w-44`}
+          aria-label="Filter by status"
         >
           <option value="ALL">All statuses</option>
           <option value="DRAFT">Draft</option>
@@ -311,7 +302,7 @@ export default function PurchaseReturnsPage() {
       </div>
 
       {/* Table */}
-      <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden">
+      <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden transition-opacity ${refreshing ? "opacity-60" : ""}`}>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -326,17 +317,25 @@ export default function PurchaseReturnsPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 && (
+              {(rows ?? []).length === 0 && (
                 <tr>
                   <td colSpan={7} className="px-4 py-10">
                     <EmptyState
-                      title="No debit notes yet"
-                      hint="Ask the AI: “Return the laptop to ABC Computers” — or create one above."
+                      title={
+                        search || statusFilter !== "ALL"
+                          ? "No debit notes match your filters"
+                          : "No debit notes yet"
+                      }
+                      hint={
+                        search || statusFilter !== "ALL"
+                          ? undefined
+                          : "Ask the AI: “Return the laptop to ABC Computers” — or create one above."
+                      }
                     />
                   </td>
                 </tr>
               )}
-              {filtered.map((r) => (
+              {(rows ?? []).map((r) => (
                 <tr
                   key={r.id}
                   className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/50 transition-colors"
@@ -362,8 +361,8 @@ export default function PurchaseReturnsPage() {
                       documentId={r.id}
                       status={r.status}
                       transitions={DN_TRANSITIONS}
-                      onUpdated={load}
-                      onError={setError}
+                      onUpdated={afterMutation}
+                      onError={setActionError}
                     />
                   </td>
                   <td className="px-4 py-3 text-right">
@@ -381,6 +380,14 @@ export default function PurchaseReturnsPage() {
         </div>
       </div>
 
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
+
       {/* New debit note modal */}
       <Modal
         open={modalOpen}
@@ -393,35 +400,19 @@ export default function PurchaseReturnsPage() {
       >
         <div className="space-y-4">
           <div>
-            <label className="text-xs font-medium text-text-secondary">Supplier</label>
-            <select
-              className={`${inputCls} mt-1.5`}
-              value={form.supplier_id}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, supplier_id: e.target.value, bill_id: "" }))
-              }
-            >
-              <option value="">Select supplier…</option>
-              {suppliers.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
-            <div className="flex gap-2 mt-2">
-              <input
-                className={inputCls}
-                placeholder="…or create a new supplier"
-                value={newSupplierName}
-                onChange={(e) => setNewSupplierName(e.target.value)}
+            <label htmlFor="debit-note-supplier" className="text-xs font-medium text-text-secondary">Supplier</label>
+            <div className="mt-1.5">
+              <PartyCombobox
+                kind="supplier"
+                organizationId={org?.organization_id ?? ""}
+                value={form.supplier_id}
+                onChange={(id) =>
+                  setForm((f) => ({ ...f, supplier_id: id, bill_id: "" }))
+                }
+                inputId="debit-note-supplier"
+                label="Supplier"
+                baseCurrency={org?.base_currency_code}
               />
-              <button
-                onClick={handleCreateSupplier}
-                disabled={creatingSupplier || !newSupplierName.trim()}
-                className="px-3.5 py-2 rounded-xl bg-bg-muted border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary disabled:opacity-40 transition-colors shrink-0"
-              >
-                {creatingSupplier ? "Adding…" : "Add"}
-              </button>
             </div>
           </div>
 

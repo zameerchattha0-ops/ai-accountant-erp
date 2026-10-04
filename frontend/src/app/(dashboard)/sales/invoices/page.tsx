@@ -1,17 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { Plus, Search, Trash2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
+import { useServerList } from "@/lib/hooks/useServerList";
+import { documentOrFilter, ilikeAny, sanitizeSearch } from "@/lib/lists/logic";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
+import Pagination from "@/components/shared/Pagination";
 import DraftDeleteButton from "@/components/shared/DraftDeleteButton";
 import StatusMenu from "@/components/shared/StatusMenu";
+import PartyCombobox from "@/components/shared/PartyCombobox";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
-import type { Customer, Invoice } from "@/lib/types/entities";
+import type { Invoice } from "@/lib/types/entities";
 
 const inputCls =
   "w-full px-3 py-2 rounded-xl bg-bg-primary border border-border-default text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-100 focus:border-ai-300 transition-colors";
@@ -42,21 +46,15 @@ type InvoiceRow = Invoice & {
   customer?: { name?: string } | { name?: string }[] | null;
 };
 
-type CustomerOption = Pick<Customer, "id" | "name">;
-
 export default function InvoicesPage() {
   const { org, loading: orgLoading } = useOrg();
-  const [rows, setRows] = useState<InvoiceRow[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("ALL");
-
-  const [customers, setCustomers] = useState<CustomerOption[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [newCustomerName, setNewCustomerName] = useState("");
-  const [creatingCustomer, setCreatingCustomer] = useState(false);
+  // Row-action failures (status change / delete) share the error surface but
+  // never fight with the list loader's own error state.
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState("ALL");
   const [form, setForm] = useState<InvoiceForm>({
     customer_id: "",
     invoice_date: today(),
@@ -65,61 +63,63 @@ export default function InvoicesPage() {
     lines: [{ description: "", quantity: "1", unit_price: "" }],
   });
 
-  const load = useCallback(async () => {
-    if (!org) return;
-    const supabase = createClient();
-    const { data, error: dbError } = await supabase
-      .from("invoices")
-      .select("*, customer:customers(name)")
-      .eq("organization_id", org.organization_id)
-      .order("created_at", { ascending: false });
-    if (dbError) setError(dbError.message);
-    else setRows(data ?? []);
-  }, [org]);
+  // SERVER-SIDE LIST: status + search (invoice number, or any customer whose
+  // name/code matches — resolved through a bounded second query) are applied
+  // by the database; the browser holds exactly one page of rows (§4–§6).
+  const {
+    rows, error, refreshing, search, setSearch,
+    page, setPage, pageSize, count, refresh,
+  } = useServerList<InvoiceRow>({
+    enabled: !!org,
+    filters: [statusFilter],
+    fetchPage: async ({ page, pageSize, search, signal }) => {
+      if (!org) return { rows: [], count: 0 };
+      const supabase = createClient();
 
-  useEffect(() => { load(); }, [load]);
+      // PostgREST cannot OR a root column with an embedded one, so party-name
+      // matches resolve to a bounded id set first (indexed, capped at 200).
+      let partyIds: string[] = [];
+      if (sanitizeSearch(search)) {
+        const { data: matches } = await supabase
+          .from("customers")
+          .select("id")
+          .eq("organization_id", org.organization_id)
+          .or(ilikeAny(["name", "customer_code"], search))
+          .limit(200)
+          .abortSignal(signal);
+        partyIds = (matches ?? []).map((m) => (m as { id: string }).id);
+      }
 
-  useEffect(() => {
-    if (!org) return;
-    const supabase = createClient();
-    supabase
-      .from("customers")
-      .select("id, name")
-      .eq("organization_id", org.organization_id)
-      .eq("is_active", true)
-      .order("name")
-      .then(({ data }) => setCustomers((data as CustomerOption[]) ?? []));
-  }, [org]);
+      let query = supabase
+        .from("invoices")
+        .select(
+          "id, invoice_number, customer_id, status, invoice_date, due_date, total, amount_paid, currency_code, created_at, customer:customers(name)",
+          { count: "exact" }
+        )
+        .eq("organization_id", org.organization_id)
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true })
+        .range(page * pageSize, page * pageSize + pageSize - 1)
+        .abortSignal(signal);
+      if (statusFilter !== "ALL") query = query.eq("status", statusFilter);
+      const expr = documentOrFilter(
+        ["invoice_number"],
+        "customer_id",
+        search,
+        partyIds
+      );
+      if (expr) query = query.or(expr);
+      const { data, error: dbError, count: total } = await query;
+      if (dbError) throw dbError;
+      return { rows: (data ?? []) as unknown as InvoiceRow[], count: total ?? null };
+    },
+  });
 
-  // Inline customer creation — the New Invoice form never forces a detour
-  // to the Customers page when the list is empty or the party is new.
-  const handleCreateCustomer = useCallback(async () => {
-    const name = newCustomerName.trim();
-    if (!org || name.length < 2) return;
-    setCreatingCustomer(true);
-    setFormError(null);
-    const supabase = createClient();
-    const { data, error: insertError } = await supabase
-      .from("customers")
-      .insert({
-        organization_id: org.organization_id,
-        name,
-        currency_code: org.base_currency_code,
-      })
-      .select("id, name")
-      .single();
-    setCreatingCustomer(false);
-    if (insertError || !data) {
-      setFormError(insertError?.message ?? "Could not create the customer");
-      return;
-    }
-    const created = data as CustomerOption;
-    setCustomers((prev) =>
-      [...prev, created].sort((a, b) => a.name.localeCompare(b.name))
-    );
-    setForm((f) => ({ ...f, customer_id: created.id }));
-    setNewCustomerName("");
-  }, [org, newCustomerName]);
+  const shownError = error ?? actionError;
+  const afterMutation = () => {
+    setActionError(null);
+    refresh();
+  };
 
   const totals = useMemo(() => {
     const subtotal = form.lines.reduce(
@@ -127,17 +127,6 @@ export default function InvoicesPage() {
     );
     return { subtotal, total: subtotal };
   }, [form.lines]);
-
-  const filtered = (rows ?? []).filter((inv) => {
-    if (statusFilter !== "ALL" && inv.status !== statusFilter) return false;
-    if (!search) return true;
-    const q = search.toLowerCase();
-    const name = Array.isArray(inv.customer) ? inv.customer[0]?.name : inv.customer?.name;
-    return (
-      inv.invoice_number.toLowerCase().includes(q) ||
-      (name ?? "").toLowerCase().includes(q)
-    );
-  });
 
   const setLine = (i: number, patch: Partial<LineDraft>) =>
     setForm((f) => ({
@@ -213,7 +202,7 @@ export default function InvoicesPage() {
       customer_id: "", invoice_date: today(), payment_terms_days: "30",
       notes: "", lines: [{ description: "", quantity: "1", unit_price: "" }],
     });
-    load();
+    refresh();
   };
 
   return (
@@ -239,12 +228,14 @@ export default function InvoicesPage() {
             placeholder="Search by number or customer…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search invoices"
           />
         </div>
         <select
           className={`${inputCls} max-w-40`}
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
+          aria-label="Filter by status"
         >
           {["ALL", "DRAFT", "ISSUED", "PARTIALLY_PAID", "PAID", "OVERDUE", "VOIDED", "CREDITED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
@@ -252,17 +243,17 @@ export default function InvoicesPage() {
         </select>
       </div>
 
-      {orgLoading || (!rows && !error) ? (
+      {orgLoading || (!rows && !shownError) ? (
         <TableSkeleton cols={6} />
-      ) : error ? (
-        <ErrorState message={error} />
-      ) : filtered.length === 0 ? (
+      ) : shownError ? (
+        <ErrorState message={shownError} onRetry={afterMutation} />
+      ) : (rows ?? []).length === 0 ? (
         <EmptyState
           title={search || statusFilter !== "ALL" ? "No invoices match your filters" : "No invoices yet"}
           hint={search ? undefined : "Create one here, or tell the AI: \"Invoice ABC Technologies Rs. 500,000 for software development\"."}
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <div className={`bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto transition-opacity ${refreshing ? "opacity-60" : ""}`}>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -277,7 +268,7 @@ export default function InvoicesPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((inv) => {
+              {(rows ?? []).map((inv) => {
                 const customerName = Array.isArray(inv.customer) ? inv.customer[0]?.name : inv.customer?.name;
                 const balance = inv.total - inv.amount_paid;
                 return (
@@ -305,8 +296,8 @@ export default function InvoicesPage() {
                           DRAFT: ["ISSUED"],
                           ISSUED: ["VOIDED"],
                         }}
-                        onUpdated={load}
-                        onError={setError}
+                        onUpdated={afterMutation}
+                        onError={setActionError}
                       />
                     </td>
                     <td className="px-4 py-3 text-right">
@@ -315,8 +306,8 @@ export default function InvoicesPage() {
                           table="invoices"
                           documentId={inv.id}
                           label="draft invoice"
-                          onDeleted={load}
-                          onError={setError}
+                          onDeleted={afterMutation}
+                          onError={setActionError}
                         />
                       )}
                     </td>
@@ -328,48 +319,31 @@ export default function InvoicesPage() {
         </div>
       )}
 
+      <Pagination
+        page={page}
+        pageSize={pageSize}
+        count={count}
+        onPageChange={setPage}
+        refreshing={refreshing}
+      />
+
       {/* New Invoice Modal */}
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title="New Invoice" wide>
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs font-medium text-text-secondary">Customer *</label>
-              <select
-                className={`${inputCls} mt-1.5`}
-                value={form.customer_id}
-                onChange={(e) => setForm({ ...form, customer_id: e.target.value })}
-              >
-                <option value="">Select customer…</option>
-                {customers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <div className="flex items-center gap-2 mt-1.5">
-                <input
-                  className={inputCls}
-                  placeholder="New customer name — create it here"
-                  value={newCustomerName}
-                  onChange={(e) => setNewCustomerName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      handleCreateCustomer();
-                    }
-                  }}
+              <label htmlFor="invoice-customer" className="text-xs font-medium text-text-secondary">Customer *</label>
+              <div className="mt-1.5">
+                <PartyCombobox
+                  kind="customer"
+                  organizationId={org?.organization_id ?? ""}
+                  value={form.customer_id}
+                  onChange={(id) => setForm((f) => ({ ...f, customer_id: id }))}
+                  inputId="invoice-customer"
+                  label="Customer"
+                  baseCurrency={org?.base_currency_code}
                 />
-                <button
-                  type="button"
-                  onClick={handleCreateCustomer}
-                  disabled={creatingCustomer || newCustomerName.trim().length < 2}
-                  className="shrink-0 px-3 py-2 rounded-xl text-xs font-medium text-white bg-ai-600 hover:bg-ai-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  {creatingCustomer ? "Creating…" : "+ Create"}
-                </button>
               </div>
-              {customers.length === 0 && (
-                <p className="text-[11px] text-warning-600 mt-1">
-                  No customers yet - type a name above to create one without
-                  leaving this form.
-                </p>
-              )}
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>

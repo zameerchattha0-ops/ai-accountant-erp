@@ -23,7 +23,9 @@ interface NavItem {
   children?: { label: string; href: string }[];
 }
 
-const navItems: NavItem[] = [
+// Exported as the single source of truth: the Sidebar renders it and the
+// command menu (Ctrl/Cmd+K) flattens the same routes — never two lists.
+export const navItems: NavItem[] = [
   { label: "Dashboard", href: "/", icon: LayoutDashboard,
     tone: { icon: "text-ai-600", chip: "bg-ai-50" } },
   {
