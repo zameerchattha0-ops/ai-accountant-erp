@@ -656,24 +656,105 @@ async def ai_progress(
     }
 
 
+#: A hard ceiling on the activity read.  ``_read_sessions_paged`` PAGES until
+#: the feed is complete (a single PostgREST response caps at ~1000 rows, which
+#: would silently truncate the feed AND the counts beside it); when the ceiling
+#: is hit, ``truncated`` says so instead of pretending completeness — and the
+#: page falls back to SERVER-side filtering, because the browser's copy is then
+#: incomplete.
+_AI_ACTIVITY_LIMIT = 2000
+_AI_ACTIVITY_PAGE = 500
+#: ``ai.session_status_code`` (migration 026) — the filter and the counts.
+_AI_SESSION_STATUSES = (
+    "PENDING",
+    "PLANNING",
+    "WAITING_FOR_USER",
+    "EXECUTING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+)
+
+
+async def _read_sessions_paged(
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Read this user's sessions in PAGES so the feed and its counts are honest.
+
+    Ordering is ``created_at desc`` (newest first — what a feed wants).  A short
+    page ends the read, so a small account pays ONE round trip.
+    """
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    while len(rows) < limit:
+        want = min(_AI_ACTIVITY_PAGE, limit - len(rows))
+        page = await fetch_many(
+            "ai_execution_sessions",
+            filters={
+                "organization_id": str(organization_id),
+                "user_id": str(user_id),
+            },
+            order="created_at.desc",
+            limit=want,
+            offset=offset,
+        )
+        rows.extend(page)
+        if len(page) < want:
+            break
+        offset += want
+    return rows
+
+
 @app.get("/api/ai/sessions")
 async def list_sessions(
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = 1000,
+    query: str = "",
+    status: str = "ALL",
     auth: AuthContext = Depends(get_current_user),
 ):
-    """List recent execution sessions for the current user."""
-    sessions = await fetch_many(
-        "ai_execution_sessions",
-        filters={
-            "organization_id": str(auth.organization_id),
-            "user_id": str(auth.user_id),
-        },
-        order="created_at.desc",
-        limit=limit,
-        offset=offset,
-    )
-    return {"sessions": sessions, "count": len(sessions)}
+    """This user's AI-activity feed: sessions + counts + search in ONE request.
+
+    The contract mirrors the Projects / Fixed Assets pages so the UI is uniform:
+    ``counts`` and ``total`` describe the WHOLE feed (the loaded page), never the
+    current filter; ``query``/``status`` narrow ``items`` only.  ``query`` is a
+    case-insensitive match over ``user_request`` — the sentence the user actually
+    typed, which is the only human-meaningful headline a session carries.
+    """
+    limit = max(1, min(limit, _AI_ACTIVITY_LIMIT))
+    rows = await _read_sessions_paged(auth.organization_id, auth.user_id, limit=limit)
+    truncated = len(rows) >= limit
+
+    counts: Dict[str, int] = {"ALL": len(rows)}
+    for name in _AI_SESSION_STATUSES:
+        counts[name] = 0
+    for row in rows:
+        key = str(row.get("status") or "").upper()
+        if key in counts:
+            counts[key] += 1
+
+    wanted = (status or "ALL").strip().upper() or "ALL"
+    if wanted not in _AI_SESSION_STATUSES:
+        # An unknown status is normalised — never an error, never an empty lie
+        # that would make the feed look broken.
+        wanted = "ALL"
+    needle = (query or "").strip().lower()
+    items = [
+        row
+        for row in rows
+        if (wanted == "ALL" or str(row.get("status") or "").upper() == wanted)
+        and (not needle or needle in str(row.get("user_request") or "").lower())
+    ]
+
+    return {
+        "items": items,
+        "counts": counts,
+        "total": len(rows),
+        "truncated": truncated,
+        "status": wanted,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +885,46 @@ async def latest_active_session(
     return {"found": False, "session": None}
 
 
+def _unknown_tool() -> Dict[str, Any]:
+    """What the page shows when the catalog row could not be resolved — an
+    honest "we don't know its name", never a fabricated one."""
+    return {"tool_name": None, "tool_read_only": None, "tool_risk_level": None}
+
+
+async def _tool_catalog() -> Dict[str, Dict[str, Any]]:
+    """Index ``ai.tools`` by id.
+
+    A tool call stores only ``tool_id`` (a UUID FK), so without this join the
+    detail view could show nothing but an opaque id.  ``ai.tools`` is a small
+    GLOBAL reference table (it has no ``organization_id``), so read it once and
+    index it — and ``read_only`` is what lets the page distinguish a READ of the
+    user's books from a WRITE to them.
+    """
+    try:
+        rows = await fetch_many(
+            "ai_tools",
+            filters={},
+            select="id,name,read_only,risk_level",
+            limit=1000,
+        )
+    except Exception as exc:  # noqa: BLE001 — names are decoration, not data
+        log.warning("api.session.tool_catalog_unavailable", error=str(exc))
+        return {}
+    return {
+        str(row.get("id")): {
+            "tool_name": row.get("name"),
+            "tool_read_only": (
+                bool(row.get("read_only"))
+                if row.get("read_only") is not None
+                else None
+            ),
+            "tool_risk_level": row.get("risk_level"),
+        }
+        for row in rows or []
+        if row.get("id")
+    }
+
+
 @app.get("/api/ai/sessions/{session_id}")
 async def get_session(
     session_id: uuid.UUID,
@@ -842,12 +963,36 @@ async def get_session(
         order="created_at.asc",
     )
 
+    tool_labels = await _tool_catalog()
+
+    # ``ai.execution_results`` is the payoff row: what changed, and whether it
+    # was VERIFIED.  It was never returned before, so the page could not say
+    # what the run actually did.  A run that has not finished (or that died
+    # mid-flight) has no result row — the page reports "not recorded yet"
+    # rather than inventing an outcome.
+    results = None
+    try:
+        results = await fetch_one(
+            "ai_execution_results",
+            filters={"execution_session_id": str(session_id)},
+        )
+    except Exception as exc:  # noqa: BLE001 — the trail must still render
+        log.warning(
+            "api.session.results_unavailable",
+            session_id=str(session_id),
+            error=str(exc),
+        )
+
     return {
         "session": session,
         "steps": steps,
-        "tool_calls": tool_calls,
+        "tool_calls": [
+            {**call, **tool_labels.get(str(call.get("tool_id")), _unknown_tool())}
+            for call in tool_calls
+        ],
         "clarifications": clarifications,
         "confirmations": confirmations,
+        "results": results,
     }
 
 

@@ -1,4 +1,4 @@
-import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, SessionSummary, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
+import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, ActivityFeed, SessionBundle, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
 import type { AssetCategory, FixedAsset, Project } from "@/lib/types/entities";
 
 // Same-origin by default: on Vercel the FastAPI backend is served under
@@ -81,8 +81,23 @@ export async function aiConfirm(decision: ConfirmationDecision): Promise<AgentRe
   });
 }
 
-export async function aiGetSessions(limit = 20, offset = 0): Promise<{ sessions: SessionSummary[] }> {
-  return fetchApi(`/api/ai/sessions?limit=${limit}&offset=${offset}`);
+/**
+ * This user's AI-activity feed.
+ *
+ * `counts` and `total` always cover the WHOLE loaded feed; `query` and `status`
+ * narrow `items` only — so a filter can never make the counts beside it lie.
+ */
+export async function aiGetSessions(
+  limit = 1000,
+  query = "",
+  status = "ALL"
+): Promise<ActivityFeed> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    query,
+    status,
+  });
+  return fetchApi<ActivityFeed>(`/api/ai/sessions?${params.toString()}`);
 }
 
 /**
@@ -95,8 +110,8 @@ export async function aiProgress(conversationId: string): Promise<AgentProgress>
   );
 }
 
-export async function aiGetSession(sessionId: string) {
-  return fetchApi(`/api/ai/sessions/${sessionId}`);
+export async function aiGetSession(sessionId: string): Promise<SessionBundle> {
+  return fetchApi<SessionBundle>(`/api/ai/sessions/${sessionId}`);
 }
 
 /**

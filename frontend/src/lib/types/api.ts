@@ -210,44 +210,117 @@ export interface ProgressTool {
   status?: string;
 }
 
+/**
+ * One row of `ai.execution_sessions` (migrations 026 + 028).
+ *
+ * The ONLY human-meaningful headline a session carries is `user_request` — the
+ * sentence the user actually typed.  (An earlier draft of these types guessed
+ * at `action` / `summary` columns that do not exist, which would have rendered
+ * as blank cards; it was corrected against the schema here.)
+ */
 export interface SessionSummary {
   id: string;
-  status: ExecutionStatus;
-  action?: string;
-  summary?: string;
+  organization_id?: string;
+  user_id?: string;
+  conversation_id?: string | null;
+  user_request: string;
+  status: ExecutionStatus | string;
+  /** `ai.execution_phase_code` — where the run got to (m028). */
+  current_phase?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  /** When a WAITING_FOR_USER run counts as abandoned (m074). */
+  expires_at?: string | null;
   created_at: string;
+  updated_at?: string | null;
 }
 
-export interface SessionDetail extends SessionSummary {
+/**
+ * GET /api/ai/sessions — same register contract as Projects / Fixed Assets:
+ * `counts` and `total` describe the WHOLE feed, never the current filter.
+ */
+export interface ActivityFeed {
+  items: SessionSummary[];
+  counts: Record<string, number>;
+  total: number;
+  /** True when the feed filled the read page (its copy is incomplete). */
+  truncated: boolean;
+  status: string;
+}
+
+/** `ai.execution_steps` — ordered stages of one run. */
+export interface SessionStep {
+  step_order: number;
+  step_type: string;
+  description?: string | null;
+  status: string;
+  input_summary?: string | null;
+  output_summary?: string | null;
+  error_details?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at?: string;
+}
+
+/**
+ * `ai.tool_calls`, with `tool_name` / `tool_read_only` / `tool_risk_level`
+ * resolved from `ai.tools` by the backend — the row itself carries only a
+ * `tool_id` UUID, and `read_only: false` is how the page tells a READ of the
+ * user's books from a WRITE to them.
+ */
+export interface ToolCallRecord {
+  call_order: number;
+  tool_id: string;
+  tool_name: string | null;
+  tool_read_only: boolean | null;
+  tool_risk_level: string | null;
+  status: string;
+  input_payload?: Record<string, unknown>;
+  output_payload?: Record<string, unknown>;
+  error_details?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+/** `ai.clarifications` — what the agent asked the user, and what they replied. */
+export interface ClarificationRecord {
+  question: string;
+  reason?: string | null;
+  user_response?: string | null;
+  status: string;
+  asked_at?: string | null;
+  answered_at?: string | null;
+}
+
+/** `ai.confirmations` — a high-impact action the user approved or declined. */
+export interface ConfirmationRecord {
+  action_type: string;
+  description?: string | null;
+  risk_level: string;
+  confirmation_required: boolean;
+  user_confirmed: boolean | null;
+  confirmed_at?: string | null;
+}
+
+/** `ai.execution_results` — what changed, and whether it was VERIFIED. */
+export interface SessionResult {
+  status: string;
+  summary?: string | null;
+  action_type?: string | null;
+  affected_entities?: unknown[];
+  result_payload?: Record<string, unknown>;
+  verification_status?: string;
+  completed_at?: string | null;
+}
+
+/** GET /api/ai/sessions/{id} — the full trail for one run. */
+export interface SessionBundle {
+  session: SessionSummary;
   steps: SessionStep[];
   tool_calls: ToolCallRecord[];
   clarifications: ClarificationRecord[];
   confirmations: ConfirmationRecord[];
-}
-
-export interface SessionStep {
-  phase: string;
-  status: string;
-  details?: Record<string, unknown>;
-}
-
-export interface ToolCallRecord {
-  tool_name: string;
-  parameters: Record<string, unknown>;
-  result: Record<string, unknown>;
-  success: boolean;
-  error?: string;
-}
-
-export interface ClarificationRecord {
-  question: string;
-  answer?: string;
-}
-
-export interface ConfirmationRecord {
-  action_description: string;
-  approved: boolean;
-  notes?: string;
+  results: SessionResult | null;
 }
 
 /* ---- Organization ---- */

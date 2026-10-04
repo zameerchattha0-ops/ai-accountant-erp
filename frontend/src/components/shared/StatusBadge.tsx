@@ -33,6 +33,20 @@ const STATUS_STYLES: Record<string, string> = {
   // Project register statuses (project_status enum).
   PLANNING: "bg-info-50 text-info-700",
   ON_HOLD: "bg-warning-50 text-warning-700",
+  // AI session statuses + execution phases (ai.session_status_code /
+  // ai.execution_phase_code).  The WARNING shades are the ones that need a
+  // human — hiding those behind the muted default would lose the only
+  // signal that a run is stuck waiting on the user.
+  RECEIVED: "bg-info-50 text-info-700",
+  INTERPRETING: "bg-info-50 text-info-700",
+  CONTEXT_LOADING: "bg-info-50 text-info-700",
+  VALIDATING: "bg-info-50 text-info-700",
+  VERIFYING: "bg-info-50 text-info-700",
+  AWAITING_CLARIFICATION: "bg-warning-50 text-warning-700",
+  AWAITING_CONFIRMATION: "bg-warning-50 text-warning-700",
+  WAITING_FOR_USER: "bg-warning-50 text-warning-700",
+  EXECUTING: "bg-ai-50 text-ai-700",
+  FAILED: "bg-error-50 text-error-700",
   SUSPENDED: "bg-warning-50 text-warning-700",
   REMOVED: "bg-bg-muted text-text-muted",
   INVITED: "bg-warning-50 text-warning-700",
@@ -49,6 +63,16 @@ const LABELS: Record<string, string> = {
   CREDITED: "Credited",
   PLANNING: "Planning",
   ON_HOLD: "On Hold",
+  RECEIVED: "Received",
+  INTERPRETING: "Interpreting",
+  CONTEXT_LOADING: "Loading context",
+  VALIDATING: "Validating",
+  VERIFYING: "Verifying",
+  AWAITING_CLARIFICATION: "Needs your answer",
+  AWAITING_CONFIRMATION: "Needs approval",
+  WAITING_FOR_USER: "Waiting for you",
+  EXECUTING: "Executing",
+  FAILED: "Failed",
 };
 
 export default function StatusBadge({ status }: { status: string }) {
