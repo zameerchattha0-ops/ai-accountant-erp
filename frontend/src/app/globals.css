@@ -35,18 +35,28 @@
   --color-warning-100: #fef3c7;
   --color-warning-500: #f59e0b;
   --color-warning-600: #d97706;
+  /* -700 is referenced by StatusBadge (pending/on-hold badges) but was never
+     defined, so those text colours silently no-op'd. Added here. */
+  --color-warning-700: #b45309;
 
   /* ---- Semantic: Error / Overdue ---- */
   --color-error-50: #fef2f2;
   --color-error-100: #fee2e2;
+  /* -200/-300 are referenced by ErrorState's border and the Fixed Assets
+     hover border; -700 by the error badges — all were undefined. Added here. */
+  --color-error-200: #fecaca;
+  --color-error-300: #fca5a5;
   --color-error-500: #ef4444;
   --color-error-600: #dc2626;
+  --color-error-700: #b91c1c;
 
   /* ---- Semantic: Info ---- */
   --color-info-50: #eff6ff;
   --color-info-100: #dbeafe;
   --color-info-500: #3b82f6;
   --color-info-600: #2563eb;
+  /* -700 is referenced by the info badges (planning/issued) but was undefined. */
+  --color-info-700: #1d4ed8;
 
   /* ---- Semantic: AI / Teal (brand-derived) ---- */
   --color-ai-50: #f0fdfa;

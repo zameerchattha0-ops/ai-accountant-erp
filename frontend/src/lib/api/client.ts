@@ -1,5 +1,5 @@
 import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, SessionSummary, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
-import type { AssetCategory, FixedAsset } from "@/lib/types/entities";
+import type { AssetCategory, FixedAsset, Project } from "@/lib/types/entities";
 
 // Same-origin by default: on Vercel the FastAPI backend is served under
 // /api/* of the same domain (see vercel.json "services"). For local dev set
@@ -657,6 +657,106 @@ export async function updateFixedAssetCategory(
     `/api/fixed-assets/categories/${categoryId}`,
     { method: "PATCH", body: JSON.stringify(payload) }
   );
+}
+
+/* ---- Projects ---- */
+
+/** A customer as the project form's picker needs it (id + display name). */
+export interface ProjectCustomer {
+  id: string;
+  name: string;
+}
+
+/** Register-wide totals for the page's KPI tiles (never the current filter). */
+export interface ProjectSummary {
+  budget: number;
+  revenue: number;
+  costs: number;
+  gross_profit: number;
+}
+
+/**
+ * A register row: the project plus its ``v_project_profitability`` columns.
+ * A project with no posted journal lines reads 0 (the view LEFT JOINs), never
+ * a hole, and ``margin_percent`` is null when there is no revenue to divide by.
+ */
+export interface ProjectRow extends Project {
+  /** The linked customer's name, or null (none linked / lookup unavailable). */
+  customer_name: string | null;
+  revenue: number;
+  costs: number;
+  gross_profit: number;
+  margin_percent: number | null;
+}
+
+export interface ProjectRegister {
+  items: ProjectRow[];
+  /** Counts per project_status, plus "ALL" — computed over the whole register. */
+  counts: Record<string, number>;
+  summary: ProjectSummary;
+  customers: ProjectCustomer[];
+  /** The register size the counts/summary describe (== items.length normally). */
+  total: number;
+  /**
+   * True when the read page filled: ``items`` (and the counts/summary) describe
+   * only the rows read, so the page must SAY SO rather than imply completeness.
+   */
+  truncated: boolean;
+  /**
+   * Lookups that failed, e.g. ``["profitability"]`` / ``["customers"]``. The
+   * related figures are UNKNOWN — the page shows "—", never a bare 0.
+   */
+  degraded: string[];
+  status: string;
+}
+
+/**
+ * The register. Counts, the summary and the customer list always cover EVERY
+ * project; `query` and `status` narrow the returned rows only.
+ */
+export async function listProjects(
+  query = "",
+  status = "ALL"
+): Promise<ProjectRegister> {
+  const params = new URLSearchParams({ query, status });
+  return fetchApi<ProjectRegister>(`/api/projects?${params.toString()}`);
+}
+
+export interface ProjectPayload {
+  name: string;
+  description?: string | null;
+  customer_id?: string | null;
+  status?: string;
+  billing_type?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  budget?: number | null;
+  /** Only honoured on create; the org's base currency is sent by the page. */
+  currency_code?: string;
+}
+
+/** Create a project — the server derives ``project_code`` when none is sent. */
+export async function createProject(
+  payload: ProjectPayload
+): Promise<{ item: Project }> {
+  return fetchApi<{ item: Project }>("/api/projects", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** ``project_code`` is an identifier other documents cite — never editable. */
+export type ProjectUpdate = Omit<ProjectPayload, "currency_code">;
+
+/** Edit a project (only editable fields; the id comes from the path). */
+export async function updateProject(
+  projectId: string,
+  payload: ProjectUpdate
+): Promise<{ item: Project }> {
+  return fetchApi<{ item: Project }>(`/api/projects/${projectId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
 }
 
 /* ---- Health ---- */

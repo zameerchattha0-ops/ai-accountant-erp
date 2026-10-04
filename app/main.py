@@ -1626,6 +1626,195 @@ async def dispose_fixed_asset_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# PROJECTS — the register the Projects page drives.  Create/edit run through
+# ``project_service`` so the page and the AI agent share ONE rule set (a
+# refusal reads the same sentence either way).  P&L columns come from
+# ``v_project_profitability``, which LEFT JOINs projects: a project with no
+# posted journal lines reads 0, never a hole.
+# ---------------------------------------------------------------------------
+_PROJECT_STATUSES = ("PLANNING", "ACTIVE", "ON_HOLD", "COMPLETED", "CANCELLED")
+#: A hard ceiling on the register read.  The repository PAGES until the register
+#: is complete, so this is only reached by a register this large; when it IS
+#: reached, ``truncated`` is True and the page says so (the counts/summary then
+#: describe the rows read) instead of pretending completeness — and the page
+#: falls back to SERVER-SIDE search, because the browser's copy is incomplete.
+_PROJECT_REGISTER_LIMIT = 2000
+
+
+@app.get("/api/projects")
+async def list_projects_endpoint(
+    query: str = "",
+    status: str = "ALL",
+    auth: AuthContext = Depends(get_current_user),
+):
+    """The project register + counts + P&L summary + customers in ONE request.
+
+    Counts and the summary describe the WHOLE register (they describe the
+    register, not the current filter); ``query``/``status`` narrow ``items`` —
+    the same contract as the Fixed Assets page.
+
+    TWO honesties the page depends on:
+
+    * ``truncated`` — the register filled the read page, so ``items`` (and the
+      counts/summary) describe only the rows read.  The page says so rather
+      than pretending the register is complete.
+    * ``degraded`` — profitability and customer names are LOOKUPS, not
+      authority.  A failure is NAMED here so the page can show "—" (unknown)
+      instead of a bare 0, which would read as "this project earned nothing".
+    """
+    from app.services import project_service
+
+    rows = await project_service.list_projects(
+        auth.organization_id, limit=_PROJECT_REGISTER_LIMIT
+    )
+    truncated = len(rows) >= _PROJECT_REGISTER_LIMIT
+    degraded: List[str] = []
+
+    # A failure degrades a lookup to 0 / blank instead of failing the page —
+    # and is recorded in ``degraded`` so the page never renders it as a zero.
+    pnl_rows: List[Dict[str, Any]] = []
+    try:
+        pnl_rows = await fetch_many(
+            "v_project_profitability",
+            filters={"organization_id": str(auth.organization_id)},
+            limit=_PROJECT_REGISTER_LIMIT,
+        )
+    except Exception as exc:  # noqa: BLE001 — the register must still render
+        degraded.append("profitability")
+        log.warning("api.projects.profitability_unavailable", error=str(exc))
+    pnl = {str(r.get("project_id")): r for r in pnl_rows}
+
+    customers: List[Dict[str, str]] = []
+    try:
+        rows_c = await fetch_many(
+            "customers",
+            filters={"organization_id": str(auth.organization_id)},
+            select="id,name",
+            limit=1000,
+        )
+        customers = [
+            {"id": str(c.get("id")), "name": str(c.get("name") or "")}
+            for c in rows_c or []
+            if c.get("id")
+        ]
+    except Exception as exc:  # noqa: BLE001 — the picker degrades to "(none)"
+        degraded.append("customers")
+        log.warning("api.projects.customers_unavailable", error=str(exc))
+    customer_names = {c["id"]: c["name"] for c in customers}
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        stats = pnl.get(str(row.get("id"))) or {}
+        customer_id = str(row.get("customer_id") or "")
+        items.append(
+            {
+                **row,
+                "customer_name": customer_names.get(customer_id) or None,
+                "revenue": round(float(stats.get("project_revenue") or 0), 2),
+                "costs": round(float(stats.get("project_costs") or 0), 2),
+                "gross_profit": round(float(stats.get("gross_profit") or 0), 2),
+                "margin_percent": stats.get("margin_percent"),
+            }
+        )
+
+    counts: Dict[str, int] = {"ALL": len(items)}
+    for name in _PROJECT_STATUSES:
+        counts[name] = 0
+    for row in items:
+        key = str(row.get("status") or "")
+        if key in counts:
+            counts[key] += 1
+
+    summary = {"budget": 0.0, "revenue": 0.0, "costs": 0.0, "gross_profit": 0.0}
+    for row in items:
+        summary["budget"] += float(row.get("budget") or 0)
+        summary["revenue"] += float(row.get("revenue") or 0)
+        summary["costs"] += float(row.get("costs") or 0)
+        summary["gross_profit"] += float(row.get("gross_profit") or 0)
+
+    wanted = (status or "ALL").strip().upper() or "ALL"
+    if wanted != "ALL" and wanted not in _PROJECT_STATUSES:
+        wanted = "ALL"
+    needle = (query or "").strip().lower()
+    filtered = [
+        row
+        for row in items
+        if (wanted == "ALL" or str(row.get("status")) == wanted)
+        and (
+            not needle
+            or needle in str(row.get("name") or "").lower()
+            or needle in str(row.get("project_code") or "").lower()
+            or needle in str(row.get("customer_name") or "").lower()
+        )
+    ]
+
+    return {
+        "items": filtered,
+        "counts": counts,
+        "summary": {key: round(value, 2) for key, value in summary.items()},
+        "customers": sorted(customers, key=lambda c: c["name"].lower()),
+        "status": wanted,
+        # Register honesty signals the page renders verbatim (see docstring).
+        "total": len(items),
+        "truncated": truncated,
+        "degraded": degraded,
+    }
+
+
+@app.post("/api/projects", status_code=201)
+async def create_project_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Create a project — ``project_code`` is derived by the server when the
+    caller does not state one (a code no user of a form ever thinks of)."""
+    from app.services import project_service
+
+    try:
+        item = await project_service.create(
+            auth.organization_id,
+            name=payload.get("name"),
+            project_code=payload.get("project_code"),
+            description=payload.get("description"),
+            customer_id=_optional_uuid(payload.get("customer_id")),
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            budget=payload.get("budget"),
+            currency_code=str(payload.get("currency_code") or "PKR"),
+            billing_type=payload.get("billing_type") or None,
+            status=str(payload.get("status") or "PLANNING"),
+        )
+    except ValueError as exc:
+        raise _catalogue_error("projects", exc)
+    return {"item": item}
+
+
+@app.patch("/api/projects/{project_id}")
+async def update_project_endpoint(
+    project_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Edit a project.  Only editable fields are accepted; the code (an
+    identifier other documents already cite) and the organisation never change."""
+    from app.services import project_service
+
+    # The path is authoritative for the id — a body claiming one is dropped
+    # before expansion, otherwise ``update(org, project_id=..., **{"project_
+    # id": ...})`` would be a TypeError → 500.
+    fields = {
+        key: value for key, value in dict(payload).items() if key != "project_id"
+    }
+    try:
+        item = await project_service.update(
+            auth.organization_id, project_id=project_id, **fields
+        )
+    except ValueError as exc:
+        raise _catalogue_error("projects", exc)
+    return {"item": item}
+
+
+# ---------------------------------------------------------------------------
 # CREDIT NOTES (sales) — proper endpoints for the Credit Note module
 # (list/detail/create/status).  Journal posting happens deterministically
 # inside the create TOOL (agent path); document creation here mirrors the

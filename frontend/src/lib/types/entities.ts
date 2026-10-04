@@ -326,6 +326,31 @@ export interface AgingRow {
   bucket_90_plus: number;
 }
 
+/**
+ * One project (``public.projects``).
+ *
+ * ``project_code`` is a server-derived identifier (``<STEM>-###``) documents
+ * and journals cite, so it is never edited from the page.  ``status`` is the
+ * ``project_status`` enum, ``billing_type`` the ``billing_type_code`` enum.
+ */
+export interface Project {
+  id: string;
+  organization_id: string;
+  project_code: string;
+  name: string;
+  description: string | null;
+  customer_id: string | null;
+  status: "PLANNING" | "ACTIVE" | "ON_HOLD" | "COMPLETED" | "CANCELLED";
+  billing_type: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  budget: number | null;
+  currency_code: string;
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface ProjectProfitabilityRow {
   organization_id: string;
   project_id: string;

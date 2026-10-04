@@ -30,6 +30,9 @@ const STATUS_STYLES: Record<string, string> = {
   DISPOSED: "bg-bg-muted text-text-muted",
   WRITTEN_OFF: "bg-error-50 text-error-700",
   ACTIVE: "bg-success-50 text-success-700",
+  // Project register statuses (project_status enum).
+  PLANNING: "bg-info-50 text-info-700",
+  ON_HOLD: "bg-warning-50 text-warning-700",
   SUSPENDED: "bg-warning-50 text-warning-700",
   REMOVED: "bg-bg-muted text-text-muted",
   INVITED: "bg-warning-50 text-warning-700",
@@ -44,6 +47,8 @@ const LABELS: Record<string, string> = {
   PARTIAL: "Partially Paid",
   PARTIALLY_PAID: "Partially Paid",
   CREDITED: "Credited",
+  PLANNING: "Planning",
+  ON_HOLD: "On Hold",
 };
 
 export default function StatusBadge({ status }: { status: string }) {
