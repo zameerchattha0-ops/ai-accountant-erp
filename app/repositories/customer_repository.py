@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.database import fetch_many, fetch_one, insert_one, search_ilike, update_one
+from app.display_names import professional_name
 
 
 async def search_customers(
@@ -88,7 +89,7 @@ async def create_customer(
     """Create a new customer. customer_code is auto-assigned by trigger."""
     data: Dict[str, Any] = {
         "organization_id": str(organization_id),
-        "name": name,
+        "name": professional_name(name),
         "email": email,
         "phone": phone,
         "legal_name": legal_name,

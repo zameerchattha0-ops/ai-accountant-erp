@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { useServerList } from "@/lib/hooks/useServerList";
 import { ilikeAny } from "@/lib/lists/logic";
+import { professionalName } from "@/lib/utils/displayName";
 import { formatCurrency } from "@/lib/utils/currency";
 import { aiExecute, aiClarify, aiConfirm } from "@/lib/api/client";
 import type { AgentResponse } from "@/lib/types/api";
@@ -210,7 +211,7 @@ export default function EmployeesPage() {
     const supabase = createClient();
     const payload: Record<string, unknown> = {
       organization_id: org.organization_id,
-      full_name: form.full_name.trim(),
+      full_name: professionalName(form.full_name),
       date_of_joining: form.date_of_joining,
       basic_salary: salary,
     };

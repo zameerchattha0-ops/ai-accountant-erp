@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.database import call_rpc, fetch_one, insert_one, search_ilike
+from app.display_names import professional_name
 
 
 async def search_services(
@@ -105,7 +106,7 @@ async def create_service(
         "organization_id": str(organization_id),
         "service_code": service_code
         or await generate_service_code(organization_id),
-        "name": name,
+        "name": professional_name(name),
         "description": description,
         "billing_unit": billing_unit,
         "standard_rate": standard_rate,

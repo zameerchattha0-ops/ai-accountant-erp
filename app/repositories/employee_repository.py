@@ -18,6 +18,7 @@ from app.database import (
     search_ilike,
     update_one,
 )
+from app.display_names import professional_name
 
 _SELECT = (
     "id,employee_code,full_name,date_of_joining,basic_salary,status,"
@@ -120,7 +121,7 @@ async def create_employee(
     """Insert an employee. ``employee_code`` is assigned by the DB trigger."""
     data: Dict[str, Any] = {
         "organization_id": str(organization_id),
-        "full_name": full_name,
+        "full_name": professional_name(full_name),
         "date_of_joining": date_of_joining,
         "basic_salary": basic_salary,
         "is_active": True,

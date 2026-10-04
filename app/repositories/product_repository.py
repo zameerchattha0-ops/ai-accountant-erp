@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.database import call_rpc, fetch_one, insert_one, search_ilike
+from app.display_names import professional_name
 
 
 async def search_products(
@@ -103,7 +104,7 @@ async def create_product(
         "organization_id": str(organization_id),
         "product_code": product_code
         or await generate_product_code(organization_id),
-        "name": name,
+        "name": professional_name(name),
         "description": description,
         "unit": unit,
         # Catalog flag only — the database has NO stock ledger, so this

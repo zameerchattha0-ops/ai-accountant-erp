@@ -22,6 +22,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { Check, ChevronDown, Loader2, Plus } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils/cn";
+import { professionalName } from "@/lib/utils/displayName";
 import {
   createRecentList,
   createSequencer,
@@ -251,7 +252,9 @@ export default function PartyCombobox({
   );
 
   const handleCreate = useCallback(async () => {
-    const name = createName.trim();
+    // Display-grade casing at the creation boundary ("motorbike" →
+    // "Motorbike") — the same rule the backend repositories apply.
+    const name = professionalName(createName);
     if (!organizationId || name.length < 2 || creating) return;
     setCreating(true);
     setCreateError(null);

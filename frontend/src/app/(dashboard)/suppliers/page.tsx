@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { useServerList } from "@/lib/hooks/useServerList";
 import { ilikeAny } from "@/lib/lists/logic";
+import { professionalName } from "@/lib/utils/displayName";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
@@ -78,7 +79,7 @@ export default function SuppliersPage() {
     const supabase = createClient();
     const { error: insertError } = await supabase.from("suppliers").insert({
       organization_id: org.organization_id,
-      name: form.name.trim(),
+      name: professionalName(form.name),
       email: form.email.trim() || null,
       phone: form.phone.trim() || null,
       tax_number: form.tax_number.trim() || null,

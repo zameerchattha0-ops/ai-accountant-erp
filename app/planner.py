@@ -2349,7 +2349,9 @@ def _is_control_answer(value: Any) -> bool:
     text = str(value or "").strip().lower()
     if not text:
         return False
-    if text.startswith(("yes -", "no -", "create '", "use the existing")):
+    if text.startswith(
+        ("yes -", "no -", "create '", "create new party", "use the existing")
+    ):
         return True
     return text in ("yes", "no", "y", "n", "ok", "okay")
 
@@ -2488,6 +2490,20 @@ def _merge_field_answer_tail(
             return True
         if low in _DECLINE_WORDS:
             return True
+        # A DECISION CHIP IS NEVER A PARTY NAME (production 2026-10-04: the
+        # party gate's own option "Yes - create 'ABC Autos'" was stored here
+        # verbatim, became the customer ledger, and printed in the invoice's
+        # Bill To section).  Reject the chip so the keyword chain's
+        # "party check:" branch runs: it sets
+        # ``customer/supplier_create_confirmed`` from the answer while the
+        # name itself stays the one extracted from the request.
+        if _is_control_answer(value):
+            log.info(
+                "planner.control_answer_rejected",
+                field=field,
+                answer=value[:60],
+            )
+            return False
         merged[field] = value
         return True
 
@@ -2521,6 +2537,15 @@ def _merge_field_answer_tail(
                  "revenue_account_name", "project_name", "period"):
         if low in _DECLINE_WORDS:
             return True
+        # Same contract as the party branch above: a control chip ("Yes - …",
+        # "Create 'X' …") answers a DECISION, it is never itself content.
+        if _is_control_answer(value):
+            log.info(
+                "planner.control_answer_rejected",
+                field=field,
+                answer=value[:60],
+            )
+            return False
         merged[field] = value
         return True
 
