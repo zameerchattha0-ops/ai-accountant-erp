@@ -65,19 +65,6 @@ const navItems: NavItem[] = [
     tone: { icon: "text-info-600", chip: "bg-info-50" } },
   { label: "Suppliers", href: "/suppliers", icon: Truck,
     tone: { icon: "text-purple-600", chip: "bg-purple-50" } },
-  { label: "Projects", href: "/projects", icon: FolderKanban,
-    tone: { icon: "text-pink-600", chip: "bg-pink-50" } },
-  // Employees replaces the empty Expense Entries module: quick-entry
-  // master data (only name, joining date and basic salary are mandatory);
-  // allowances are written by the AI from the user's own words.
-  { label: "Employees", href: "/employees", icon: UserRound,
-    tone: { icon: "text-orange-600", chip: "bg-orange-50" } },
-  { label: "Payments", href: "/payments", icon: CreditCard,
-    tone: { icon: "text-indigo-600", chip: "bg-indigo-50" } },
-  { label: "Receipts", href: "/receipts", icon: Wallet,
-    tone: { icon: "text-emerald-600", chip: "bg-emerald-50" } },
-  { label: "Banking", href: "/banking", icon: Landmark,
-    tone: { icon: "text-sky-600", chip: "bg-sky-50" } },
   {
     label: "Reports", icon: BarChart3,
     tone: { icon: "text-fuchsia-600", chip: "bg-fuchsia-50" },
@@ -89,6 +76,19 @@ const navItems: NavItem[] = [
       { label: "Project P&L", href: "/reports/project-profitability" },
     ],
   },
+  // Employees replaces the empty Expense Entries module: quick-entry
+  // master data (only name, joining date and basic salary are mandatory);
+  // allowances are written by the AI from the user's own words.
+  { label: "Employees", href: "/employees", icon: UserRound,
+    tone: { icon: "text-orange-600", chip: "bg-orange-50" } },
+  { label: "Payments", href: "/payments", icon: CreditCard,
+    tone: { icon: "text-indigo-600", chip: "bg-indigo-50" } },
+  { label: "Receipts", href: "/receipts", icon: Wallet,
+    tone: { icon: "text-emerald-600", chip: "bg-emerald-50" } },
+  { label: "Banking", href: "/banking", icon: Landmark,
+    tone: { icon: "text-sky-600", chip: "bg-sky-50" } },
+  { label: "Projects", href: "/projects", icon: FolderKanban,
+    tone: { icon: "text-pink-600", chip: "bg-pink-50" } },
   { label: "AI Activity", href: "/ai-activity", icon: Sparkles,
     tone: { icon: "text-ai-700", chip: "bg-ai-100" } },
   { label: "Settings", href: "/settings", icon: Settings,
