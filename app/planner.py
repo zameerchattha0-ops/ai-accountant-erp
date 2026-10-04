@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
@@ -730,14 +730,20 @@ def plan(
             entities.setdefault("date_to", rng[1])
     item = _extract_item(msg)
     if item:
-        entities["item_description"] = item
         # The count in the item phrasing IS the quantity ("selling 2 ovens").
-        # It used to be discarded, which made the agent ask for a quantity
-        # the user had already given.
+        # It used to be discarded, which made the agent ask for a quantity the
+        # user had already given.
         stated_qty = _extract_item_quantity(msg, item)
         if stated_qty is not None:
+            # A WRITTEN count rides inside the item the extractor returned
+            # ("two motorbikes"), so it must come OUT of the description — the
+            # line is "motorbikes" x2, not "two motorbikes" x2.
+            clean_item, _ = _split_leading_count(item)
+            entities["item_description"] = clean_item or item
             entities.setdefault("item_quantity", stated_qty)
             entities.setdefault("quantity", stated_qty)
+        else:
+            entities["item_description"] = item
     # several items stated in ONE
     # request ("2 laptops at 5000 each and 3 mice at 500") are parsed into
     # DISTINCT lines; the invoice total is DERIVED from them (Σ qty ×
@@ -1409,8 +1415,20 @@ def text_understanding_gaps(user_message: str) -> List[str]:
         intent, user_message
     ):
         gaps.append("transaction_nature")
-    if intent in _ITEM_REQUIRED_INTENTS and not _extract_item(user_message):
-        gaps.append("item_description")
+    if intent in _ITEM_REQUIRED_INTENTS:
+        item = _extract_item(user_message)
+        if not item:
+            gaps.append("item_description")
+        elif (
+            _extract_item_quantity(user_message, item) is None
+            and _COUNT_WORD_HINT_RE.search(user_message)
+        ):
+            # The user DID state a count, in wording the deterministic reader
+            # could not take ("twenty-five bikes", "half a dozen").  Ask the
+            # understanding call rather than questioning the user about a
+            # number they have just given — this is the wording the call exists
+            # for, and without this gap it was never made.
+            gaps.append("quantity")
     return gaps
 
 
@@ -2658,12 +2676,72 @@ def _extract_item(msg: str) -> Optional[str]:
 
 # "<count> <item>" — the count that precedes the item name in the request.
 _ITEM_QTY_RE = re.compile(
-    r"\b(?P<qty>\d+(?:\.\d+)?)\s*"
+    # The count may NOT start inside a bigger number: without the guard the
+    # thousands comma in "for 367,000 to be received..." yielded the fragment
+    # "000" as a count, paired with the trailing clause as its "item".
+    r"(?<![\d.,])(?P<qty>\d+(?:\.\d+)?)\s*"
     r"(?:x\s+|pcs\b\s*|units?\b\s*|pieces\b\s*|nos\b\s*)?"
     r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
     r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
     re.IGNORECASE,
 )
+
+
+# Written counts ("sale of two motorbikes", "a couple of bikes", "a dozen
+# pens").  The digit pattern above cannot see them, and `_extract_item` KEEPS
+# the word inside the item it returns — so the count ended up inside the
+# DESCRIPTION and `quantity` stayed empty.  The agent then asked "How many
+# units are you invoicing?" for a count the user had already given.
+_COUNT_WORDS: Dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+    "couple": 2, "pair": 2, "dozen": 12,
+}
+
+# Longest first, so "seventeen" is never read as the prefix "seven".
+_COUNT_WORD_ALT = "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+
+_ITEM_QTY_WORD_RE = re.compile(
+    # `(?<!-)` keeps a hyphenated compound intact: "twenty-five bikes" must not
+    # be read as FIVE (the count is 25, and the understanding call resolves it).
+    rf"(?<!-)\b(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+"
+    r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
+    r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
+    re.IGNORECASE,
+)
+
+#: Any written count word, as a hint that wording states a number we may not
+#: have been able to take (drives the understanding-call gap, never a guess).
+_COUNT_WORD_HINT_RE = re.compile(rf"\b(?:{_COUNT_WORD_ALT})\b", re.IGNORECASE)
+
+_COUNT_PREFIX_RE = re.compile(
+    rf"^\s*(?<!-)(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+",
+    re.IGNORECASE,
+)
+
+
+def _split_leading_count(text: str) -> Tuple[str, Optional[float]]:
+    """Split a leading WRITTEN count off a phrase.
+
+        "two motorbikes"   -> ("motorbikes", 2.0)
+        "a couple of bikes" -> ("bikes", 2.0)
+        "motorbikes"       -> ("motorbikes", None)
+
+    The original text is returned unchanged when there is no written count, so
+    a caller may always use the first element as the (possibly unchanged) name.
+    """
+    raw = str(text or "").strip()
+    match = _COUNT_PREFIX_RE.match(raw)
+    if not match:
+        return raw, None
+    value = _COUNT_WORDS.get((match.group("qty") or "").lower())
+    if value is None:
+        return raw, None
+    return raw[match.end():].strip(), float(value)
 
 
 def _extract_item_quantity(msg: str, item: str) -> Optional[float]:
@@ -2684,17 +2762,41 @@ def _extract_item_quantity(msg: str, item: str) -> Optional[float]:
     target = (item or "").strip().lower()
     if not target:
         return None
+    # A WRITTEN count rides INSIDE the item the extractor returned
+    # ("two motorbikes"), so the phrase without it is a name to match too.
+    bare, _ = _split_leading_count(target)
+    names = {name for name in (target, bare) if name}
+
+    def _matches(name: str) -> bool:
+        return any(
+            name == candidate
+            or candidate.startswith(name)
+            or name.startswith(candidate)
+            for candidate in names
+        )
+
     for m in _ITEM_QTY_RE.finditer(msg):
         name = (m.group("name") or "").strip().lower()
-        if not name:
+        if not name or not _matches(name):
             continue
-        if name == target or target.startswith(name) or name.startswith(target):
-            try:
-                qty = float(m.group("qty"))
-            except (TypeError, ValueError):
-                continue
-            if qty > 0:
-                return qty
+        try:
+            qty = float(m.group("qty"))
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    # Written counts: "two motorbikes", "a couple of bikes", "a dozen pens".
+    for m in _ITEM_QTY_WORD_RE.finditer(msg):
+        prefix = (msg or "")[: m.start()].rstrip().lower()
+        # "half a dozen" is SIX — never silently read as twelve.
+        if prefix.endswith(("half", "quarter", "halve")):
+            continue
+        name = (m.group("name") or "").strip().lower()
+        if not name or not _matches(name):
+            continue
+        value = _COUNT_WORDS.get((m.group("qty") or "").lower())
+        if value:
+            return float(value)
     return None
 
 

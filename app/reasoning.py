@@ -407,6 +407,13 @@ def fuzzy_word_match(word: str, vocabulary: Sequence[str]) -> Optional[str]:
     """
     if len(word) < _FUZZY_MIN_WORD or not vocabulary:
         return None
+    # A typo keeps the FIRST letter ("servcies", "invetory", "vehcile"); an
+    # unrelated word that merely shares letters does not.  Without this guard
+    # "received" scored as a match for "service", silently turning a GOODS sale
+    # into a SERVICE one — revenue with no COGS and inventory never relieved.
+    pool = [candidate for candidate in vocabulary if candidate[:1] == word[:1]]
+    if not pool:
+        return None
     signature = "".join(sorted(word))
 
     def similarity(candidate: str) -> float:
@@ -418,7 +425,7 @@ def fuzzy_word_match(word: str, vocabulary: Sequence[str]) -> Optional[str]:
         )
 
     scored: List[Tuple[float, str]] = sorted(
-        ((similarity(candidate), candidate) for candidate in vocabulary),
+        ((similarity(candidate), candidate) for candidate in pool),
         reverse=True,
     )
     best_ratio, best_word = scored[0]

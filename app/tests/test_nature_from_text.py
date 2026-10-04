@@ -173,3 +173,47 @@ class TestCategoryAndClassifierTypoParity:
         assert rule_based_nature("vehcile", {}) == rule_based_nature("vehicle", {})
         assert rule_based_nature("invetory", {})[0] == INVENTORY
         assert rule_based_nature("consultancy", {})[0] == SERVICE_NATURE
+
+
+class TestUnrelatedWordsCannotNameANature:
+    """F/S treatment: an unrelated word must never decide the nature.
+
+    "received" scored as a match for "service", so a GOODS sale was derived
+    as SERVICE — revenue booked with no COGS and inventory never relieved.
+    """
+
+    REPORTED = (
+        "Create an Invoice for ABC Autos for the sale of two motorbikes "
+        "for 367,000 to be received within default credit limit"
+    )
+
+    def test_received_is_not_a_service(self):
+        sale_vocabulary = nature_keyword_vocabulary("create_invoice")
+        assert fuzzy_word_match("received", sale_vocabulary) is None
+
+    def test_the_reported_goods_sale_is_never_called_a_service(self):
+        assert derive_nature_from_text("create_invoice", self.REPORTED) is None
+
+    def test_real_typos_still_resolve(self):
+        # The guard must not blind the typo tolerance it protects.
+        assert (
+            derive_nature_from_text(
+                "create_invoice",
+                "Create an Invoice for 45000 against sale of tax servcies "
+                "to Beta Traders",
+            )
+            == "SERVICE"
+        )
+        assert (
+            derive_nature_from_text(
+                "record_purchase", "purchased invetory for resale"
+            )
+            == "INVENTORY"
+        )
+
+    def test_the_nature_is_asked_instead_of_guessed(self):
+        p = plan(self.REPORTED)
+        assert p.transaction_nature is None
+        assert "transaction_nature" in (p.missing_fields or [])
+        # …while the count the user DID state is no longer asked for.
+        assert "quantity" not in (p.missing_fields or [])
