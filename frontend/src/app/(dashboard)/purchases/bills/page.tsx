@@ -270,7 +270,7 @@ export default function PurchaseBillsPage() {
                 <th className="px-4 py-3 font-medium text-right">Total</th>
                 <th className="px-4 py-3 font-medium text-right">Balance</th>
                 <th className="px-4 py-3 font-medium">Status</th>
-                <th className="px-4 py-3 font-medium text-right">Actions</th>
+                <th className="px-4 py-3 font-medium text-right print:hidden">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -304,7 +304,7 @@ export default function PurchaseBillsPage() {
                         onError={setActionError}
                       />
                     </td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-4 py-3 text-right print:hidden">
                       {bill.status === "DRAFT" && (
                         <DraftDeleteButton
                           table="purchase_bills"

@@ -277,7 +277,7 @@ export default function QuotationsPage() {
                 <th className="px-4 py-3 font-medium">Valid Until</th>
                 <th className="px-4 py-3 font-medium text-right">Total</th>
                 <th className="px-4 py-3 font-medium">Status</th>
-                <th className="px-4 py-3 font-medium text-right">Actions</th>
+                <th className="px-4 py-3 font-medium text-right print:hidden">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -310,7 +310,7 @@ export default function QuotationsPage() {
                         onError={setActionError}
                       />
                     </td>
-                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                    <td className="px-4 py-3 text-right whitespace-nowrap print:hidden">
                       {q.status === "DRAFT" && (
                         <div className="inline-flex items-center gap-2">
                           <button

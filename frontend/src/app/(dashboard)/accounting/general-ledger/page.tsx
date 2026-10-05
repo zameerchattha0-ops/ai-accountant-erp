@@ -111,7 +111,7 @@ export default function GeneralLedgerPage() {
         subtitle="Every posted journal line, account by account"
       />
 
-      <div className="flex flex-col lg:flex-row gap-3">
+      <div className="flex flex-col lg:flex-row gap-3 print:hidden">
         <AccountCombobox
           className="w-full lg:max-w-64"
           inputId="gl-account-filter"

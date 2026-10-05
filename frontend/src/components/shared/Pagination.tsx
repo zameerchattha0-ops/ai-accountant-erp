@@ -31,7 +31,7 @@ export default function Pagination({
   if (range.totalPages <= 1) {
     if (range.total === 0) return null;
     return (
-      <p className="px-1 pt-1 text-xs text-text-muted tabular-nums">
+      <p className="px-1 pt-1 text-xs text-text-muted tabular-nums print:hidden">
         {rangeLabel(range)}
       </p>
     );
@@ -43,7 +43,7 @@ export default function Pagination({
   return (
     <nav
       aria-label="Pagination"
-      className={`flex flex-wrap items-center justify-between gap-2 px-1 pt-1 transition-opacity ${
+      className={`flex flex-wrap items-center justify-between gap-2 px-1 pt-1 transition-opacity print:hidden ${
         refreshing ? "opacity-60" : "opacity-100"
       }`}
     >

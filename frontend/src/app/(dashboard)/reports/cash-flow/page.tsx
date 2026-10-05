@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import {
@@ -115,10 +116,22 @@ export default function CashFlowReportPage() {
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
-      <PageHeader title="Cash Flow Statement" subtitle="Classified by operating, investing, and financing activities" />
+      <PageHeader
+        title="Cash Flow Statement"
+        subtitle="Classified by operating, investing, and financing activities"
+        actions={
+          <button
+            onClick={() => window.print()}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
+          >
+            <Printer className="w-4 h-4" /> Print
+          </button>
+        }
+      />
 
-      {/* Period scope — defaults to the current reporting year; editable. */}
-      <div className="flex flex-wrap items-end gap-3">
+      {/* Period scope — defaults to the current reporting year; editable.
+          Screen-only: date pickers have no place on paper. */}
+      <div className="flex flex-wrap items-end gap-3 print:hidden">
         <div>
           <label htmlFor="cf-from" className="text-xs font-medium text-text-secondary">From</label>
           <input id="cf-from" type="date" className={`${inputCls} w-40 mt-1.5`} value={fromDate}
@@ -140,7 +153,7 @@ export default function CashFlowReportPage() {
       </div>
 
       {truncated && (
-        <div className="rounded-xl bg-warning-50 border border-warning-200 px-4 py-3 text-xs text-warning-700">
+        <div className="rounded-xl bg-warning-50 border border-warning-200 px-4 py-3 text-xs text-warning-700 print:hidden">
           Showing the most recent {(rows ?? []).length.toLocaleString()} movements in
           this range{sqlTotals
             ? " — category totals above are complete."
