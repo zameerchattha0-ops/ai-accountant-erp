@@ -16,6 +16,9 @@ import { cn } from "@/lib/utils/cn";
 import { useInView } from "@/lib/hooks/useInView";
 import FounderChat from "@/components/welcome/FounderChat";
 import dynamic from "next/dynamic";
+import GeometricShapes from "@/components/background/GeometricShapes";
+import { HERO_TAGLINES } from "@/data/heroTaglines";
+import GlassTaglineCarousel from "@/components/hero/GlassTaglineCarousel";
 
 /* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
    the server; renders nothing until the scene is interactive. */
@@ -110,86 +113,14 @@ function LinkedInIcon({ className }: { className?: string }) {
 /* ---- Rotating hero headline --------------------------------------
    Five FULL-SENTENCE headlines (the old word-sized "power words" are
    gone, along with the "Your Books," lead-in — these lines stand on
-   their own). Still rendered in Bodoni Moda ITALIC with the brand ramp
-   so they read as the brand's voice. Dwell times scale with length
-   (~75ms/char) so a long sentence is comfortably readable before it
-   crossfades. Rotation pauses under prefers-reduced-motion (the first
-   line then remains).
+   The glass tagline carousel (GlassTaglineCarousel) renders each
+   headline through a frosted backdrop-blur glass chip with Framer
+   Motion AnimatePresence layout transitions and an elite cubic-bezier
+   glass ease (`cubic-bezier(0.16, 1, 0.3, 1)`), fading and rising
+   through a pastel gradient ramp. Rotation pauses under
+   prefers-reduced-motion (the first line then remains). */
 
-   The colour itself lives in ONE place: the `--hero-headline-gradient`
-   token in globals.css (deep navy → teal → cyan, every stop >= 5:1 on
-   white), shared with the `.text-aurora` accent on the inner page heros
-   and painted by `.hero-tagline-rotate` together with a white halo. That
-   keeps the headline prominent through entering, exiting, morphing and
-   fading — including over the bright hero photograph — while staying
-   inside the existing brand palette. */
-const HERO_TAGLINES = [
-  { text: "No Accountant? No Problem. Run Your Books Yourself.", dur: 5400 },
-  { text: "Built for Founders Who Don't Speak Accounting.", dur: 4600 },
-  { text: "Fire Your Bookkeeper. Hire Your AI Agent.", dur: 4500 },
-  { text: "The AI-Native ERP That Replaces the Need for an Accountant.", dur: 5800 },
-  { text: "Just Type What Happened. Our AI Does the Accounting.", dur: 5100 },
-] as const;
 
-function HeroTagline() {
-  const [idx, setIdx] = useState(0);
-  /* The outgoing line lingers behind the incoming one for the crossfade,
-     then unmounts once its exit animation has fully played. */
-  const [prevIdx, setPrevIdx] = useState<number | null>(null);
-  const idxRef = useRef(0);
-
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    if (mq.matches) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const tick = () => {
-      if (cancelled) return;
-      const next = (idxRef.current + 1) % HERO_TAGLINES.length;
-      setPrevIdx(idxRef.current);
-      idxRef.current = next;
-      setIdx(next);
-      timer = setTimeout(tick, HERO_TAGLINES[next].dur);
-    };
-    /* First swap after the masked reveal lands + one full dwell */
-    timer = setTimeout(tick, HERO_TAGLINES[0].dur + 1200);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, []);
-
-  /* Retire the outgoing line after its 0.8s exit finishes */
-  useEffect(() => {
-    if (prevIdx === null) return;
-    const id = setTimeout(() => setPrevIdx(null), 850);
-    return () => clearTimeout(id);
-  }, [prevIdx]);
-
-  const t = HERO_TAGLINES[idx];
-  return (
-    <span
-      className="hero-tagline-stack"
-      style={{
-        fontFamily: "var(--font-bodoni), Georgia, serif",
-        fontStyle: "italic",
-        fontWeight: 700,
-      }}
-    >
-      {prevIdx !== null && prevIdx !== idx && (
-        <span
-          key={`out-${prevIdx}`}
-          className="hero-tagline-rotate hero-tagline-out"
-        >
-          {HERO_TAGLINES[prevIdx].text}
-        </span>
-      )}
-      <span key={idx} className="hero-tagline-rotate">
-        {t.text}
-      </span>
-    </span>
-  );
-}
 
 /* ---- Ledger's routines -------------------------------------------
    The hero used to carry an on-screen "Commands" launcher + deck of
@@ -617,6 +548,7 @@ export default function WelcomePage() {
 
   return (
     <div className={cn(cinzel.variable, cormorant.variable, fraunces.variable, dmSerif.variable, antic.variable, bodoni.variable, "min-h-screen bg-bg-primary")}>
+      <GeometricShapes />
       {/* ============================================================ */}
       {/* NAVBAR — light floating glass                                 */}
       {/* ============================================================ */}
@@ -773,11 +705,7 @@ export default function WelcomePage() {
                   gone. sr-only keeps one canonical line for crawlers and
                   assistive tech. */}
               <span className="sr-only">{HERO_TAGLINES[0].text}</span>
-              <span className="reveal-line" aria-hidden="true">
-                <span style={{ "--d": "220ms" } as React.CSSProperties}>
-                  <HeroTagline />
-                </span>
-              </span>
+              <GlassTaglineCarousel />
             </h1>
 
             <p

@@ -22,6 +22,17 @@ const eslintConfig = defineConfig([
       "react-hooks/set-state-in-effect": "off",
     },
   },
+  {
+    // eslint-plugin-react-hooks "purity" lint (new React Compiler rule) falsely flags
+    // module-level decorative initialization in GeometricShapes.tsx. The shapes are
+    // randomly generated once at import and used immutably; the randomness is purely
+    // for visual variation of static background graphics, not render-time mutation,
+    // so the rule does not apply to this component.
+    files: ["src/components/background/GeometricShapes.tsx"],
+    rules: {
+      "react-hooks/purity": "off",
+    },
+  },
 ]);
 
 export default eslintConfig;

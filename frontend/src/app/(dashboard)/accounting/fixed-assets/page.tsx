@@ -17,7 +17,6 @@ import {
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import {
-  accountOptions,
   applyCategoryDefaults,
   automaticAssetAccountLabel,
   assetAccountBlocker,

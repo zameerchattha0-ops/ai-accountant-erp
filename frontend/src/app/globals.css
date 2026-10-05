@@ -1018,6 +1018,14 @@ body {
     #0e7490 52%,
     #155e75 100%
   );
+  --tagline-pastel-gradient: linear-gradient(
+    100deg,
+    #9333EA 0%,
+    #A855F7 25%,
+    #EC4899 50%,
+    #F472B6 75%,
+    #FB7185 100%
+  );
 }
 
 /* Signature GLASS panel */
@@ -1347,5 +1355,129 @@ body {
 @media (prefers-reduced-motion: reduce) {
   [role="menu"] {
     animation: none !important;
+  }
+}
+
+/* ================================================================
+   GeometricShapes — minimal geometric background for the landing page.
+   Fixed layer at z-index -10; shapes drift and shift colour via CSS
+   keyframes (transform + background-position only — GPU-friendly).
+   Paused under prefers-reduced-motion.
+   ================================================================ */
+.geometric-shapes-layer {
+  position: fixed;
+  inset: 0;
+  z-index: -10;
+  overflow: hidden;
+  pointer-events: none;
+}
+.geometric-shape {
+  will-change: transform, background-position;
+}
+@keyframes geometricDrift {
+  0%   { transform: translate(0, 0) rotate(0deg) scale(1); }
+  20%  { transform: translate(2%, -1.5%) rotate(1.5deg) scale(1.06); }
+  40%  { transform: translate(-1.5%, 1.5%) rotate(-1deg) scale(0.94); }
+  60%  { transform: translate(1.5%, 1%) rotate(0.8deg) scale(1.04); }
+  80%  { transform: translate(-1%, -1.5%) rotate(-0.5deg) scale(0.96); }
+  100% { transform: translate(0, 0) rotate(0deg) scale(1); }
+}
+@keyframes geometricColorShift {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .geometric-shape {
+    animation: none !important;
+  }
+}
+
+/* ================================================================
+   GlassTaglineCarousel — frosted backdrop-blur glassmorphic heading
+   carousel on the welcome hero: pastel gradient text rises and falls
+   through an AnimatePresence layout transition, revealed by a
+   glass sweep and held in a frosted glass chip.
+   ================================================================ */
+.tagline-reveal-wrap {
+  display: inline-flex;
+  position: relative;
+  align-items: baseline;
+  line-height: 1.26;
+  white-space: nowrap;
+}
+
+.glass-sweep-line {
+  position: absolute;
+  left: 0.06em;
+  right: 0.06em;
+  top: 0.15em;
+  height: 1.35em;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.5) 45%,
+    rgba(255, 255, 255, 0.9) 50%,
+    rgba(255, 255, 255, 0.5) 55%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  backdrop-filter: blur(6px) saturate(180%);
+  -webkit-backdrop-filter: blur(6px) saturate(180%);
+  border-top: 1px solid rgba(255, 255, 255, 0.7);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 9px;
+  pointer-events: none;
+  transform-origin: left center;
+  will-change: transform, opacity;
+  z-index: 0;
+}
+
+.glass-tagline-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.09em 0.5em;
+  border-radius: 17px;
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.92) 0%,
+    rgba(255, 255, 255, 0.58) 55%,
+    rgba(239, 246, 255, 0.82) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow:
+    0 10px 40px rgba(139, 92, 246, 0.16),
+    0 3px 10px rgba(0, 0, 0, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  will-change: transform, opacity, filter;
+  z-index: 1;
+}
+
+.tagline-pastel-text {
+  background-image: var(--tagline-pastel-gradient);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  display: inline-block;
+  vertical-align: bottom;
+  will-change: transform, filter, opacity;
+  animation: taglineSheen 9s ease-in-out infinite;
+  text-shadow: 0 0 2px rgba(147, 51, 234, 0.25);
+}
+
+@keyframes taglineSheen {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tagline-reveal-wrap * {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+    filter: none !important;
   }
 }
