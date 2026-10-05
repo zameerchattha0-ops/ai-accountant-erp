@@ -1,11 +1,10 @@
 # AI-Native ERP with AI Accountant Agent
 
-An AI-native ERP for small businesses: a full double-entry accounting core
-(sales, purchases, expenses, banking, fixed assets, financial statements)
-driven by a natural-language AI agent that reasons about business events,
-resolves dependencies, asks consolidated clarifying questions, requires
-explicit confirmation for sensitive mutations, and independently verifies
-every execution against the database.
+An AI-native ERP built for small businesses: a complete double-entry accounting system — sales, purchases, expenses, banking, fixed assets, and financial reporting — driven by a natural-language AI agent that interprets business events, applies accounting logic, and verifies every change.
+
+## Overview
+
+Manage customers, suppliers, products and services, quotations and invoices, purchase bills and credit notes, receipts and payments, banking, fixed assets, and financial statements — all through natural language or the intuitive web interface. The AI Accountant agent handles everything from intent understanding to journal entry creation, asks clarifying questions when information is missing, and requires explicit confirmation before sensitive changes.
 
 ## Architecture
 
@@ -13,135 +12,57 @@ every execution against the database.
 Next.js 15 frontend (port 3000)
         │  Bearer JWT (Supabase session)
         ▼
-FastAPI backend (port 8000)  —  app/main.py
+FastAPI backend (port 8000)
         │
-        ├── Agent pipeline (app/agent.py, planner.py, reasoning.py)
-        │     intent → economic-event classification → 360° impact analysis
-        │     → targeted context → dependency resolution → consolidated
-        │     clarification → confirmation gate → trusted tools → validation
-        │     → accounting engine → independent verification
-        │
-        ├── AI Orchestrator (app/ai_orchestrator.py)
-        │     Token Harbor gateway (DeepSeek V4.1 text/tools, Mimo vision,
-        │     OpenAI-compatible, free-tier models)
-        │     → Qwen chain (Alibaba Model Studio, capability-aware)
-        │     → Gemini (final fallback, key from Supabase Vault)
-        │     provider fallback ONLY for provider-level failures; never
-        │     replays a request after any tool has executed
-        │
-        ├── Tool Router (app/tool_router.py) — registry, permissions,
-        │     validation, duplicate protection; no arbitrary SQL from the LLM
-        │
-        └── Supabase PostgreSQL (service_role, RLS enforced for clients)
-              public.* business schema + ai.* agent control plane
+        ├── AI agent pipeline — intent classification → economic-event analysis →
+        │     dependency resolution → clarification → confirmation → trusted tools
+        │     → double-entry journal construction → database verification
+        ├── Model orchestration — configurable AI providers with automatic fallback
+        ├── Tool router — permission-checked, registered ERP operations only
+        │     (the agent cannot run arbitrary SQL or code)
+        └── Supabase PostgreSQL (Row Level Security enabled)
 ```
+
+## Features
+
+- **Party ledger management** — customers and suppliers with dedicated receivable/payable
+  sub-ledgers segregated from control accounts
+- **Sales cycle** — quotations that convert to invoices, sales invoices, and credit notes
+  (branded, source-linked reversal entries)
+- **Purchases & expenses** — purchase bills, debit notes / purchase returns, and expense tracking
+- **Payments** — receipts and payments with full or partial allocation and settlement
+- **Banking** — bank accounts, transfers, and transaction management
+- **Fixed assets** — asset registration, depreciation schedules, and disposal
+- **Reports** — trial balance, general ledger, profit & loss, balance sheet, cash flow,
+  accounts receivable/payable aging, and project profitability
+- **Product & service catalogue** — live search, filters, and inline create/edit/deactivate
+- **AI Accountant agent** — natural-language transaction entry, document/vision extraction,
+  and clarification and confirmation workflows
 
 ## Stack
 
 - **Backend:** Python 3.12, FastAPI, pydantic-settings, supabase-py, structlog
 - **Frontend:** Next.js 15 (App Router), TypeScript, Tailwind CSS 4, Supabase SSR
-- **Database:** Supabase-hosted PostgreSQL (RLS on all tables)
-- **AI:** Token Harbor gateway (DeepSeek V4.1 / Mimo, primary) · Alibaba
-  Cloud Model Studio / Qwen (secondary) · Google Gemini (final fallback)
+- **Database:** Supabase-hosted PostgreSQL (Row Level Security on all tables)
+- **AI:** Configurable provider gateway with primary/secondary/fallback routing
 
-## Capabilities
+## Getting Started
 
-- Customers, suppliers, products, services, projects
-- **Products & Services catalogue**: a dedicated management page with live
-  status, search and status filters, inline create/edit/deactivate/delete.
-  Items that documents already reference are archived instead of deleted, so
-  history keeps resolving them.
-- **Party sub-ledgers**: every customer gets its own receivable account and
-  every supplier its own payable account, as a child of the control account,
-  so receivables/payables stay segregated per party for reporting.
-- Quotations (with conversion to invoices), sales invoices
-- Credit notes (customer returns): branded printable documents, mandatory
-  reason, status flow DRAFT → ISSUED → VOIDED, and a deterministic reversal
-  journal (Dr revenue / Cr receivable) auto-validated, auto-posted and
-  source-tied on creation
-- Purchase bills, debit notes / purchase returns (same journal discipline
-  on the payable side), expenses
-- Receipts and payments with full/partial allocation and settlement
-- Banking: accounts, transfers, transactions
-- Fixed assets: registration, depreciation schedules, disposal
-- Double-entry journal engine with source-tied entries, reversals
-- Trial balance, general ledger, profit & loss, balance sheet, cash flow,
-  aging, project profitability reports
-- AI agent: reasoning/planning, clarification and confirmation workflows,
-  document/vision extraction feeding normal ERP reasoning
-- IFRS-oriented account proposals: a new revenue or expense nature is routed to
-  a dedicated account under the right parent, and the classification is
-  confirmed by the user before any account is created
-- Prerequisite resolution: when a document needs a customer, supplier or
-  catalogue item that does not exist yet, the agent resolves it against the
-  live books, asks when the reference is ambiguous, and proposes the missing
-  record for confirmation before the document is posted
-- Organization onboarding, roles/permissions, audit logging
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-## Getting started
+# Configure environment (see .env.example)
+cp .env.example .env
 
-### Prerequisites
-
-- Python 3.12+
-- Node.js 20+
-- A Supabase project (database URL + keys)
-- An AI provider key — optional for UI-only use; supported providers are a
-  Token Harbor universal key (primary), an Alibaba Model Studio key (Qwen)
-  and Google Gemini. The app starts and serves the dashboard even with no
-  AI provider configured (provider initialisation is lazy and never blocks
-  startup)
-
-### Setup
-
-1. **Database:** apply the SQL migrations in `database/migrations/` in
-   filename order (`001…086`). There is no local Postgres CLI — use the
-   Management-API runner (needs `SUPABASE_ACCESS_TOKEN` in
-   `E:\Qoder\.secrets\tokens.env` next to your `.env`):
-
-   ```bat
-   venv\Scripts\python scripts\apply_migrations.py 086_seed_payroll_tools_control_plane.sql
-   ```
-
-   Run it with **no arguments** to re-check the employees + payroll
-   migrations idempotently and print a verification block (tool rows and the
-   `master_data` / `payroll` capabilities).
-
-   or paste the files into the Supabase SQL editor in the same order.
-2. **Backend config:** copy `.env.example` to `.env` and fill in your values.
-   Never commit `.env`. The Gemini key lives in Supabase Vault and is read
-   via the `get_gemini_api_key()` RPC (service_role only).
-3. **Python deps:**
-   ```bat
-   python -m venv venv
-   venv\Scripts\pip install -r requirements.txt
-   ```
-4. **Frontend deps:**
-   ```bat
-   cd frontend
-   npm install
-   ```
-
-### Run
-
-One click (starts backend + frontend, waits for health, opens the browser):
-
-```bat
-Runapp.bat
+# Start the application
+./Runapp.bat
 ```
 
-Or manually:
-
-```bat
-venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-cd frontend && npm run dev
-```
-
-- App: http://localhost:3000
+- Frontend: http://localhost:3000
 - API: http://localhost:8000 (docs at `/docs`, health at `/api/health`)
 
-### Health
-
-```bat
+```bash
 curl http://localhost:8000/api/health
 ```
 
@@ -151,11 +72,9 @@ See `.env.example` for the full annotated list. Key variables:
 
 | Variable | Purpose |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Database access (service role: backend only, never the browser) |
-| `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL_CHAIN`, `QWEN_VISION_MODEL_CHAIN`, `QWEN_BANNED_MODELS` | Secondary AI provider and capability-aware chains |
-| `TH_API_KEY`, `TH_BASE_URL`, `TH_TEXT_MODEL`, `TH_VISION_MODEL_CHAIN`, `TH_TIMEOUT_SECONDS` | Primary AI gateway (Token Harbor) — the key may be resolved from Supabase Vault instead of the environment |
-| `GEMINI_MODEL` | Fallback provider model (key stays in Supabase Vault) |
-| `AI_PRIMARY_PROVIDER`, `AI_FALLBACK_PROVIDER` | Provider routing |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Database access (the service-role key is backend-only) |
+| AI provider keys (`TH_API_KEY`, `QWEN_API_KEY`, `GEMINI_MODEL`) | Primary and secondary AI provider configuration |
+| `AI_PRIMARY_PROVIDER`, `AI_FALLBACK_PROVIDER` | Model provider routing |
 | `APP_HOST`, `APP_PORT`, `APP_ENV`, `CORS_ORIGINS` | Server configuration |
 
 Frontend (`.env.local`): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
@@ -163,19 +82,18 @@ Frontend (`.env.local`): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_
 
 ## Deployment
 
-The repository ships a `vercel.json` with two services: the Next.js app
-(`frontend/`) and the FastAPI backend (`app.main:app`). Pushing to `main`
-deploys production; every other branch gets a preview deployment.
+The repository ships a `vercel.json` that deploys both the Next.js app (`frontend/`) and the
+FastAPI backend (`app.main:app`) as one project. Pushing to `main` deploys production; every
+other branch creates a preview deployment.
 
-| Check | Command |
+| Check | Details |
 |---|---|
-| Production URL | `https://ai-accountant-erp.vercel.app` |
+| Production URL | https://ai-accountant-erp.vercel.app |
 | Backend health | `GET /api/health` → `{"status":"ok",...}` |
 | API docs | `/docs` (OpenAPI) |
 
-Set the environment variables from `.env.example` in the Vercel project
-(Production + Preview) before the first deploy; leave the service-role key and
-provider keys as project secrets.
+Configure the environment variables from `.env.example` in the Vercel project before the
+first deploy; keep provider keys and the service-role key as project secrets.
 
 ## Project structure
 
@@ -184,35 +102,26 @@ app/                 FastAPI application
   main.py            HTTP surface (auth, catalogue, AI, reports, …)
   agent.py           agent pipeline entry point
   accounting_reasoning.py, semantic_layer.py, planner.py
-  tool_router.py, tools/           registered, permission-checked ERP tools
-  accounting_engine.py             deterministic journal construction
-  services/, repositories/         business logic and data access
-  prompts.py, config.py            model instructions and settings
-database/migrations/ SQL schema, applied in filename order
+  tool_router.py, tools/      registered, permission-checked ERP tools
+  accounting_engine.py        deterministic double-entry journal construction
+  services/, repositories/    business logic and data access
+  prompts.py, config.py       model instructions and settings
+database/migrations/         SQL schema, applied in filename order
 frontend/            Next.js 15 App Router UI
-docs/                governance document and design references
+docs/                design references and governance
 scripts/             background worker and operator utilities
 ```
 
-## Security notes
+## Security
 
-- All secrets are environment/Vault based; no credentials are hardcoded.
-  `.gitignore` protects `.env`, `.env.*`, logs, caches and build output.
-- RLS is enabled on every table; clients only ever use the anon key.
-- The LLM can only invoke the registered, permission-checked ERP tools;
-  it never executes arbitrary SQL or code.
-- Financial mutations pass a validator + accounting engine and an
-  independent database verification step before success is reported.
-- Resolution logic (matching a name to a record) is read-only and
-  tenant-scoped: it never invents ids and never writes during resolution.
-
-## Known limitations
-
-The following are not implemented and are refused cleanly rather than
-simulated: multi-warehouse stock ledger / inventory movements, the wider HR
-surface around salary runs (attendance, leave, tax slabs / withholding
-schedules), cost centers / departments / locations, and complete tax-to-GL
-mapping for all jurisdictions.
+- All secrets come from environment variables or managed vaults; nothing is hardcoded.
+- `.gitignore` protects local secrets, logs, caches, and build output.
+- Row Level Security is enforced on every table; client applications use the read-only anon key.
+- The agent can only call registered, permission-checked ERP tools — no arbitrary SQL or code.
+- Every financial change is validated through the accounting engine and independently verified
+  against the database before it is reported as complete.
+- Record resolution is read-only and scoped per tenant; identifiers are matched from existing
+  data rather than invented.
 
 ## License
 
