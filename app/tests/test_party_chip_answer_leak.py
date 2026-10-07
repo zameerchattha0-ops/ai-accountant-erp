@@ -87,3 +87,58 @@ class TestGenuinePicksStillStore:
               "field": "customer_name"}],
         )
         assert merged["customer_name"] == "ABC Autos Trading"
+
+
+class TestBareSeededRowKeywordLeak:
+    """A SEEDED bare row (question == field name, no ``field`` key) is
+    rejected by the field router — which returns False for chips — and then
+    falls through to the KEYWORD chain, where ``"customer" in question``
+    matched "customer_name" and stored the chip verbatim.
+
+    Observed (AES production 2026-10-07, session 7951a863): the customer
+    AND its AR ledger were created literally named
+    ``Yes - Create 'Haris & Co'`` — while test_chip... above (full-sentence
+    question) kept passing the whole time, because that path routes to the
+    "party check:" branch instead.
+    """
+
+    def test_yes_chip_on_bare_row_never_becomes_the_name(self):
+        merged = _merge_clarification_answers(
+            {},
+            [{"question": "customer_name",
+              "answer": "Yes - create 'Haris & Co'"}],
+        )
+        assert "customer_name" not in merged
+        assert merged.get("customer_create_confirmed") is True
+
+    def test_chip_on_bare_row_does_not_overwrite_a_grounded_name(self):
+        merged = _merge_clarification_answers(
+            {"customer_name": "Haris & Co"},
+            [{"question": "customer_name",
+              "answer": "Yes - create 'Haris & Co'"}],
+        )
+        assert merged["customer_name"] == "Haris & Co"
+        assert merged.get("customer_create_confirmed") is True
+
+    def test_no_chip_on_bare_row_neither_stores_nor_confirms(self):
+        merged = _merge_clarification_answers(
+            {},
+            [{"question": "customer_name", "answer": "No - cancel"}],
+        )
+        assert "customer_name" not in merged
+        assert not merged.get("customer_create_confirmed")
+
+    def test_bare_supplier_row_gets_the_same_guard(self):
+        merged = _merge_clarification_answers(
+            {},
+            [{"question": "supplier_name", "answer": "Yes - create 'Acme Traders'"}],
+        )
+        assert "supplier_name" not in merged
+        assert merged.get("supplier_create_confirmed") is True
+
+    def test_a_genuine_name_on_a_bare_row_still_stores(self):
+        merged = _merge_clarification_answers(
+            {},
+            [{"question": "customer_name", "answer": "Haris & Co"}],
+        )
+        assert merged["customer_name"] == "Haris & Co"

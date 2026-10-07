@@ -2241,17 +2241,43 @@ def _merge_clarification_answers(
             value = _parse_bare_amount(answer)
             if value is not None:
                 merged["amount"] = value
-        elif "supplier" in question and not merged.get("supplier_name"):
+        elif "supplier" in question and (
+            _is_control_answer(answer) or not merged.get("supplier_name")
+        ):
             low = answer.lower().strip()
-            if "local vendor" in low or low in ("local", "no party", "none"):
+            # A DECISION CHIP answers the party GATE — it is never the name.
+            # The field router rejects chips too, but a SEEDED bare row
+            # (question = "supplier_name") falls PAST that router into this
+            # keyword branch, which used to store the chip verbatim.
+            if _is_control_answer(answer):
+                if low.startswith(("yes", "create", "ok", "y")):
+                    merged["supplier_create_confirmed"] = True
+                # never stored as the supplier's name; an unrecognised chip
+                # leaves the name unset so the gate re-asks.
+            elif "local vendor" in low or low in ("local", "no party", "none"):
                 # fold into the
                 # standing 'Local Vendor' account (searched and created
                 # on first use by the deterministic executor).
                 merged["supplier_name"] = "Local Vendor"
             else:
                 merged["supplier_name"] = answer
-        elif "customer" in question and not merged.get("customer_name"):
-            merged["customer_name"] = answer
+        elif "customer" in question and (
+            _is_control_answer(answer) or not merged.get("customer_name")
+        ):
+            low = answer.lower().strip()
+            # Same chip guard as the supplier branch (AES production
+            # 2026-10-07: the bare row ``customer_name: Yes - create 'X'``
+            # was stored here verbatim, so the customer AND its AR ledger
+            # were created literally named "Yes - Create 'Haris & Co'").
+            # A yes-chip CONFIRMS the creation and leaves the name to the
+            # extraction/prefill that grounded it from the request.  The
+            # chip is handled even when a name is already set (confirmation
+            # must land); a genuine name never overwrites one that exists.
+            if _is_control_answer(answer):
+                if low.startswith(("yes", "create", "ok", "y")):
+                    merged["customer_create_confirmed"] = True
+            else:
+                merged["customer_name"] = answer
         elif "date" in question and not merged.get("transaction_date"):
             # route the answer through the deterministic
             # parser.  On failure keep the raw answer so the validation
