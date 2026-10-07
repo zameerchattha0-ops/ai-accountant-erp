@@ -43,6 +43,7 @@ __all__ = [
     "TREATMENTS",
     "CANONICAL_INTENTS",
     "ACCOUNT_SHAPES",
+    "NATURE_LEDGER_NAMES",
     "AccountShape",
     "InvalidAccountingNature",
     "account_shape",
@@ -139,6 +140,23 @@ ACCOUNT_SHAPES: Dict[str, AccountShape] = {
         "REVENUE", "CREDIT", "4100", "IFRS 15: revenue from contracts with customers"
     ),
     "OTHER_INCOME": AccountShape("REVENUE", "CREDIT", "4200", "IFRS: other income"),
+}
+
+
+#: Canonical LEDGER NAME for a nature whose standard chart entry has exactly
+#: one unambiguous name.  Used when a YES account-creation approval carries no
+#: parseable name (production 2026-10-07, Zameer Labs session afcfecae: the
+#: model's free-form "Should I create a new inventory account?" question
+#: cannot satisfy planner's ``no '<name>' account`` merge contract, so
+#: "Yes, Create Inventory Account" folded nothing and the ``create_account``
+#: tool was never granted).
+#:
+#: Deliberately PARTIAL: a nature whose ledger name depends on the ITEM's
+#: category (FIXED_ASSET -> "Vehicles" vs "Furniture & Fixtures") has NO
+#: canonical name and must never guess one here — the merge falls back to the
+#: answer's own wording or leaves the question open instead.
+NATURE_LEDGER_NAMES: Dict[str, str] = {
+    "INVENTORY": "Inventory",
 }
 
 

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
+from app.accounting_vocabulary import NATURE_LEDGER_NAMES
 from app.date_parser import (
     parse_transaction_date,
     resolve_date_range,
@@ -1714,7 +1715,7 @@ def _explode_multi_answers(
         elif (
             len(sub_questions) >= 2
             and len(parts) == len(sub_questions) - 1
-            and not sub_questions[0].rstrip().endswith("?")
+            and "?" not in sub_questions[0]
         ):
             # A leading PREAMBLE is not a question ("To record this transaction
             # I need a few things:\n1. …\n2. …\n3. …").  Dropping it makes the
@@ -1722,6 +1723,10 @@ def _explode_multi_answers(
             # field — without this, the whole consolidated answer fell through
             # as one blob and the depreciation trio repeated forever
             # (production 2026-10-01, building session 6b78909c).
+            # A first item that ASKS (contains "?") is a real question even
+            # when a trailing sentence follows the mark — dropping it paired
+            # a bare "Yes" with the WRONG question and silently lost the
+            # account-creation approval (Zameer Labs 2026-10-07).
             for sq, part in zip(sub_questions[1:], parts):
                 exploded.append({"question": sq, "answer": part})
         elif (
@@ -1933,6 +1938,47 @@ def _merge_depreciation_policy_answer(
     return handled
 
 
+#: Generic words that are never a ledger's NAME — "Yes, create it" folds
+#: nothing by itself and must reach the nature-name fallback instead.
+_CREATION_NAME_STOPWORDS = frozenset({
+    "it", "one", "this", "that", "new", "account", "ledger", "yes", "sure",
+    "ok", "okay", "please", "the", "a", "an", "some", "something", "item",
+})
+
+
+def _creation_name_from_answer(answer: str) -> Optional[str]:
+    """A ledger name the YES answer itself states.
+
+    ``"Yes, Create Inventory Account"`` -> ``"Inventory"``.  Only the
+    approval verb + NAME shape may name a ledger: prose that steers away
+    from creation ("use an existing account instead") never matches, and
+    the generic tail ("account"/"ledger") and articles are stripped so the
+    ledger is named by its content, not its plumbing.  Returns ``None``
+    whenever the answer carries no usable name — the caller then falls
+    back to the nature's canonical name or leaves the gap open.
+    """
+    text = " ".join(str(answer or "").split())
+    m = re.match(
+        r"^(?:yes\b[\s,:;-]*)?(?:please\s+)?create\s+(?P<name>\S.*)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    name = m.group("name").strip(" .,'\"")
+    name = re.sub(r"^(?:a|an|the)\s+", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+(?:account|ledger)$", "", name, flags=re.IGNORECASE).strip()
+    if not name or name.lower() in _CREATION_NAME_STOPWORDS:
+        return None
+    if (
+        len(name) > 60
+        or len(name.split()) > 6
+        or not re.search(r"[a-z]", name, re.IGNORECASE)
+    ):
+        return None
+    return name
+
+
 def _merge_clarification_answers(
     entities: Dict[str, Any],
     qa_history: List[Dict[str, str]],
@@ -2110,6 +2156,27 @@ def _merge_clarification_answers(
                     pm = re.search(r"under '(.+?)'", qa.get("question") or "")
                     if pm and pm.group(1).strip():
                         merged["create_parent_name"] = pm.group(1).strip()
+                elif not any(
+                    w in low for w in ("existing", "instead", "different")
+                ):
+                    # FALLBACK (production 2026-10-07, Zameer Labs session
+                    # afcfecae): a MODEL-AUTHORED question cannot carry the
+                    # `no '<name>' account` contract, so this YES used to
+                    # fold NOTHING and `create_account` was never granted.
+                    # The name comes from the ANSWER when it states one
+                    # ("Yes, Create Inventory Account" -> "Inventory"),
+                    # else from the nature's canonical ledger name.  A reply
+                    # that steers to an EXISTING account never reaches here,
+                    # and an unknown nature still leaves the gap open.
+                    fallback = _creation_name_from_answer(answer) or (
+                        NATURE_LEDGER_NAMES.get(
+                            str(merged.get("transaction_nature") or "")
+                            .strip()
+                            .upper()
+                        )
+                    )
+                    if fallback:
+                        merged["create_account"] = fallback
             elif (
                 # REFUSED the closest-existing leg of a RELATED-treatment
                 # round (owner directive: refusing the near-relevant account

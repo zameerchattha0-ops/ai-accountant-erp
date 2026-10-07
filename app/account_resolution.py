@@ -50,6 +50,7 @@ log = structlog.get_logger(__name__)
 # InvalidAccountingNature instead of silently becoming an operating expense.
 from app.accounting_vocabulary import (
     ACCOUNT_SHAPES as _VOCAB_SHAPES,
+    NATURE_LEDGER_NAMES as _NATURE_LEDGER_NAMES,
     InvalidAccountingNature,
     account_shape,
 )
@@ -959,6 +960,78 @@ async def expense_category_gap(
 
 
 # ---------------------------------------------------------------------------
+# INVENTORY-nature probe: a goods-for-resale posting REQUIRES the inventory
+# ledger.  Production 2026-10-07 (Zameer Labs session afcfecae-124e, "We
+# Purchase Two Bikes, for resale on cash today"): the chart held 46 accounts
+# with NO inventory ledger, preflight proposed nothing (it checked only
+# explicit refs / fixed-asset / expense), so the canonical question_for_gap
+# never fired — the execution model asked its OWN free-form question whose
+# wording cannot satisfy the answer-merge TEXT CONTRACT, the owner's "Yes,
+# Create Inventory Account" folded nothing, and the run ended informational
+# with zero mutations: "There is no create_account tool available to me."
+# ---------------------------------------------------------------------------
+
+#: An ACTIVE ASSET ledger worded this way IS the inventory account.  Only
+#: ASSET rows count — "Cost of Goods Sold" (EXPENSE) is the P&L side and can
+#: never satisfy the balance-sheet debit this nature posts.
+_INVENTORY_LEDGER_RE = re.compile(
+    r"\b(?:inventor\w*|merchandise|stocks?|goods)\b", re.IGNORECASE
+)
+
+#: Intents whose posting debits (or credits) the INVENTORY ledger.  The
+#: purchase family is where the missing ledger blocks the very first write —
+#: the reported defect.  Sale-side flows reach the same ledger through the
+#: execution-time rescue and are deliberately NOT re-asked here.
+_INVENTORY_LEDGER_INTENTS = frozenset(
+    {"record_cash_purchase", "record_credit_purchase", "record_purchase"}
+)
+
+
+def inventory_gap_from_chart(
+    chart: Optional[Sequence[Mapping[str, Any]]],
+) -> Optional[AccountGap]:
+    """``None`` when the chart already holds an inventory ledger, else the gap.
+
+    Pure (no I/O) so the decision is unit-testable: the probe reads the
+    ASSET side of the chart once and looks for the standard ledger words
+    ("Inventory", "Merchandise Inventory", "Stock in Trade", "Finished
+    Goods").  Nothing found -> the shape-backed gap ("Inventory", ASSET,
+    1200, IFRS: inventories) whose question satisfies the merge contract.
+    """
+    for row in chart or ():
+        if str(row.get("account_type") or "").upper() != "ASSET":
+            continue
+        if row.get("is_active") is False:
+            continue
+        if _INVENTORY_LEDGER_RE.search(str(row.get("name") or "")):
+            return None
+    return gap_for_nature(
+        _NATURE_LEDGER_NAMES.get("INVENTORY", "Inventory"), "INVENTORY", "nature"
+    )
+
+
+async def inventory_account_gap(
+    organization_id: uuid.UUID,
+) -> Optional[AccountGap]:
+    """INVENTORY nature with no inventory ledger -> creation gap (fail open).
+
+    A chart read failure never breaks a run: the pre-flight simply proposes
+    nothing and the execution-time rescue still covers a real posting error
+    (same fail-open contract as ``fixed_asset_account_gap``).
+    """
+    from app.repositories import account_repository as a_repo
+
+    try:
+        chart = await a_repo.get_chart_of_accounts(
+            organization_id, account_type="ASSET", limit=200
+        )
+    except Exception as exc:  # noqa: BLE001 — fail open (status quo)
+        log.warning("account_resolution.inventory_probe_failed", error=str(exc)[:200])
+        return None
+    return inventory_gap_from_chart(chart)
+
+
+# ---------------------------------------------------------------------------
 # PRE-FLIGHT: the single chokepoint every path (reasoning proposal, model,
 # deterministic fast path, approved plan) passes before confirmation/execute.
 # ---------------------------------------------------------------------------
@@ -1014,6 +1087,20 @@ async def preflight_account_gaps(
         _add(await expense_category_gap(
             organization_id, entities=ents, message=message,
         ))
+
+    # (d) INVENTORY nature REQUIRES the inventory ledger — the debit side of
+    # a goods-for-resale purchase can never post to cash, an expense or PPE
+    # (production 2026-10-07, Zameer Labs: see the probe's section comment).
+    # A confirmed ledger choice (create_account / account_name) suppresses
+    # the proposal — the owner already named the account this run posts to.
+    if (
+        nature == "INVENTORY"
+        and (intent in _INVENTORY_LEDGER_INTENTS or "create_purchase_bill" in names)
+        and not str(
+            ents.get("create_account") or ents.get("account_name") or ""
+        ).strip()
+    ):
+        _add(await inventory_account_gap(organization_id))
 
     return gaps
 
