@@ -1404,15 +1404,27 @@ body {
   position: relative;
   align-items: baseline;
   line-height: 1.26;
-  white-space: nowrap;
+  /* RESPONSIVE FIX (2026-10-06): the taglines are FULL sentences — at
+     lg:text-[2.25rem] a 60-char line measures ~1000px+, far wider than
+     the copy column (~550px).  nowrap forced the glass chip to overflow
+     right, sliding UNDER the hero stage's floating cards (stage z-20
+     paints over copy z-10) — the heading visibly "merged" into the
+     cards.  Let the line wrap inside the column instead: shrink-to-fit
+     then wrap at the available width, never past it. */
+  white-space: normal;
+  max-width: 100%;
 }
 
 .glass-sweep-line {
   position: absolute;
   left: 0.06em;
   right: 0.06em;
-  top: 0.15em;
-  height: 1.35em;
+  top: 0.1em;
+  /* Inset from BOTH edges instead of a fixed 1.35em height: the chip can
+     now wrap to multiple lines, so the frosted wipe spans its full height
+     (one line → same visual as before, multi-line → whole chip). */
+  bottom: 0.1em;
+  height: auto;
   background: linear-gradient(
     90deg,
     rgba(255, 255, 255, 0) 0%,
@@ -1438,6 +1450,10 @@ body {
   align-items: center;
   padding: 0.09em 0.5em;
   border-radius: 17px;
+  /* Never wider than the h1's copy column — text wraps inside the chip,
+     so the chip itself can't reach the card stage on the right. */
+  max-width: 100%;
+  box-sizing: border-box;
   backdrop-filter: blur(14px) saturate(180%);
   -webkit-backdrop-filter: blur(14px) saturate(180%);
   background: linear-gradient(

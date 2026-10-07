@@ -697,7 +697,7 @@ export default function WelcomePage() {
             </p>
 
             <h1
-              className="text-brand-navy text-[1.55rem] sm:text-[1.9rem] lg:text-[2.25rem] leading-[1.26] tracking-[0.01em] font-bold max-w-[36rem]"
+              className="text-brand-navy text-[1.55rem] sm:text-[1.9rem] lg:text-[2.25rem] leading-[1.26] tracking-[0.01em] font-bold max-w-[36rem] lg:pr-6"
               style={{ fontFamily: "var(--font-bodoni), Georgia, serif" }}
             >
               {/* The rotating sentence IS the headline: these lines are

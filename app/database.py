@@ -604,6 +604,18 @@ async def get_clarification_history(
     the round asked, in the SAME order as its rendered lines) so a TYPED
     numbered answer can be field-tagged positionally — an LLM-authored
     question may be worded any way, so wording must never decide routing.
+
+    RECENCY GUARD (production 2026-10-06, AES Engineering sessions
+    aa041df4…7951a863): every resume BULK-SEEDS prior Q&A into a NEW
+    session row, so a conversation accumulates 40+ rows per session and
+    the LAST question asked — the ``revenue_ledger_decision`` gate — sits
+    at the very end.  The old ``created_at ASC LIMIT 20`` read only the
+    OLDEST 20 rows, so the revenue answer NEVER reached the planner, the
+    gate re-asked itself on every resume and the sale never executed
+    (zero ``tool_calls`` rows across 6 sessions).  Read NEWEST-first with
+    a generous cap, reverse to chronological for the merge, and drop
+    exact duplicate Q&A pairs (the seed re-inserts the same pairs each
+    round) so the history stays small and every late answer survives.
     """
     rows = await fetch_many(
         "ai_clarifications",
@@ -611,18 +623,32 @@ async def get_clarification_history(
             "execution_session_id": str(session_id),
             "status": "COMPLETED",
         },
-        order="created_at",
-        limit=20,
+        order="created_at.desc",
+        limit=200,
     )
-    return [
-        {
-            "question": str(r.get("question") or ""),
-            "answer": str(r.get("user_response") or ""),
-            "required_information": list(r.get("required_information") or []),
-        }
-        for r in rows
-        if r.get("user_response")
-    ]
+    # Newest-first from the DB → chronological for the planner (later
+    # answers must merge AFTER earlier ones so an authoritative re-answer
+    # still wins), then dedupe exact repeats the seeding round-trip adds.
+    seen: set = set()
+    history: List[Dict[str, Any]] = []
+    for r in reversed(rows or []):
+        answer = str(r.get("user_response") or "")
+        if not answer:
+            continue
+        question = str(r.get("question") or "")
+        fields = list(r.get("required_information") or [])
+        key = (question, answer, tuple(fields))
+        if key in seen:
+            continue
+        seen.add(key)
+        history.append(
+            {
+                "question": question,
+                "answer": answer,
+                "required_information": fields,
+            }
+        )
+    return history
 
 
 async def seed_clarification_history(
