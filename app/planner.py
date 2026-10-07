@@ -418,11 +418,22 @@ _ITEM_PATTERNS = [
     re.compile(
         r"\b(?:purchas(?:e|es|ed|ing)|bought|buy(?:ing)?|procured?|acquired?)\s+"
         r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+        # (2026-10-07, AES) — never capture the SOURCE side as the item:
+        # "bought from Dell" used to capture "from Dell", the leading-
+        # preposition strip removed "from " and the SUPPLIER became
+        # item_description.  A standalone to/from right after the verb means
+        # the sentence states no object — ask, never guess.
+        r"(?!from\b|to\b)"
         r"([\w][\w\s-]*?)(?=\s+(?:from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:sold|sells?|selling)\s+(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+        # (2026-10-07, AES production) — same guard on the sale verb:
+        # "Sold to Murkez Technologies pvt Limited" captured "to Murkez …",
+        # the strip removed "to " and the CUSTOMER became item_description
+        # (product, catalog gate and revenue gate all then named the party).
+        r"(?!to\b|from\b)"
         r"([\w][\w\s-]*?)(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
