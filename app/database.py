@@ -255,9 +255,22 @@ async def delete_one(
 
 # ---- RPC helpers ----------------------------------------------------------
 
-async def call_rpc(function_name: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
-    """Call a Supabase RPC function and return the result data."""
-    rpc = get_service_client().rpc(function_name, params or {})
+async def call_rpc(
+    function_name: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    schema: str = "public",
+) -> Any:
+    """Call a Supabase RPC function and return the result data.
+
+    ``schema`` selects the exposed schema the function lives in (``ai`` for
+    the worker-queue functions — migrations 052/073).  ``.schema()`` builds
+    a NEW scoped client (it never mutates the cached service client), so
+    the default profile of every other caller is untouched.
+    """
+    client = get_service_client()
+    scoped = client.schema(schema) if schema and schema != "public" else client
+    rpc = scoped.rpc(function_name, params or {})
     return (await _execute(rpc)).data
 
 

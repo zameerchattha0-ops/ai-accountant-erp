@@ -36,7 +36,13 @@ from app.auth import (
     authenticate_user_header,
 )
 from app.config import get_settings
-from app.database import fetch_many, fetch_one, insert_one, set_session_phase
+from app.database import (
+    fetch_many,
+    fetch_one,
+    insert_one,
+    call_rpc,
+    set_session_phase,
+)
 from app.models.schemas import (
     AgentResponse,
     ClarificationAnswer,
@@ -952,8 +958,65 @@ async def cancel_session(
             },
         )
     if row is None:
-        # Scoped by org AND user above: a foreign run is simply "not found".
-        raise HTTPException(status_code=404, detail="Session not found")
+        # CANCEL-BEFORE-CLAIM (L2, local background mode): the session row
+        # does not exist until a worker CLAIMS the queued job — cancel the
+        # JOB itself so it can never be claimed (migration 073's
+        # ai.cancel_worker_job: a QUEUED job becomes CANCELLED immediately).
+        # Only QUEUED jobs are considered: a RUNNING job's worker has
+        # already created the session (found above), and the scan is
+        # org+user scoped, so a foreign run is simply "not found".  A scan
+        # FAILURE propagates (honest error) — it must never fake success.
+        if conversation_id:
+            jobs = await fetch_many(
+                "ai_worker_jobs",
+                filters={
+                    "organization_id": str(auth.organization_id),
+                    "user_id": str(auth.user_id),
+                    "status": "QUEUED",
+                },
+                order="created_at.desc",
+                limit=20,
+            )
+            job_id = next(
+                (
+                    str(job.get("id"))
+                    for job in jobs or []
+                    if str(
+                        (job.get("payload") or {}).get("conversation_id") or ""
+                    )
+                    == conversation_id
+                ),
+                None,
+            )
+            if job_id:
+                try:
+                    await call_rpc(
+                        "cancel_worker_job",
+                        params={"p_job_id": job_id},
+                        schema="ai",
+                    )
+                except Exception as exc:  # noqa: BLE001 — cancel failed → 500, never a fake yes
+                    log.warning(
+                        "api.job.cancel_failed", job_id=job_id, error=str(exc)
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to cancel the queued run",
+                    )
+                log.info(
+                    "api.job.cancelled_before_claim",
+                    job_id=job_id,
+                    conversation_id=conversation_id,
+                )
+                return {
+                    "cancelled": True,
+                    "status": "CANCELLED",
+                    "session_id": None,
+                    "job_id": job_id,
+                }
+        raise HTTPException(
+            status_code=404, detail="No active run found to cancel"
+        )
 
     current = str(row.get("status") or "").upper()
     session_id_out = str(row.get("id"))

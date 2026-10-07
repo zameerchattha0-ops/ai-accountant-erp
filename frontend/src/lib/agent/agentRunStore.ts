@@ -153,6 +153,22 @@ function runBackground(request: UserRequest) {
     },
     onError: (msg) => set({ error: msg, loading: false }),
     onStalled: (jobId) => set({ stalledJobId: jobId }),
+    onCancelled: () => {
+      /* The job hit CANCELLED.  A same-tab cancel already cleared the
+         snapshot (activeRequestId gone) — only clean up when THIS run is
+         still active, e.g. another tab cancelled it (cross-tab sync). */
+      if (!rid || state.activeRequestId !== rid) return;
+      set({
+        loading: false,
+        activeRequestId: null,
+        liveSteps: [],
+        response: null,
+        reattached: false,
+        stalledJobId: null,
+        cancelling: false,
+        notice: "Request cancelled — nothing was recorded.",
+      });
+    },
   });
 }
 

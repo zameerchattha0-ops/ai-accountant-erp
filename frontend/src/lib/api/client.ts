@@ -155,7 +155,10 @@ export async function latestActiveSession(): Promise<ActiveSessionInfo> {
 export interface CancelRunResult {
   cancelled: boolean;
   status: string;
-  session_id: string;
+  /** The cancelled session — null when the run was still a QUEUED job. */
+  session_id: string | null;
+  /** Set when cancel landed BEFORE a worker claimed the run (L2). */
+  job_id?: string | null;
 }
 
 export async function aiCancelRun(payload: {
@@ -289,7 +292,7 @@ export async function aiEnqueueJob(request: UserRequest): Promise<EnqueueJobResu
 
 export interface AiJobStatus {
   job_id: string;
-  status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
+  status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
   conversation_id: string | null;
   result: AgentResponse | null;
   error: string | null;
@@ -316,6 +319,10 @@ export interface BackgroundJobHandlers {
   onResult: (res: AgentResponse) => void;
   onError: (message: string) => void;
   onStalled: (jobId: string) => void;
+  /** The job reached CANCELLED (cancel-before-claim, or another surface
+   *  cancelled it). Without this the poll loop would spin for ever —
+   *  CANCELLED matches none of the other terminal branches. */
+  onCancelled?: () => void;
   /** Poll cadence and stall window (injectable for tests). */
   pollIntervalMs?: number;
   stallAfterMs?: number;
@@ -348,6 +355,12 @@ export async function runBackgroundJob(
     }
     if (status.status === "FAILED") {
       h.onError(status.error || "The background run failed.");
+      return;
+    }
+    if (status.status === "CANCELLED") {
+      // Terminal: the run was cancelled (this tab's Cancel, or another
+      // surface).  Stop polling — never spin on a state we handle here.
+      h.onCancelled?.();
       return;
     }
     if (status.status === "QUEUED" && Date.now() - startedAt > stallAfter) {

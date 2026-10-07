@@ -132,7 +132,12 @@ class TestCancelEndpoint:
         async def fake_fetch_one(table, *, filters, select="*"):
             return None  # the org+user scoped lookup simply finds nothing
 
+        async def fake_fetch_many(table, *, filters, select="*", order=None,
+                                  limit=100, offset=0):
+            return []  # …and no queued job exists for the conversation either
+
         monkeypatch.setattr(main_mod, "fetch_one", fake_fetch_one)
+        monkeypatch.setattr(main_mod, "fetch_many", fake_fetch_many)
 
         with pytest.raises(HTTPException) as exc:
             await main_mod.cancel_session(
@@ -270,4 +275,290 @@ class TestExecutorMutationGate:
         assert "agent.mutation_blocked_after_cancel" in src
         # Reads stay allowed; only non-read-only tools hit the gate.
         assert "if not is_read_only_tool(tool_name):" in src
+
+
+class TestCancelBeforeClaim:
+    """L2 (2026-10-08): in background mode the SESSION row does not exist
+    until a worker CLAIMS the queued job — cancelling in that window must
+    cancel the JOB (migration 073's ``ai.cancel_worker_job``), not 404."""
+
+    @staticmethod
+    def _patch_session_missing(monkeypatch, main_mod):
+        async def fake_fetch_one(table, *, filters, select="*"):
+            return None
+
+        monkeypatch.setattr(main_mod, "fetch_one", fake_fetch_one)
+
+    @staticmethod
+    def _jobs(rows):
+        async def fake_fetch_many(table, *, filters, select="*", order=None,
+                                  limit=100, offset=0):
+            assert table == "ai_worker_jobs"
+            return rows
+
+        return fake_fetch_many
+
+    @pytest.mark.asyncio
+    async def test_a_queued_job_is_cancelled_when_no_session_exists(
+        self, monkeypatch
+    ):
+        from app import main as main_mod
+
+        self._patch_session_missing(monkeypatch, main_mod)
+
+        async def fake_fetch_many(table, *, filters, select="*", order=None,
+                                  limit=100, offset=0):
+            assert table == "ai_worker_jobs"
+            assert filters["status"] == "QUEUED"
+            assert filters["organization_id"] == str(ORG)
+            assert filters["user_id"] == str(USER)
+            return [
+                {"id": "job-other",
+                 "payload": {"conversation_id": "conv-someone-else"}},
+                {"id": "job-ours",
+                 "payload": {"conversation_id": "conv-abc"}},
+            ]
+
+        rpc_calls = []
+
+        async def fake_rpc(name, *, params=None, schema="public"):
+            rpc_calls.append((name, params, schema))
+            return {}
+
+        monkeypatch.setattr(main_mod, "fetch_many", fake_fetch_many)
+        monkeypatch.setattr(main_mod, "call_rpc", fake_rpc)
+
+        out = await main_mod.cancel_session(
+            SessionCancelRequest(conversation_id="conv-abc"), auth=_auth()
+        )
+
+        assert out == {
+            "cancelled": True,
+            "status": "CANCELLED",
+            "session_id": None,
+            "job_id": "job-ours",
+        }
+        # The REAL queue function, in its REAL schema — ownership is the
+        # endpoint's org+user filters; the RPC enforces its own too.
+        assert rpc_calls == [
+            ("cancel_worker_job", {"p_job_id": "job-ours"}, "ai")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_another_conversations_job_is_never_touched(
+        self, monkeypatch
+    ):
+        from app import main as main_mod
+
+        self._patch_session_missing(monkeypatch, main_mod)
+        monkeypatch.setattr(
+            main_mod,
+            "fetch_many",
+            self._jobs([{"id": "job-other",
+                         "payload": {"conversation_id": "conv-someone-else"}}]),
+        )
+
+        async def no_rpc(*args, **kwargs):
+            raise AssertionError("a foreign job must never be cancelled")
+
+        monkeypatch.setattr(main_mod, "call_rpc", no_rpc)
+
+        with pytest.raises(HTTPException) as exc:
+            await main_mod.cancel_session(
+                SessionCancelRequest(conversation_id="conv-abc"), auth=_auth()
+            )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_a_job_scan_failure_never_fakes_success(self, monkeypatch):
+        from app import main as main_mod
+
+        self._patch_session_missing(monkeypatch, main_mod)
+
+        async def boom(table, **kwargs):
+            raise RuntimeError("queue unreachable")
+
+        monkeypatch.setattr(main_mod, "fetch_many", boom)
+
+        with pytest.raises(RuntimeError):
+            await main_mod.cancel_session(
+                SessionCancelRequest(conversation_id="conv-abc"), auth=_auth()
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_queue_cancellation_is_a_500_not_a_false_yes(
+        self, monkeypatch
+    ):
+        from app import main as main_mod
+
+        self._patch_session_missing(monkeypatch, main_mod)
+        monkeypatch.setattr(
+            main_mod,
+            "fetch_many",
+            self._jobs([{"id": "job-ours",
+                         "payload": {"conversation_id": "conv-abc"}}]),
+        )
+
+        async def failing_rpc(*args, **kwargs):
+            raise RuntimeError("rpc down")
+
+        monkeypatch.setattr(main_mod, "call_rpc", failing_rpc)
+
+        with pytest.raises(HTTPException) as exc:
+            await main_mod.cancel_session(
+                SessionCancelRequest(conversation_id="conv-abc"), auth=_auth()
+            )
+        assert exc.value.status_code == 500
+
+
+class TestCallRpcSchemaRouting:
+    """``call_rpc(..., schema="ai")`` must scope the client WITHOUT ever
+    mutating the cached service client's default profile."""
+
+    @pytest.mark.asyncio
+    async def test_a_non_public_schema_scopes_the_client(self, monkeypatch):
+        from app import database as db_mod_rpc
+
+        seen: dict = {}
+
+        class FakeScoped:
+            def rpc(self, fn, params):
+                seen["fn"] = fn
+                seen["params"] = params
+                return "REQ"
+
+        class FakeClient:
+            def schema(self, name):
+                seen["schema"] = name
+                return FakeScoped()
+
+            def rpc(self, fn, params):  # pragma: no cover - must not be hit
+                raise AssertionError("must route through the scoped client")
+
+        async def fake_execute(request):
+            assert request == "REQ"
+
+            class Result:
+                data = {"ok": True}
+
+            return Result()
+
+        monkeypatch.setattr(
+            db_mod_rpc, "get_service_client", lambda: FakeClient()
+        )
+        monkeypatch.setattr(db_mod_rpc, "_execute", fake_execute)
+
+        out = await db_mod_rpc.call_rpc(
+            "cancel_worker_job", params={"p_job_id": "j"}, schema="ai"
+        )
+
+        assert out == {"ok": True}
+        assert seen == {
+            "schema": "ai",
+            "fn": "cancel_worker_job",
+            "params": {"p_job_id": "j"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_default_path_never_scopes(self, monkeypatch):
+        from app import database as db_mod_rpc
+
+        seen: dict = {}
+
+        class FakeClient:
+            def schema(self, name):  # pragma: no cover - must not be hit
+                raise AssertionError("public must never switch schema")
+
+            def rpc(self, fn, params):
+                seen["fn"] = fn
+                return "REQ"
+
+        async def fake_execute(request):
+            class Result:
+                data = {"ok": True}
+
+            return Result()
+
+        monkeypatch.setattr(
+            db_mod_rpc, "get_service_client", lambda: FakeClient()
+        )
+        monkeypatch.setattr(db_mod_rpc, "_execute", fake_execute)
+
+        out = await db_mod_rpc.call_rpc("some_public_fn")
+        assert out == {"ok": True}
+        assert seen == {"fn": "some_public_fn"}
+
+
+class TestCallRpcSchemaRouting:
+    """``call_rpc(..., schema="ai")`` must scope the client WITHOUT ever
+    mutating the cached service client's default profile."""
+
+    @pytest.mark.asyncio
+    async def test_a_non_public_schema_scopes_the_client(self, monkeypatch):
+        from app import database as db
+
+        seen: dict = {}
+
+        class FakeScoped:
+            def rpc(self, fn, params):
+                seen["fn"] = fn
+                seen["params"] = params
+                return "REQ"
+
+        class FakeClient:
+            def schema(self, name):
+                seen["schema"] = name
+                return FakeScoped()
+
+            def rpc(self, fn, params):  # pragma: no cover - must not be hit
+                raise AssertionError("must route through the scoped client")
+
+        async def fake_execute(request):
+            assert request == "REQ"
+
+            class Result:
+                data = {"ok": True}
+
+            return Result()
+
+        monkeypatch.setattr(db, "get_service_client", lambda: FakeClient())
+        monkeypatch.setattr(db, "_execute", fake_execute)
+
+        out = await db.call_rpc(
+            "cancel_worker_job", params={"p_job_id": "j"}, schema="ai"
+        )
+
+        assert out == {"ok": True}
+        assert seen == {
+            "schema": "ai",
+            "fn": "cancel_worker_job",
+            "params": {"p_job_id": "j"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_default_path_never_scopes(self, monkeypatch):
+        from app import database as db
+
+        seen: dict = {}
+
+        class FakeClient:
+            def schema(self, name):  # pragma: no cover - must not be hit
+                raise AssertionError("public must never switch schema")
+
+            def rpc(self, fn, params):
+                seen["fn"] = fn
+                return "REQ"
+
+        async def fake_execute(request):
+            class Result:
+                data = {"ok": True}
+
+            return Result()
+
+        monkeypatch.setattr(db, "get_service_client", lambda: FakeClient())
+        monkeypatch.setattr(db, "_execute", fake_execute)
+
+        out = await db.call_rpc("some_public_fn")
+        assert out == {"ok": True}
+        assert seen == {"fn": "some_public_fn"}
 
