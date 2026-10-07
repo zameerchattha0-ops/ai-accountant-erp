@@ -434,11 +434,70 @@ async def set_session_phase(
 
     The 13-value phase enum and the 7-value session enum are distinct in the
     database — the caller maps phase→status (see agent._PHASE_STATUS_MAP).
+
+    TERMINAL GUARD (cancel feature, 2026-10-08): once a session is
+    COMPLETED / FAILED / CANCELLED its status is HISTORY.  An in-flight
+    executor writes its next phase unconditionally, so without this check a
+    run the user just cancelled would flip back to EXECUTING (and later
+    COMPLETED) — resurrected.  A DIFFERENT status is therefore never written
+    over a terminal one; a same-status rewrite stays allowed so idempotent
+    stamps keep working.  A read failure fails OPEN (the write proceeds) —
+    a transient blip must not swallow a real transition.
     """
+    new_status = str(status or "").upper()
+    try:
+        current = await fetch_one(
+            "ai_execution_sessions",
+            filters={"id": str(session_id)},
+            select="status",
+        )
+    except Exception:  # noqa: BLE001 — fail open (status quo write)
+        current = None
+    if current:
+        current_status = str(current.get("status") or "").upper()
+        if (
+            current_status in _TERMINAL_SESSION_STATUSES
+            and current_status != new_status
+        ):
+            log.warning(
+                "database.session_terminal_no_rewrite",
+                session_id=str(session_id),
+                current=current_status,
+                attempted=new_status,
+            )
+            return current
     data: Dict[str, Any] = {"current_phase": phase, "status": status}
     if completed:
         data["completed_at"] = datetime.now(timezone.utc).isoformat()
     return await update_execution_session(session_id, data=data)
+
+
+#: Session statuses that are FINAL (``REJECTED`` is stored as ``CANCELLED`` —
+#: see agent._PHASE_STATUS_MAP).  Used by the terminal guard above and the
+#: executor's post-cancel mutation gate.
+_TERMINAL_SESSION_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
+
+async def get_session_status(session_id: uuid.UUID) -> Optional[str]:
+    """Current status of *session_id* (upper-cased), or ``None`` when unknown.
+
+    Best-effort by design: a read failure returns ``None``, which callers
+    treat as NOT terminal / NOT cancelled — refusing every mutation on a
+    transient DB blip would break runs nobody cancelled.  Cancel decisions
+    only ever move in ONE direction: ``CANCELLED`` can never be un-set (the
+    terminal guard above refuses to rewrite it).
+    """
+    try:
+        row = await fetch_one(
+            "ai_execution_sessions",
+            filters={"id": str(session_id)},
+            select="status",
+        )
+    except Exception:  # noqa: BLE001 — best-effort probe
+        return None
+    if not row:
+        return None
+    return str(row.get("status") or "").upper() or None
 
 
 # ai.execution_steps.step_type values (step_type_code enum).

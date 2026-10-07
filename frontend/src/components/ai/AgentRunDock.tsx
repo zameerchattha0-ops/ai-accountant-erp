@@ -49,27 +49,40 @@ export default function AgentRunDock() {
   return (
     <div className="fixed bottom-4 right-4 z-40 print:hidden">
       {loading ? (
-        <button
-          type="button"
-          onClick={() => router.push("/")}
-          aria-label="Agent working — open the live progress"
-          className="w-[calc(100vw-2rem)] max-w-xs rounded-2xl bg-bg-surface/95 backdrop-blur-xl border border-ai-200 shadow-[0_22px_48px_-20px_rgba(27,42,74,0.5)] p-3.5 flex items-center gap-3 text-left transition-transform hover:-translate-y-0.5"
-        >
-          <span className="w-9 h-9 rounded-full bg-ai-50 flex items-center justify-center shrink-0">
-            <Loader2 className="w-4.5 h-4.5 w-[18px] h-[18px] animate-spin text-ai-600" />
-          </span>
-          <span className="min-w-0">
-            <span className="block text-sm font-semibold text-text-primary">
-              Agent working…
+        <div className="w-[calc(100vw-2rem)] max-w-xs rounded-2xl bg-bg-surface/95 backdrop-blur-xl border border-ai-200 shadow-[0_22px_48px_-20px_rgba(27,42,74,0.5)] p-3.5 flex items-center gap-2 transition-transform hover:-translate-y-0.5">
+          <button
+            type="button"
+            onClick={() => router.push("/")}
+            aria-label="Agent working — open the live progress"
+            className="flex items-center gap-3 flex-1 min-w-0 text-left"
+          >
+            <span className="w-9 h-9 rounded-full bg-ai-50 flex items-center justify-center shrink-0">
+              <Loader2 className="w-4.5 h-4.5 w-[18px] h-[18px] animate-spin text-ai-600" />
             </span>
-            <span className="block text-xs text-text-muted truncate">
-              {lastStep?.phase
-                ? `${lastStep.phase}`
-                : "Reasoning about your request"}
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-text-primary">
+                Agent working…
+              </span>
+              <span className="block text-xs text-text-muted truncate">
+                {lastStep?.phase
+                  ? `${lastStep.phase}`
+                  : "Reasoning about your request"}
+              </span>
             </span>
-          </span>
-          <ChevronRight className="w-4 h-4 text-text-muted shrink-0" />
-        </button>
+            <ChevronRight className="w-4 h-4 text-text-muted shrink-0" />
+          </button>
+          {/* Abort in ONE click from any tab (production 2026-10-08). */}
+          <button
+            type="button"
+            onClick={() => void agentRunStore.cancel()}
+            disabled={run.cancelling}
+            aria-label="Cancel the running request"
+            title="Cancel this request"
+            className="shrink-0 p-1.5 rounded-lg text-text-muted hover:text-error-600 hover:bg-error-50 transition-colors disabled:opacity-60"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       ) : finishedOk ? (
         <div
           className="w-[calc(100vw-2rem)] max-w-xs rounded-2xl bg-bg-surface/95 backdrop-blur-xl border border-border-subtle shadow-[0_22px_48px_-20px_rgba(27,42,74,0.5)] p-3.5 flex items-center gap-3"

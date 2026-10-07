@@ -32,6 +32,7 @@ from app.idempotency import FINANCIAL_WRITE_TOOLS
 from app.database import (
     REQUEST_TIMINGS,
     create_clarification,
+    get_session_status,
     create_confirmation,
     create_execution_result,
     create_execution_session,
@@ -4919,8 +4920,41 @@ async def execute(
         # session a6dae819).
         sync_excluded_with_plan(planned_tool_calls, excluded_tools)
 
+        # CANCELLATION MEMO (production 2026-10-08): once ONE mutation has
+        # seen the session CANCELLED, every later mutation is refused without
+        # re-reading — the status can never un-cancel (set_session_phase's
+        # terminal guard), so a single confirmed read is enough for the run.
+        _cancel_state = {"cancelled": False}
 
         async def _executor(tool_name: str, args: dict) -> dict:
+            # CANCELLATION GATE: a run the user cancelled mid-way must never
+            # reach the books.  Reads stay allowed (harmless, and they let the
+            # loop wind down and report honestly); every MUTATION checks the
+            # control plane first.  The status read is best-effort — on a
+            # transient failure the run proceeds exactly as before (fail
+            # open), because refusing writes on a DB blip would break runs
+            # nobody cancelled.
+            from app.tool_execution import is_read_only_tool
+
+            if not is_read_only_tool(tool_name):
+                if not _cancel_state["cancelled"]:
+                    _status = await get_session_status(session_id)
+                    _cancel_state["cancelled"] = _status == "CANCELLED"
+                if _cancel_state["cancelled"]:
+                    log.warning(
+                        "agent.mutation_blocked_after_cancel",
+                        session_id=str(session_id),
+                        tool=tool_name,
+                    )
+                    return {
+                        "success": False,
+                        "error": (
+                            "REQUEST_CANCELLED: the user cancelled this run — "
+                            "nothing will be recorded. Do NOT retry the same "
+                            "call; stop and report that no changes were made."
+                        ),
+                        "error_category": "REQUEST_CANCELLED",
+                    }
             # GENERIC negative-reasoning gate: refuse any tool the economic
             # event profile PROHIBITS (cash ⇒ party-ledger creation; SERVICE
             # ⇒ inventory movement; expense/consumable ⇒ fixed-asset

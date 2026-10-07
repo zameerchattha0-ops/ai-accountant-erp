@@ -18,6 +18,7 @@
    Components subscribe with useSyncExternalStore; updates are plain
    immutable snapshots. */
 import {
+  aiCancelRun,
   aiClarify,
   aiConfirm,
   aiExecuteStream,
@@ -50,6 +51,9 @@ export interface AgentRunState {
   notice: string;
   reattached: boolean;
   stalledJobId: string | null;
+  /* A cancel is in flight (server asked to stop the run) — the buttons
+     show "Cancelling…" and ignore repeat clicks. */
+  cancelling: boolean;
 }
 
 let state: AgentRunState = {
@@ -61,6 +65,7 @@ let state: AgentRunState = {
   notice: "",
   reattached: false,
   stalledJobId: null,
+  cancelling: false,
 };
 
 const listeners = new Set<() => void>();
@@ -113,8 +118,14 @@ function applyResponse(res: AgentResponse) {
 }
 
 async function runForeground(request: UserRequest) {
+  /* The rid THIS run started with. cancel() clears activeRequestId, so a
+     stream that finishes afterwards is DROPPED — a cancelled run never
+     renders a late result card or fakes the completion the user aborted. */
+  const rid = request.conversation_id;
+  const stillMine = () => !rid || state.activeRequestId === rid;
   const res = await aiExecuteStream(request, {
-    onStep: (step) =>
+    onStep: (step) => {
+      if (!stillMine()) return;
       set({
         liveSteps: [
           ...state.liveSteps,
@@ -125,16 +136,21 @@ async function runForeground(request: UserRequest) {
             created_at: step.created_at ?? null,
           },
         ],
-      }),
+      });
+    },
   });
+  if (!stillMine()) return;
   applyResponse(res);
 }
 
 function runBackground(request: UserRequest) {
+  const rid = request.conversation_id;
   return runBackgroundJob({
     enqueue: () => aiEnqueueJob(request),
     getJob: aiGetJob,
-    onResult: applyResponse,
+    onResult: (res) => {
+      if (!rid || state.activeRequestId === rid) applyResponse(res);
+    },
     onError: (msg) => set({ error: msg, loading: false }),
     onStalled: (jobId) => set({ stalledJobId: jobId }),
   });
@@ -281,6 +297,7 @@ export const agentRunStore = {
      navigation cannot abort, unmount or orphan it. */
   async startRun(request: UserRequest) {
     if (state.loading) return; // one run at a time
+    const rid = requestId();
     set({
       loading: true,
       response: null,
@@ -289,9 +306,9 @@ export const agentRunStore = {
       stalledJobId: null,
       reattached: false,
       liveSteps: [],
+      cancelling: false,
+      activeRequestId: rid,
     });
-    const rid = requestId();
-    set({ activeRequestId: rid });
     try {
       if (USE_BACKGROUND_RUNS) {
         try {
@@ -368,6 +385,43 @@ export const agentRunStore = {
       set({ error: err instanceof Error ? err.message : "Something went wrong" });
     } finally {
       set({ loading: false, activeRequestId: null, liveSteps: [] });
+    }
+  },
+
+  /* Cancel the run IN FLIGHT (production 2026-10-08).
+     Control plane FIRST: the server marks the session CANCELLED (the
+     executor's mutation gate then refuses every further write), and only
+     a successful cancel clears the local snapshot — a FAILED cancel never
+     fakes success: the run keeps going and the error surfaces honestly.
+     A run that FINISHED while the click was in flight reports
+     `cancelled: false`; its real outcome stands untouched. */
+  async cancel() {
+    const rid = state.activeRequestId;
+    if (!state.loading || !rid || state.cancelling) return;
+    set({ cancelling: true, error: "" });
+    try {
+      const result = await aiCancelRun({ conversation_id: rid });
+      if (!result.cancelled) {
+        // Finished before the cancel landed — leave the real result alone.
+        set({ cancelling: false });
+        return;
+      }
+      set({
+        cancelling: false,
+        loading: false,
+        activeRequestId: null,
+        liveSteps: [],
+        response: null,
+        reattached: false,
+        stalledJobId: null,
+        notice: "Request cancelled — nothing was recorded.",
+      });
+    } catch (err) {
+      set({
+        cancelling: false,
+        error:
+          err instanceof Error ? err.message : "Failed to cancel the request",
+      });
     }
   },
 

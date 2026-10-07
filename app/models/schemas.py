@@ -151,6 +151,20 @@ class AttachmentRef(BaseModel):
     )
 
 
+class SessionCancelRequest(BaseModel):
+    """POST /api/ai/sessions/cancel — identify the in-flight run to cancel.
+
+    The frontend knows its run by the CLIENT-GENERATED ``conversation_id``
+    from the moment it starts (the session UUID only arrives with the final
+    response), so either identifier is accepted; at least one is required
+    (enforced by the endpoint).  Ownership (org + user) is enforced there —
+    this model only carries the identifiers.
+    """
+
+    conversation_id: Optional[str] = Field(default=None, max_length=128)
+    session_id: Optional[str] = None
+
+
 # ===================================================================
 # Canonical contracts (shared with the frontend types in
 # frontend/src/lib/types/api.ts — keep both in sync)

@@ -41,6 +41,7 @@ from app.models.schemas import (
     AgentResponse,
     ClarificationAnswer,
     ConfirmationDecision,
+    SessionCancelRequest,
     UserRequest,
 )
 
@@ -895,6 +896,97 @@ async def latest_active_session(
             },
         }
     return {"found": False, "session": None}
+
+
+# ---------------------------------------------------------------------------
+# CANCEL — abort a run mid-way (production request 2026-10-08: "where is the
+# button to cancel the ongoing request?").  Until now cancellation only
+# happened IMPLICITLY (a new request superseded the old one; the 24h reaper).
+#
+# What this endpoint guarantees:
+#   * a NON-TERMINAL session moves to CANCELLED — the AI-Activity feed hides
+#     it (cancelled runs are not activity), reattach/progress treat it
+#     terminal, and the terminal guard in ``set_session_phase`` stops the
+#     in-flight executor from ever flipping it back;
+#   * the executor's mutation gate (agent._executor) refuses every write
+#     after a cancel, so NOTHING lands in the books post-cancel;
+#   * a finished run's outcome is HISTORY — reported, never rewritten;
+#   * idempotent: cancelling an already-cancelled run reports success.
+# ---------------------------------------------------------------------------
+@app.post("/api/ai/sessions/cancel")
+async def cancel_session(
+    payload: SessionCancelRequest,
+    auth: AuthContext = Depends(get_current_user),
+):
+    conversation_id = (payload.conversation_id or "").strip()
+    session_id_raw = (payload.session_id or "").strip()
+    if not conversation_id and not session_id_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="conversation_id or session_id is required",
+        )
+
+    row = None
+    if conversation_id:
+        row = await fetch_one(
+            "ai_execution_sessions",
+            filters={
+                "organization_id": str(auth.organization_id),
+                "user_id": str(auth.user_id),
+                "conversation_id": conversation_id,
+            },
+        )
+    if row is None and session_id_raw:
+        try:
+            session_uuid = uuid.UUID(session_id_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="session_id must be a UUID"
+            )
+        row = await fetch_one(
+            "ai_execution_sessions",
+            filters={
+                "organization_id": str(auth.organization_id),
+                "user_id": str(auth.user_id),
+                "id": str(session_uuid),
+            },
+        )
+    if row is None:
+        # Scoped by org AND user above: a foreign run is simply "not found".
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    current = str(row.get("status") or "").upper()
+    session_id_out = str(row.get("id"))
+    if current == "CANCELLED":
+        return {
+            "cancelled": True,
+            "status": "CANCELLED",
+            "session_id": session_id_out,
+        }
+    if current in ("COMPLETED", "FAILED"):
+        return {
+            "cancelled": False,
+            "status": current,
+            "session_id": session_id_out,
+        }
+
+    await set_session_phase(
+        uuid.UUID(session_id_out),
+        phase="CANCELLED",
+        status="CANCELLED",
+        completed=True,
+    )
+    log.info(
+        "api.session.cancelled",
+        session_id=session_id_out,
+        conversation_id=conversation_id or None,
+        previous_status=current,
+    )
+    return {
+        "cancelled": True,
+        "status": "CANCELLED",
+        "session_id": session_id_out,
+    }
 
 
 def _unknown_tool() -> Dict[str, Any]:

@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { CheckCircle2, XCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { aiProgress } from "@/lib/api/client";
+import { agentRunStore } from "@/lib/agent/agentRunStore";
 import type { AgentProgress, ProgressStep } from "@/lib/types/api";
 
 const POLL_MS = 1500;
@@ -163,6 +164,12 @@ export default function AIProgress({
   // the wait feels alive (perceived-latency psychology).
   const [thoughtIdx, setThoughtIdx] = useState(0);
   const [elapsed, setElapsed] = useState(0);
+  // Cancel-in-flight flag (store-owned — the dock's button shares it).
+  const { cancelling } = useSyncExternalStore(
+    agentRunStore.subscribe,
+    agentRunStore.getSnapshot,
+    agentRunStore.getSnapshot
+  );
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -245,10 +252,13 @@ export default function AIProgress({
 
   return (
     <div className="glass rounded-2xl p-4">
-      {/* Header - collapsible */}
+      {/* Header row - collapsible toggle + the CANCEL button (production
+          2026-10-08: a run the user is watching must be abortable in ONE
+          click, right where the progress lives). */}
+      <div className="flex items-center gap-2">
       <button
         onClick={() => setExpanded((v) => !v)}
-        className="w-full flex items-center gap-3 text-sm font-medium text-text-primary text-left"
+        className="flex-1 flex items-center gap-3 text-sm font-medium text-text-primary text-left"
         aria-expanded={expanded}
       >
         {terminal && progress?.status === "COMPLETED" ? (
@@ -315,6 +325,18 @@ export default function AIProgress({
           <ChevronRight className="w-4 h-4 text-text-muted" />
         )}
       </button>
+      {!terminal && (
+        <button
+          type="button"
+          onClick={() => void agentRunStore.cancel()}
+          disabled={cancelling}
+          aria-label="Cancel this request"
+          className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wide text-error-600 border border-error-100 hover:bg-error-50 transition-colors disabled:opacity-60"
+        >
+          {cancelling ? "Cancelling…" : "Cancel"}
+        </button>
+      )}
+      </div>
 
       {/* Multi-colour pipeline stepper - visible while the agent works */}
       {!terminal && stepIndex >= 0 && (

@@ -142,6 +142,33 @@ export async function latestActiveSession(): Promise<ActiveSessionInfo> {
   return fetchApi("/api/ai/sessions/latest-active");
 }
 
+/**
+ * Cancel the user's in-flight run (production request 2026-10-08: "where is
+ * the button to cancel the ongoing request?").
+ *
+ * The control plane marks the session CANCELLED — the executor refuses
+ * further mutations, the terminal guard stops the status being rewritten,
+ * reattach stops, and the AI-Activity feed never shows it.  `cancelled:
+ * false` means the run had already FINISHED while the click was in flight:
+ * its real outcome stands (a finished run is history, never rewritten).
+ */
+export interface CancelRunResult {
+  cancelled: boolean;
+  status: string;
+  session_id: string;
+}
+
+export async function aiCancelRun(payload: {
+  conversation_id?: string;
+  session_id?: string;
+}): Promise<CancelRunResult> {
+  return fetchApi<CancelRunResult>("/api/ai/sessions/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 /* ---- Catalogue (products & services) -------------------------------------
  *
  * The page goes through the API rather than querying Supabase directly (the
