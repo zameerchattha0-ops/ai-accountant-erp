@@ -169,6 +169,13 @@ describe("constants", () => {
       expect(STATUS_FILTERS).toContain(status);
     }
   });
+
+  it("never offers a cancelled filter — cancelled runs are not activity", () => {
+    // Production request 2026-10-08: the API drops cancelled rows at read
+    // time, so a "cancelled (0)" chip would be a permanently dead option.
+    expect(STATUS_FILTERS).not.toContain("CANCELLED");
+    expect(SESSION_STATUSES).not.toContain("CANCELLED");
+  });
 });
 
 describe("visibleSessions", () => {

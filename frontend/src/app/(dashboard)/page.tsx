@@ -66,16 +66,24 @@ const isOverdue = (due: string | null) => {
 };
 
 /* ---- KPI Card ---- */
-function KPICard({ label, value, hint, currency, icon: Icon, iconColor, iconBg }: KPIData & {
+function KPICard({ label, value, hint, currency, icon: Icon, iconColor, iconBg, labelColor }: KPIData & {
   currency?: string;
   icon: LucideIcon;
   iconColor: string;
   iconBg: string;
+  /**
+   * The label's own hue (production request 2026-10-08: the uniform grey
+   * label made six very different numbers read as one wallpaper).  Each card
+   * keeps its icon's hue at LABEL strength so the owner learns the colour
+   * language once — green money IN, violet money OUT, blue the bottom line,
+   * amber money WAITING, pink money OWEING, navy the cash anchor.
+   */
+  labelColor: string;
 }) {
   return (
     <div className="clay-sm hover-lift bg-bg-surface p-5 space-y-2">
       <div className="flex items-center justify-between">
-        <p className="text-[11px] font-semibold text-text-muted uppercase tracking-wider">{label}</p>
+        <p className={cn("text-[11px] font-semibold uppercase tracking-wider", labelColor)}>{label}</p>
         <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center", iconBg)}>
           <Icon className={cn("w-4 h-4", iconColor)} />
         </div>
@@ -224,14 +232,16 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* KPI Grid */}
+      {/* KPI Grid — label hues are the colour language described in KPICard:
+          green inflow, violet outflow, blue bottom line, amber awaiting,
+          pink owed, navy cash. */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <KPICard label="Revenue" value={data?.revenue ?? 0} hint="Posted, year to date" currency={currency} icon={TrendingUp} iconColor="text-success-500" iconBg="bg-success-50" />
-        <KPICard label="Expenses" value={data?.expenses ?? 0} hint="Posted, year to date" currency={currency} icon={Wallet} iconColor="text-purple-500" iconBg="bg-purple-50" />
-        <KPICard label="Net Profit" value={(data?.revenue ?? 0) - (data?.expenses ?? 0)} hint="Revenue \u2212 expenses" currency={currency} icon={BarChart3} iconColor="text-info-500" iconBg="bg-info-50" />
-        <KPICard label="Receivables" value={data?.receivables ?? 0} hint={`${data?.overdueInvoices ?? 0} overdue`} currency={currency} icon={UserCheck} iconColor="text-warning-500" iconBg="bg-warning-50" />
-        <KPICard label="Payables" value={data?.payables ?? 0} hint={`${data?.openBills ?? 0} open bills`} currency={currency} icon={CreditCard} iconColor="text-pink-500" iconBg="bg-pink-50" />
-        <KPICard label="Cash & Bank" value={data?.cash ?? 0} hint="Current balances" currency={currency} icon={Landmark} iconColor="text-brand-teal" iconBg="bg-brand-aqua" />
+        <KPICard label="Revenue" value={data?.revenue ?? 0} hint="Posted, year to date" currency={currency} icon={TrendingUp} iconColor="text-success-500" iconBg="bg-success-50" labelColor="text-success-700" />
+        <KPICard label="Expenses" value={data?.expenses ?? 0} hint="Posted, year to date" currency={currency} icon={Wallet} iconColor="text-purple-500" iconBg="bg-purple-50" labelColor="text-purple-700" />
+        <KPICard label="Net Profit" value={(data?.revenue ?? 0) - (data?.expenses ?? 0)} hint="Revenue \u2212 expenses" currency={currency} icon={BarChart3} iconColor="text-info-500" iconBg="bg-info-50" labelColor="text-info-700" />
+        <KPICard label="Receivables" value={data?.receivables ?? 0} hint={`${data?.overdueInvoices ?? 0} overdue`} currency={currency} icon={UserCheck} iconColor="text-warning-500" iconBg="bg-warning-50" labelColor="text-warning-700" />
+        <KPICard label="Payables" value={data?.payables ?? 0} hint={`${data?.openBills ?? 0} open bills`} currency={currency} icon={CreditCard} iconColor="text-pink-500" iconBg="bg-pink-50" labelColor="text-pink-700" />
+        <KPICard label="Cash & Bank" value={data?.cash ?? 0} hint="Current balances" currency={currency} icon={Landmark} iconColor="text-brand-teal" iconBg="bg-brand-aqua" labelColor="text-brand-navy" />
       </div>
 
       {/* Recent Activity + Upcoming */}

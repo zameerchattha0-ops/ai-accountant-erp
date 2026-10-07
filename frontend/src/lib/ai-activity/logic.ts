@@ -22,7 +22,14 @@ import type {
 /** The API carries the refusal text in ``detail`` — surface it verbatim. */
 export { apiErrorMessage as messageOf } from "@/lib/api/errors";
 
-/** ``ai.session_status_code`` (migration 026) — the filter and the counts. */
+/**
+ * ``ai.session_status_code`` (migration 026) — the filter and the counts.
+ *
+ * CANCELLED is deliberately ABSENT (production request 2026-10-08): a run the
+ * user abandoned mid-way is never stored in the AI Activity feed (the API
+ * drops those rows at read time), so offering the filter would render a dead
+ * "cancelled (0)" option forever.
+ */
 export const SESSION_STATUSES = [
   "PENDING",
   "PLANNING",
@@ -30,7 +37,6 @@ export const SESSION_STATUSES = [
   "EXECUTING",
   "COMPLETED",
   "FAILED",
-  "CANCELLED",
 ] as const;
 
 /** The status filter's options, ALL first — same shape as the other registers. */

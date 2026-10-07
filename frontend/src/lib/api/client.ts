@@ -86,9 +86,14 @@ export async function aiConfirm(decision: ConfirmationDecision): Promise<AgentRe
  *
  * `counts` and `total` always cover the WHOLE loaded feed; `query` and `status`
  * narrow `items` only — so a filter can never make the counts beside it lie.
+ *
+ * The default page is BOUNDED (production request 2026-10-08 "remove extra
+ * load"): real feeds sit far below it, so the common load is one small
+ * response — and beyond it the API's honest `truncated` flag already switches
+ * the page to server-side search, so nothing is lost by not asking for 1000.
  */
 export async function aiGetSessions(
-  limit = 1000,
+  limit = 300,
   query = "",
   status = "ALL"
 ): Promise<ActivityFeed> {

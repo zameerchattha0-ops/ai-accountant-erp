@@ -188,6 +188,120 @@ def _patch_detail(monkeypatch, *, tools: dict, steps=None, tool_calls=None,
     monkeypatch.setattr(main_mod, "_tool_catalog", fake_catalog)
 
 
+class TestCancelledRunsAreNeverActivity:
+    """A request cancelled mid-way is not AI Activity (production 2026-10-08).
+
+    The feed used to show every abandoned/superseded run — the Zameer Labs
+    feed was more CANCELLED rows than real ones — so the page read like a
+    history of failed work.  The rows stay in the control plane (audit,
+    resume forensics); the READ path drops them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_rows_never_reach_items_counts_or_total(
+        self, monkeypatch
+    ):
+        from app import main as main_mod
+
+        # Small pages so the loop really pages: page 1 is all cancelled,
+        # page 2 carries one real run beside another cancelled row.
+        monkeypatch.setattr(main_mod, "_AI_ACTIVITY_PAGE", 2)
+        pages = {
+            0: [
+                _row(id=str(uuid.uuid4()), status="CANCELLED",
+                     user_request="abandoned mid-way"),
+                _row(id=str(uuid.uuid4()), status="CANCELLED",
+                     user_request="superseded by the next request"),
+            ],
+            2: [
+                _row(id=str(uuid.uuid4()), status="COMPLETED"),
+                _row(id=str(uuid.uuid4()), status="CANCELLED",
+                     user_request="cancelled later"),
+            ],
+            4: [],
+        }
+
+        async def fake_fetch(table, *, filters, select="*", order=None,
+                             limit=100, offset=0):
+            assert table == "ai_execution_sessions"
+            return list(pages.get(offset, []))
+
+        monkeypatch.setattr(main_mod, "fetch_many", fake_fetch)
+
+        out = await main_mod.list_sessions(auth=_auth())
+
+        assert out["total"] == 1
+        assert [row["status"] for row in out["items"]] == ["COMPLETED"]
+        assert out["counts"]["ALL"] == 1
+        assert out["counts"]["CANCELLED"] == 0
+        assert out["counts"]["COMPLETED"] == 1
+        assert out["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_only_feed_reads_empty_not_error(self, monkeypatch):
+        from app import main as main_mod
+
+        async def fake_fetch(table, *, filters, select="*", order=None,
+                             limit=100, offset=0):
+            return [_row(id=str(uuid.uuid4()), status="CANCELLED")]
+
+        monkeypatch.setattr(main_mod, "fetch_many", fake_fetch)
+
+        out = await main_mod.list_sessions(auth=_auth())
+
+        assert out["items"] == []
+        assert out["total"] == 0
+        assert out["counts"]["ALL"] == 0
+        assert out["truncated"] is False
+
+
+class TestToolCatalogCache:
+    """The global tool reference is read once per TTL, not once per modal."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_reads_hit_the_cache(self, monkeypatch):
+        from app import main as main_mod
+
+        monkeypatch.setattr(
+            main_mod, "_tool_catalog_cache", {"at": 0.0, "data": None}
+        )
+        calls = {"n": 0}
+
+        async def fake_fetch(table, *, filters, select="*", order=None,
+                             limit=100, offset=0):
+            calls["n"] += 1
+            return [{"id": "9999", "name": "create_invoice",
+                     "read_only": False, "risk_level": "HIGH"}]
+
+        monkeypatch.setattr(main_mod, "fetch_many", fake_fetch)
+
+        first = await main_mod._tool_catalog()
+        second = await main_mod._tool_catalog()
+
+        assert first == second
+        assert first["9999"]["tool_name"] == "create_invoice"
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_is_never_cached(self, monkeypatch):
+        from app import main as main_mod
+
+        monkeypatch.setattr(
+            main_mod, "_tool_catalog_cache", {"at": 0.0, "data": None}
+        )
+        calls = {"n": 0}
+
+        async def boom(table, **kwargs):
+            calls["n"] += 1
+            raise RuntimeError("catalog unreachable")
+
+        monkeypatch.setattr(main_mod, "fetch_many", boom)
+
+        assert await main_mod._tool_catalog() == {}
+        assert await main_mod._tool_catalog() == {}
+        assert calls["n"] == 2  # the outage degraded two calls, never poisoned
+
+
 class TestSessionDetail:
     @pytest.mark.asyncio
     async def test_a_tool_call_resolves_to_a_name_and_a_write_flag(

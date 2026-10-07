@@ -686,6 +686,14 @@ async def _read_sessions_paged(
 
     Ordering is ``created_at desc`` (newest first — what a feed wants).  A short
     page ends the read, so a small account pays ONE round trip.
+
+    CANCELLED rows are dropped HERE (production request 2026-10-08): a request
+    the user abandoned mid-way — or superseded by their next one — is not AI
+    Activity, and seeing them made the feed read like failed work.  The rows
+    themselves are never deleted (the control plane keeps them for audit and
+    resume forensics); they simply never reach ``items``, ``counts`` or
+    ``total``.  Dropping per page — not after the read — keeps ``limit`` /
+    ``truncated`` honest against the VISIBLE feed.
     """
     rows: List[Dict[str, Any]] = []
     offset = 0
@@ -701,7 +709,11 @@ async def _read_sessions_paged(
             limit=want,
             offset=offset,
         )
-        rows.extend(page)
+        rows.extend(
+            row
+            for row in page
+            if str(row.get("status") or "").upper() != "CANCELLED"
+        )
         if len(page) < want:
             break
         offset += want
@@ -891,15 +903,29 @@ def _unknown_tool() -> Dict[str, Any]:
     return {"tool_name": None, "tool_read_only": None, "tool_risk_level": None}
 
 
+#: ``ai.tools`` is a small GLOBAL reference table (no ``organization_id``), and
+#: it is IDENTICAL for every viewer — re-reading it on every detail-open was
+#: pure repeat load (a 1000-row fetch per modal, production request 2026-10-08
+#: "remove extra load").  One process serves many requests, so a short TTL
+#: serves them all; a FAILED read is never cached, so a transient outage only
+#: degrades one call.
+_TOOL_CATALOG_TTL_SECONDS = 300.0
+_tool_catalog_cache: Dict[str, Any] = {"at": 0.0, "data": None}
+
+
 async def _tool_catalog() -> Dict[str, Dict[str, Any]]:
-    """Index ``ai.tools`` by id.
+    """Index ``ai.tools`` by id — cached for ``_TOOL_CATALOG_TTL_SECONDS``.
 
     A tool call stores only ``tool_id`` (a UUID FK), so without this join the
-    detail view could show nothing but an opaque id.  ``ai.tools`` is a small
-    GLOBAL reference table (it has no ``organization_id``), so read it once and
-    index it — and ``read_only`` is what lets the page distinguish a READ of the
-    user's books from a WRITE to them.
+    detail view could show nothing but an opaque id.  ``read_only`` is what
+    lets the page distinguish a READ of the user's books from a WRITE to them.
     """
+    cached = _tool_catalog_cache.get("data")
+    if cached is not None and (
+        time.monotonic() - float(_tool_catalog_cache.get("at") or 0.0)
+        < _TOOL_CATALOG_TTL_SECONDS
+    ):
+        return cached
     try:
         rows = await fetch_many(
             "ai_tools",
@@ -910,7 +936,7 @@ async def _tool_catalog() -> Dict[str, Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 — names are decoration, not data
         log.warning("api.session.tool_catalog_unavailable", error=str(exc))
         return {}
-    return {
+    data = {
         str(row.get("id")): {
             "tool_name": row.get("name"),
             "tool_read_only": (
@@ -923,6 +949,9 @@ async def _tool_catalog() -> Dict[str, Dict[str, Any]]:
         for row in rows or []
         if row.get("id")
     }
+    _tool_catalog_cache["at"] = time.monotonic()
+    _tool_catalog_cache["data"] = data
+    return data
 
 
 @app.get("/api/ai/sessions/{session_id}")
