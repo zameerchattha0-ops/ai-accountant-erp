@@ -388,7 +388,8 @@ async def create_loan(
             entry_id = uuid.UUID(str(entry["id"]))
             await accounting_service.validate_journal(entry_id=entry_id)
             await accounting_service.post_journal(entry_id=entry_id)
-            await update_one("loans", filters={"id": str(loan_id)},
+            await update_one("loans", row_id=loan_id,
+                             organization_id=organization_id,
                              data={"initial_entry_id": str(entry_id)})
             journal = {"entry_id": str(entry_id), "posted": True}
         except Exception as exc:  # noqa: BLE001 — honest warning, never fake
@@ -512,7 +513,9 @@ async def record_installment_payment(
     new_status = "PAID" if paid_total >= remaining - 0.005 else "PARTIAL"
     prior_principal_paid = float(inst.get("principal_paid") or 0)
     prior_interest_paid = float(inst.get("interest_paid") or 0)
-    await update_one("loan_installments", filters={"id": str(inst["id"])}, data={
+    await update_one("loan_installments",
+                     row_id=uuid.UUID(str(inst["id"])),
+                     organization_id=organization_id, data={
         "status": new_status,
         "paid_amount": paid_total,
         "principal_paid": round(prior_principal_paid + principal_part, 2),
@@ -522,14 +525,22 @@ async def record_installment_payment(
     })
 
     # Settle the sweep's PENDING event (if any): the proposed journal this
-    # installment carried is now actually posted.
+    # installment carried is now actually posted.  update_one is by primary
+    # key, so the pending row is fetched first, then updated by id.
     try:
-        await update_one(
+        pending_rows = await fetch_many(
             "loan_payment_events",
             filters={"installment_id": str(inst["id"]), "status": "PENDING"},
-            data={"status": "COMPLETED",
-                  "resolved_at": date.today().isoformat()},
+            limit=1,
         )
+        if pending_rows:
+            await update_one(
+                "loan_payment_events",
+                row_id=uuid.UUID(str(pending_rows[0]["id"])),
+                organization_id=organization_id,
+                data={"status": "COMPLETED",
+                      "resolved_at": date.today().isoformat()},
+            )
     except Exception as exc:  # noqa: BLE001 — event bookkeeping is secondary
         log.warning("loan.event_settle_failed", installment_id=str(inst["id"]),
                     error=str(exc)[:200])
@@ -542,7 +553,8 @@ async def record_installment_payment(
     outstanding = [r for r in unpaid or ()
                    if str(r.get("status")) not in ("PAID", "WAIVED")]
     if not outstanding:
-        await update_one("loans", filters={"id": str(loan_id)},
+        await update_one("loans", row_id=loan_id,
+                         organization_id=organization_id,
                          data={"status": "COMPLETED"})
 
     log.info("loan.installment_paid", loan_id=str(loan_id),
@@ -650,8 +662,8 @@ async def run_due_installment_sweep(
             target = "OVERDUE" if str(row.get("due_date")) < today else "DUE"
             if stored != target:
                 await update_one(
-                    "loan_installments", filters={"id": str(inst_id)},
-                    data={"status": target})
+                    "loan_installments", row_id=inst_id,
+                    organization_id=org, data={"status": target})
                 if target == "OVERDUE":
                     marked_overdue += 1
                 else:
@@ -769,8 +781,8 @@ async def restructure_loan(
 
     for row in rebuildable:
         await update_one(
-            "loan_installments", filters={"id": str(row["id"])},
-            data={"status": "WAIVED"})
+            "loan_installments", row_id=uuid.UUID(str(row["id"])),
+            organization_id=organization_id, data={"status": "WAIVED"})
 
     schedule = build_schedule(
         principal=outstanding, annual_rate=interest_rate,
@@ -780,7 +792,13 @@ async def restructure_loan(
         interest_method=interest_method, grace_months=grace_months,
         balloon_amount=balloon_amount,
     )
-    next_no = max((int(r.get("installment_no") or 0) for r in kept), default=0)
+    # Numbering continues after EVERY existing row — waived rows stay as
+    # history and keep their numbers, so the (loan_id, installment_no)
+    # unique constraint must clear them too (live-caught E2E 2026-10-14).
+    next_no = max(
+        (int(r.get("installment_no") or 0) for r in kept + rebuildable),
+        default=0,
+    )
     created: List[Dict[str, Any]] = []
     for row in schedule:
         next_no += 1
@@ -806,7 +824,8 @@ async def restructure_loan(
         "new_terms": new_terms,
         "reason": reason,
     })
-    await update_one("loans", filters={"id": str(loan_id)}, data={
+    await update_one("loans", row_id=loan_id,
+                     organization_id=organization_id, data={
         "tenure_months": int(tenure_months),
         "frequency": str(frequency or "MONTHLY").upper(),
         "interest_rate": round(float(interest_rate), 5),
@@ -882,8 +901,8 @@ async def write_off_loan(
 
     for row in rebuildable:
         await update_one(
-            "loan_installments", filters={"id": str(row["id"])},
-            data={"status": "WAIVED"})
+            "loan_installments", row_id=uuid.UUID(str(row["id"])),
+            organization_id=organization_id, data={"status": "WAIVED"})
 
     prepared = await accounting_service.prepare_journal(
         organization_id=organization_id, transaction_date=str(write_off_date),
@@ -900,7 +919,8 @@ async def write_off_loan(
         await accounting_service.post_journal(entry_id=entry_id)
         journal = {"entry_id": str(entry_id), "posted": True}
 
-    await update_one("loans", filters={"id": str(loan_id)}, data={
+    await update_one("loans", row_id=loan_id,
+                     organization_id=organization_id, data={
         "status": "WRITTEN_OFF",
         "updated_at": date.today().isoformat(),
     })

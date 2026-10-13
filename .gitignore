@@ -98,3 +98,10 @@ _e2e_out.txt
 _e2e_exit.txt
 _e2e_run.ps1
 
+
+# ---- Live-verification runner scratch (regenerated per run) ----
+_lc_out.txt
+_lc_exit.txt
+_lc_run.ps1
+_worker_out.txt
+_worker_run.ps1

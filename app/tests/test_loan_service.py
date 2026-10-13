@@ -255,12 +255,13 @@ def test_sweep_marks_due_and_creates_pending_events_exactly_once(monkeypatch):
         seen_events.append({"installment_id": data["installment_id"]})
         return {"id": str(uuid.uuid4())}
 
-    async def _update_one(table, filters=None, data=None, **kw):
-        captured["updated"].append((table, filters, data))
+    async def _update_one(table, data=None, **kw):
+        row_id = kw.get("row_id")
+        captured["updated"].append((table, row_id, data))
         # Model persistence: the real table reflects the status write, so the
         # second run must see DUE and skip re-marking.
-        if table == "loan_installments" and filters and data:
-            if filters.get("id") == due_row["id"] and "status" in data:
+        if table == "loan_installments" and data and "status" in data:
+            if str(row_id) == due_row["id"]:
                 due_row["status"] = data["status"]
 
     monkeypatch.setattr(loan_service, "fetch_many", _fetch_many)
@@ -274,7 +275,7 @@ def test_sweep_marks_due_and_creates_pending_events_exactly_once(monkeypatch):
     assert event_rows[0]["proposed"]["principal"] == 50000
     assert event_rows[0]["proposed"]["interest"] == 6000
     # The future installment was NOT touched.
-    assert not any(f and f.get("id") == future_row["id"]
+    assert not any(f is not None and str(f) == future_row["id"]
                    for (_t, f, _d) in captured["updated"])
 
     # Second run: idempotent — no duplicate events, nothing re-marked.
@@ -300,8 +301,8 @@ def test_sweep_flags_past_due_as_overdue(monkeypatch):
     async def _insert_one(table, data=None, **kw):
         return {"id": str(uuid.uuid4())}
 
-    async def _update_one(table, filters=None, data=None, **kw):
-        captured["updated"].append((table, filters, data))
+    async def _update_one(table, data=None, **kw):
+        captured["updated"].append((table, kw.get("row_id"), data))
 
     monkeypatch.setattr(loan_service, "fetch_many", _fetch_many)
     monkeypatch.setattr(loan_service, "insert_one", _insert_one)
@@ -332,8 +333,8 @@ def _wire_restructure(monkeypatch, loan: dict, installments: list) -> dict:
         captured["inserted"].append((table, data))
         return {"id": str(uuid.uuid4())}
 
-    async def _update_one(table, filters=None, data=None, **kw):
-        captured["updated"].append((table, filters, data))
+    async def _update_one(table, data=None, **kw):
+        captured["updated"].append((table, kw.get("row_id"), data))
 
     monkeypatch.setattr(loan_service, "fetch_many", _fetch_many)
     monkeypatch.setattr(loan_service, "insert_one", _insert_one)
@@ -368,11 +369,12 @@ def test_restructure_keeps_paid_rebuilds_rest_and_audits(monkeypatch):
     # REAL outstanding = 1,000,000 - 90,000 persisted principal_paid.
     assert res["outstanding"] == 910000
     assert res["waived"] == 3 and res["kept"] == 1
-    # New schedule closes at zero and numbering continues after the kept row.
-    assert res["new_schedule"][0]["installment_no"] == 2
+    # New schedule closes at zero and numbering clears ALL existing rows
+    # (waived history keeps its numbers 1-4, so the rebuild starts at 5).
+    assert res["new_schedule"][0]["installment_no"] == 5
     assert res["new_schedule"][-1]["closing_principal"] == 0
     # The PAID row was never updated; only the three SCHEDULED rows were waived.
-    waived_ids = {f.get("id") for (t, f, d) in cap["updated"]
+    waived_ids = {str(f) for (t, f, d) in cap["updated"]
                   if t == "loan_installments" and d.get("status") == "WAIVED"}
     assert waived_ids == {r["id"] for r in future}
     assert paid["id"] not in waived_ids
@@ -405,8 +407,8 @@ def _wire_writeoff(monkeypatch, loan: dict, installments: list) -> dict:
             return [loan]
         return []
 
-    async def _update_one(table, filters=None, data=None, **kw):
-        captured["updated"].append((table, filters, data))
+    async def _update_one(table, data=None, **kw):
+        captured["updated"].append((table, kw.get("row_id"), data))
 
     async def _insert_one(table, data=None, **kw):
         captured["inserted"].append((table, data))
