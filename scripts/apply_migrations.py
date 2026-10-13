@@ -98,6 +98,32 @@ def query(ref: str, token: str, sql: str):
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def track(ref: str, token: str, name: str, sql: str) -> None:
+    """Record an applied file in supabase_migrations.schema_migrations.
+
+    The Management-API runner executes DDL but leaves no migration-history
+    row, so files 084..091 were invisible to history tooling — and an
+    untracked DROP+recreate of get_income_statement (091) silently
+    re-granted EXECUTE to PUBLIC, undoing 071's hardening.  Recording the
+    applied body after each success keeps the audit trail complete.
+    Idempotent per name: an existing row is left untouched.
+    """
+    escaped = sql.replace("'", "''")
+    stmt = (
+        "insert into supabase_migrations.schema_migrations "
+        "(version, name, statements, created_by) "
+        "select to_char(now() at time zone 'UTC', 'YYYYMMDDHH24MISS'), "
+        f"'{name}', array['{escaped}']::text[], 'apply_migrations.py' "
+        "where not exists (select 1 from supabase_migrations.schema_migrations "
+        f"where name = '{name}')"
+    )
+    _, err = query(ref, token, stmt)
+    if err:
+        print(f"WARN could not track {name}: {err}")
+    else:
+        print(f"TRACKED {name}")
+
+
 def main() -> int:
     sec = load_secrets()
     for required in ("SUPABASE_URL", "SUPABASE_ACCESS_TOKEN"):
@@ -144,12 +170,14 @@ def main() -> int:
                 print(f"FAIL  {arg}: file not found (tried as given and under {MIG})")
                 failed = True
                 continue
-            result, err = query(ref, token, path.read_text(encoding="utf-8"))
+            sql = path.read_text(encoding="utf-8")
+            result, err = query(ref, token, sql)
             if err:
                 print(f"FAIL  {path.name}: {err}")
                 failed = True
             else:
                 print(f"OK    {path.name}: {json.dumps(result)[:500]}")
+                track(ref, token, path.stem, sql)
         return 1 if failed else 0
 
     pre, err = query(ref, token,
@@ -172,6 +200,7 @@ def main() -> int:
             failed = True
         else:
             print(f"OK    {name}: {json.dumps(result)[:500]}")
+            track(ref, token, Path(name).stem, sql)
 
     print("--- verification ---")
     result, err = query(ref, token, VERIFY_SQL)
