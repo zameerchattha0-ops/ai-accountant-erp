@@ -283,6 +283,44 @@ class Settings(BaseSettings):
             "request as unauthenticated."
         ),
     )
+    allow_legacy_jwt_secret_auth: bool = Field(
+        default=False,
+        description=(
+            "Explicit PER-DEPLOYMENT approval for the legacy HS256 "
+            "shared-secret JWT verification path (app/auth.py Path B). "
+            "Separate from allow_dev_header_auth: this gates the symmetric "
+            "secret path only. Defaults to false so a deployment that has "
+            "fully rotated to ES256/JWKS rejects every HS256 token (fail "
+            "closed); enabling it in a NON-LOCAL environment REQUIRES a "
+            "real jwt_secret (enforced by the model validator below) — the "
+            "legacy path can never run on the 'change-me' placeholder."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_real_secret_where_legacy_path_is_approved(self):
+        """Fail CLOSED: the legacy HS256 path needs a real secret to run.
+
+        A non-local deployment (staging/production) that explicitly opts IN
+        to ``allow_legacy_jwt_secret_auth`` must also configure a real
+        ``jwt_secret`` — the placeholder (``change-me`` / empty) is refused
+        at BOOT, not silently skipped at verify time.  Deployments that do
+        not approve the legacy path (the default) are unaffected: they
+        verify ES256 via JWKS only and stay bootable without a symmetric
+        secret.
+        """
+        if self.allow_legacy_jwt_secret_auth and self.app_env not in (
+            "development", "local",
+        ):
+            secret = (self.jwt_secret or "").strip()
+            if not secret or secret == "change-me":
+                raise ValueError(
+                    "jwt_secret must be configured to a real value when "
+                    "allow_legacy_jwt_secret_auth is enabled outside "
+                    "development (set a strong secret or disable the "
+                    "legacy path)."
+                )
+        return self
 
     # ---- Database --------------------------------------------------------
     database_pool_size: int = Field(default=10)

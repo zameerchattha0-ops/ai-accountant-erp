@@ -55,6 +55,10 @@ _ALLOWED_ALGORITHMS = ["ES256", "RS256", "HS256"]
 # 3 minutes is standard practice and does not weaken the auth model).
 _CLOCK_LEEWAY_SECONDS = 180
 
+# One-shot latch for the loud dev-header-auth warning (see
+# _dev_header_auth_enabled): emitted at most once per process.
+_HEADER_AUTH_WARNED: Dict[str, bool] = {"done": False}
+
 
 def _clock_skew_message(token: str) -> str:
     """Explain a future-iat rejection and quantify the local clock skew."""
@@ -202,9 +206,14 @@ def _decode_jwt(token: str) -> Dict[str, Any]:
             )
 
     # --- Path B: Symmetric verification (HS256 legacy shared secret) -----
+    # FAIL CLOSED: this path runs ONLY with explicit per-deployment approval
+    # (allow_legacy_jwt_secret_auth, default False) AND a real configured
+    # secret — never on the "change-me" placeholder.  A deployment that has
+    # rotated to ES256/JWKS rejects every HS256 token outright.
     if token_alg in ("HS256", "HS384", "HS512"):
+        settings = get_settings()
         jwt_secret = settings.jwt_secret
-        if jwt_secret and jwt_secret != "change-me":
+        if settings.allow_legacy_jwt_secret_auth and jwt_secret and jwt_secret != "change-me":
             for secret_bytes in _resolve_secret_candidates(jwt_secret):
                 try:
                     payload = pyjwt.decode(
@@ -299,9 +308,25 @@ def _dev_header_auth_enabled() -> bool:
     Because the flag defaults to false, an unconfigured deployment fails
     CLOSED: a request carrying only ``X-User-Id`` is treated as
     unauthenticated (HTTP 401) instead of being trusted as that user.
+
+    A LOUD (once-per-process) warning is emitted whenever the fallback is
+    live, so a shared environment that accidentally ships
+    ``APP_ENV=development ALLOW_DEV_HEADER_AUTH=true`` is impossible to miss
+    in the logs.
     """
     settings = get_settings()
-    return settings.app_env == "development" and settings.allow_dev_header_auth
+    enabled = settings.app_env == "development" and settings.allow_dev_header_auth
+    if enabled and not _HEADER_AUTH_WARNED["done"]:
+        _HEADER_AUTH_WARNED["done"] = True
+        log.warning(
+            "auth.dev_header_auth_enabled",
+            app_env=settings.app_env,
+            message=(
+                "X-User-Id header authentication is LIVE for this process. "
+                "This must NEVER happen outside local development."
+            ),
+        )
+    return enabled
 
 
 # ---------------------------------------------------------------------------
