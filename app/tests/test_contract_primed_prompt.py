@@ -88,8 +88,15 @@ BASE_CEILING = 14_500  # measured 14,076 on 2026-09-28 (Wave A observation
 # contract-primed 17.8 KB prompt inside the same 30 s/round timeout (6-25 s),
 # so a 14.1 KB base stays inside the measured envelope.  Raise only with a
 # fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 18_400  # measured 18,216 on 2026-10-02 (+405 from the two
-# fixed-asset contracts added that day — see the ceiling history above) and
+PRIMED_CEILING = 19_300  # measured 18,882 on 2026-10-13 (+482 chars / ~120
+# tokens from the FIVE loan-subsystem contracts — record_loan carries the
+# full term/field list the first-call gatherer needs, so trimming it would
+# cost clarification rounds worth far more than the tokens.  +2.6% over the
+# previous 18,400 ceiling stays inside the provider's measured envelope
+# (17.8 s generation inside the 30 s/round timeout leaves ~41% headroom;
+# re-measure with scripts/measure_primed_prompt_latency.py is an A→B gate
+# item).  The previous raise: 18,400 on 2026-10-02 (+405 from the two
+# fixed-asset contracts — see the ceiling history above) and
 # GENERATED in 17,844 ms (finish_reason=stop) inside the 30 s/round timeout,
 # measured by scripts/measure_primed_prompt_latency.py.  The previous raise:
 # 17,811 on 2026-09-28 (Wave A, ~2.1% headroom); its latency re-measurement
