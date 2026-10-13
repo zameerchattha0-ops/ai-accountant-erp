@@ -2,10 +2,15 @@
 
 There is no local Postgres CLI in this project (MASTER_PROMPT 7.5): the
 database lives on Supabase and PostgREST cannot run DDL.  This runner is
-the supported way to apply a migration — it needs only
-``SUPABASE_ACCESS_TOKEN`` from ``E:\\Qoder\\.secrets\\tokens.env`` plus
-``SUPABASE_URL`` (from ``.env`` / the secrets file) and never prints
-secret values, only their lengths.
+the supported way to apply a migration — it needs a Supabase PAT from, in
+PRIORITY order:
+
+    1. ``Supabase.txt`` in the repo root (the ROTATION DROP — newest wins;
+       gitignored; save the fresh dashboard PAT here after every rotation)
+    2. ``E:\\Qoder\\.secrets\\tokens.env`` (legacy store)
+    3. ``.env`` (``SUPABASE_URL`` etc.)
+
+and never prints secret values, only their lengths.
 
 Modes::
 
@@ -30,6 +35,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent   # scripts/ sits inside the repo root
 SECRETS = Path(r"E:\Qoder\.secrets\tokens.env")
+# ROTATION DROP: a hand-saved Supabase.txt (newest PAT) always WINS over the
+# secrets file, so rotating the token is "save the new PAT into Supabase.txt"
+# — no tokens.env editing, and a stale token there can never break a run.
+PAT_DROP = ROOT / "Supabase.txt"
 MIG = ROOT / "database" / "migrations"
 FILES = [
     "084_create_employees.sql",
@@ -69,6 +78,12 @@ def load_env(path: Path) -> dict:
 def load_secrets() -> dict:
     merged = load_env(ROOT / ".env")          # repo defaults (SUPABASE_URL...)
     merged.update({k: v for k, v in load_env(SECRETS).items() if v})
+    # Highest priority: the hand-dropped rotation file.  A fresh PAT lands
+    # here and instantly supersedes anything stale in tokens.env.
+    if PAT_DROP.exists():
+        pat = PAT_DROP.read_text(encoding="utf-8-sig").strip()
+        if pat:
+            merged["SUPABASE_ACCESS_TOKEN"] = pat
     print("--- credential inventory (name -> value length) ---")
     for name in ("SUPABASE_URL", "SUPABASE_ACCESS_TOKEN",
                  "SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL"):

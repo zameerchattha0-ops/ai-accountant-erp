@@ -21,6 +21,9 @@ github.txt.txt
 *secrets*.txt
 *credential*.txt
 *credentials*.txt
+# Hand-dropped Supabase PAT for scripts/apply_migrations.py rotation
+# (the runner reads it as the highest-priority token source).
+Supabase.txt
 
 # ---- Vercel ----
 .vercel/
