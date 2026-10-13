@@ -35,6 +35,35 @@ log = structlog.get_logger(__name__)
 
 WORKER_ID = f"ai-worker-{uuid.uuid4().hex[:8]}"
 POLL_INTERVAL_SECONDS = 1.0
+# Cron emulation inside the supervised worker: the loan due-installment
+# sweep runs at startup and every 6 hours thereafter.
+LOAN_SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+async def loan_sweep_loop() -> None:
+    """Periodic loan DUE-installment sweep (the scheduled-event engine).
+
+    For every ACTIVE loan the sweep marks arrived installments DUE/OVERDUE
+    and records a PENDING proposed journal (principal/interest split from
+    the schedule).  It NEVER posts — a due date does not mean cash was
+    paid; the owner settles via record_loan_repayment.  The per-installment
+    unique index makes re-runs idempotent, so a crash mid-sweep or an
+    overlapping tick is harmless.
+    """
+    while True:
+        try:
+            from app.services import loan_service
+            result = await loan_service.run_due_installment_sweep()
+            log.info(
+                "worker.loan_sweep",
+                as_of=result.get("as_of"),
+                marked_due=result.get("marked_due"),
+                marked_overdue=result.get("marked_overdue"),
+                events_created=result.get("events_created"),
+            )
+        except Exception as exc:  # noqa: BLE001 — the cron must survive
+            log.error("worker.loan_sweep_failed", error=str(exc))
+        await asyncio.sleep(LOAN_SWEEP_INTERVAL_SECONDS)
 
 
 async def process_one(client) -> bool:
@@ -138,6 +167,11 @@ async def main(once: bool = False) -> None:
 
     client = get_service_client()
     log.info("worker.started", worker=WORKER_ID)
+    # The loan due-installment sweep runs as a background task alongside the
+    # claim loop (skipped in --once mode, which drains a single job and exits).
+    sweep_task: asyncio.Task | None = None
+    if not once:
+        sweep_task = asyncio.create_task(loan_sweep_loop())
     while True:
         try:
             processed = await process_one(client)

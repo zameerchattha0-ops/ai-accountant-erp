@@ -36,6 +36,7 @@ from app.services import (
     employee_service,
     payroll_service,
     inventory_service,
+    loan_service,
 )
 from datetime import date
 
@@ -1536,6 +1537,155 @@ register("reverse_journal", handler=_reverse_journal, read_only=False, descripti
 # inventory COGS trigger hangs off it (see _record_cash_sale).
 register("record_cash_sale", handler=_record_cash_sale, read_only=False,
          description="Record an immediate cash sale: resolves the Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine. For sales of stock-tracked goods pass items=[{product_id, quantity}] so the accounting engine also posts the Cost-of-Sales entry (Dr Cost of Sales / Cr Inventory) and relieves the stock ledger at weighted-average cost")
+
+# =====================================================================
+# LOANS & FINANCING — controlled accounting objects (schedule = truth)
+# =====================================================================
+
+async def _record_loan(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """Record a borrowing (direction=BORROWED) or lending (GIVEN).
+
+    The service gathers terms, builds the amortization schedule, creates a
+    DEDICATED ledger named with the unique narration, posts the initial
+    journal (proceeds/advance) and auto-posts it — deterministic backend
+    calls, never an LLM decision.
+    """
+    try:
+        data = await loan_service.create_loan(
+            organization_id,
+            direction=kw.get("direction"),
+            narration=kw.get("narration"),
+            counterparty=kw.get("counterparty"),
+            principal=kw.get("principal"),
+            loan_date=kw.get("loan_date") or date.today().isoformat(),
+            first_payment_date=kw.get("first_payment_date"),
+            tenure_months=kw.get("tenure_months"),
+            frequency=kw.get("frequency") or "MONTHLY",
+            interest_rate=kw.get("interest_rate") or 0.0,
+            interest_method=kw.get("interest_method") or "REDUCING",
+            custom_interval_months=kw.get("custom_interval_months"),
+            grace_months=kw.get("grace_months") or 0,
+            balloon_amount=kw.get("balloon_amount") or 0.0,
+            fees_charges=kw.get("fees_charges") or 0.0,
+            purpose=kw.get("purpose"),
+            currency_code=kw.get("currency_code") or "PKR",
+            cash_account_id=_safe_account_hint(kw.pop("cash_account_id", None)),
+            party_id=_safe_account_hint(kw.pop("party_id", None)),
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="record_loan", success=False, error=str(exc))
+    return ToolResult(tool_name="record_loan", success=True, data=data)
+
+
+async def _record_loan_repayment(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await loan_service.record_installment_payment(
+            organization_id,
+            loan_id=uuid.UUID(str(kw["loan_id"])),
+            installment_no=int(kw["installment_no"]),
+            amount_paid=kw.get("amount_paid"),
+            paid_date=kw.get("paid_date"),
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="record_loan_repayment", success=False, error=str(exc))
+    return ToolResult(tool_name="record_loan_repayment", success=True, data=data)
+
+
+async def _list_loans(organization_id: uuid.UUID, **kw) -> ToolResult:
+    data = await loan_service.list_loans(
+        organization_id, direction=kw.get("direction"), status=kw.get("status")
+    )
+    return ToolResult(tool_name="list_loans", success=True, data={"loans": data})
+
+
+async def _get_loan_schedule(organization_id: uuid.UUID, **kw) -> ToolResult:
+    rows = await loan_service.get_schedule(
+        organization_id, loan_id=uuid.UUID(str(kw["loan_id"]))
+    )
+    return ToolResult(tool_name="get_loan_schedule", success=True,
+                      data={"schedule": rows})
+
+
+async def _check_due_loan_installments(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """The scheduled-event sweep: installments due/overdue as of a date.
+    The agent proposes the segregated journal (principal -> loan ledger,
+    interest -> expense/income) for each — posting still obeys the
+    confirmation gate (a due date does NOT mean cash was paid)."""
+    rows = await loan_service.due_installments(
+        organization_id, as_of=kw.get("as_of")
+    )
+    return ToolResult(tool_name="check_due_loan_installments", success=True,
+                      data={"due_installments": rows})
+
+
+
+# Loans — controlled accounting objects
+register("record_loan", handler=_record_loan, read_only=False,
+         contract=contract_from_callable(
+             loan_service.create_loan,
+             extra_arguments=("cash_account_id", "party_id")),
+         description="Record a BORROWING (direction='BORROWED': Dr Bank / Cr Loan ledger) or a LENDING (direction='GIVEN': Dr Loan receivable / Cr Bank). Requires a UNIQUE descriptive narration (e.g. 'Loan - HBL - Vehicle Financing - 2026') that identifies the facility in every journal. Collect the terms up front: counterparty, purpose, principal, loan_date, first_payment_date, tenure_months, frequency (MONTHLY/QUARTERLY/SEMI_ANNUAL/ANNUALLY/CUSTOM), interest_rate (annual %), interest_method (REDUCING or FLAT), optional grace_months/balloon_amount/fees_charges. The service builds the full amortization schedule, creates a dedicated ledger under Long-Term Loans (or Loans Receivable) and posts the initial journal automatically")
+register("record_loan_repayment", handler=_record_loan_repayment, read_only=False,
+         contract=contract_from_callable(loan_service.record_installment_payment),
+         description="Settle one loan installment BY NUMBER. The principal/interest split comes from the schedule (never guessed): BORROWED posts Dr Loan ledger (principal) + Dr Interest Expense / Cr Bank; GIVEN posts Dr Bank / Cr Loan ledger (principal) + Cr Interest Income. Only interest reaches the P&L")
+register("list_loans", handler=_list_loans, read_only=True,
+         contract=contract_from_callable(loan_service.list_loans),
+         description="List loans with schedule-derived position: outstanding principal, current portion (principal due within 12 months), non-current portion, next due date, overdue count. direction='BORROWED' or 'GIVEN' filters")
+register("get_loan_schedule", handler=_get_loan_schedule, read_only=True,
+         contract=contract_from_callable(loan_service.get_schedule),
+         description="Full amortization schedule of one loan: installment no, due date, opening principal, principal, interest, total, closing principal, live status")
+register("check_due_loan_installments", handler=_check_due_loan_installments, read_only=True,
+         contract=contract_from_callable(loan_service.due_installments),
+         description="Scheduled-event sweep: installments DUE or OVERDUE as of a date (default today), across all loans. Use it to propose the segregated installment journals (principal + interest) for confirmation — a due date alone never posts cash")
+
+
+
+async def _record_loan_restructure(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """Re-amortize the UNPAID future schedule under new terms.  Cash already
+    moved (paid/partial installments) is never touched and no journal posts —
+    a restructure changes future terms, not the ledger balance."""
+    try:
+        data = await loan_service.restructure_loan(
+            organization_id,
+            loan_id=uuid.UUID(str(kw["loan_id"])),
+            first_payment_date=kw["first_payment_date"],
+            tenure_months=int(kw["tenure_months"]),
+            frequency=kw.get("frequency") or "MONTHLY",
+            interest_rate=kw.get("interest_rate") or 0.0,
+            interest_method=kw.get("interest_method") or "REDUCING",
+            custom_interval_months=kw.get("custom_interval_months"),
+            grace_months=kw.get("grace_months") or 0,
+            balloon_amount=kw.get("balloon_amount") or 0.0,
+            reason=kw.get("reason"),
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="record_loan_restructure", success=False, error=str(exc))
+    return ToolResult(tool_name="record_loan_restructure", success=True, data=data)
+
+
+async def _write_off_loan(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """Write off the real remaining principal with a segregated journal
+    (forgiveness gain for borrowings, impairment loss for lendings)."""
+    try:
+        data = await loan_service.write_off_loan(
+            organization_id,
+            loan_id=uuid.UUID(str(kw["loan_id"])),
+            write_off_date=kw.get("write_off_date") or date.today().isoformat(),
+            reason=kw.get("reason"),
+        )
+    except ValueError as exc:
+        return ToolResult(tool_name="write_off_loan", success=False, error=str(exc))
+    return ToolResult(tool_name="write_off_loan", success=True, data=data)
+
+
+
+register("record_loan_restructure", handler=_record_loan_restructure, read_only=False,
+         contract=contract_from_callable(loan_service.restructure_loan),
+         description="Restructure a loan: re-amortize the UNPAID future installments from a new first_payment_date under new tenure/frequency/rate/method terms. Paid or partial installments are never touched and NO journal posts (a restructure changes future terms, not the ledger balance); the change is recorded in the loan's restructure audit trail with old and new terms plus the reason")
+register("write_off_loan", handler=_write_off_loan, read_only=False,
+         contract=contract_from_callable(loan_service.write_off_loan),
+         description="Write off a loan's real remaining principal with a proper segregated journal: a BORROWED loan posts Dr Loan ledger / Cr Loan Forgiveness Gain (Other Income); a GIVEN loan posts Dr Loan Impairment Loss (Other Expenses) / Cr Loan receivable. Unpaid installments are waived, status flips to WRITTEN_OFF, and every line carries the loan narration. Use only with explicit owner confirmation of the reason")
+
 
 # Reporting
 register("get_general_ledger", handler=_get_general_ledger, read_only=True, description="Get general ledger")
