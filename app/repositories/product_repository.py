@@ -98,6 +98,7 @@ async def create_product(
     cost_price: Optional[float] = None,
     revenue_account_id: Optional[uuid.UUID] = None,
     tax_rate_id: Optional[uuid.UUID] = None,
+    category_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """Create a catalog product. ``product_code`` is generated when absent."""
     data: Dict[str, Any] = {
@@ -106,6 +107,7 @@ async def create_product(
         or await generate_product_code(organization_id),
         "name": professional_name(name),
         "description": description,
+        "category_id": str(category_id) if category_id else None,
         "unit": unit,
         # Catalog flag only — the database has NO stock ledger, so this
         # never implies quantity tracking capability.

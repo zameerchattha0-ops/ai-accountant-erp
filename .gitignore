@@ -87,3 +87,11 @@ scripts/smoke_test.py
 .env.local
 *.png.tmp
 
+# ---- Session artifacts (local runtime state — NEVER commit) ----
+aes_session_ids.json
+
+# ---- Live-E2E runner scratch (regenerated on every run) ----
+_e2e_out.txt
+_e2e_exit.txt
+_e2e_run.ps1
+

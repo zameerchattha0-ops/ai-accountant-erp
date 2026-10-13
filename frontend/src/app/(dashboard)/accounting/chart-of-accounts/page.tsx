@@ -9,6 +9,7 @@ import PageHeader from "@/components/shared/PageHeader";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
+import { allowedParentHeads, isAllowedParentName } from "@/lib/accounting/parent-heads";
 import type { Account, AccountType } from "@/lib/types/entities";
 
 const inputCls =
@@ -76,10 +77,22 @@ export default function ChartOfAccountsPage() {
     return map;
   }, [filtered]);
 
-  const parentOptions = useMemo(
-    () => (rows ?? []).filter((a) => a.account_type === form.account_type && a.is_active),
-    [rows, form.account_type]
-  );
+  // CONTEXT-SENSITIVE PARENTS (Critical COA rule): only the section heads of
+  // the selected account TYPE are offered — an EXPENSE account may hang under
+  // Cost of Sales / Operating Expenses / Finance Costs / Tax Expense /
+  // Other Expenses, never under a cross-type parent.  Charts seeded without
+  // those named heads fall back to TOP-LEVEL accounts of the type (the honest
+  // fallback: a parent is never invented, and the dropdown is never empty).
+  const parentOptions = useMemo(() => {
+    const sameType = (rows ?? []).filter(
+      (a) => a.account_type === form.account_type && a.is_active
+    );
+    const heads = sameType.filter((a) =>
+      isAllowedParentName(form.account_type, a.name)
+    );
+    if (heads.length > 0) return heads;
+    return sameType.filter((a) => !a.parent_account_id);
+  }, [rows, form.account_type]);
 
   const handleSave = async () => {
     if (!org) return;
@@ -251,6 +264,9 @@ export default function ChartOfAccountsPage() {
                   <option key={a.id} value={a.id}>{a.code} - {a.name}</option>
                 ))}
               </select>
+              <p className="text-[11px] text-text-muted mt-1">
+                Allowed heads: {allowedParentHeads(form.account_type).join(", ") || "—"}
+              </p>
             </div>
           </div>
 

@@ -58,6 +58,54 @@ async def get_income_statement(
     return await repo.get_income_statement(organization_id, limit=limit)
 
 
+async def get_profit_loss_statement(
+    organization_id: uuid.UUID,
+    *,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Multi-step P&L built from the accounting hierarchy.
+
+    The raw ``v_income_statement`` rows are classified into statement sections
+    by their SECTION HEAD (app/pl_structure.py) and the subtotals are computed
+    once, here, from those same buckets — so the presented lines and the
+    presented subtotals can never disagree.
+
+    Shape (backward compatible — ``rows`` stays the flat per-account list):
+        {
+          "rows": [...],                 # flat v_income_statement rows
+          "statement": {
+              "operating_revenue": …, "cost_of_sales": …,
+              "gross_profit": …,
+              "operating_expenses": {"categories": […], "total": …},
+              "operating_profit": …, "other_income": …,
+              "finance_costs": …, "tax_expense": …,
+              "net_profit": …, "is_loss": …,
+          }
+        }
+    """
+    from app.pl_llm_classification import refine_buckets
+    from app.pl_structure import build_statement, classify_rows
+
+    rows = await repo.get_income_statement(organization_id, limit=limit)
+    buckets = classify_rows(rows)
+    # AI-assisted REFINE (flag-gated, default OFF): only the rows the
+    # deterministic pass could only guess at (expense catch-all, revenue
+    # default) may move between sections.  refine_buckets never raises and
+    # returns the deterministic buckets untouched on any failure — the
+    # statement must always render (contract documented in the module).
+    try:
+        buckets = await refine_buckets(
+            buckets, organization_id=organization_id
+        )
+    except AssertionError:
+        raise  # a test's no-LLM guard must never be swallowed
+    except Exception as exc:  # noqa: BLE001 — belt and braces
+        log.warning(
+            "reporting.pl_refine_failed", error=str(exc)[:200]
+        )
+    return {"rows": rows or [], "statement": build_statement(buckets)}
+
+
 async def get_customer_aging(
     organization_id: uuid.UUID,
     *,

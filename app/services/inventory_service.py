@@ -1,0 +1,309 @@
+"""
+Inventory Service — the PERPETUAL stock ledger.
+
+Every inventory purchase adds a RECEIPT movement (quantity + purchase unit
+cost); every sale of stock-tracked goods adds an ISSUE movement carrying the
+weighted-average cost the accounting engine used for its Cost-of-Sales
+journal — the ledger and the journal can therefore never disagree about the
+cost of an issue.
+
+Contracts (deliberately strict — a stock ledger that silently drifts is
+worse than no ledger at all):
+
+* ``receive_stock``   — purchases only.  Adds quantity at the given unit cost.
+* ``issue_stock``     — sales only.  REFUSES (ValueError) when the product
+                        has insufficient stock: an oversold issue would
+                        understate inventory and fabricate Cost of Sales.
+                        The caller surfaces the refusal as an honest
+                        warning (the sale itself is never blocked — the
+                        revenue entry stands, the COGS entry is skipped).
+* ``stock_position``  — read-time derivation from ``v_product_stock``; a
+                        lookup failure returns None (fail-open for callers
+                        that only need a best-effort cost).
+
+No aggregate is ever cached on ``products``: quantity/value are derived
+from the movement rows at read time (migration 091), so a journal reversal
+or manual correction can never leave a stale counter behind.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any, Dict, List, Optional
+
+import structlog
+
+from app.database import fetch_many, insert_one
+
+log = structlog.get_logger(__name__)
+
+
+async def receive_stock(
+    organization_id: uuid.UUID,
+    *,
+    product_id: uuid.UUID,
+    quantity: float,
+    unit_cost: float,
+    source_type: Optional[str] = None,
+    source_id: Optional[uuid.UUID] = None,
+    movement_date: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a stock RECEIPT (purchase).  Raises on invalid input."""
+    if float(quantity) <= 0:
+        raise ValueError("Stock receipt quantity must be greater than 0.")
+    if float(unit_cost) < 0:
+        raise ValueError("Stock receipt unit cost cannot be negative.")
+    movement = await insert_one(
+        "inventory_movements",
+        data={
+            "organization_id": str(organization_id),
+            "product_id": str(product_id),
+            "direction": "RECEIPT",
+            "quantity": float(quantity),
+            "unit_cost": float(unit_cost),
+            "source_type": source_type,
+            "source_id": str(source_id) if source_id else None,
+            "movement_date": movement_date,
+            "description": description,
+        },
+    )
+    log.info(
+        "inventory.received",
+        product_id=str(product_id),
+        quantity=float(quantity),
+        unit_cost=float(unit_cost),
+        source_type=source_type,
+    )
+    return movement
+
+
+
+async def issue_stock(
+    organization_id: uuid.UUID,
+    *,
+    product_id: uuid.UUID,
+    quantity: float,
+    source_type: Optional[str] = None,
+    source_id: Optional[uuid.UUID] = None,
+    movement_date: Optional[str] = None,
+    description: Optional[str] = None,
+    unit_cost: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Record a stock ISSUE (sale) at weighted-average cost.
+
+    ``unit_cost`` may be supplied by the caller when the accounting engine
+    already computed the cost for its Cost-of-Sales journal — the movement
+    then records EXACTLY the figure the journal used.  When omitted the
+    weighted-average cost is read from ``v_product_stock``.
+
+    Raises ``ValueError`` when stock is insufficient OR when no cost can be
+    determined (an issue valued at zero would fabricate profit).
+    """
+    qty = float(quantity)
+    if qty <= 0:
+        raise ValueError("Stock issue quantity must be greater than 0.")
+
+    resolved_cost = unit_cost
+    if resolved_cost is None:
+        position = await stock_position(organization_id, product_id=product_id)
+        if position is None:
+            raise ValueError(
+                "Stock position is unavailable — the issue cannot be valued."
+            )
+        resolved_cost = float(position.get("average_cost") or 0)
+    resolved_cost = float(resolved_cost)
+    if resolved_cost < 0:
+        raise ValueError("Stock issue unit cost cannot be negative.")
+
+    # Insufficient-stock guard: read the CURRENT quantity first so an
+    # oversold issue is refused instead of silently driving stock negative.
+    position = await stock_position(organization_id, product_id=product_id)
+    on_hand = float((position or {}).get("quantity_on_hand") or 0)
+    if position is not None and on_hand < qty - 1e-9:
+        raise ValueError(
+            f"Insufficient stock: {on_hand:g} on hand, {qty:g} requested. "
+            "The Cost-of-Sales entry was NOT recorded — record the missing "
+            "purchase (or a stock adjustment) first."
+        )
+    if position is not None and resolved_cost == 0 and on_hand > 0:
+        raise ValueError(
+            "The stock ledger has no unit cost for this product — the "
+            "Cost-of-Sales entry cannot be valued. Set the product's cost "
+            "price or record the purchase that seeded the stock."
+        )
+
+    movement = await insert_one(
+        "inventory_movements",
+        data={
+            "organization_id": str(organization_id),
+            "product_id": str(product_id),
+            "direction": "ISSUE",
+            "quantity": qty,
+            "unit_cost": resolved_cost,
+            "source_type": source_type,
+            "source_id": str(source_id) if source_id else None,
+            "movement_date": movement_date,
+            "description": description,
+        },
+    )
+    log.info(
+        "inventory.issued",
+        product_id=str(product_id),
+        quantity=qty,
+        unit_cost=resolved_cost,
+        source_type=source_type,
+    )
+    return movement
+
+
+async def stock_position(
+    organization_id: uuid.UUID, *, product_id: uuid.UUID
+) -> Optional[Dict[str, Any]]:
+    """Current quantity / value / average cost — derived, never cached.
+
+    Returns None when the ledger view is unreadable (migration not applied
+    yet, network failure): callers treat None as "cannot value" and warn,
+    never as "stock is zero".
+    """
+    try:
+        rows = await fetch_many(
+            "v_product_stock",
+            filters={
+                "organization_id": str(organization_id),
+                "product_id": str(product_id),
+            },
+            limit=1,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail open, same as chart reads
+        log.warning(
+            "inventory.position_lookup_failed",
+            product_id=str(product_id),
+            error=str(exc)[:200],
+        )
+        return None
+    return rows[0] if rows else None
+
+
+async def positions_for_products(
+    organization_id: uuid.UUID, *, product_ids: List[uuid.UUID]
+) -> Dict[str, Dict[str, Any]]:
+    """One read for many products (the sale path values several lines)."""
+    wanted = {str(p) for p in product_ids}
+    if not wanted:
+        return {}
+    try:
+        rows = await fetch_many(
+            "v_product_stock",
+            filters={"organization_id": str(organization_id)},
+            limit=1000,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "inventory.positions_lookup_failed", error=str(exc)[:200]
+        )
+        return {}
+    return {
+        str(r.get("product_id")): r
+        for r in rows
+        if str(r.get("product_id")) in wanted
+    }
+
+
+# ---------------------------------------------------------------------------
+# Catalogue synchronisation — the purchase must create/find the product,
+# assign its SKU (product_code), inventory category and valuation cost in
+# the SAME call that records the stock movement.
+# ---------------------------------------------------------------------------
+
+_INVENTORY_CATEGORY_NAME = "Inventory"
+
+
+async def ensure_inventory_category(
+    organization_id: uuid.UUID,
+) -> Optional[uuid.UUID]:
+    """Find-or-create the "Inventory" product category (fail-soft).
+
+    A category failure must never block a purchase: the product is still
+    created (category_id None) and the stock movement still records — only
+    the catalogue grouping is missing, which the user can fix later.
+    """
+    from app.database import fetch_one
+
+    try:
+        existing = await fetch_one(
+            "product_categories",
+            filters={
+                "organization_id": str(organization_id),
+                "name": _INVENTORY_CATEGORY_NAME,
+            },
+        )
+        if existing:
+            return uuid.UUID(str(existing["id"]))
+        created = await insert_one(
+            "product_categories",
+            data={
+                "organization_id": str(organization_id),
+                "name": _INVENTORY_CATEGORY_NAME,
+            },
+        )
+        return uuid.UUID(str(created["id"]))
+    except Exception as exc:  # noqa: BLE001 — fail soft, never block a sale
+        log.warning(
+            "inventory.category_lookup_failed", error=str(exc)[:200]
+        )
+        return None
+
+
+async def find_or_create_catalogue_product(
+    organization_id: uuid.UUID,
+    *,
+    name: str,
+    quantity: float,
+    unit_cost: float,
+) -> Optional[Dict[str, Any]]:
+    """Find-or-create the catalogue product for a purchased stock line.
+
+    * exact (case-insensitive) name match -> REUSE (never a duplicate row);
+    * otherwise create with ``is_stock_tracked=True``, the SKU generated by
+      the product repository, the Inventory category and ``cost_price`` set
+      to the purchase unit cost (the first cost the perpetual ledger sees).
+
+    Returns the product row, or None when the catalogue write failed — the
+    caller records an honest warning; the purchase itself must not fail
+    because the catalogue is down.
+    """
+    from app.services import product_service
+
+    term = str(name or "").strip()
+    if not term:
+        return None
+    try:
+        rows = await product_service.search(
+            organization_id, query=term, limit=10
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "inventory.product_search_failed", name=term, error=str(exc)[:200]
+        )
+        rows = []
+    for row in rows or ():
+        if str(row.get("name") or "").strip().lower() == term.lower():
+            return row
+
+    category_id = await ensure_inventory_category(organization_id)
+    try:
+        return await product_service.create(
+            organization_id,
+            name=term,
+            is_stock_tracked=True,
+            unit_price=float(unit_cost),
+            cost_price=float(unit_cost),
+            category_id=category_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail soft with a warning
+        log.warning(
+            "inventory.product_create_failed", name=term, error=str(exc)[:200]
+        )
+        return None
+

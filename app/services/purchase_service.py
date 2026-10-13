@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.repositories import purchase_repository as repo
-from app.database import call_rpc
+from app.database import call_rpc, fetch_many
 from app.services import supplier_service
 from app.services.item_validation import validate_document_items
 
@@ -121,4 +121,57 @@ async def create_purchase_bill(
 async def get_purchase_bill(
     organization_id: uuid.UUID, *, bill_id: uuid.UUID
 ) -> Optional[Dict[str, Any]]:
+    """Fetch a purchase bill with its line items attached.
+
+    Returns None when the bill does not exist (callers surface a not-found
+    rather than an empty object).
+    """
+    bill = await repo.get_purchase_bill(organization_id, bill_id=bill_id)
+    if not bill:
+        return None
+    items = await fetch_many(
+        "purchase_bill_items",
+        filters={
+            "organization_id": str(organization_id),
+            "bill_id": str(bill_id),
+        },
+        order="line_number.asc",
+        limit=200,
+    )
+    bill["items"] = items
+    bill["item_count"] = len(items)
+    return bill
+
+
+async def mark_bill_paid(
+    organization_id: uuid.UUID, *, bill_id: uuid.UUID, amount: float
+) -> None:
+    """Mark a bill settled at creation (CASH purchases).
+
+    A cash purchase credits Cash/Bank directly in its journal, so the bill
+    must NOT stay open — an open bill would let a later "pay the supplier"
+    settlement credit cash a SECOND time (double payment).  Same arithmetic
+    as payment_service._update_bill_paid, but public and owned by the bill
+    aggregate.
+    """
+    from app.database import update_one
+
+    bill = await repo.get_purchase_bill(organization_id, bill_id=bill_id)
+    if not bill:
+        return
+    new_paid = float(bill.get("amount_paid", 0)) + amount
+    total = float(bill.get("total", 0))
+    if new_paid >= total:
+        status = "PAID"
+    elif new_paid > 0:
+        status = "PARTIALLY_PAID"
+    else:
+        status = bill.get("status", "OPEN")
+    await update_one(
+        "purchase_bills",
+        row_id=bill_id,
+        data={"amount_paid": new_paid, "status": status},
+        organization_id=organization_id,
+    )
+
     return await repo.get_purchase_bill(organization_id, bill_id=bill_id)

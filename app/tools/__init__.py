@@ -35,10 +35,15 @@ from app.services import (
     service_service,
     employee_service,
     payroll_service,
+    inventory_service,
 )
 from datetime import date
 
-from app.accounting_engine import auto_journal, record_cash_sale
+from app.accounting_engine import (
+    auto_journal,
+    prepare_cogs_for_items,
+    record_cash_sale,
+)
 from app.tool_contract import contract_from_callable
 
 log = structlog.get_logger(__name__)
@@ -149,6 +154,18 @@ async def _get_chart_of_accounts(organization_id: uuid.UUID, **kw) -> ToolResult
     data = await account_repo.get_chart_of_accounts(organization_id, account_type=kw.get("account_type"))
     return ToolResult(tool_name="get_chart_of_accounts", success=True, data=data)
 
+#: Normal balance by account type — used only when creating a MISSING
+#: section HEADING for ``parent_account_name``; the heading's shape
+#: defaults to the child's type (a parent is never invented from thin air).
+_NORMAL_BY_TYPE = {
+    "ASSET": "DEBIT",
+    "EXPENSE": "DEBIT",
+    "LIABILITY": "CREDIT",
+    "EQUITY": "CREDIT",
+    "REVENUE": "CREDIT",
+}
+
+
 async def _create_account(organization_id: uuid.UUID, **kw) -> ToolResult:
     # Explicit account-creation requests MUST NOT fail on a colliding code
     # (a suggested code such as 6150 may already exist; the unique constraint
@@ -197,6 +214,88 @@ async def _create_account(organization_id: uuid.UUID, **kw) -> ToolResult:
                 },
             )
 
+    # MISSING-HEAD PREREQUISITE: an explicitly named parent that does not
+    # exist yet is CREATED FIRST (a grouping account of the child's type),
+    # so "create X under <heading>" never fails on a sparse chart.  An
+    # EXISTING parent must MATCH the child's type — an expense must never
+    # hang under an asset heading (production 2026-09-30).  No name, an
+    # unknown child type, or a type clash -> the parent is ignored and the
+    # child is created top-level (a parent is never invented).
+    requested_parent = str(kw.pop("parent_account_name", "") or "").strip()
+    parent_heading: Optional[Dict[str, Any]] = None
+    if requested_parent and not kw.get("parent_account_id"):
+        _child_type = str(kw.get("account_type") or "").strip().upper()
+        try:
+            parent_hits = await account_repo.search_accounts(
+                organization_id, query=requested_parent, limit=25
+            )
+        except Exception as exc:  # noqa: BLE001 — search is best-effort
+            log.warning(
+                "tools.create_account.parent_search_failed",
+                error=str(exc)[:200],
+            )
+            parent_hits = []
+        _name_row = next(
+            (
+                row for row in parent_hits or ()
+                if str(row.get("name") or "").strip().lower()
+                == requested_parent.lower()
+            ),
+            None,
+        )
+        if (
+            _name_row is not None
+            and str(_name_row.get("account_type") or "").upper() == _child_type
+        ):
+            # Exact-name match of the SAME type — reuse it.
+            kw["parent_account_id"] = str(_name_row["id"])
+            parent_heading = {
+                "id": str(_name_row["id"]),
+                "name": _name_row.get("name"),
+                "created": False,
+            }
+        elif (
+            _name_row is None
+            and _child_type in _NORMAL_BY_TYPE
+            and str(kw.get("code") or "").strip()
+        ):
+            # The heading is absent — create it as a top-level GROUPING
+            # account of the child's type (it becomes a heading the moment
+            # the child is parented under it), then parent the child.
+            _heading_normal = (
+                str(kw.get("normal_balance") or "").strip()
+                or _NORMAL_BY_TYPE[_child_type]
+            )
+            _heading = None
+            try:
+                _heading_code = await account_repo.next_available_code(
+                    organization_id, str(kw.get("code") or "").strip()
+                )
+                _heading = await account_repo.create_account(
+                    organization_id=organization_id,
+                    code=_heading_code,
+                    name=requested_parent,
+                    account_type=_child_type,
+                    normal_balance=_heading_normal,
+                    description=(
+                        "Section heading created automatically for a new "
+                        "account."
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — never fatal to the child
+                log.warning(
+                    "tools.create_account.parent_heading_failed",
+                    error=str(exc)[:200],
+                )
+                _heading = None
+            if isinstance(_heading, dict) and _heading.get("id"):
+                kw["parent_account_id"] = str(_heading["id"])
+                parent_heading = {
+                    "id": str(_heading["id"]),
+                    "name": _heading.get("name"),
+                    "created": True,
+                }
+
     try:
         resolved_code = await account_repo.next_available_code(
             organization_id, requested_code
@@ -220,7 +319,114 @@ async def _create_account(organization_id: uuid.UUID, **kw) -> ToolResult:
     data = await account_repo.create_account(organization_id=organization_id, **kw)
     if resolved_code != requested_code:
         data["code_resolved_from"] = requested_code
+    if parent_heading is not None:
+        # Audit trail: the agent's narrative can state whether the heading
+        # was REUSED or CREATED — never silently.
+        data["parent_heading"] = parent_heading
     return ToolResult(tool_name="create_account", success=True, data=data)
+
+
+async def _derive_purchase_nature(
+    organization_id: uuid.UUID, kw: Dict[str, Any]
+) -> str:
+    """``"INVENTORY"`` when the bill's OWN data proves resale stock, else ``""``.
+
+    Two deterministic signals, in order of authority (audit fix — the fast
+    path and a minimal model reply may omit ``transaction_nature``):
+
+    1. a line already linked to a ``is_stock_tracked`` catalogue product —
+       the catalogue flag IS the user's resale answer (authoritative);
+    2. the intent family's OWN wording rules (``derive_nature_from_text`` —
+       the exact function the planner applies to the request), limited to
+       the INVENTORY outcome: other natures remain the classifier's job.
+
+    Never raises; never guesses: no signal → ``""`` → the caller keeps
+    whatever it was given (status quo behaviour).
+    """
+    # 1. Authoritative product flag.
+    for line in kw.get("items") or ():
+        if not isinstance(line, dict):
+            continue
+        pid = line.get("product_id")
+        if not pid:
+            continue
+        try:
+            product = await product_service.get(
+                organization_id, product_id=uuid.UUID(str(pid))
+            )
+        except Exception:  # noqa: BLE001 — per line, never fatal
+            product = None
+        if product and product.get("is_stock_tracked"):
+            return "INVENTORY"
+
+    # 2. The family's wording rules over the bill's own text.
+    text = " ".join(
+        str(x)
+        for x in (
+            kw.get("notes"),
+            *(
+                str(l.get("description") or "")
+                for l in kw.get("items") or ()
+                if isinstance(l, dict)
+            ),
+        )
+        if x
+    )
+    if not text.strip():
+        return ""
+    try:
+        from app.reasoning import derive_nature_from_text
+
+        for intent in ("create_purchase_bill", "record_purchase"):
+            nature = derive_nature_from_text(intent, text)
+            if str(nature or "").upper() == "INVENTORY":
+                return "INVENTORY"
+    except Exception as exc:  # noqa: BLE001 — recovery is best-effort
+        log.warning(
+            "tools.create_purchase_bill.nature_recovery_failed",
+            error=str(exc)[:200],
+        )
+    return ""
+
+
+async def _link_products_to_items(
+    organization_id: uuid.UUID, items: Optional[List[Dict[str, Any]]]
+) -> None:
+    """Attach ``product_id`` to SALE lines by EXACT catalogue-name match.
+
+    The perpetual-inventory COGS trigger only values lines that reference a
+    product; the sale paths (fast path, model, form) describe the item in
+    TEXT and historically never linked it — so revenue posted while Cost of
+    Sales was silently skipped (audit finding).  EXACT case-insensitive name
+    match only (the purchase-side catalogue sync creates products from the
+    same descriptions), read-only, best-effort: an unmatched line keeps its
+    text and the engine's honest per-line handling decides.
+    """
+    for item in items or ():
+        if not isinstance(item, dict) or item.get("product_id"):
+            continue
+        name = str(item.get("description") or "").strip()
+        if not name:
+            continue
+        try:
+            hits = await product_service.search(
+                organization_id, query=name, limit=5
+            )
+        except Exception as exc:  # noqa: BLE001 — linkage is best-effort
+            log.warning(
+                "tools.sale.product_link_search_failed",
+                error=str(exc)[:200],
+            )
+            continue
+        exact = next(
+            (
+                p for p in hits or ()
+                if str(p.get("name") or "").strip().lower() == name.lower()
+            ),
+            None,
+        )
+        if exact and exact.get("id"):
+            item["product_id"] = str(exact["id"])
 
 
 async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
@@ -336,6 +542,19 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
         )
 
     customer_id = kw.get("customer_id")
+    # Stock-tracked lines the customer actually bought.  PERPETUAL INVENTORY:
+    # the SALE triggers cost recognition (Dr Cost of Sales / Cr Inventory) —
+    # never the purchase.  Optional: a service-only cash sale carries no items
+    # and behaves exactly as before.  AUDIT FIX: link lines to their catalogue
+    # product (EXACT name match) first — the COGS engine only values lines
+    # carrying product_id, so an unlinked line posted revenue with NO cost.
+    items = kw.get("items") or None
+    if items:
+        try:
+            await _link_products_to_items(organization_id, items)
+        except Exception as exc:  # noqa: BLE001 — never block the sale
+            log.warning("tools.record_cash_sale.product_link_failed",
+                        error=str(exc)[:200])
     result = await record_cash_sale(
         organization_id=organization_id,
         cash_account_id=uuid.UUID(str(cash["id"])),
@@ -346,6 +565,7 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
         customer_id=(
             uuid.UUID(str(customer_id)) if customer_id else None
         ),
+        items=items,
     )
     # Auto-validate + auto-post — same convention as the other trusted
     # document tools (deterministic backend calls, never an LLM decision).
@@ -367,6 +587,31 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
             )
             result["journal_posted"] = False
             result["journal_warning"] = f"Journal prepared but posting failed: {exc}"
+    # PERPETUAL INVENTORY: a posted CASH SALE also triggers cost recognition
+    # — the same Dr Cost of Sales / Cr Inventory entry the invoice path
+    # prepares, derived from the stock-tracked lines (if any).  A pure
+    # service cash sale passes no items and simply has no COGS.  Any failure
+    # is a warning; the revenue entry already stands (C4).
+    if result.get("journal_posted"):
+        cogs_items = kw.get("items") or []
+        if cogs_items:
+            cogs = await prepare_cogs_for_items(
+                organization_id,
+                items=cogs_items,
+                transaction_date=transaction_date,
+                description=description,
+            )
+            result.update(cogs)
+            await _post_cogs_and_issue_stock(
+                organization_id,
+                result,
+                source_type="cash_sale",
+                movement_date=transaction_date,
+                description=description,
+                source_id=(
+                    uuid.UUID(entry["id"]) if entry.get("id") else None
+                ),
+            )
     result["cash_account"] = cash.get("name")
     result["revenue_account"] = revenue.get("name")
     # Audit trail: HOW the revenue account was chosen (stream / only-one), so a
@@ -374,6 +619,28 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     result["revenue_account_source"] = revenue_source
     if stream:
         result["revenue_stream"] = stream
+
+    if items and result.get("journal_posted"):
+        # PERPETUAL INVENTORY: the POSTED sale triggers cost recognition.
+        # The engine values each stock-tracked line from the stock ledger
+        # (weighted-average cost, catalogue cost_price fallback) and prepares
+        # Dr Cost of Sales / Cr Inventory; _post_cogs_and_issue_stock posts it
+        # and relieves the quantity ledger in that order.  A failure is a
+        # warning — the revenue entry stands (C4).
+        cogs = await prepare_cogs_for_items(
+            organization_id,
+            items=items,
+            transaction_date=transaction_date,
+            description=description,
+        )
+        result.update(cogs)
+        await _post_cogs_and_issue_stock(
+            organization_id,
+            result,
+            source_type="cash_sale",
+            movement_date=transaction_date,
+            description=f"Cash sale {amount:,.2f}",
+        )
     log.info(
         "sale_tool_succeeded",
         organization_id=str(organization_id),
@@ -389,6 +656,16 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
 # ===================================================================
 
 async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
+    # PERPETUAL INVENTORY (audit fix): link every sale line to its catalogue
+    # product (EXACT name match) BEFORE persistence — the COGS trigger only
+    # values lines carrying product_id, and the atomic posting RPC persists
+    # the same payload, so journal + lines + stock issue all see the link.
+    if kw.get("items"):
+        try:
+            await _link_products_to_items(organization_id, kw["items"])
+        except Exception as exc:  # noqa: BLE001 — never block the revenue doc
+            log.warning("tools.create_invoice.product_link_failed",
+                        error=str(exc)[:200])
     data = await invoice_service.create_invoice(organization_id=organization_id, **kw)
     # C3+C4: Atomic document + journal creation
     amount = float(data.get("total", 0))
@@ -446,6 +723,17 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
                 data["journal_warning"] = (
                     f"Journal prepared but posting failed: {exc}"
                 )
+        if data.get("journal_posted"):
+            # PERPETUAL INVENTORY: the posted sale triggers cost recognition
+            # (the engine prepared the COGS journal inside auto_journal from
+            # the stock-tracked lines) — post it and issue the stock.
+            await _post_cogs_and_issue_stock(
+                organization_id,
+                data,
+                source_type="invoice",
+                movement_date=data.get("invoice_date"),
+                description=f"Invoice {data.get('invoice_number', data.get('id', ''))}",
+            )
     return ToolResult(tool_name="create_invoice", success=True, data=data)
 
 async def _get_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
@@ -466,13 +754,154 @@ def _safe_account_hint(value: Any) -> Optional[uuid.UUID]:
         return None
 
 
+async def _post_cogs_and_issue_stock(
+    organization_id: uuid.UUID,
+    data: Dict[str, Any],
+    *,
+    source_type: str,
+    movement_date: Optional[str] = None,
+    description: str = "",
+    source_id: Optional[uuid.UUID] = None,
+) -> None:
+    """Post the prepared Cost-of-Sales journal, then issue the stock.
+
+    ORDER MATTERS (skeptical by design): stock leaves the ledger only when
+    the COGS journal actually POSTED — a prepared-but-unposted journal never
+    hit the GL, so the quantity ledger must not move either (GL/ledger
+    divergence is the one failure a perpetual system cannot survive).
+    Every failure becomes an honest key on *data*; never raises.
+    """
+    cogs_prepared = data.get("cogs_entry") or {}
+    cogs_entry = cogs_prepared.get("entry") or {}
+    if cogs_entry.get("id"):
+        try:
+            cogs_id = uuid.UUID(cogs_entry["id"])
+            await accounting_service.validate_journal(entry_id=cogs_id)
+            await accounting_service.post_journal(entry_id=cogs_id)
+            data["cogs_journal_posted"] = True
+            data["cogs_journal_entry_id"] = str(cogs_id)
+        except Exception as exc:  # noqa: BLE001 — never fake success
+            log.warning(
+                "tools.sale.cogs_post_failed",
+                entry_id=str(cogs_entry.get("id")),
+                error=str(exc)[:300],
+            )
+            data["cogs_journal_posted"] = False
+            data["cogs_warning"] = (
+                "The revenue entry posted, but the Cost-of-Sales journal "
+                f"could NOT be posted: {exc}. Inventory was NOT relieved — "
+                "record the cost recognition after fixing the accounts."
+            )
+            return  # NO stock issue for an unposted COGS journal
+    else:
+        # LIVE-CAUGHT (E2E 2026-10-13): valuations exist but NO journal was
+        # ever prepared (chart lacked the Cost of Sales head and creation
+        # failed).  Issuing stock here would move the quantity ledger
+        # WITHOUT moving value in the GL — the divergence a perpetual system
+        # cannot survive.  Block the issue; keep prepare's honest warning.
+        if data.get("cogs_lines"):
+            data["cogs_journal_posted"] = False
+            data.setdefault(
+                "cogs_warning",
+                "The Cost-of-Sales journal was never prepared — inventory "
+                "was NOT relieved (no GL/ledger divergence).",
+            )
+        return
+
+    failed_lines: list = []
+    doc_source_id = (
+        source_id
+        or (uuid.UUID(str(data["id"])) if data.get("id") else None)
+    )
+    for line in data.get("cogs_lines") or ():
+        try:
+            await inventory_service.issue_stock(
+                organization_id,
+                product_id=uuid.UUID(str(line["product_id"])),
+                quantity=float(line["quantity"]),
+                unit_cost=float(line["unit_cost"]),
+                source_type=source_type,
+                source_id=doc_source_id,
+                movement_date=movement_date,
+                description=description or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — per line, never fatal
+            failed_lines.append(str(exc))
+    if failed_lines:
+        data["cogs_warning"] = " ".join(failed_lines)
+
+
 async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
-    # account_id is a JOURNAL hint (validated by the accounting engine),
-    # not a bill column — pop it before the service call.
+    # Arguments the HANDLER consumes (declared as extra contract arguments):
+    #   account_id         — journal hint, validated by the accounting engine;
+    #   transaction_nature — INVENTORY routes the debit to the Inventory
+    #                        valuation account (perpetual inventory) and
+    #                        triggers catalogue + stock-ledger sync;
+    #   payment_method     — CASH credits Bank/Cash directly at creation
+    #                        (the bill is then marked PAID so a later
+    #                        supplier payment can never double-credit cash).
     account_hint = _safe_account_hint(kw.pop("account_id", None))
+    transaction_nature = str(kw.pop("transaction_nature", "") or "").strip()
+    payment_method = str(kw.pop("payment_method", "") or "").strip()
+    # DETERMINISTIC NATURE RECOVERY (audit finding): the fast path and a
+    # minimal model reply may omit transaction_nature.  Without it the
+    # engine falls to the expense default and the catalogue/stock sync is
+    # skipped — the exact "purchase silently polluted the P&L" failure the
+    # perpetual-inventory requirement forbids.  Derive INVENTORY from the
+    # bill's OWN data (authoritative stock-tracked product link, else the
+    # intent family's resale/stock wording rules — planner parity).
+    if not transaction_nature:
+        transaction_nature = await _derive_purchase_nature(organization_id, kw)
+        if transaction_nature:
+            log.info(
+                "tools.create_purchase_bill.nature_recovered",
+                transaction_nature=transaction_nature,
+                bill_number=kw.get("bill_number"),
+            )
+    is_inventory = transaction_nature.upper() == "INVENTORY"
+
+    catalogue_notes: list = []
+    if is_inventory and kw.get("items"):
+        # PERPETUAL INVENTORY: the purchase simultaneously creates/finds the
+        # catalogue product (SKU, Inventory category, cost) and links the
+        # bill line to it — the stock ledger and the COGS trigger both hang
+        # off this product_id.  Failures are warnings, never blockers.
+        synced_items = []
+        for raw in kw["items"]:
+            item = dict(raw)
+            if not item.get("product_id") and item.get("description"):
+                product = await inventory_service.find_or_create_catalogue_product(
+                    organization_id,
+                    name=str(item["description"]),
+                    quantity=float(item.get("quantity") or 0),
+                    unit_cost=float(item.get("unit_price") or 0),
+                )
+                if product and product.get("id"):
+                    item["product_id"] = str(product["id"])
+                    if product.get("reused"):
+                        catalogue_notes.append(
+                            f"Reused catalogue product '{product.get('name')}' "
+                            f"({product.get('product_code')})."
+                        )
+                    else:
+                        catalogue_notes.append(
+                            f"Created catalogue product '{product.get('name')}' "
+                            f"with SKU {product.get('product_code')}."
+                        )
+                else:
+                    catalogue_notes.append(
+                        f"Catalogue sync failed for '{item.get('description')}' "
+                        "— the product was NOT created; the stock ledger "
+                        "cannot track this line."
+                    )
+            synced_items.append(item)
+        kw["items"] = synced_items
+
     data = await purchase_service.create_purchase_bill(organization_id=organization_id, **kw)
     # C3+C4: Atomic document + journal creation
     amount = float(data.get("total", 0))
+    if catalogue_notes:
+        data["catalogue_notes"] = catalogue_notes
     if amount > 0:
         journal_result = await auto_journal(
             organization_id=organization_id,
@@ -483,6 +912,8 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
             description=f"Purchase bill {data.get('bill_number', data.get('id', ''))}",
             supplier_id=kw.get("supplier_id"),
             account_hint_id=account_hint,
+            transaction_nature=transaction_nature or None,
+            payment_method=payment_method or None,
         )
         data.update(journal_result)
         # Auto-validate + auto-post the bill journal — same convention as
@@ -510,6 +941,78 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
                 data["journal_warning"] = (
                     f"Journal prepared but posting failed: {exc}"
                 )
+
+        if data.get("journal_posted"):
+            # CASH settlement: the journal credited Bank/Cash directly —
+            # mark the bill settled so a later supplier payment cannot
+            # credit cash a second time (double-payment hazard).
+            if journal_result.get("settlement") == "CASH":
+                try:
+                    await purchase_service.mark_bill_paid(
+                        organization_id,
+                        bill_id=uuid.UUID(str(data["id"])),
+                        amount=amount,
+                    )
+                    data["bill_marked_paid"] = True
+                except Exception as exc:  # noqa: BLE001 — surface, don't fail
+                    log.warning(
+                        "tools.create_purchase_bill.mark_paid_failed",
+                        bill_id=str(data.get("id")),
+                        error=str(exc)[:300],
+                    )
+                    data["journal_warning"] = (
+                        "The cash journal posted but the bill could not be "
+                        f"marked paid: {exc}. Record NO second payment for "
+                        "this bill or cash will be credited twice."
+                    )
+
+            # PERPETUAL INVENTORY: record the RECEIPT movements with EXACTLY
+            # the quantities/costs on the persisted bill lines.  Only after a
+            # posted journal — an unposted journal never moved value into
+            # Inventory, so the quantity ledger must not move either.
+            if is_inventory:
+                stock_warnings: list = []
+                received: list = []
+                lines = data.get("items") or kw.get("items") or []
+                for line in lines:
+                    pid = line.get("product_id")
+                    if not pid:
+                        stock_warnings.append(
+                            f"Line '{line.get('description')}' has no linked "
+                            "catalogue product — its quantity was NOT added "
+                            "to the stock ledger."
+                        )
+                        continue
+                    try:
+                        qty = float(line.get("quantity") or 0)
+                        gross = qty * float(line.get("unit_price") or 0)
+                        discount = float(line.get("discount_amount") or 0)
+                        unit_cost = (gross - discount) / qty if qty else 0.0
+                        movement = await inventory_service.receive_stock(
+                            organization_id,
+                            product_id=uuid.UUID(str(pid)),
+                            quantity=qty,
+                            unit_cost=round(unit_cost, 4),
+                            source_type="purchase_bill",
+                            source_id=uuid.UUID(str(data["id"])),
+                            movement_date=data.get("bill_date"),
+                            description=line.get("description"),
+                        )
+                        received.append({
+                            "product_id": str(pid),
+                            "quantity": qty,
+                            "unit_cost": round(unit_cost, 4),
+                            "movement_id": str(movement.get("id")),
+                        })
+                    except Exception as exc:  # noqa: BLE001 — never fatal
+                        stock_warnings.append(
+                            f"Stock receipt failed for line "
+                            f"'{line.get('description')}': {exc}"
+                        )
+                if received:
+                    data["stock_received"] = received
+                if stock_warnings:
+                    data["stock_warning"] = " ".join(stock_warnings)
     return ToolResult(tool_name="create_purchase_bill", success=True, data=data)
 
 async def _get_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
@@ -668,7 +1171,13 @@ async def _get_trial_balance(organization_id: uuid.UUID, **kw) -> ToolResult:
     return ToolResult(tool_name="get_trial_balance", success=True, data=data)
 
 async def _get_profit_loss(organization_id: uuid.UUID, **kw) -> ToolResult:
-    data = await reporting_service.get_income_statement(organization_id)
+    # Multi-step statement from the accounting hierarchy: Operating Revenue →
+    # Cost of Sales → Gross Profit → Operating Expenses (Administrative /
+    # Selling & Marketing / Distribution / Other Operating) → Operating Profit
+    # → Other Income → Finance Costs → Tax Expense → Net Profit.
+    # ``rows`` remains the flat per-account list, so every existing consumer
+    # keeps working unchanged.
+    data = await reporting_service.get_profit_loss_statement(organization_id)
     return ToolResult(tool_name="get_profit_loss", success=True, data=data)
 
 async def _get_balance_sheet(organization_id: uuid.UUID, **kw) -> ToolResult:
@@ -982,14 +1491,17 @@ register("get_supplier_ledger", handler=_get_supplier_ledger, read_only=True, de
 # Account
 register("search_account", handler=_search_account, read_only=True, description="Search chart of accounts")
 register("get_chart_of_accounts", handler=_get_chart_of_accounts, read_only=True, description="Get full chart of accounts")
-register("create_account", handler=_create_account, read_only=False, description="Create a new account")
+register("create_account", handler=_create_account, read_only=False, description="Create a new account. Optionally pass parent_account_name to file it under a section heading (e.g. 'Operating Expenses', 'Current Assets'); an existing heading of the same account type is reused, and a missing one is created automatically as a grouping account — the account never fails on a sparse chart")
 
 # Invoice
 register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice), description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] — lines are validated and their totals computed by the service (never invent amounts)")
 register("get_invoice", handler=_get_invoice, read_only=True, description="Get invoice details")
 
 # Purchase
-register("create_purchase_bill", handler=_create_purchase_bill, read_only=False, contract=contract_from_callable(purchase_service.create_purchase_bill, extra_arguments=("account_id",)), description="Create a purchase bill")
+register("create_purchase_bill", handler=_create_purchase_bill, read_only=False,
+         contract=contract_from_callable(purchase_service.create_purchase_bill,
+                                         extra_arguments=("account_id", "transaction_nature", "payment_method")),
+         description="Create a purchase bill (supplier invoice). For INVENTORY purchases (resale stock) pass transaction_nature='INVENTORY' so the debit lands on the Inventory asset account, the product is created/linked in the catalogue, and the stock ledger records the receipt; pass payment_method='CASH' when the goods were paid for immediately (Cash/Bank is credited and the bill is marked paid)")
 register("get_purchase_bill", handler=_get_purchase_bill, read_only=True, description="Get purchase bill details")
 
 # Expense
@@ -1012,12 +1524,23 @@ register("post_journal", handler=_post_journal, read_only=False, contract=contra
 register("reverse_journal", handler=_reverse_journal, read_only=False, description="Reverse a posted journal entry")
 
 # Sales — trusted cash-sale domain operation (deterministic journal)
-register("record_cash_sale", handler=_record_cash_sale, read_only=False, description="Record an immediate cash sale: resolves the Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine")
+# NOTE: record_cash_sale deliberately has NO argument contract.  It is a
+# trusted domain operation whose signature (app/accounting_engine.record_cash_sale)
+# carries BACKEND-RESOLVED parameters (cash_account_id, revenue_account_id,
+# transaction_date, description) that the model must never supply.  Deriving a
+# contract from that signature would (a) mark those resolved fields REQUIRED and
+# reject the model's natural {"total": ...} call, and (b) add a contract line to
+# the primed reasoning prompt, over its measured latency budget.  Validation is
+# intentionally skipped ("cannot judge" -> never reject); the handler reads the
+# optional items=[{product_id, quantity}] straight from **kw, and the perpetual
+# inventory COGS trigger hangs off it (see _record_cash_sale).
+register("record_cash_sale", handler=_record_cash_sale, read_only=False,
+         description="Record an immediate cash sale: resolves the Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine. For sales of stock-tracked goods pass items=[{product_id, quantity}] so the accounting engine also posts the Cost-of-Sales entry (Dr Cost of Sales / Cr Inventory) and relieves the stock ledger at weighted-average cost")
 
 # Reporting
 register("get_general_ledger", handler=_get_general_ledger, read_only=True, description="Get general ledger")
 register("get_trial_balance", handler=_get_trial_balance, read_only=True, description="Get trial balance")
-register("get_profit_loss", handler=_get_profit_loss, read_only=True, description="Get profit & loss statement")
+register("get_profit_loss", handler=_get_profit_loss, read_only=True, description="Get the multi-step profit & loss statement: Operating Revenue less Cost of Sales = Gross Profit, less Operating Expenses (Administrative / Selling & Marketing / Distribution / Other Operating) = Operating Profit, then plus Other Income, less Finance Costs and Tax Expense = Net Profit. Returns rows (flat per-account) and statement (sections + subtotals)")
 register("get_balance_sheet", handler=_get_balance_sheet, read_only=True, description="Get balance sheet")
 register("get_cash_flow", handler=_get_cash_flow, read_only=True, description="Get cash flow data")
 register("list_expenses", handler=_list_expenses, read_only=True, description="List recorded expenses with dates, payees and totals (supports from_date/to_date)")

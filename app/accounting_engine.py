@@ -18,6 +18,7 @@ Mandatory invariant:  TOTAL DEBIT == TOTAL CREDIT
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import date
 from typing import Any, Dict, List, Optional
@@ -119,6 +120,48 @@ async def record_cash_purchase(
     )
 
 
+async def record_cogs(
+    *,
+    organization_id: uuid.UUID,
+    cogs_account_id: uuid.UUID,
+    inventory_account_id: uuid.UUID,
+    amount: float,
+    transaction_date: str,
+    description: str,
+    source_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Perpetual-inventory COST RECOGNITION entry — triggered BY THE SALE.
+
+    Debit:  Cost of Sales (EXPENSE — hits the P&L only now, not at purchase)
+    Credit: Inventory (ASSET — the stock that left the business)
+
+    The engine never invents *amount*: the caller passes the cost derived
+    from the stock ledger (quantity x weighted-average unit cost).
+    """
+    lines = [
+        {
+            "account_id": str(cogs_account_id),
+            "description": f"Cost of sales — {description}",
+            "debit": amount,
+            "credit": 0,
+        },
+        {
+            "account_id": str(inventory_account_id),
+            "description": f"Inventory relieved — {description}",
+            "debit": 0,
+            "credit": amount,
+        },
+    ]
+    return await accounting_service.prepare_journal(
+        organization_id=organization_id,
+        transaction_date=transaction_date,
+        description=f"Cost of sales — {description}",
+        lines=lines,
+        source_type="cogs",
+        source_id=source_id,
+    )
+
+
 async def record_credit_sale(
     *,
     organization_id: uuid.UUID,
@@ -173,11 +216,17 @@ async def record_cash_sale(
     description: str,
     source_id: Optional[uuid.UUID] = None,
     customer_id: Optional[uuid.UUID] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Record a cash sale journal.
 
     Debit:  Cash / Bank account
     Credit: Revenue account
+
+    ``items`` is carried so the caller can trigger cost recognition for
+    stock-tracked lines — see ``prepare_cogs_for_items``.  It never changes
+    the journal itself: the entry stays exactly the two lines above, because
+    the sale of goods is a single revenue event.
     """
     lines = [
         {
@@ -195,7 +244,7 @@ async def record_cash_sale(
             "customer_id": str(customer_id) if customer_id else None,
         },
     ]
-    return await accounting_service.prepare_journal(
+    prepared = await accounting_service.prepare_journal(
         organization_id=organization_id,
         transaction_date=transaction_date,
         description=description,
@@ -203,6 +252,9 @@ async def record_cash_sale(
         source_type="cash_sale",
         source_id=source_id,
     )
+    if items:
+        prepared["items"] = items
+    return prepared
 
 
 async def record_credit_note(
@@ -558,6 +610,387 @@ async def _resolve_default_account(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Perpetual-inventory account resolution (migration 091)
+#
+# The purchase side of an INVENTORY-natured transaction must debit the
+# INVENTORY valuation account (an ASSET) — NEVER an expense account — and the
+# sale side must credit it against a COST OF SALES expense account.  Both
+# resolvers are read-only and honest: no match -> None -> the caller surfaces
+# a warning instead of silently posting to a wrong ledger (the same contract
+# as _resolve_default_account for EXPENSE).
+# ---------------------------------------------------------------------------
+_INVENTORY_LEDGER_RE = re.compile(
+    r"\b(?:inventor\w*|merchandise|stocks?|goods\s+on\s+hand)\b",
+    re.IGNORECASE,
+)
+_COGS_LEDGER_RE = re.compile(
+    r"cost\s+of\s+(?:sales|goods)|\bcogs\b",
+    re.IGNORECASE,
+)
+
+
+async def resolve_inventory_account(
+    organization_id: uuid.UUID,
+    *,
+    hint_account: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The ASSET ledger that carries stock valuation.
+
+    Order: the validated hint (when it IS an inventory-named asset), then a
+    chart search for the standard ledger words.  Grouping accounts are
+    skipped — a heading ("Inventory" over "Finished Goods" children) must
+    never carry the posting.
+    """
+    if hint_account and hint_account.get("account_type") == "ASSET":
+        if _INVENTORY_LEDGER_RE.search(str(hint_account.get("name") or "")):
+            return hint_account
+    group_ids = await _grouping_account_ids(organization_id)
+    for term in ("Inventory", "Merchandise", "Stock"):
+        try:
+            rows = await a_repo.search_accounts(
+                organization_id, query=term, limit=10
+            )
+        except Exception as exc:  # noqa: BLE001 — never block on a lookup
+            log.warning(
+                "accounting_engine.inventory_lookup_failed",
+                term=term, error=str(exc)[:200],
+            )
+            continue
+        for row in rows or ():
+            if row.get("account_type") != "ASSET":
+                continue
+            if row.get("id") in group_ids:
+                continue
+            if row.get("is_active") is False:
+                continue
+            if _INVENTORY_LEDGER_RE.search(str(row.get("name") or "")):
+                return row
+    return None
+
+
+async def resolve_cogs_account(
+    organization_id: uuid.UUID,
+    *,
+    hint_account: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The EXPENSE ledger that carries Cost of Sales (credited on a sale)."""
+    if hint_account and hint_account.get("account_type") == "EXPENSE":
+        if _COGS_LEDGER_RE.search(str(hint_account.get("name") or "")):
+            return hint_account
+    group_ids = await _grouping_account_ids(organization_id)
+    for term in ("Cost of Sales", "Cost of Goods", "COGS"):
+        try:
+            rows = await a_repo.search_accounts(
+                organization_id, query=term, limit=10
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "accounting_engine.cogs_lookup_failed",
+                term=term, error=str(exc)[:200],
+            )
+            continue
+        for row in rows or ():
+            if row.get("account_type") != "EXPENSE":
+                continue
+            if row.get("id") in group_ids:
+                continue
+            if row.get("is_active") is False:
+                continue
+            name = str(row.get("name") or "")
+            if _COGS_LEDGER_RE.search(name) or "purchase" in name.lower():
+                return row
+    return None
+
+
+async def ensure_inventory_account(
+    organization_id: uuid.UUID,
+    *,
+    hint_account: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The Inventory ASSET ledger — creating it when the chart lacks one.
+
+    Same execution-time self-heal contract as ``ensure_cogs_account``: an
+    INVENTORY purchase may not be refused because the chart was seeded
+    without the optional Inventory ledger.  Top-level (parent never
+    invented); the hint path is unchanged.  None only when both resolve and
+    create fail — the caller's warning then still fires.
+    """
+    row = await resolve_inventory_account(organization_id, hint_account=hint_account)
+    if row is not None:
+        return row
+    try:
+        code = await a_repo.next_available_code(organization_id, "1200")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Inventory",
+            account_type="ASSET",
+            normal_balance="DEBIT",
+            parent_account_id=None,
+            description=(
+                "Inventory valuation — created on demand by the perpetual-"
+                "inventory engine when a stock purchase needed it."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — honest warning, never a crash
+        log.warning(
+            "accounting_engine.inventory_account_create_failed",
+            error=str(exc)[:200],
+        )
+        return None
+    log.info(
+        "accounting_engine.inventory_account_created",
+        code=str(created.get("code")),
+        name=str(created.get("name")),
+    )
+    return created
+
+
+async def ensure_cogs_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """Resolve the Cost-of-Sales ledger, CREATING it when the chart lacks one.
+
+    A first-ever inventory sale on a chart that never approved the optional
+    Cost-of-Sales bundle (migration 067 seeds it only when approved) would
+    otherwise fail cost recognition with "ask the user to create it" — the
+    missing-head must be a PREREQUISITE the engine creates itself, exactly
+    like ``revenue_ledger_service``'s parent creation and
+    ``inventory_service.ensure_inventory_category``.
+
+    Postable by construction: a fresh TOP-LEVEL "Cost of Sales" account has
+    no children, so it is not a grouping heading (a heading must never carry
+    a posting).  Returns None only when the chart write failed — the caller
+    keeps its honest warning (never a fake ledger).
+    """
+    account = await resolve_cogs_account(organization_id)
+    if account is not None:
+        return account
+    try:
+        code = await a_repo.next_available_code(organization_id, "6010")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Cost of Sales",
+            account_type="EXPENSE",
+            normal_balance="DEBIT",
+            parent_account_id=None,
+            description=(
+                "Direct cost of inventory/services sold — created "
+                "automatically when the first sale recognised cost."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — chart write failed → honest None
+        log.warning(
+            "accounting_engine.cogs_account_create_failed",
+            error=str(exc)[:200],
+        )
+        return None
+    log.info(
+        "accounting_engine.cogs_account_created",
+        code=created.get("code"),
+        account_id=str(created.get("id")),
+    )
+    return created
+
+
+async def _resolve_cash_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """The ledger a CASH purchase credits — by NAME, never "first asset".
+
+    "First ASSET" is usually Cash in simple charts but becomes Accounts
+    Receivable the moment one exists, which would credit a customer's
+    obligation for a supplier payment — exactly the silent mis-posting this
+    resolver exists to prevent.  No cash-named ledger -> None -> warning.
+    """
+    for name in ("Cash", "Cash Account", "Petty Cash", "Bank"):
+        row = await _resolve_named_postable_account(organization_id, name)
+        if row is not None:
+            return row
+    try:
+        rows = await a_repo.search_accounts(
+            organization_id, query="cash", limit=10
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    group_ids = await _grouping_account_ids(organization_id)
+    for row in rows or ():
+        if row.get("account_type") != "ASSET":
+            continue
+        if row.get("id") in group_ids:
+            continue
+        if row.get("is_active") is False:
+            continue
+        return row
+    return None
+
+
+async def _resolve_named_postable_account(
+    organization_id: uuid.UUID, name: str
+) -> Optional[Dict[str, Any]]:
+    """Exact-name lookup that refuses grouping (heading) accounts."""
+    from app.services import accounting_service
+
+    row = await accounting_service.resolve_account(
+        organization_id, account_name=name
+    )
+    if not row or row.get("is_active") is False:
+        return None
+    group_ids = await _grouping_account_ids(organization_id)
+    if row.get("id") in group_ids:
+        return None
+    return row
+
+
+
+async def prepare_cogs_for_items(
+    organization_id: uuid.UUID,
+    *,
+    items: Optional[List[Dict[str, Any]]],
+    transaction_date: str,
+    description: str,
+    source_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Cost-recognition journal for the stock-tracked lines of a SALE.
+
+    Perpetual inventory: the Cost-of-Sales entry is triggered by the sale,
+    never by the purchase.  For every line that references a stock-tracked
+    product this helper
+
+      1. reads the weighted-average cost from the stock ledger (fallback:
+         the product's catalogue ``cost_price``),
+      2. refuses lines whose stock/cost cannot be valued (honest per-line
+         warning — an issue valued at zero would fabricate profit),
+      3. prepares ``Dr Cost of Sales / Cr Inventory`` when at least one
+         line could be valued.
+
+    Returns a dict that is MERGED into the caller's result:
+      * success -> ``cogs_entry`` (prepared, not posted), ``cost_of_sales``
+        (total), ``cogs_lines`` (per product: quantity + unit_cost — the
+        caller issues stock with EXACTLY these costs after posting);
+      * nothing to recognise -> ``{}`` (service sales / no stock lines);
+      * any failure -> ``cogs_warning`` (the revenue entry still stands).
+    """
+    from app.repositories import product_repository as prod_repo
+    from app.services import inventory_service
+
+    tracked: List[Dict[str, Any]] = []
+    for raw in items or ():
+        if not isinstance(raw, dict):
+            continue
+        pid = raw.get("product_id")
+        if not pid:
+            continue
+        try:
+            product = await prod_repo.get_product(
+                organization_id, product_id=uuid.UUID(str(pid))
+            )
+        except Exception as exc:  # noqa: BLE001 — per-line, never fatal
+            log.warning(
+                "accounting_engine.cogs_product_lookup_failed",
+                product_id=str(pid), error=str(exc)[:200],
+            )
+            continue
+        if not product or not product.get("is_stock_tracked"):
+            continue
+        try:
+            qty = float(raw.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        tracked.append({"product": product, "quantity": qty, "raw": raw})
+
+    if not tracked:
+        return {}  # nothing here is stock — a service sale has no COGS
+
+    positions = await inventory_service.positions_for_products(
+        organization_id,
+        product_ids=[t["product"]["id"] for t in tracked],
+    )
+
+    cogs_lines: List[Dict[str, Any]] = []
+    total = 0.0
+    skipped: List[str] = []
+    for t in tracked:
+        product = t["product"]
+        qty = t["quantity"]
+        position = positions.get(str(product.get("id"))) or {}
+        cost = position.get("average_cost")
+        try:
+            cost = float(cost) if cost is not None else 0.0
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost <= 0:
+            # Ledger unreadable or empty: fall back to the CATALOGUE cost.
+            fallback = product.get("cost_price")
+            try:
+                cost = float(fallback) if fallback is not None else 0.0
+            except (TypeError, ValueError):
+                cost = 0.0
+        if cost <= 0:
+            skipped.append(str(product.get("name") or "unnamed product"))
+            continue
+        cogs_lines.append({
+            "product_id": str(product["id"]),
+            "quantity": qty,
+            "unit_cost": round(cost, 4),
+        })
+        total += qty * cost
+
+    if not cogs_lines:
+        return {
+            "cogs_warning": (
+                "No Cost-of-Sales entry was recorded: the cost of "
+                f"{', '.join(skipped)} could not be determined from the "
+                "stock ledger or the product catalogue."
+            ),
+        }
+
+    # ensure: a chart with no Cost of Sales head CREATES it here (missing
+    # prerequisite → engine-created), so the first inventory sale never fails.
+    cogs_account = await ensure_cogs_account(organization_id)
+    inventory_account = await ensure_inventory_account(organization_id)
+    if not cogs_account or not inventory_account:
+        missing = []
+        if not cogs_account:
+            missing.append("Cost of Sales (EXPENSE)")
+        if not inventory_account:
+            missing.append("Inventory (ASSET)")
+        return {
+            "cogs_warning": (
+                "No Cost-of-Sales entry was recorded: the chart has no "
+                f"{'/'.join(missing)} account. Ask the user to create it, "
+                "then re-record the cost recognition."
+            ),
+            "cogs_lines": cogs_lines,
+        }
+
+    total = round(total, 2)
+    prepared = await record_cogs(
+        organization_id=organization_id,
+        cogs_account_id=uuid.UUID(str(cogs_account["id"])),
+        inventory_account_id=uuid.UUID(str(inventory_account["id"])),
+        amount=total,
+        transaction_date=transaction_date,
+        description=description,
+        source_id=source_id,
+    )
+    result: Dict[str, Any] = {
+        "cogs_entry": prepared,
+        "cost_of_sales": total,
+        "cogs_lines": cogs_lines,
+    }
+    if skipped:
+        result["cogs_warning"] = (
+            "Some lines were NOT cost-recognised (no cost could be "
+            f"determined): {', '.join(skipped)}."
+        )
+    return result
+
+
 async def auto_journal(
     *,
     organization_id: uuid.UUID,
@@ -570,6 +1003,8 @@ async def auto_journal(
     supplier_id: Optional[uuid.UUID] = None,
     project_id: Optional[uuid.UUID] = None,
     account_hint_id: Optional[uuid.UUID] = None,
+    transaction_nature: Optional[str] = None,
+    payment_method: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Automatically create a journal entry for a document.
 
@@ -653,16 +1088,91 @@ async def auto_journal(
                 source_id=source_id,
                 project_id=project_id,
             )
-            return {"journal_entry": entry}
+            result: Dict[str, Any] = {"journal_entry": entry}
+            # PERPETUAL INVENTORY: the SALE triggers cost recognition —
+            # Dr Cost of Sales / Cr Inventory for the stock-tracked lines
+            # (never at purchase time).  Prepared here, posted by the tool
+            # layer alongside the revenue entry; any failure is a warning,
+            # never a reason to drop the revenue entry (C4).
+            cogs = await prepare_cogs_for_items(
+                organization_id,
+                items=document.get("items") or [],
+                transaction_date=transaction_date,
+                description=description,
+                source_id=source_id,
+            )
+            result.update(cogs)
+            return result
 
         elif document_type == "purchase_bill":
-            # A validated hint (from the classifier/user) may route the debit
-            # to a fixed-asset account instead of the generic expense default.
-            expense = hint_account if (
-                hint_account and hint_account.get("account_type") in ("EXPENSE", "ASSET")
-            ) else await _resolve_default_account(
-                organization_id, "EXPENSE",
-            )
+            # PERPETUAL INVENTORY (migration 091): an INVENTORY-natured
+            # purchase debits the INVENTORY VALUATION account (an ASSET) —
+            # never an expense account — so the P&L is untouched at purchase
+            # time; Cost of Sales is recognised later, triggered by the sale
+            # (prepare_cogs_for_items).  The hint wins when it IS the
+            # inventory ledger; otherwise the chart search resolves it — and
+            # ensure_inventory_account CREATES the ledger when the chart has
+            # none (missing prerequisite → engine-created, never "ask the
+            # user" for a standard statement head).
+            is_inventory = str(transaction_nature or "").upper() == "INVENTORY"
+            if is_inventory or (
+                hint_account
+                and hint_account.get("account_type") == "ASSET"
+                and _INVENTORY_LEDGER_RE.search(str(hint_account.get("name") or ""))
+            ):
+                inventory = await ensure_inventory_account(
+                    organization_id, hint_account=hint_account
+                )
+                if not inventory:
+                    return {
+                        "journal_warning": (
+                            "Cannot resolve the Inventory valuation account "
+                            "(no postable ASSET ledger named Inventory/Stock "
+                            "exists). The purchase was NOT journalised — ask "
+                            "the user to create the Inventory account first."
+                        )
+                    }
+                debit_account: Optional[Dict[str, Any]] = inventory
+            else:
+                # A validated hint (from the classifier/user) may route the debit
+                # to a fixed-asset account instead of the generic expense default.
+                debit_account = hint_account if (
+                    hint_account and hint_account.get("account_type") in ("EXPENSE", "ASSET")
+                ) else await _resolve_default_account(
+                    organization_id, "EXPENSE",
+                )
+            if not debit_account:
+                return {"journal_warning": "Cannot resolve the debit account"}
+
+            # SETTLEMENT SIDE: a CASH purchase credits Bank/Cash directly
+            # (the bill is settled at creation — the tool marks it PAID so a
+            # later supplier payment can never double-credit cash); a credit
+            # purchase credits the party payable (existing behaviour).
+            if str(payment_method or "").upper() == "CASH":
+                cash_account = await _resolve_cash_account(organization_id)
+                if not cash_account:
+                    return {
+                        "journal_warning": (
+                            "Cannot resolve the Cash/Bank account for this "
+                            "cash purchase. Ask the user which asset ledger "
+                            "holds cash, then re-record it."
+                        )
+                    }
+                entry = await record_cash_purchase(
+                    organization_id=organization_id,
+                    asset_account_id=uuid.UUID(debit_account["id"]),
+                    cash_account_id=uuid.UUID(cash_account["id"]),
+                    amount=amount,
+                    transaction_date=transaction_date,
+                    description=description,
+                    source_id=source_id,
+                )
+                return {
+                    "journal_entry": entry,
+                    "settlement": "CASH",
+                    "cash_account_id": str(cash_account["id"]),
+                }
+
             # PARTY SEGREGATION (payable side): the SUPPLIER'S OWN payable
             # ledger when it exists; the AP control account otherwise.
             payable = None
@@ -682,12 +1192,12 @@ async def auto_journal(
                 payable = await _resolve_default_account(
                     organization_id, "LIABILITY", fallback_type="CURRENT_LIABILITY",
                 )
-            if not expense or not payable:
-                return {"journal_warning": "Cannot resolve Expense or Payable accounts"}
+            if not debit_account or not payable:
+                return {"journal_warning": "Cannot resolve debit or Payable accounts"}
             entry = await record_credit_purchase(
                 organization_id=organization_id,
                 supplier_id=supplier_id or uuid.UUID(int=0),
-                asset_account_id=uuid.UUID(expense["id"]),
+                asset_account_id=uuid.UUID(debit_account["id"]),
                 payable_account_id=uuid.UUID(payable["id"]),
                 amount=amount,
                 transaction_date=transaction_date,

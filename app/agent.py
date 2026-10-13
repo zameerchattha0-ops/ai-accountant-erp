@@ -741,6 +741,47 @@ def _cash_sale_fast_path_call(
     reviewed_account = entities.get("revenue_account_id")
     if reviewed_account:
         params["revenue_account_id"] = str(reviewed_account)
+    # PERPETUAL INVENTORY (audit fix): the fast path historically passed NO
+    # items, so a GOODS cash sale posted revenue with the Cost-of-Sales
+    # trigger unreachable (prepare_cogs only values lines).  Build the line
+    # from the SAME entities the invoice fast path uses — parsed lines when
+    # they reconcile with the stated total, else the single-line form
+    # (quantity × derived unit price = the amount the user actually said).
+    parsed_lines = entities.get("line_items")
+    items = None
+    if parsed_lines:
+        try:
+            built = [
+                {
+                    "description": str(l.get("description") or "").strip(),
+                    "quantity": float(l.get("quantity")),
+                    "unit_price": float(l.get("unit_price")),
+                }
+                for l in parsed_lines
+            ]
+            derived = round(sum(i["quantity"] * i["unit_price"] for i in built), 2)
+            if built and abs(derived - float(amount)) <= 0.01:
+                items = built
+        except (TypeError, ValueError):
+            items = None
+    if items is None:
+        raw_qty = entities.get("quantity")
+        try:
+            quantity = float(raw_qty) if raw_qty is not None else 1.0
+        except (TypeError, ValueError):
+            quantity = 1.0
+        if quantity <= 0:
+            quantity = 1.0
+        items = [{
+            "description": str(
+                entities.get("item_description")
+                or entities.get("description")
+                or ("Goods" if nature == "GOODS" else "Service")
+            ),
+            "quantity": quantity,
+            "unit_price": round(float(amount) / quantity, 2),
+        }]
+    params["items"] = items
     return [ToolCall(tool_name="record_cash_sale", arguments=params)]
 
 
@@ -6595,9 +6636,34 @@ def _plan_performs_no_financial_mutation(
 
 #: Planned MUTATIONS and the account-gap SOURCE that is a hard prerequisite
 #: for them.  Only these gaps may be auto-created at execution time; every
-#: other gap keeps its ask-the-user path.
+#: other gap keeps its ask-the-user path.  Rules are (tool/intent names,
+#: gap_source); the FIRST matching rule whose gap has NO existing candidates
+#: wins — a gap that lists CANDIDATES is a CHOICE among existing ledgers and
+#: is never auto-created.
+_PREREQUISITE_GAP_RULES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (("register_fixed_asset",), "fixed_asset_nature"),
+    # An INVENTORY-natured purchase cannot post without its valuation
+    # ledger (the debit side would otherwise fall to cash/expense/PPE).
+    # The gap carries the determined SHAPE ("Inventory", ASSET, 1200,
+    # IFRS: inventories) and only exists when NO inventory ledger is in
+    # the chart, so creating it is a prerequisite, not a choice —
+    # exactly the fixed-asset precedent.  Same approval covers it: the
+    # create_account call is injected BEFORE the confirmation snapshot.
+    (
+        (
+            "record_cash_purchase",
+            "record_credit_purchase",
+            "record_purchase",
+            "create_purchase_bill",
+        ),
+        "inventory_nature",
+    ),
+)
+
+#: Legacy alias (single-source dict form) — kept for any importer that
+#: still reads the fixed-asset mapping directly.
 _PREREQUISITE_GAP_SOURCES = {
-    "register_fixed_asset": "fixed_asset_nature",
+    tool: source for tools, source in _PREREQUISITE_GAP_RULES for tool in tools
 }
 
 
@@ -6613,18 +6679,20 @@ def _prerequisite_gap_for_plan(
     a ``fixed_asset_nature`` gap with NO existing candidates is a
     PREREQUISITE, not a configuration question: it is created first (dedup by
     exact name inside the ``create_account`` tool) and only then does the
-    acquisition run.
+    acquisition run.  The same holds for an INVENTORY-natured purchase and
+    its ``inventory_nature`` gap.
 
-    A gap that already lists CANDIDATES (the chart HAS PPE ledgers, but the
-    service's keyword match is ambiguous) is a CHOICE among EXISTING accounts,
-    never a missing prerequisite — auto-creating there would add a semantically
-    duplicate ledger (e.g. a third PPE account while "Vehicle - Car" already
-    exists), which is exactly what "no duplication of an already existed COA"
-    forbids.  Those gaps keep their ask-the-user path with the candidates.
+    A gap that already lists CANDIDATES (the chart HAS PPE/inventory
+    ledgers, but the service's keyword match is ambiguous) is a CHOICE among
+    EXISTING accounts, never a missing prerequisite — auto-creating there
+    would add a semantically duplicate ledger (e.g. a third PPE account
+    while "Vehicle - Car" already exists), which is exactly what "no
+    duplication of an already existed COA" forbids.  Those gaps keep their
+    ask-the-user path with the candidates.
     """
     names = {getattr(tc, "tool_name", "") for tc in planned or ()}
-    for planned_tool, gap_source in _PREREQUISITE_GAP_SOURCES.items():
-        if planned_tool not in names and intent != planned_tool:
+    for tools, gap_source in _PREREQUISITE_GAP_RULES:
+        if not any(tool in names or intent == tool for tool in tools):
             continue
         for gap in gaps or ():
             if str(getattr(gap, "source", "")) != gap_source:

@@ -1006,7 +1006,13 @@ def inventory_gap_from_chart(
         if _INVENTORY_LEDGER_RE.search(str(row.get("name") or "")):
             return None
     return gap_for_nature(
-        _NATURE_LEDGER_NAMES.get("INVENTORY", "Inventory"), "INVENTORY", "nature"
+        _NATURE_LEDGER_NAMES.get("INVENTORY", "Inventory"),
+        "INVENTORY",
+        # Distinctive source (not the generic "nature") so the agent's
+        # prerequisite gate can recognise this gap and auto-create the
+        # valuation ledger before the purchase posts — exactly like the
+        # fixed_asset_nature gap (agent._PREREQUISITE_GAP_RULES).
+        "inventory_nature",
     )
 
 
@@ -1022,13 +1028,88 @@ async def inventory_account_gap(
     from app.repositories import account_repository as a_repo
 
     try:
-        chart = await a_repo.get_chart_of_accounts(
-            organization_id, account_type="ASSET", limit=200
-        )
+        chart = await a_repo.get_chart_of_accounts(organization_id, limit=200)
     except Exception as exc:  # noqa: BLE001 — fail open (status quo)
         log.warning("account_resolution.inventory_probe_failed", error=str(exc)[:200])
         return None
     return inventory_gap_from_chart(chart)
+
+
+# ---------------------------------------------------------------------------
+# CONTEXT-SENSITIVE PARENT ACCOUNTS (critical COA rule)
+#
+# The Parent Account field is a SECTION choice, not a free list of every
+# account of that type: parenting "Marketing" under "Accounts Receivable" is a
+# meaningless chart, and offering every EXPENSE account as a parent let that
+# happen (production 2026-09-30 — see _NON_CATEGORY_PARENT_PATTERNS above).
+#
+# So the acceptable parents of a NEW account of a given type are the section
+# HEADS of that type — and for EXPENSE those heads ARE the statement sections:
+#
+#   ASSET     → Current Assets, Non-Current Assets
+#   LIABILITY → Current Liabilities, Non-Current Liabilities
+#   EQUITY    → Equity
+#   EXPENSE   → Cost of Sales, Operating Expenses, Finance Costs,
+#               Tax Expense, Other Expenses
+#   REVENUE   → Operating Revenue, Other Income
+#
+# This is the same vocabulary the P&L engine classifies by
+# (app/pl_structure.py), so the chart a user builds and the statement the
+# engine produces can never drift apart.
+# ---------------------------------------------------------------------------
+ASSET_PARENT_HEADS: Tuple[str, ...] = (
+    "Current Assets",
+    "Non-Current Assets",
+)
+LIABILITY_PARENT_HEADS: Tuple[str, ...] = (
+    "Current Liabilities",
+    "Non-Current Liabilities",
+)
+EQUITY_PARENT_HEADS: Tuple[str, ...] = (
+    "Equity",
+)
+EXPENSE_PARENT_HEADS: Tuple[str, ...] = (
+    "Cost of Sales",
+    "Operating Expenses",
+    "Finance Costs",
+    "Tax Expense",
+    "Other Expenses",
+)
+REVENUE_PARENT_HEADS: Tuple[str, ...] = (
+    "Operating Revenue",
+    "Other Income",
+)
+
+PARENT_HEADS_BY_TYPE: Dict[str, Tuple[str, ...]] = {
+    "ASSET": ASSET_PARENT_HEADS,
+    "LIABILITY": LIABILITY_PARENT_HEADS,
+    "EQUITY": EQUITY_PARENT_HEADS,
+    "EXPENSE": EXPENSE_PARENT_HEADS,
+    "REVENUE": REVENUE_PARENT_HEADS,
+}
+
+
+def allowed_parent_heads(account_type: Any) -> Tuple[str, ...]:
+    """The section heads a NEW account of *account_type* may be parented under.
+
+    Matching is name-based and case-insensitive on the seeded chart's own
+    headings, so a chart seeded with different codes still validates.  An
+    unknown type returns ``()`` — no parent is invented (a parent is never
+    guessed, and a top-level account is the honest fallback).
+    """
+    key = str(account_type or "").strip().upper()
+    return PARENT_HEADS_BY_TYPE.get(key, ())
+
+
+def is_allowed_parent_name(account_type: Any, parent_name: Any) -> bool:
+    """May an account of *account_type* be parented under *parent_name*?"""
+    heads = allowed_parent_heads(account_type)
+    if not heads:
+        return False
+    candidate = str(parent_name or "").strip().lower()
+    if not candidate:
+        return False
+    return any(h.strip().lower() == candidate for h in heads)
 
 
 # ---------------------------------------------------------------------------

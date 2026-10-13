@@ -474,6 +474,26 @@ class Settings(BaseSettings):
             "parking the request."
         ),
     )
+    llm_pl_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the LLM FALLBACK for P&L section classification "
+            "(app/pl_llm_classification.py). When a chart head matches no "
+            "deterministic phrase (custom charts), the model places it into "
+            "its statement section; an invalid/unreachable/unparseable reply "
+            "returns None and the deterministic buckets stand. Disabling "
+            "restores the purely deterministic statement exactly. PRESENTATION "
+            "PROFILE: default False."
+        ),
+    )
+    llm_pl_timeout: float = Field(
+        default=15.0,
+        description=(
+            "Per-call wall-clock cap for the P&L classification fallback. "
+            "Bounds the stage so a slow provider degrades to the deterministic "
+            "statement instead of parking the report."
+        ),
+    )
     accounting_reasoning_max_rounds: int = Field(
         default=4,
         description=(

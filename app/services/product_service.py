@@ -45,6 +45,7 @@ async def create(
     cost_price: Optional[float] = None,
     revenue_account_id: Optional[uuid.UUID] = None,
     tax_rate_id: Optional[uuid.UUID] = None,
+    category_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """Create a catalog product after verifying it doesn't already exist."""
     if not name or not name.strip():
@@ -77,6 +78,7 @@ async def create(
         cost_price=cost_price,
         revenue_account_id=revenue_account_id,
         tax_rate_id=tax_rate_id,
+        category_id=category_id,
     )
 
 
