@@ -58,6 +58,9 @@ export const navItems: NavItem[] = [
       // The asset register: register / depreciate / dispose, all backed by the
       // same fixed-asset service the AI agent uses.
       { label: "Fixed Assets", href: "/accounting/fixed-assets" },
+      // The loans subsystem: borrowings + lendings with amortization
+      // schedules, current/non-current portions and due-installment sweeps.
+      { label: "Loans & Financing", href: "/accounting/loans" },
     ],
   },
   // The item master both Sales and Purchases consume, so it sits next to them.

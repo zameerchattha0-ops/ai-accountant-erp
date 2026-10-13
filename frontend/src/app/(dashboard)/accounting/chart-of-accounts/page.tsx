@@ -9,7 +9,7 @@ import PageHeader from "@/components/shared/PageHeader";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
-import { allowedParentHeads, isAllowedParentName } from "@/lib/accounting/parent-heads";
+import { allowedParentHeads } from "@/lib/accounting/parent-heads";
 import type { Account, AccountType } from "@/lib/types/entities";
 
 const inputCls =
@@ -77,21 +77,46 @@ export default function ChartOfAccountsPage() {
     return map;
   }, [filtered]);
 
-  // CONTEXT-SENSITIVE PARENTS (Critical COA rule): only the section heads of
-  // the selected account TYPE are offered — an EXPENSE account may hang under
-  // Cost of Sales / Operating Expenses / Finance Costs / Tax Expense /
-  // Other Expenses, never under a cross-type parent.  Charts seeded without
-  // those named heads fall back to TOP-LEVEL accounts of the type (the honest
-  // fallback: a parent is never invented, and the dropdown is never empty).
+  // CONTEXT-SENSITIVE PARENTS (Critical COA rule): the Parent Account field
+  // offers CATEGORIES, never every same-type ledger:
+  //   Asset   -> Current Assets / Non-Current Assets (+ sub-categories like
+  //              Property, Plant & Equipment rooted under them)
+  //   Expense -> Cost of Sales / Operating Expenses / Finance Costs /
+  //              Tax Expense / Other Expenses (+ groupings under them)
+  // A category is: (a) an exact allowed section head, or (b) a grouping or
+  // control account whose ROOT ancestor is one — so "Buildings" files under
+  // Non-Current Assets -> PPE, while a plain leaf ledger is never offered.
+  // Root walking handles the migrated hierarchy (migration 094) and the
+  // older flat charts alike; when the chart has no headings yet the
+  // dropdown honestly shows only "None (top level)".
   const parentOptions = useMemo(() => {
     const sameType = (rows ?? []).filter(
       (a) => a.account_type === form.account_type && a.is_active
     );
-    const heads = sameType.filter((a) =>
-      isAllowedParentName(form.account_type, a.name)
+    const byId = new Map(sameType.map((a) => [a.id, a]));
+    const childIds = new Set(
+      sameType.map((a) => a.parent_account_id).filter(Boolean)
     );
-    if (heads.length > 0) return heads;
-    return sameType.filter((a) => !a.parent_account_id);
+    const headSet = new Set(
+      allowedParentHeads(form.account_type).map((h) => h.trim().toLowerCase())
+    );
+    const rootNameOf = (a: Account): string => {
+      let cur: Account | undefined = a;
+      const seen = new Set<string>();
+      while (cur?.parent_account_id && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        const next: Account | undefined = byId.get(cur.parent_account_id);
+        if (!next) break;
+        cur = next;
+      }
+      return (cur?.name ?? a.name).trim().toLowerCase();
+    };
+    return sameType.filter((a) => {
+      const own = (a.name ?? "").trim().toLowerCase();
+      if (headSet.has(own)) return true;                    // (a) exact head
+      const isCategory = childIds.has(a.id) || a.is_control_account;
+      return isCategory && headSet.has(rootNameOf(a));       // (b) rooted category
+    });
   }, [rows, form.account_type]);
 
   const handleSave = async () => {
