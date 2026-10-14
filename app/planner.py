@@ -102,6 +102,10 @@ _CONFIRMATION_INTENTS = frozenset({
     # Quotation → invoice conversion posts a receivable journal, so the
     # user confirms before the accounting mutation (same as create_invoice).
     "convert_quotation",
+    # Loans move real money (opening journal / installment settlement) and
+    # create or settle a liability or loan receivable — the user always
+    # authorizes first (same class as record_receipt / record_payment).
+    "record_loan", "record_loan_repayment",
 })
 
 
@@ -125,8 +129,11 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ("generate_profit_loss", [r"profit.*loss", r"\bp\s*&?\s*l\b", r"income\s*statement"]),
     ("generate_cash_flow", [r"cash\s*flow"]),
     ("generate_general_ledger", [r"general\s*ledger"]),
-    ("customer_balance", [r"owe", r"receivable", r"customer.*ledger", r"how much.*owe"]),
-    ("supplier_balance", [r"supplier.*ledger", r"payable.*supplier", r"how much.*owe.*supplier"]),
+    # "owe" with WORD BOUNDARIES (Fix 5): the bare substring `owe` matched
+    # inside "borrow**owe**d", so every borrowing phrasing was routed to the
+    # customer-ledger report.  owe/owes/owed/owing still match.
+    ("customer_balance", [r"\bowe(?:s|d|ing)?\b", r"receivable", r"customer.*ledger", r"how much.*\bowe"]),
+    ("supplier_balance", [r"supplier.*ledger", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
     ("project_profitability", [r"project.*profit", r"profitability"]),
     ("generate_customer_ledger", [r"customer.*ledger"]),
     ("generate_supplier_ledger", [r"supplier.*ledger"]),
@@ -193,7 +200,16 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     # Mutations
     ("create_invoice", [r"create.*invoice", r"invoice.*for", r"bill.*customer"]),
     ("record_credit_sale", [r"sold.*credit", r"credit\s*sale", r"on\s*credit.*sold"]),
-    ("record_cash_sale", [r"sold.*cash", r"cash\s*sale", r"received\s*payment.*for"]),
+    # "received payment for X" claims the sale family ONLY when X is
+    # actually sale vocabulary (Fix 5/6, RC-4: "Received payment for loan
+    # repayment" matched the loose `.*for` pattern, took the sale nature
+    # ladder and asked "nature of this sale?" on a borrowing).  Without a
+    # sale marker the phrase falls through to the receipt family (the
+    # operation question — which offers LOAN as a settlement — decides).
+    ("record_cash_sale", [
+        r"sold.*cash", r"cash\s*sale",
+        r"received\s*payment[^.\n]*\b(?:sale|invoice|goods|services?|stock|products?|items?)\b",
+    ]),
     ("record_credit_purchase", [r"bought.*credit", r"credit\s*purchase", r"on\s*credit.*bought", r"purchased.*credit"]),
     ("record_cash_purchase", [r"bought.*cash", r"cash\s*purchase", r"purchased.*cash", r"bought.*paid"]),
     # record_expense requires a RECORDING verb (or an amount-bearing
@@ -260,17 +276,25 @@ _TRANSACTION_INTENTS = {
     "create_invoice", "create_credit_note", "create_purchase_return",
     "record_expense_payment", "record_bank_transfer",
     "register_fixed_asset",
+    # Loans are material money movements — a missing amount is worth
+    # clarifying exactly like any other transaction intent.
+    "record_loan", "record_loan_repayment",
 }
 
 # planner intents the SEMANTIC layer may set. This is the
 # deterministic whitelist: a semantic intent outside it is ignored and the
 # keyword extractor decides (the LLM cannot invent an intent).
+# record_loan / record_loan_repayment are intentionally reachable ONLY via
+# this whitelist (LLM-identified route): the keyword ladder carries no
+# borrowing vocabulary by design — nature/route identification for loans
+# belongs to the understanding stage, never to substring routing.
 _SEMANTIC_INTENTS = frozenset({
     "record_credit_sale", "record_cash_sale", "record_sale",
     "record_credit_purchase", "record_cash_purchase", "record_purchase",
     "record_expense", "record_receipt", "record_payment",
     "create_invoice", "create_purchase_bill", "create_credit_note",
     "create_purchase_return", "run_payroll",
+    "record_loan", "record_loan_repayment",
 })
 
 # every mutation
@@ -878,6 +902,13 @@ def plan(
 
     nature_before_merge = entities.get("transaction_nature")
     if clarification_history:
+        # An explicit "SAME" reply reuses the learned value for that exact
+        # question (the memory hint's "reply SAME to reuse" contract) — the
+        # ONE way a preference may answer a field, and only on the user's
+        # explicit say-so.
+        clarification_history = _reuse_learned_answers(
+            clarification_history, org_preferences or {}
+        )
         entities = _merge_clarification_answers(entities, clarification_history)
         if not nature_before_merge and entities.get("transaction_nature"):
             # the nature came from an explicit user answer
@@ -972,57 +1003,32 @@ def plan(
                 nature=_derived_nature,
             )
 
-    # 3a. ORG PREFERENCES - learned defaults are treated as
-    #     answered-for entities; an explicit user value ALWAYS wins (the
-    #     extraction above already captured it).  The transaction date is
-    #     NEVER defaulted - it is governed by the mandatory date protocol.
+    # 3a. ORG PREFERENCES — a learned ``transaction_nature`` is a HINT, NEVER
+    #     an answered entity (Fix 1 / RC-1, production 2026-10-06 sessions
+    #     62bc94c0 & 49775d68: the injected FIXED_ASSET preference routed
+    #     "shoes"/"60 shoes" into the register_fixed_asset ladder and the
+    #     nature question was never asked).  Nature is a per-transaction
+    #     user decision and is answered ONLY by
+    #       (a) the first LLM understanding hit (grounded prefill),
+    #       (b) the user's own words (TEXT_INFERENCE),
+    #       (c) an explicit user answer (USER_ANSWER), incl. an explicit
+    #       "SAME" reuse of the learned value via _reuse_learned_answers.
+    #     The learned value is otherwise merely OFFERED inside the question
+    #     through the clarification-memory hint ("previously: ... - reply
+    #     SAME to reuse").  It therefore never reaches the fixed-asset /
+    #     disposal re-route gates below (which additionally hard-block
+    #     nature_source == PREFERENCE as a belt-and-braces guard).
+    #     The payment TREATMENT is likewise a per-transaction question,
+    #     NEVER an assumed default — a learned payment_method stays
+    #     recorded for reporting only.  The transaction date is NEVER
+    #     defaulted — it is governed by the mandatory date protocol.
     prefs = org_preferences or {}
-    if prefs:
-        # the payment TREATMENT is a
-        # per-transaction question, NEVER an assumed default.  The user
-        # explicitly chooses cash/bank/credit in the first round, and only
-        # a CREDIT answer pulls the party question into the next round.
-        # A learned payment_method preference is deliberately NOT
-        # auto-applied (it stays recorded for reporting only).
-        #
-        # The learned nature default must NOT be applied to ANY intent,
-        # including SALES.  Its vocabulary is the EXPENSE decision tree
-        # (FIXED_ASSET / INVENTORY / CONSUMABLE / OPERATING_EXPENSE /
-        # SERVICE), so applying it to a sale would record
-        # transaction_nature=OPERATING_EXPENSE on a SALE and show the wrong
-        # badge in the UI.  It would also suppress the sale-type question,
-        # so the revenue account would be resolved silently.  A learned
-        # nature may only answer where that taxonomy applies.
-        if (
-            not entities.get("transaction_nature")
-            and prefs.get("transaction_nature")
-            and intent in _EXPENSE_NATURE_INTENTS
-        ):
-            # RC-4b (production 2026-09-24, "3 computers" incident): a
-            # LEARNED default may only answer the nature BELOW the
-            # capitalization threshold.  At/above it the expense-vs-asset
-            # distinction is exactly what must be asked (or derived from the
-            # item) — injecting "OPERATING_EXPENSE" here suppressed the
-            # nature question and made the plan promise an expense while
-            # the reasoning layer proposed capitalisation.  Amount unknown
-            # keeps the legacy injection (the threshold/ladder questions
-            # still fire through their own paths).
-            _pref_amt = entities.get("amount")
-            try:
-                _pref_amt_f = float(_pref_amt) if _pref_amt is not None else None
-            except (TypeError, ValueError):
-                _pref_amt_f = None
-            _pref_thr = capitalization_threshold_from_prefs(prefs)
-            if _pref_amt_f is not None and _pref_amt_f >= _pref_thr:
-                log.info(
-                    "planner.nature_preference_skipped_at_or_above_threshold",
-                    amount=_pref_amt_f,
-                    threshold=_pref_thr,
-                )
-            else:
-                entities["transaction_nature"] = prefs["transaction_nature"]
-                # a learned org default answered the nature.
-                nature_source = "PREFERENCE"
+    if prefs.get("transaction_nature"):
+        log.info(
+            "planner.nature_preference_hint_only",
+            value=str(prefs.get("transaction_nature")),
+            intent=intent,
+        )
 
     # 
     # the org-set capitalization threshold governs when the R3.2
@@ -1156,8 +1162,13 @@ def plan(
     # register_fixed_asset, so credit asset purchases landed as bills in an
     # asset-named GL account with no asset record, no depreciation schedule
     # and no disposal trail.  register_asset handles the payable itself.)
+    # HARD BLOCK: a PREFERENCE-sourced nature may never trigger this re-route
+    # (Fix 1: a learned default must not hijack the workflow — only the
+    # LLM's grounded reading, the user's words or an explicit user answer
+    # can).
     if (
         nature == "FIXED_ASSET"
+        and nature_source != "PREFERENCE"
         and intent in (*_purchase_family, "record_expense", "record_credit_purchase")
     ):
         intent = "register_fixed_asset"
@@ -1418,9 +1429,23 @@ def text_understanding_gaps(user_message: str) -> List[str]:
     already read everything the request says, so the bounded understanding
     call is NOT made at all — the call exists for wording it cannot read,
     never as a toll on every turn.
+
+    INTENT UNKNOWN: the keyword ladder could not classify a material
+    recording request (Fix 4 — the loans case: "borrow loan from MCB of
+    300000" matched nothing, so no LLM was ever consulted and the run died
+    in the generic loop).  Such a request now opens the FIRST LLM HIT, which
+    classifies the nature AND delegates the route through the
+    ``_SEMANTIC_INTENTS`` whitelist — the Python ladder never invents a
+    route for it.  Report-shaped wording is excluded: a read must not cost
+    a call or risk a mutation route.
     """
     intent = intent_for_message(user_message)
     if not intent or intent == "unknown":
+        msg = user_message or ""
+        if _REPORT_HINT_RE.search(msg):
+            return []
+        if _extract_amount(msg) is not None or _RECORDING_HINT_RE.search(msg):
+            return ["transaction_nature"]
         return []
     gaps: List[str] = []
     if nature_family_for_intent(intent) and not derive_nature_from_text(
@@ -1449,6 +1474,27 @@ _ITEM_REQUIRED_INTENTS = frozenset({
     "record_purchase", "record_cash_purchase", "record_credit_purchase",
     "create_quotation",
 })
+
+# Read-shaped wording: a report/list request never triggers the first LLM
+# hit (cost control + a read can never be delegated to a mutation route).
+_REPORT_HINT_RE = re.compile(
+    r"(?:^|\s)(?:show|list|give|provide|tell|view|display|details?|summary|"
+    r"summar\w*|breakdown|report|what|which|who|when|where|how\s+much|"
+    r"balance|history)\b",
+    re.IGNORECASE,
+)
+
+# Recording-shaped wording for an UNCLASSIFIED request: enough to justify
+# the first LLM hit (which owns nature + route).  This gate only decides
+# WHETHER to spend the call — never WHERE the request routes; the LLM's
+# whitelisted identification decides that.
+_RECORDING_HINT_RE = re.compile(
+    r"\b(?:record|log|book|create|add|register|enter|pay|paid|pay(?:ing|ment)s?|"
+    r"receiv\w*|borrow\w*|lend\w*|lent|repay\w*|repayment|settle\w*|transfer|"
+    r"buy|bought|purchas\w*|sold|sell|selling|spent|spend|deposit|withdraw\w*|"
+    r"disburse\w*|invest\w*|owe|owed)\b",
+    re.IGNORECASE,
+)
 
 
 def human_questions_for_missing(
@@ -1799,6 +1845,107 @@ def _resolve_same_answers(
     return resolved
 
 
+# Field tags that are NOT entity fields: the plan-incomplete / model-failure
+# cards persist "missing_details" (and similar prose tags).  An answer to
+# such a card is conversation context — NEVER entity content (Fix 3 / RC-3:
+# the failure summary's own prose ("...search_supplier...") routed the
+# user's instruction "re-route it from expenses account" into
+# supplier_name through the keyword chain below).
+_NON_ENTITY_FIELD_TAGS = frozenset({
+    "missing_details", "missing information", "missing_information",
+    "information", "details", "missing",
+})
+
+# First words that can never lead a party NAME in an answer: instructions
+# and sentence openers (production RC-3 answers: "re-route it from expenses
+# account", "Create new Account in COA ...").  Extends _NON_PARTY_WORDS with
+# instruction vocabulary the capture-time guard never needed.
+_ANSWER_NON_NAME_WORDS = _NON_PARTY_WORDS | {
+    "please", "should", "would", "could", "you", "we", "they", "it", "this",
+    "that", "these", "those", "reroute", "route", "use", "using", "choose",
+    "select", "reply", "answer", "avoid", "fix", "correct", "update",
+    "change", "delete", "remove", "send", "move", "keep", "apply", "ensure",
+    "just", "also", "instead", "rather", "log", "book", "put",
+    "set", "check", "review", "confirm", "whether", "if", "when", "because",
+}
+
+
+def _is_party_name_answer(value: str) -> bool:
+    """True only when a typed answer reads like a party NAME.
+
+    Guards both merge routes (field tag + keyword chain): a real name is
+    short and name-shaped; an instruction or failure-prose reply ("re-route
+    it from expenses account", "Create new Account in COA ... and Record
+    it's Expense Paid") is rejected so the name stays unset and the gate
+    re-asks instead of writing prose into the party ledger (RC-3).
+    """
+    text = (value or "").strip()
+    if not text or _is_control_answer(text):
+        return False
+    if len(text) > 80:
+        return False
+    words = text.split()
+    if not words or len(words) > 8:
+        return False
+    if not _is_plausible_party(text):
+        return False
+    # Normalise the first word ("re-route" -> "reroute") so hyphenated
+    # instruction openers cannot slip past the vocabulary check.
+    first_word = re.sub(r"[^a-z]", "", words[0].lower())
+    return first_word not in _ANSWER_NON_NAME_WORDS
+
+
+def _reuse_learned_answers(
+    qa_history: List[Dict[str, str]],
+    prefs: Dict[str, str],
+) -> List[Dict[str, str]]:
+    """A "SAME" reply explicitly reuses the learned value for that question.
+
+    The clarification-memory hint offers "previously: <value> - reply SAME
+    to reuse".  A prior answer to the same question in THIS conversation
+    wins (``_resolve_same_answers``' contract); when the question is new,
+    the organization preference for that exact question supplies the value.
+    This is the ONLY path by which a learned preference may answer a field —
+    applied solely on the user's explicit SAME.
+    """
+    if not prefs or not qa_history:
+        return qa_history
+    try:
+        from app.services.preference_service import preference_key_for_question
+    except Exception:  # noqa: BLE001 — hint plumbing must never break planning
+        return qa_history
+
+    def _norm(q: str) -> str:
+        return (q or "").split("(previously")[0].strip().lower()
+
+    answered: Dict[str, str] = {}
+    out: List[Dict[str, str]] = []
+    for qa in qa_history:
+        question = qa.get("question") or ""
+        answer = (qa.get("answer") or "").strip()
+        if answer.lower() == "same":
+            prior = answered.get(_norm(question))
+            if prior:
+                answer = prior
+            else:
+                try:
+                    key = preference_key_for_question(_norm(question))
+                except Exception:  # noqa: BLE001
+                    key = None
+                learned = str(prefs.get(key) or "").strip() if key else ""
+                if learned:
+                    log.info(
+                        "planner.same_reuses_learned_value",
+                        field=key,
+                        value=learned[:60],
+                    )
+                    answer = learned
+        out.append({**qa, "answer": answer})
+        if answer and answer.lower() != "same":
+            answered[_norm(question)] = answer
+    return out
+
+
 def _party_name_candidate(answer: str) -> Optional[str]:
     """A party NAME extracted from a party-check answer, or ``None``.
 
@@ -1825,6 +1972,11 @@ def _party_name_candidate(answer: str) -> Optional[str]:
     ):
         return None
     if not _is_plausible_party(candidate):
+        return None
+    # Name-shape guard (Fix 3 / RC-3): a party-check reply that is an
+    # instruction or sentence ("re-route it from expenses account") is
+    # never a ledger name — the gate re-asks instead.
+    if not _is_party_name_answer(candidate):
         return None
     return candidate
 
@@ -2015,6 +2167,20 @@ def _merge_clarification_answers(
         # chain below (never guessed).
         field_tag = str(qa.get("field") or "").strip()
         if field_tag and _merge_field_answer(merged, field_tag, answer):
+            continue
+
+        # NON-ENTITY TAG: an answer to a plan-incomplete / model-failure
+        # card (field "missing_details" and friends) is conversation
+        # context, NEVER entity content (Fix 3 / RC-3).  Falling into the
+        # keyword chain let the failure summary's own prose — which quoted
+        # the tool name "search_supplier" — claim supplier_name with the
+        # user's instruction text.
+        if field_tag and field_tag.lower() in _NON_ENTITY_FIELD_TAGS:
+            log.info(
+                "planner.non_entity_answer_dropped",
+                field=field_tag,
+                answer=answer[:80],
+            )
             continue
 
         # BARE FIELD-NAME QUESTION: a field-shaped answer survives a resumed
@@ -2337,8 +2503,16 @@ def _merge_clarification_answers(
                 # standing 'Local Vendor' account (searched and created
                 # on first use by the deterministic executor).
                 merged["supplier_name"] = "Local Vendor"
-            else:
+            elif _is_party_name_answer(answer):
                 merged["supplier_name"] = answer
+            else:
+                # Not a name-shaped reply (instruction/prose) — leave the
+                # name unset so the party gate re-asks (Fix 3 / RC-3).
+                log.info(
+                    "planner.party_answer_rejected",
+                    route="keyword:supplier",
+                    answer=answer[:80],
+                )
         elif "customer" in question and (
             _is_control_answer(answer) or not merged.get("customer_name")
         ):
@@ -2354,8 +2528,16 @@ def _merge_clarification_answers(
             if _is_control_answer(answer):
                 if low.startswith(("yes", "create", "ok", "y")):
                     merged["customer_create_confirmed"] = True
-            else:
+            elif _is_party_name_answer(answer):
                 merged["customer_name"] = answer
+            else:
+                # Not a name-shaped reply (instruction/prose) — never stored
+                # as the customer ledger name (Fix 3 / RC-3).
+                log.info(
+                    "planner.party_answer_rejected",
+                    route="keyword:customer",
+                    answer=answer[:80],
+                )
         elif "date" in question and not merged.get("transaction_date"):
             # route the answer through the deterministic
             # parser.  On failure keep the raw answer so the validation
@@ -2606,6 +2788,19 @@ def _merge_field_answer_tail(
                 "planner.control_answer_rejected",
                 field=field,
                 answer=value[:60],
+            )
+            return False
+        # A typed party answer must read like a NAME (Fix 3 / RC-3:
+        # "re-route it from expenses account" was stored verbatim as
+        # supplier_name and became the party-gate's ledger proposal).
+        # Instruction-shaped prose is rejected → the keyword chain gets no
+        # better reading either (it applies the same test) and the gate
+        # re-asks; the name extracted from the request stays authoritative.
+        if not _is_party_name_answer(value):
+            log.info(
+                "planner.party_answer_rejected",
+                field=field,
+                answer=value[:80],
             )
             return False
         merged[field] = value
@@ -3227,6 +3422,18 @@ def _tools_for_intent(intent: str) -> List[str]:
         "create_product": ["search_product", "create_product"],
         "create_service": ["search_service", "create_service"],
         "create_project": ["search_customer", "create_project"],
+        # Loans (LLM-delegated route): the service builds the schedule and
+        # posts the opening journal itself; the readers let the model anchor
+        # an installment repayment to an existing facility.
+        "record_loan": [
+            "list_loans", "get_loan_schedule", "record_loan",
+            "list_bank_accounts", "search_account",
+            "prepare_journal", "validate_journal", "post_journal",
+        ],
+        "record_loan_repayment": [
+            "list_loans", "get_loan_schedule", "record_loan_repayment",
+            "list_bank_accounts", "prepare_journal", "post_journal",
+        ],
         "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
         "supplier_balance": ["search_supplier", "get_supplier", "get_supplier_ledger"],
         "generate_trial_balance": ["get_trial_balance"],
@@ -3268,6 +3475,8 @@ def _context_for_intent(intent: str) -> List[str]:
         "create_product": ["chart_of_accounts"],
         "create_service": ["chart_of_accounts"],
         "create_project": ["projects", "customer_master"],
+        "record_loan": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
+        "record_loan_repayment": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
         "create_bank_account": ["chart_of_accounts"],
         "list_bank_accounts": ["bank_accounts"],
         "customer_balance": ["customer_master", "customer_ledger", "invoices", "receipts"],
@@ -3298,6 +3507,8 @@ def _outcome(intent: str) -> str:
         "record_payment": "Supplier payment recorded with journal entry and allocation",
         "record_bank_transfer": "Bank-to-bank transfer recorded with journal entry",
         "register_fixed_asset": "Fixed asset registered and capitalised with journal entry",
+        "record_loan": "Loan recorded with amortization schedule and opening journal",
+        "record_loan_repayment": "Loan installment recorded with principal/interest split",
         "dispose_fixed_asset": "Fixed asset disposed of with gain/loss journal entry",
         "record_asset_depreciation": "Asset depreciation recorded with journal entry",
         "run_payroll": "Payroll run recorded with journal entry",

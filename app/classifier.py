@@ -643,9 +643,13 @@ async def classify_transaction(
     )
 
     # Payment intents: no item to classify — never pause for classification.
+    # Loans likewise carry NO classifiable item (a liability/loan receivable
+    # is not a purchase item): the classifier must never present a borrowing
+    # as the 4-way item decision ("For 'bank': FIXED ASSET/INVENTORY/...").
     _PAYMENT_INTENTS = (
         "record_expense_payment", "record_payment", "record_receipt",
         "record_bank_transfer", "record_supplier_payment", "record_customer_receipt",
+        "record_loan", "record_loan_repayment",
     )
     if intent in _PAYMENT_INTENTS:
         return TransactionClassification(

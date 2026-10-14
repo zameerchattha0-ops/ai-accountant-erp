@@ -109,6 +109,18 @@ _INTENT_TOOLS: dict[str, set[str]] = {
     # invented the call until the DB refused `project_code` (production
     # 2026-10-01, project sessions 500d0aa4 / 03221efb).
     "create_project": {"create_project"},
+    # Loans (LLM-delegated route; planner._CONFIRMATION_INTENTS gates them).
+    # The loan service builds the amortization schedule and posts the opening
+    # journal itself; repayment settles one installment BY NUMBER, so the
+    # schedule readers are part of the trusted set.
+    "record_loan": {
+        "record_loan", "list_loans", "get_loan_schedule",
+        "prepare_journal", "validate_journal", "post_journal",
+    },
+    "record_loan_repayment": {
+        "record_loan_repayment", "list_loans", "get_loan_schedule",
+        "prepare_journal", "post_journal",
+    },
 }
 
 
@@ -143,6 +155,11 @@ def _lookups_for_intent(intent: str) -> Set[str]:
         lookups |= _EMPLOYEE_LOOKUPS | _BANK_LOOKUPS | _ACCOUNT_LOOKUPS
     if "bank" in intent or "transfer" in intent or "receipt" in intent:
         lookups |= _BANK_LOOKUPS
+    if "loan" in intent:
+        # A loan settles through a bank/cash ledger and posts to its own GL
+        # headings — the borrower/lender itself is NOT a customer/supplier
+        # master record.
+        lookups |= _BANK_LOOKUPS | _ACCOUNT_LOOKUPS
     if intent in ("record_expense", "create_credit_note",
                   "create_purchase_return"):
         lookups |= _ACCOUNT_LOOKUPS

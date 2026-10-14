@@ -93,6 +93,12 @@ ACTIVITIES = (
     "fixed_asset_disposal",
     "depreciation",
     "bank_transfer",
+    # Borrowings / lendings / repayments are their own activities — NEVER a
+    # sale, purchase or ordinary receipt (RC-4: loan content must never land
+    # on the sale nature ladder).
+    "borrowing",
+    "lending",
+    "loan_repayment",
     "report",
 )
 

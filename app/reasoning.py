@@ -1324,6 +1324,8 @@ DATE_REQUIRED_INTENTS = {
     # Payroll: the date decides the period AND which allowance components are
     # in force (never silently defaulted to today).
     "run_payroll",
+    # Loans: loan_date / repayment date are material (schedule + period).
+    "record_loan", "record_loan_repayment",
 }
 
 

@@ -3332,13 +3332,22 @@ async def execute(
         # when the deterministic pass cannot read a material field from the
         # user's own words, so free wording and typos ("sale of tax servcies")
         # answer the nature/item instead of triggering those questions.
+        # THE FIRST HIT OWNS NATURE *AND* ROUTE (per transaction): it also
+        # receives the planner's own whitelisted intents, so a request the
+        # keyword ladder could not classify (the loans case) is delegated to
+        # the right workflow by THIS call — Python never invents the route
+        # (planner._SEMANTIC_INTENTS re-validates before execution).
         if (
             not _ai_prefill
             and not _provider_down
             and bool(getattr(_settings, "bounded_understanding_enabled", False))
         ):
             try:
-                from app.planner import intent_for_message, text_understanding_gaps
+                from app.planner import (
+                    _SEMANTIC_INTENTS,
+                    intent_for_message,
+                    text_understanding_gaps,
+                )
                 from app.reasoning import accepted_nature_values
 
                 _gaps = text_understanding_gaps(user_message)
@@ -3361,12 +3370,13 @@ async def execute(
                             intent_for_message(user_message)
                         )
                         or None,
+                        intent_values=sorted(_SEMANTIC_INTENTS),
                     )
                     if _facts:
                         _ai_prefill = {**_ai_prefill, **_facts}
                         await _log_step(session_id, "AI_PERCEPTION", {
                             "facts": sorted(_facts.keys()),
-                            "intent": None,
+                            "intent": _facts.get("semantic_intent"),
                             "ambiguous": False,
                             "gaps": _gaps,
                             "source": "bounded_understanding",

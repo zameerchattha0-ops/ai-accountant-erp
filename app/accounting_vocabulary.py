@@ -183,6 +183,10 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "create_project",
         "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
         "run_payroll",
+        # Loans — LLM-delegated routes (planner._SEMANTIC_INTENTS whitelist +
+        # tool_selector/_tools_for_intent wiring); the keyword ladder carries
+        # no borrowing vocabulary by design.
+        "record_loan", "record_loan_repayment",
         "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
         "generate_cash_flow", "generate_general_ledger",
         "generate_customer_ledger", "generate_supplier_ledger",

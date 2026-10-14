@@ -48,7 +48,21 @@ _GENERIC_ITEMS = frozenset(
 )
 
 # Canonical nature taxonomy â€” mirrors reasoning.py's nature question values.
-_NATURES = frozenset({"GOODS", "SERVICE", "ASSET_DISPOSAL", "OTHER_INCOME"})
+_NATURES = frozenset({
+    # purchase family
+    "FIXED_ASSET", "INVENTORY", "OPERATING_EXPENSE", "SERVICE",
+    # sale family
+    "GOODS", "ASSET_DISPOSAL", "OTHER_INCOME",
+    # expense family
+    "PREPAID_EXPENSE", "OWNER_DRAWING",
+    # settlement family (receipt / payment)
+    "ALLOCATION", "ADVANCE", "LOAN_OR_SETTLEMENT",
+    # return family
+    "RETURN_OF_GOODS", "PRICE_ADJUSTMENT", "SERVICE_REVERSAL",
+    # legacy planner vocabulary
+    "CONSUMABLE", "REVENUE", "PREPAYMENT", "DEPOSIT_ADVANCE",
+    "INTANGIBLE_ASSET",
+})
 
 # Payment-method grounding: canonical -> keyword(s) that must appear in text.
 _PAYMENT_KEYWORDS = {
@@ -105,14 +119,14 @@ _SYSTEM_PROMPT = (
     "4. transaction_date: resolve relative dates (today/yesterday/"
     "tomorrow) to ISO YYYY-MM-DD using the provided today's date. Format "
     "explicit dates as YYYY-MM-DD (DD/MM/YYYY is day-first).\n"
-    "5. transaction_nature - classify ONLY when the item makes it "
-    "unambiguous: GOODS (a stock item sold for resale), SERVICE, "
-    "ASSET_DISPOSAL (selling a fixed asset the business owns), "
-    "OTHER_INCOME. When unsure, OMIT the key.\n"
+    "5. transaction_nature - classify ONLY when the request itself makes "
+    "what this is unambiguous. When unsure, OMIT the key. The allowed "
+    "values are listed below.\n"
     "6. payment_method: CASH, CREDIT, BANK_TRANSFER, CHEQUE or CARD.\n"
     "7. Direction: money coming in (sale, invoice, receipt) names a "
     "customer_name; money going out (purchase, bill, expense, payment) "
-    "names a supplier_name.\n"
+    "names a supplier_name. A borrowing, lending or repayment request "
+    "names neither role - never force one.\n"
     "Answer with ONLY a JSON object."
 )
 
@@ -352,6 +366,7 @@ async def extract_request_facts(
     max_output_tokens: Optional[int] = None,
     timeout_seconds: Optional[float] = None,
     nature_values: Optional[Sequence[str]] = None,
+    intent_values: Optional[Sequence[str]] = None,
 ) -> dict:
     """AI-first perception: segregate the user's request into grounded facts.
 
@@ -359,6 +374,12 @@ async def extract_request_facts(
     is grounded against the user's own text before it is returned; any
     failure degrades to ``{}`` so the deterministic regex pipeline behaves
     exactly as before.
+
+    ``intent_values`` (route delegation): when the deterministic ladder
+    could not classify the request, the planner offers its own whitelisted
+    intents and THIS call identifies the workflow — the returned value is
+    validated against that whitelist (the model can never invent a route)
+    and surfaced as ``semantic_intent`` for planner.py's whitelist check.
     """
     from app.config import get_settings
 
@@ -377,15 +398,30 @@ async def extract_request_facts(
         return {}
 
     today = today or date.today()
-    nature_rule = (
-        "transaction_nature must be one of: "
-        + ", ".join(str(v) for v in nature_values)
-        + ". Use it only when the request itself says what this is.\n"
-        if nature_values
+    if nature_values:
+        nature_rule = (
+            "transaction_nature must be one of: "
+            + ", ".join(str(v) for v in nature_values)
+            + ". Use it only when the request itself says what this is.\n"
+        )
+    else:
+        # No route yet (intent unknown): the full canonical taxonomy is the
+        # LLM's to choose from — still classified ONLY when unambiguous.
+        nature_rule = (
+            "transaction_nature (only when unambiguous, else OMIT) must be "
+            "one of: " + ", ".join(sorted(_NATURES)) + ".\n"
+        )
+    intent_rule = (
+        "intent: the WORKFLOW this request asks for — one of: "
+        + ", ".join(str(v) for v in intent_values)
+        + ". Choose it only when the request clearly asks for that "
+        "workflow; OMIT the key otherwise (reports, questions and vague "
+        "wording have no intent).\n"
+        if intent_values
         else ""
     )
     prompt = (
-        f"{_SYSTEM_PROMPT}\n\n{nature_rule}"
+        f"{_SYSTEM_PROMPT}\n\n{nature_rule}{intent_rule}"
         f"User request:\n{msg}\n\nToday's date: {today.isoformat()}\n\n"
         "Extract the facts. Copy every text value verbatim from the request; "
         "omit anything not stated. A misspelling is still the thing it means."
@@ -441,7 +477,33 @@ async def extract_request_facts(
                 k: v for k, v in parsed.items() if k != "transaction_nature"
             }
 
+    # ROUTE DELEGATION (whitelist-validated): the model's identification of
+    # the workflow is honoured only when it is one of the planner's OWN
+    # offered intents; anything else is dropped and the deterministic
+    # pipeline keeps its say.  Returned as ``semantic_intent`` — planner.py
+    # re-validates it against the same whitelist before routing.
+    semantic_intent: Optional[str] = None
+    raw_intent = parsed.pop("intent", None)
+    if raw_intent is not None:
+        candidate = (
+            str(raw_intent).strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        _allowed_intents = {
+            str(v).strip().lower().replace(" ", "_") for v in (intent_values or ())
+        }
+        if candidate and candidate in _allowed_intents:
+            semantic_intent = candidate
+        else:
+            log.info(
+                "llm_entity_rejected",
+                field="intent",
+                reason="outside_whitelist",
+                value=str(raw_intent)[:60],
+            )
+
     grounded = _ground_fields(parsed, _norm(msg), msg.lower(), today)
+    if semantic_intent:
+        grounded["semantic_intent"] = semantic_intent
     if grounded:
         log.info("llm_facts_grounded", fields=sorted(grounded.keys()))
     else:

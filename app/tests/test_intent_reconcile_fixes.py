@@ -307,8 +307,16 @@ class TestClassifierProvenance:
 
 # ---------------------------------------------------------------- FIX-4b ---
 class TestPreferenceNatureThreshold:
-    """A LEARNED nature default may only answer BELOW the capitalization
-    threshold; at/above it the expense-vs-asset question must be asked."""
+    """A LEARNED nature default NEVER answers the nature (Fix 1 / RC-1).
+
+    Supersedes the old threshold guard: production 2026-10-06 (sessions
+    62bc94c0 / 49775d68) proved that ANY injection — below the threshold,
+    with an unknown amount, on any family — takes the nature decision away
+    from the transaction.  The learned value is a HINT inside the question
+    ("reply SAME to reuse") and is applied only on that explicit user
+    action; it can never reach the register_fixed_asset / disposal
+    re-routes (planner hard-blocks nature_source == PREFERENCE).
+    """
 
     def test_above_threshold_preference_never_injects(self):
         p = plan(
@@ -322,26 +330,27 @@ class TestPreferenceNatureThreshold:
         # and the nature question is genuinely asked again.
         assert "transaction_nature" in p.missing_fields
 
-    def test_below_threshold_preference_still_answers(self):
-        # CONTROL: same preference, same intent family, amount under the
-        # default 50,000 threshold — legacy injection preserved.
+    def test_below_threshold_preference_never_answers(self):
+        # Same preference, same intent family, amount under the default
+        # 50,000 threshold — the learned value may NOT answer (Fix 1): the
+        # nature question must be asked for THIS transaction.
         p = plan(
             "i purchased printer paper for Rs.5,000",
             org_preferences={"transaction_nature": "CONSUMABLE"},
         )
-        assert p.extracted_entities["transaction_nature"] == "CONSUMABLE"
-        assert p.transaction_nature_source == "PREFERENCE"
-        assert "transaction_nature" not in p.missing_fields
+        assert p.extracted_entities.get("transaction_nature") in (None, "")
+        assert p.transaction_nature_source != "PREFERENCE"
+        assert "transaction_nature" in p.missing_fields
 
-    def test_unknown_amount_keeps_legacy_injection(self):
-        # no amount in the sentence -> the threshold cannot apply; the
-        # legacy behavior (and the archived pin) is preserved.
+    def test_unknown_amount_preference_never_answers(self):
+        # No amount in the sentence — the preference may NOT answer either.
         p = plan(
             "I purchased a table",
             org_preferences={"transaction_nature": "INVENTORY"},
         )
-        assert p.extracted_entities["transaction_nature"] == "INVENTORY"
-        assert p.transaction_nature_source == "PREFERENCE"
+        assert p.extracted_entities.get("transaction_nature") in (None, "")
+        assert p.transaction_nature_source != "PREFERENCE"
+        assert "transaction_nature" in p.missing_fields
 
     def test_explicit_user_nature_still_wins_everywhere(self):
         p = plan(
@@ -354,5 +363,19 @@ class TestPreferenceNatureThreshold:
         )
         # a real USER ANSWER always beats the threshold guard.
         assert p.transaction_nature == "FIXED_ASSET"
+        assert p.transaction_nature_source == "USER_ANSWER"
+
+    def test_explicit_same_reuses_the_learned_value(self):
+        # The ONE user-initiated way a learned value answers: the memory
+        # hint offers "reply SAME to reuse" and the user replies SAME.
+        p = plan(
+            "I purchased a table for Rs.5,000",
+            clarification_history=[{
+                "question": NATURE_DECISION_QUESTION,
+                "answer": "SAME",
+            }],
+            org_preferences={"transaction_nature": "INVENTORY"},
+        )
+        assert p.transaction_nature == "INVENTORY"
         assert p.transaction_nature_source == "USER_ANSWER"
 

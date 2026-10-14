@@ -79,6 +79,7 @@ _PARTY_ROLES = ("customer", "supplier")
 _ACTIVITIES = (
     "sale", "purchase", "expense", "receipt", "payment",
     "invoice", "bill", "credit_note", "purchase_return",
+    "borrowing", "lending", "loan_repayment",
 )
 
 # Activities where money flows IN (party = customer) vs OUT (party = supplier).
@@ -505,6 +506,12 @@ _ACTIVITY_INTENT_MAP = {
     ("fixed_asset_disposal", None): "dispose_fixed_asset",
     ("depreciation", None): "record_asset_depreciation",
     ("bank_transfer", None): "record_bank_transfer",
+    # Loans: borrowing (money in, liability) and lending (money out, loan
+    # receivable) both run the loan workflow; a repayment settles one
+    # installment of an existing facility.
+    ("borrowing", None): "record_loan",
+    ("lending", None): "record_loan",
+    ("loan_repayment", None): "record_loan_repayment",
 }
 
 
