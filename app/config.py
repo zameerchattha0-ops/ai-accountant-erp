@@ -248,8 +248,12 @@ class Settings(BaseSettings):
 
     # ---- Provider orchestration ------------------------------------------
     ai_primary_provider: str = Field(
-        default="qwen",
-        description="PRIMARY runtime AI provider when Token Harbor is unconfigured (qwen)",
+        default="token-harbor",
+        description=(
+            "PRIMARY runtime AI provider (DeepSeek V4.1 / Mimo via the "
+            "Token Harbor gateway). The Qwen chain is a LAST-resort "
+            "fallback, never the primary."
+        ),
     )
     ai_fallback_provider: str = Field(
         default="gemini",

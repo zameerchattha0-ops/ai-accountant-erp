@@ -196,7 +196,16 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"pay\s+(?:the\s+)?(?:staff|employees|workers|team)\b",
         r"\bwages\b[^.\n]{0,20}\b(?:pay|paying|disburs\w*)\b",
     ]),
-    ("record_expense_payment", [r"paid.*expense", r"expense.*payment", r"paid.*bill", r"settled.*bill"]),
+    # Settlement of an ALREADY-RECORDED expense liability (mandate Case C):
+    # only UNMISTAKABLE settlement wording claims this family deterministically
+    # — "settled the bill", "expense payment".  A bare "paid ... bill/expense"
+    # phrasing is a NEW event whose nature (expense vs purchase vs settlement)
+    # is the LLM understanding stage's decision via the semantic-intent
+    # whitelist (planner._SEMANTIC_INTENTS) — never a Python keyword guess
+    # (production 2026-10-14: `paid.*bill` hijacked "Paid 3000 against monthly
+    # internet bill of flash fibre" into the supplier-settlement family and
+    # dead-ended the whole app).
+    ("record_expense_payment", [r"expense\s+payment", r"settled?\s+[^.\n]*\bbill\b"]),
     # Mutations
     ("create_invoice", [r"create.*invoice", r"invoice.*for", r"bill.*customer"]),
     ("record_credit_sale", [r"sold.*credit", r"credit\s*sale", r"on\s*credit.*sold"]),
@@ -295,6 +304,13 @@ _SEMANTIC_INTENTS = frozenset({
     "create_invoice", "create_purchase_bill", "create_credit_note",
     "create_purchase_return", "run_payroll",
     "record_loan", "record_loan_repayment",
+    # record_expense_payment is reachable ONLY via this whitelist (LLM-
+    # identified route): a bare "paid ... bill" must never be claimed by the
+    # keyword ladder, but when the understanding stage DOES identify it as the
+    # settlement of an already-recorded expense liability (mandate Case C) the
+    # whitelist must carry it to the settlement workflow — dropping it to
+    # `unknown` would dead-end the exact decision the LLM just made.
+    "record_expense_payment",
 })
 
 # every mutation
@@ -476,11 +492,20 @@ _ITEM_PATTERNS = [
         r"|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
-    # "invoice/bill for <item>" — same noun phrasing with "for".
+    # "invoice/bill for <item>" — same noun phrasing with "for".  The lookahead
+    # also stops at a NESTED transaction preposition followed by a number or a
+    # clause: "create invoice for zeta pvt ltd for selling them 2 laptops" —
+    # "…ltd for selling them" is not an item (it swallowed the party + a
+    # pronoun and dead-ended the flow), and "invoice for inventory stock of
+    # 50000 to X" — "inventory stock of 50000" stops at "of 5000".  A real
+    # "invoice for <item>" keeps its own tail or is read by the verb/noun
+    # patterns above.
     re.compile(
         r"\b(?:invoice|bill)\s+for\s+"
         r"([a-zA-Z][\w\s-]*?)"
-        r"(?=\s+(?:to|from|on|in|at|via|against)\b|[,.!?;]|\s*$|\s+\d)",
+        r"(?=\s+(?:to|from|for|on|in|at|via|against)\b"
+        r"|\s+(?:of|for|worth|total|amounting)\s+(?:\d|[Rr]s\b|PKR\b|₨)"
+        r"|[,.!?;]|\s*$|\s+\d)",
         re.IGNORECASE,
     ),
     # "<party> returned <items>" — the goods that came back, so a return can
@@ -513,6 +538,25 @@ _PAYMENT_METHOD_PATTERNS = [
     (re.compile(r"\bcheque\b|\bcheck\b", re.IGNORECASE), "CHEQUE"),
     (re.compile(r"\b(?:credit|debit)\s+card\b|\bcard\s+payment\b|\bby\s+card\b", re.IGNORECASE), "CARD"),
 ]
+
+# ---------------------------------------------------------------------------
+# Expense payment-status markers (mandate Cases A/B): the user's OWN words
+# decide paid-now vs outstanding when they say it — "Paid 3000 ..." states
+# the payment happened; "will pay … next month" / "due" states it has not.
+# Explicit answer text always wins (the derivation only fills an open
+# treatment), and when neither is stated the settlement question is still
+# asked — never guessed.
+# ---------------------------------------------------------------------------
+_UNPAID_MARKERS_RE = re.compile(
+    r"\bwill\s+pay\b|\bdue\b|\boutstanding|\bpending\b|"
+    r"\bpay(?:ing)?\s+(?:it\s+)?(?:later|next|soon|after|tomorrow)\b|"
+    r"\bnext\s+(?:month|week)\b|\bon\s+credit\b|\bto\s+be\s+paid\b",
+    re.IGNORECASE,
+)
+_PAID_MARKERS_RE = re.compile(
+    r"\bpaid\b|\bpaying\s+now\b|\bpaid\s+now\b|\bsettled\s+now\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +944,60 @@ def plan(
                 "destination_bank_name", _tb.group(2).strip()
             )
 
+    # LOAN TERM INTAKE — the record_loan contract needs its schedule terms.
+    # The Loans-page message enumerates them ("Narration: …", "Lender: …",
+    # "first repayment YYYY-MM-DD", "tenure N months", "frequency MONTHLY");
+    # chat states some of them.  Entity EXTRACTION only — the route itself
+    # stays the LLM's decision (semantic whitelist); anything still missing
+    # is asked in ONE consolidated round below, never assumed.
+    if intent == "record_loan":
+        _lm = re.search(r"narration\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
+        if _lm and not entities.get("narration"):
+            entities["narration"] = _lm.group(1).strip()
+        _lc = re.search(r"\b(?:lender|borrower)\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
+        if _lc and not entities.get("counterparty"):
+            entities["counterparty"] = _lc.group(1).strip()
+        _lf = re.search(
+            r"\bfirst\s+(?:repayment|payment)\s*(?:date\s*)?:?\s*"
+            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})",
+            msg, re.IGNORECASE,
+        )
+        if _lf and not entities.get("first_payment_date"):
+            _fparsed = parse_transaction_date(_lf.group(1))
+            entities["first_payment_date"] = (
+                _fparsed.iso_date if _fparsed.ok else _lf.group(1)
+            )
+        _lt = re.search(r"\btenure\s*(?:of\s*)?:?\s*(\d{1,3})\s*month", msg, re.IGNORECASE)
+        if _lt and not entities.get("tenure_months"):
+            entities["tenure_months"] = int(_lt.group(1))
+        _lq = re.search(
+            r"\bfrequency\s*(?:of\s*)?:?\s*"
+            r"(monthly|quarterly|semi[-_ ]?annual\w*|annually|yearly|custom)\b",
+            msg, re.IGNORECASE,
+        )
+        if _lq and not entities.get("frequency"):
+            _fq = _lq.group(1).upper().replace("-", "_").replace(" ", "_")
+            entities["frequency"] = "ANNUALLY" if _fq.startswith("YEAR") else _fq
+        # Direction from the USER'S OWN WORDS (page: "borrowed loan" /
+        # "loan given"; chat: "borrow loan", "we lent").  Never guessed when
+        # the wording does not say — it is asked below.
+        if not entities.get("loan_direction"):
+            if re.search(r"\bborrow", msg, re.IGNORECASE):
+                entities["loan_direction"] = "BORROWED"
+            elif re.search(
+                r"\b(?:give|gave|lend|lent)\b[^.\n]*\bloan\b|\bloan\s+given\b",
+                msg, re.IGNORECASE,
+            ):
+                entities["loan_direction"] = "GIVEN"
+        # A chat "borrow … from <party>" lands in supplier_name via the
+        # generic capture — the contract's parameter name is counterparty.
+        if not entities.get("counterparty"):
+            entities["counterparty"] = (
+                entities.get("supplier_name") or entities.get("customer_name") or None
+            )
+            if not entities["counterparty"]:
+                entities.pop("counterparty", None)
+
     nature_before_merge = entities.get("transaction_nature")
     if clarification_history:
         # An explicit "SAME" reply reuses the learned value for that exact
@@ -1143,11 +1241,36 @@ def plan(
     #                unanswered treatment must never pick a paid tool).
     #                Exception: the record_expense tool is by definition a
     #                PAID expense, so its default treatment is cash.
+    # EXPENSE PAYMENT STATUS FROM THE USER'S OWN WORDS (mandate Cases A/B):
+    # "Paid 3000 ..." states paid-now; "we will pay it next month" / "due"
+    # states outstanding.  Fills an OPEN treatment only — an explicit answer
+    # or a settled position always wins, and silence still asks the
+    # settlement question (never guessed).  Payroll claims "paid … salary"
+    # higher up the ladder, so this runs only for record_expense.
+    if (
+        intent == "record_expense"
+        and not entities.get("payment_method")
+        and not entities.get("settlement_position")
+    ):
+        if _UNPAID_MARKERS_RE.search(msg_lower) and not _PAID_MARKERS_RE.search(
+            msg_lower
+        ):
+            entities["settlement_position"] = "OUTSTANDING"
+            entities["payment_method"] = "CREDIT"
+            log.info("planner.expense_settlement_from_text", position="OUTSTANDING")
+        elif _PAID_MARKERS_RE.search(msg_lower):
+            entities["payment_method"] = "CASH"
+            log.info("planner.expense_settlement_from_text", position="PAID_NOW")
+
     nature = entities.get("transaction_nature")
     payment = entities.get("payment_method")
     _purchase_family = (
         "record_purchase", "record_cash_purchase", "record_credit_purchase",
     )
+    # Whether the CREDIT re-route below originates from an ORDINARY expense
+    # (mandate Case B) — its liability is the standing Local Vendor payable,
+    # never a supplier question.
+    _credit_from_expense = intent == "record_expense"
     if (
         intent == "record_expense" and payment is None
         and str(entities.get("settlement_position") or "").upper()
@@ -1176,8 +1299,21 @@ def plan(
             entities["asset_name"] = entities["item_description"]
     elif payment == "CREDIT" and intent in (
         "record_purchase", "record_cash_purchase", "record_expense",
+    ) and (
+        # An ORDINARY expense may only join the bill path once its nature is
+        # resolved (the purpose ladder runs under record_expense first) —
+        # re-routing earlier would swap the purpose question for the
+        # purchase-item nature menu (the exact misroute the mandate bans).
+        intent != "record_expense" or nature
     ):
         intent = "record_credit_purchase"
+        if _credit_from_expense and not entities.get("supplier_name"):
+            # Mandate Case B: an unpaid ordinary expense posts the liability
+            # WITHOUT a supplier question — the standing "Local Vendor"
+            # payable (the merge vocabulary's one-off party account, reused
+            # and created on first use) carries it; a NAMED provider stays
+            # captured as descriptive info.  Never a new dedicated ledger.
+            entities["supplier_name"] = "Local Vendor"
     elif (
         nature in ("OPERATING_EXPENSE", "CONSUMABLE") and payment == "CASH"
         and intent in _purchase_family
@@ -1328,6 +1464,29 @@ _FIELD_QUESTION = {
         "exist yet)."
     ),
     "customer_name": "Who is the customer?",
+    # Loan contract fields (record_loan): asked in ONE consolidated round
+    # when the request genuinely omits them; the Loans-page message never
+    # does (its terms are extracted, not asked).
+    "loan_direction": (
+        "Is this loan BORROWED (money received by the business) or GIVEN "
+        "(money lent out)? Reply BORROWED or GIVEN."
+    ),
+    "counterparty": (
+        "Who is the counterparty of this loan (the lender for a borrowing, "
+        "the borrower for a lending)?"
+    ),
+    "first_payment_date": (
+        "What is the FIRST REPAYMENT date? Reply the date as YYYY-MM-DD or "
+        "DD/MM/YYYY (for example 2026-11-14)."
+    ),
+    "tenure_months": (
+        "Over how many MONTHS is this loan repaid (the tenure)? Reply with "
+        "just the number, e.g. 36."
+    ),
+    "frequency": (
+        "How often are the repayments? Reply MONTHLY, QUARTERLY, "
+        "SEMI_ANNUAL or ANNUALLY."
+    ),
     # invoice LINE-DETAIL.  The manual invoice form
     # mandates a line item (description + quantity); the AI path must ask
     # for both in the SAME consolidated round instead of silently
@@ -1442,7 +1601,14 @@ def text_understanding_gaps(user_message: str) -> List[str]:
     intent = intent_for_message(user_message)
     if not intent or intent == "unknown":
         msg = user_message or ""
-        if _REPORT_HINT_RE.search(msg):
+        # A MATERIAL MONEY-MOVEMENT phrase overrides the read gate.  "give a
+        # loan" / "lend money" / "advance funds" contain a report verb ("give")
+        # but are unambiguously mutations — and record_loan is reachable ONLY
+        # via this first LLM hit (the ladder carries no loan vocabulary by
+        # design).  Reading them as reports starved the call and dead-ended
+        # the request.  "give me the loan balance" still reads as a report
+        # (no lend/money movement verb), so reads never spend the call.
+        if _REPORT_HINT_RE.search(msg) and not _MUTATION_OVERRIDE_RE.search(msg):
             return []
         if _extract_amount(msg) is not None or _RECORDING_HINT_RE.search(msg):
             return ["transaction_nature"]
@@ -1493,6 +1659,18 @@ _RECORDING_HINT_RE = re.compile(
     r"receiv\w*|borrow\w*|lend\w*|lent|repay\w*|repayment|settle\w*|transfer|"
     r"buy|bought|purchas\w*|sold|sell|selling|spent|spend|deposit|withdraw\w*|"
     r"disburse\w*|invest\w*|owe|owed)\b",
+    re.IGNORECASE,
+)
+
+# A money-movement phrase that can never be a report, even though it contains
+# a report-shaped verb ("give").  Present only for genuine mutations: giving/
+# lending/advancing/granting a loan or money, or repaying.  A read like "give
+# me the loan balance" has no lend/money/repay verb, so it stays a report and
+# never spends the first LLM hit.
+_MUTATION_OVERRIDE_RE = re.compile(
+    r"\b(?:give|gave|grant|granted|lend|lent|advance|advanced|float|disburse)"
+    r"[^.!?\n]{0,40}?\b(?:loan|loans|money|funds|cash|advance|principal|amount)"
+    r"\b|\b(?:repay\w*|repayment)\b",
     re.IGNORECASE,
 )
 
@@ -1684,6 +1862,21 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 
     if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
         missing.append("amount")
+
+    # LOAN CONTRACT FLOOR (record_loan): the schedule terms have no defaults
+    # — they are material inputs of the record_loan tool, asked in ONE
+    # consolidated round and merged back by field tag.  The Loans-page
+    # message states all of them (extracted above), so the page flow is
+    # never re-asked; a chat request asks only what it genuinely omitted.
+    # This is what removed the "lookup-only plan → dead-end card" loop for
+    # loans: the model receives a COMPLETE request on the next turn.
+    if intent == "record_loan":
+        for _loan_field in (
+            "loan_direction", "counterparty",
+            "first_payment_date", "tenure_months", "frequency",
+        ):
+            if not entities.get(_loan_field):
+                missing.append(_loan_field)
 
     # the transaction date is material for EVERY mutation -
     # an absent or unparseable date is asked (never silently defaulted).
@@ -2761,6 +2954,56 @@ def _merge_field_answer(
                 return True
         return True  # unresolved → re-asked
 
+    # Loan contract answers (record_loan floor round): routed by field tag
+    # like every other fixed-format answer.
+    if field == "loan_direction":
+        if "borrow" in low:
+            merged["loan_direction"] = "BORROWED"
+            return True
+        if "lend" in low or "lent" in low or "given" in low or "give" in low:
+            merged["loan_direction"] = "GIVEN"
+            return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
+
+    if field == "counterparty":
+        if low in _DECLINE_WORDS:
+            return True
+        if _is_control_answer(value) or not _is_party_name_answer(value):
+            log.info("planner.party_answer_rejected", field=field, answer=raw[:80])
+            return False
+        merged["counterparty"] = value
+        return True
+
+    if field == "first_payment_date":
+        parsed = parse_transaction_date(value)
+        if not parsed.ok:
+            resolved = resolve_relative_date_text(value)
+            parsed = resolved if resolved is not None else parsed
+        merged["first_payment_date"] = (
+            parsed.iso_date if parsed.ok else value
+        )
+        return True
+
+    if field == "tenure_months":
+        number = _parse_bare_amount(value)
+        if number is not None and 1 <= number <= 600:
+            merged["tenure_months"] = int(number)
+            return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
+
+    if field == "frequency":
+        _freq = low.replace("-", "_").replace(" ", "_")
+        if _freq.startswith("year"):
+            _freq = "annually"
+        for _canon in ("monthly", "quarterly", "semi_annual", "annually", "custom"):
+            if _freq.startswith(_canon):
+                merged["frequency"] = _canon.upper()
+                return True
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+        return False
+
     return _merge_field_answer_tail(merged, field, low, value)
 
 
@@ -2974,7 +3217,56 @@ def _extract_entities(msg: str) -> Dict[str, str]:
     return entities
 
 
+def _is_plausible_item(value: str) -> bool:
+    """True when a captured string can plausibly be an item/description.
+
+    Reuses the party guard, so a PRONOUN or an ACTION-VERB-led capture is
+    never treated as a product.  Production 2026-10-14: ``create invoice for
+    zeta pvt ltd for selling them 2 laptops`` captured ``them`` as the item
+    (the sale-verb pattern's optional ``(an?|the|some|\\d+)?`` matched nothing,
+    so ``them`` filled the group and the lookahead stopped at ``2``).  ``them``
+    then named the revenue stream (``them Sales``) and the flow dead-ended.
+    A pronoun is never a product, so it must fall through to the same
+    ``item_description`` question a genuinely-unstated item gets.
+
+    A leading article/count (``a``, ``an``, ``the``, ``couple of``) is stripped
+    first: the count rides INSIDE the captured item (``a couple of bikes``) and
+    must not make the guard reject a genuine product.
+    """
+    text = re.sub(
+        r"^(?:(?:an?|the|some|couple|pair|dozen)\s+(?:of\s+)?)",
+        "",
+        (value or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    return _is_plausible_party(text or value)
+
+
+# A legal-entity suffix: "zeta pvt ltd", "Beta Traders Inc".  A product is
+# never suffixed this way, so a capture carrying one is the COUNTERPARTY
+# that the "invoice for <party>" pattern mistook for the item.
+_COMPANY_SUFFIX_RE = re.compile(
+    r"(?:\s+(?:pvt\.?\s+)?(?:ltd|limited)|\s+inc\.?|\s+llc|\s+corp\.?"
+    r"|\s+company|\s+co\.?)\s*$",
+    re.IGNORECASE,
+)
+
+# A nested deal clause right after the captured span: "… for zeta pvt ltd
+# FOR SELLING them 2 laptops".  When the "invoice for <X>" span is followed
+# by a sale/purchase verb clause, <X> is the PARTY and the real item lives
+# in that clause — asking (or the bounded understanding call) beats naming
+# the revenue stream after the customer.
+_NESTED_DEAL_CLAUSE_RE = re.compile(
+    r"\s+(?:for|against|with|by)\s+"
+    r"(?:selling|sold|sell|sale|supply|supplies|supplying|providing|"
+    r"rendering|purchas\w*|buying|bought|buy)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_item(msg: str) -> Optional[str]:
+    candidate: Optional[str] = None
+    candidate_end = 0
     for pat in _ITEM_PATTERNS:
         m = pat.search(msg)
         if m:
@@ -2993,9 +3285,33 @@ def _extract_item(msg: str) -> Optional[str]:
                 item,
                 flags=re.IGNORECASE,
             )
-            if item and item.lower() not in ("it", "something", "goods", "items", "stuff"):
-                return item
-    return None
+            if item.lower() not in ("it", "something", "goods", "items", "stuff") and (
+                _is_plausible_item(item)
+            ):
+                candidate = item
+                candidate_end = m.end()
+                break
+    if not candidate:
+        return None
+    # PARTY, NOT PRODUCT (production 2026-10-14): "create invoice for zeta
+    # pvt ltd for selling them 2 laptops" — the "invoice for <item>" pattern
+    # captured the CUSTOMER ("zeta pvt ltd"), which then named the revenue
+    # stream and dead-ended the flow.  Two deterministic signals mark the
+    # capture as the counterparty: a legal-entity suffix, or a nested
+    # sale/purchase clause right after it.  Neither compares against the
+    # party extractor (which is itself wrong on "invoice for inventory
+    # stock of 50000 to X"), so a genuine item is never dropped.  Returning
+    # no item opens the item question — and the bounded understanding call,
+    # which proposes the real product from the user's words.
+    if _COMPANY_SUFFIX_RE.search(candidate):
+        log.info("planner.item_rejected", reason="company_suffix",
+                 value=candidate[:60])
+        return None
+    if _NESTED_DEAL_CLAUSE_RE.search(msg[candidate_end:candidate_end + 40]):
+        log.info("planner.item_rejected", reason="nested_deal_clause",
+                 value=candidate[:60])
+        return None
+    return candidate
 
 
 # "<count> <item>" — the count that precedes the item name in the request.

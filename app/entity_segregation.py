@@ -1,4 +1,4 @@
-﻿"""
+"""
 AI-first perception stage â€” grounded LLM fact extraction.
 
 ARCHITECTURE CHANGE (S1 -> S2)
@@ -42,10 +42,13 @@ import structlog
 log = structlog.get_logger(__name__)
 
 # Generic nouns that must never be taken as an item description
-# (mirrors the filter in planner._extract_item).
-_GENERIC_ITEMS = frozenset(
-    {"it", "something", "goods", "items", "stuff", "things", "product", "products"}
-)
+# (mirrors the filter in planner._extract_item).  Pronouns are included
+# because production 2026-10-14 saw "selling them 2 laptops" propose
+# "them" as the item — a pronoun can never name a product.
+_GENERIC_ITEMS = frozenset({
+    "it", "something", "goods", "items", "stuff", "things", "product", "products",
+    "them", "they", "these", "those", "this", "that", "which", "who", "whom",
+})
 
 # Canonical nature taxonomy â€” mirrors reasoning.py's nature question values.
 _NATURES = frozenset({
@@ -101,6 +104,15 @@ _ALLOWED_FIELDS = frozenset(
         "payment_method",
         "transaction_date",
         "transaction_nature",
+        # Loan contract facts (record_loan): the FIRST hit reads the terms
+        # the message already states, so the second-run questionnaire asks
+        # only what is genuinely missing (never facts the user gave).
+        "loan_direction",
+        "counterparty",
+        "narration",
+        "first_payment_date",
+        "tenure_months",
+        "frequency",
     }
 )
 
@@ -127,6 +139,20 @@ _SYSTEM_PROMPT = (
     "customer_name; money going out (purchase, bill, expense, payment) "
     "names a supplier_name. A borrowing, lending or repayment request "
     "names neither role - never force one.\n"
+    "8. Loan facts - ONLY for a borrowing/lending request, and only what "
+    "the request states (omit everything else): loan_direction "
+    "(BORROWED when the business receives the money, GIVEN when it "
+    "lends it - only when the wording says borrow/lend/give), "
+    "counterparty (the lender or borrower name copied verbatim), "
+    "narration (the facility label copied verbatim), first_payment_date "
+    "(ISO YYYY-MM-DD), tenure_months (the number of months), "
+    "frequency (MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUALLY or CUSTOM).\n"
+    "9. item_description - the PRODUCT or SERVICE being sold, bought or "
+    "invoiced (the noun after the count, e.g. 'selling them 2 laptops' -> "
+    "'laptops'). It is NEVER a person or company name (that is "
+    "customer_name/supplier_name) and NEVER a pronoun (it/them/this/that/"
+    "these/those). When the request names no product or service, OMIT the "
+    "key - never invent one.\n"
     "Answer with ONLY a JSON object."
 )
 
@@ -307,6 +333,19 @@ def _ground_fields(
             if key == "item_description" and candidate.lower() in _GENERIC_ITEMS:
                 log.info("llm_entity_rejected", field=key, reason="generic_item")
                 continue
+            if key == "item_description":
+                # PARTY ECHO: the item must not be the counterparty of the
+                # same payload ("create invoice for zeta pvt ltd ... them"
+                # once proposed the customer as the item, naming the revenue
+                # stream after the party and dead-ending the flow).
+                _party = str(
+                    parsed.get("customer_name") or parsed.get("supplier_name") or ""
+                ).strip().lower()
+                if _party and candidate.strip().lower() == _party:
+                    log.info(
+                        "llm_entity_rejected", field=key, reason="party_echo"
+                    )
+                    continue
             if not _is_grounded(candidate, normalized):
                 # EVERY name field must be the user's own words; anything
                 # else is a hallucinated vendor/customer/item and would
@@ -353,6 +392,88 @@ def _ground_fields(
                 log.info("llm_entity_rejected", field=key, reason="unknown_nature")
                 continue
             grounded[key] = nature
+
+        elif key == "loan_direction":
+            canon = str(raw_value).strip().upper().replace(" ", "_")
+            if canon not in ("BORROWED", "GIVEN"):
+                log.info("llm_entity_rejected", field=key, reason="unknown_direction")
+                continue
+            # Grounded by the request's OWN verbs: BORROWED needs
+            # "borrow…", GIVEN needs lend/give wording.  A direction the
+            # words do not support is a hallucination — dropped.
+            _verb = (
+                r"\bborrow" if canon == "BORROWED"
+                else r"\b(?:give|gave|lend|lent)\b|\bloan\s+given\b"
+            )
+            if not re.search(_verb, normalized):
+                log.info("llm_entity_rejected", field=key, reason="verb_absent")
+                continue
+            grounded[key] = canon
+
+        elif key == "counterparty":
+            candidate = _clean_candidate(raw_value)
+            if not candidate or len(candidate) > 120:
+                log.info("llm_entity_rejected", field=key, reason="empty_or_oversized")
+                continue
+            if not _is_grounded(candidate, normalized):
+                log.info("llm_entity_rejected", field=key, reason="not_in_text")
+                continue
+            grounded[key] = candidate
+
+        elif key == "narration":
+            candidate = _clean_candidate(raw_value)
+            if not candidate or len(candidate) > 120:
+                log.info("llm_entity_rejected", field=key, reason="empty_or_oversized")
+                continue
+            if not _is_grounded(candidate, normalized):
+                log.info("llm_entity_rejected", field=key, reason="not_in_text")
+                continue
+            grounded[key] = candidate
+
+        elif key == "first_payment_date":
+            text = str(raw_value).strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+                log.info("llm_entity_rejected", field=key, reason="bad_format")
+                continue
+            if not _date_grounded(text, raw_lower, today):
+                log.info("llm_entity_rejected", field=key, reason="untraceable_date")
+                continue
+            grounded[key] = text
+
+        elif key == "tenure_months":
+            try:
+                months = int(float(str(raw_value).strip()))
+            except (TypeError, ValueError):
+                log.info("llm_entity_rejected", field=key, reason="not_a_number")
+                continue
+            if not (1 <= months <= 600) or not _number_grounded(months, normalized):
+                log.info("llm_entity_rejected", field=key, reason="untraceable_number")
+                continue
+            grounded[key] = months
+
+        elif key == "frequency":
+            canon = str(raw_value).strip().upper().replace("-", "_").replace(" ", "_")
+            if canon.startswith("YEAR"):
+                canon = "ANNUALLY"
+            _canon = next(
+                (c for c in ("MONTHLY", "QUARTERLY", "SEMI_ANNUAL", "ANNUALLY", "CUSTOM")
+                 if canon.startswith(c)),
+                None,
+            )
+            if _canon is None:
+                log.info("llm_entity_rejected", field=key, reason="unknown_frequency")
+                continue
+            # Grounded by the request's own word (monthly / quarterly / …).
+            if _canon == "ANNUALLY":
+                if not re.search(r"\b(?:annually|yearly|per\s+year|annual)\b", normalized):
+                    log.info("llm_entity_rejected", field=key, reason="keyword_absent")
+                    continue
+            elif _canon == "CUSTOM":
+                pass  # "custom interval" wording varies too much to ground
+            elif _canon.split("_")[0] not in normalized:
+                log.info("llm_entity_rejected", field=key, reason="keyword_absent")
+                continue
+            grounded[key] = _canon
 
     return grounded
 

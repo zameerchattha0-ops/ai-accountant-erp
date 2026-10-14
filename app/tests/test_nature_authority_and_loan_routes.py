@@ -279,8 +279,15 @@ class TestFirstLlmHitOwnsNatureAndRoute:
         assert p.intent == "record_loan"
         assert "record_loan" in p.potential_tools
         assert p.requires_confirmation
-        # amount was stated; the date is genuinely missing.
-        assert p.missing_fields == ["transaction_date"]
+        # amount + direction (BORROWED) + counterparty (mcb bank) were read
+        # from the words; the loan floor asks the schedule terms the request
+        # did NOT state, in one round, plus the transaction date.
+        assert "loan_direction" not in p.missing_fields
+        assert "counterparty" not in p.missing_fields
+        assert "first_payment_date" in p.missing_fields
+        assert "tenure_months" in p.missing_fields
+        assert "frequency" in p.missing_fields
+        assert "transaction_date" in p.missing_fields
 
     def test_repayment_route_delegation(self):
         p = plan(
@@ -434,4 +441,193 @@ class TestUnderstandingOwnsNatureAndRoute:
         # a nature outside the intent's family is dropped, never translated.
         assert "transaction_nature" not in facts
         assert facts.get("item_description") == "tax services"
+        # a nature outside the intent's family is dropped, never translated.
+        assert "transaction_nature" not in facts
+        assert facts.get("item_description") == "tax services"
+
+
+# ---------------------------------------------------------------------------
+# The first LLM hit owns loan nature + route AND the stated contract terms.
+# A lending phrase ("give a loan") contains a report verb ("give") but is a
+# mutation — the read gate must not starve the call, and once it fires the
+# model reads loan_direction/counterparty from the words so the second-run
+# questionnaire asks only what is genuinely missing (never facts the user gave).
+# ---------------------------------------------------------------------------
+class TestLoanFirstHitOwnsRouteAndTerms:
+    GIVE = "give a loan of 50000 to my cousin"
+    READ = "give me the loan balance"
+
+    def test_lending_phrase_opens_the_understanding_hit(self):
+        # "give a loan" is a mutation, not a report — the first LLM hit runs.
+        assert intent_for_message(self.GIVE) == "unknown"
+        assert text_understanding_gaps(self.GIVE)
+
+    def test_a_read_of_a_loan_still_costs_no_call(self):
+        assert text_understanding_gaps(self.READ) == []
+
+    @pytest.mark.asyncio
+    async def test_first_hit_reads_direction_and_counterparty(self, monkeypatch):
+        from app import entity_segregation
+
+        monkeypatch.setattr("app.config.get_settings", lambda: _StubSettings())
+        orch = _Orchestrator(
+            '{"intent": "record_loan", "loan_direction": "GIVEN", '
+            '"counterparty": "cousin", "amount": 50000}'
+        )
+        facts = await entity_segregation.extract_request_facts(
+            self.GIVE,
+            orchestrator=orch,
+            thinking_off=True,
+            intent_values=sorted(_SEMANTIC_INTENTS),
+        )
+        assert facts.get("semantic_intent") == "record_loan"
+        assert facts.get("loan_direction") == "GIVEN"
+        assert facts.get("counterparty") == "cousin"
+        assert facts.get("amount") == 50000.0
+
+    @pytest.mark.asyncio
+    async def test_direction_the_words_do_not_support_is_dropped(self, monkeypatch):
+        from app import entity_segregation
+
+        monkeypatch.setattr("app.config.get_settings", lambda: _StubSettings())
+        # A BORROWED direction on a give-a-loan message is a hallucination.
+        orch = _Orchestrator('{"intent": "record_loan", "loan_direction": "BORROWED"}')
+        facts = await entity_segregation.extract_request_facts(
+            self.GIVE,
+            orchestrator=orch,
+            thinking_off=True,
+            intent_values=sorted(_SEMANTIC_INTENTS),
+        )
+        assert "loan_direction" not in facts
+
+    def test_floor_asks_only_genuinely_missing_terms(self):
+        # Simulate the first-hit facts the agent prefills into the planner.
+        facts = {
+            "semantic_intent": "record_loan",
+            "loan_direction": "GIVEN",
+            "counterparty": "cousin",
+            "amount": 50000.0,
+        }
+        p = plan(self.GIVE, prefill_entities=facts)
+        assert p.intent == "record_loan"
+        # Stated facts are never re-asked…
+        assert "loan_direction" not in p.missing_fields
+        assert "counterparty" not in p.missing_fields
+        assert "amount" not in p.missing_fields
+        # …only the genuinely-missing schedule terms are, in one round.
+        assert "first_payment_date" in p.missing_fields
+        assert "tenure_months" in p.missing_fields
+        assert "frequency" in p.missing_fields
+
+
+# ---------------------------------------------------------------------------
+# Expense vs purchase vs settlement — the LLM decides the route, never a
+# Python keyword (production 2026-10-14: `paid.*bill` claimed "Paid 3000
+# against monthly internet bill of flash fibre" for the payables-settlement
+# family, demanded a supplier lookup, and dead-ended the whole app).
+# ---------------------------------------------------------------------------
+
+# "paid <amount> ... bill/expense" phrasings that are NEW expenses until the
+# understanding stage says otherwise — the keyword ladder must NOT claim them.
+NEW_EXPENSE_PAID_NOW = [
+    "Paid 3000 for monthly internet.",
+    "Paid 3000 against monthly internet bill of flash fibre",
+    "Paid 3000 for electricity to Flash Fibre",
+    "Paid 5000 for office rent",
+    "Paid 2000 for the phone bill",
+]
+
+SETTLEMENT_FAMILY = {"record_expense_payment", "record_payment", "record_receipt"}
+PURCHASE_FAMILY = {
+    "record_purchase", "record_credit_purchase", "record_cash_purchase",
+    "create_purchase_bill",
+}
+
+
+class TestPaidBillIsNeverClaimedByPython:
+    @pytest.mark.parametrize("message", NEW_EXPENSE_PAID_NOW)
+    def test_keyword_ladder_never_claims_a_paid_bill(self, message):
+        # Python must NOT decide expense-vs-purchase-vs-settlement: the
+        # request stays unclassified and opens the LLM understanding gate.
+        intent = intent_for_message(message.lower())
+        assert intent not in SETTLEMENT_FAMILY
+        assert intent not in PURCHASE_FAMILY
+        assert intent != "record_expense"
+
+    @pytest.mark.parametrize("message", NEW_EXPENSE_PAID_NOW)
+    def test_understanding_gate_opens_for_the_llm(self, message):
+        assert text_understanding_gaps(message)
+
+
+class TestLlmDelegationCarriesTheRoute:
+    """The LLM's identification is carried to its workflow — never dropped
+    to ``unknown`` (which would dead-end the decision the model just made)."""
+
+    @pytest.mark.parametrize(
+        "delegated,intent",
+        [
+            ("record_expense", "record_expense"),
+            ("record_expense_payment", "record_expense_payment"),
+            ("record_payment", "record_payment"),
+            ("record_cash_purchase", "record_cash_purchase"),
+        ],
+    )
+    def test_delegated_intent_is_honoured(self, delegated, intent):
+        p = plan(
+            "Paid 3000 against monthly internet bill of flash fibre",
+            prefill_entities={"semantic_intent": delegated},
+        )
+        assert p.intent == intent
+        assert p.intent != "unknown"
+
+
+class TestSettlementWordingStillClaims:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "settled the bill of 5000",
+            "Record expense payment of 3000",
+        ],
+    )
+    def test_unmistakable_settlement_wording_is_deterministic(self, message):
+        # Cases C/E: wording that explicitly says "settled"/"expense payment"
+        # IS the settlement decision — Python may read the user's own words.
+        assert intent_for_message(message.lower()) == "record_expense_payment"
+
+
+class TestPurchaseRulesIntact:
+    @pytest.mark.parametrize(
+        "message,entity",
+        [
+            ("Purchased inventory on credit from ABC Traders", "ABC Traders"),
+            ("bought 10 laptops from Techno IT on credit", "Techno IT"),
+        ],
+    )
+    def test_credit_purchase_keeps_supplier_tracking(self, message, entity):
+        p = plan(message)
+        assert p.intent == "record_credit_purchase"
+        # the party is captured as the supplier (not dropped as an expense
+        # provider) and the purchase workflow keeps supplier tools.
+        assert p.extracted_entities.get("supplier_name") == entity
+        tools = set(p.potential_tools)
+        assert "create_purchase_bill" in tools
+        assert "search_supplier" in tools or "get_supplier" in tools
+
+    def test_unnamed_credit_purchase_asks_for_the_supplier(self):
+        p = plan("Purchased inventory on credit")
+        assert p.intent == "record_credit_purchase"
+        assert "supplier_name" in p.missing_fields
+
+
+class TestDelegatedExpenseNeedsNoParty:
+    def test_expense_route_has_no_supplier_dependency(self):
+        p = plan(
+            "Paid 3000 for monthly internet",
+            prefill_entities={"semantic_intent": "record_expense"},
+        )
+        assert p.intent == "record_expense"
+        assert "supplier_name" not in (p.missing_fields or [])
+        # the expense ladder asks purpose + settlement, never a party.
+        assert "transaction_purpose" in p.missing_fields
+
 
