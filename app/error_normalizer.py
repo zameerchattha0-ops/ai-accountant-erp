@@ -141,6 +141,11 @@ _INFRASTRUCTURE_PATTERNS = (
     "connection timed out",
     "connect timeout",
     "connection reset",
+    # A dropped HTTP/2 stream (postgrest pools with http2=True; Supabase's
+    # gateway kills idle streams — production 2026-10-14, session 7fdd9860).
+    "connectionterminated",
+    "remoteprotocolerror",
+    "peer closed connection",
     "name or service not known",
     "getaddrinfo",
     "service unavailable",

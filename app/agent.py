@@ -269,6 +269,24 @@ def _provider_stall_summary(reason: Optional[str]) -> str:
     )
 
 
+def _transport_failure_summary() -> str:
+    """Honest wording for a run killed by a DROPPED CONNECTION.
+
+    Production 2026-10-14 (session 7fdd9860): postgrest 2.x pools one HTTP/2
+    connection process-wide; Supabase's gateway killed stream 17 mid-request
+    and the raw ``httpx.RemoteProtocolError`` escaped to the catch-all as the
+    generic "Something went wrong" card.  A dropped connection is an
+    infrastructure event, not an application bug — say exactly that, and
+    (like every other closed-without-recording branch) tell the user their
+    conversation answers are kept.
+    """
+    return (
+        "The connection to the service was interrupted mid-request, so "
+        "nothing was recorded. Please send your request again — everything "
+        "you have already told me is kept in this conversation."
+    )
+
+
 def _provider_down_summary(failure_reason: Optional[str]) -> str:
     """Honest wording for a run closed WITHOUT recording anything.
 
@@ -5931,6 +5949,17 @@ async def execute(
         )
 
     except Exception as exc:
+        import httpx as _httpx
+
+        # A DROPPED CONNECTION is an infrastructure event, not an application
+        # bug (production 2026-10-14, session 7fdd9860: postgrest 2.x's
+        # process-wide HTTP/2 pool lost stream 17 to Supabase's gateway
+        # mid-request; the raw httpx.RemoteProtocolError surfaced here as the
+        # generic "Something went wrong").  app.database already replays READS
+        # once on such a fault; when one still escapes (a WRITE, or the second
+        # strike) the user gets the honest "nothing was recorded, resend"
+        # story and the step is marked CONTROLLED, never "unexpected".
+        _transport = isinstance(exc, _httpx.TransportError)
         log.error("agent.execute.error", error=str(exc), session_id=str(session_id) if session_id else None)
         if session_id:
             await _update_status(session_id, ExecutionStatus.FAILED)
@@ -5951,12 +5980,19 @@ async def execute(
                 "stage": "agent_execute",
                 "reason": str(exc)[:300],
                 "error_type": type(exc).__name__,
-                "controlled": False,
+                "controlled": _transport,
+                "category": (
+                    "INFRASTRUCTURE_ERROR" if _transport else "UNKNOWN_ERROR"
+                ),
             })
         return AgentResponse(
             status=ExecutionStatus.FAILED,
             execution_id=session_id,
-            summary="An unexpected error occurred. Please try again.",
+            summary=(
+                _transport_failure_summary()
+                if _transport
+                else "An unexpected error occurred. Please try again."
+            ),
         )
     finally:
         # all fire-and-forget audit writes are drained

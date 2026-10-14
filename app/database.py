@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
+import httpx
 from supabase import Client, create_client
 
 from app.config import get_settings
@@ -104,6 +105,38 @@ def get_th_api_key() -> str:
 # ---------------------------------------------------------------------------
 # Generic helpers — thin wrappers used by repositories
 # ---------------------------------------------------------------------------
+# Which query builders are READS.  postgrest 2.x builds its pooled client with
+# ``http2=True`` (measured from the installed source, postgrest 2.31.0), so a
+# long-lived process (a warm Vercel instance) reuses ONE multiplexed HTTP/2
+# connection.  Supabase's gateway kills idle streams; the first request that
+# rides the dead stream fails with ``httpx.RemoteProtocolError
+# (ConnectionTerminated, stream 17)`` even though the very next one succeeds.
+# That is a transient TRANSPORT fault, not an application error — a READ can
+# simply be replayed, while a WRITE may have reached Postgres before the drop
+# and is therefore never blindly retried.
+# (2026-10-14, production session 7fdd9860 — see app/tests/test_db_transport_retry.py)
+# ---------------------------------------------------------------------------
+_SELECT_BUILDERS: Tuple[type, ...] = ()
+try:  # pragma: no cover — import path differs across postgrest versions
+    from postgrest._sync.request_builder import SyncSelectRequestBuilder
+
+    _SELECT_BUILDERS = (SyncSelectRequestBuilder,)
+except Exception:  # noqa: BLE001 — a missing postgrest internals module just
+    # disables the read-retry; nothing else may break at import time.
+    _SELECT_BUILDERS = ()
+
+
+def _is_retryable_transport(exc: BaseException) -> bool:
+    """True for a transient connection-level fault worth replaying a READ for.
+
+    ``httpx.TransportError`` covers ``RemoteProtocolError`` (connection dropped
+    mid-response), ``ConnectError``, ``ReadError`` and ``ReadTimeout`` — all of
+    which mean the request never completed, not that the data was rejected.
+    Anything else (a 4xx/5xx surfaced as ``APIError``, an auth failure, a
+    validation error) is NOT retried here.
+    """
+    return isinstance(exc, httpx.TransportError)
+
 
 def _table(table_name: str):
     """Shortcut to get a table query-builder from the service client.
@@ -128,8 +161,36 @@ async def _execute(query):
     audit writes) into sequential round-trips — the stage-2 latency bug.
     ``asyncio.to_thread`` restores real concurrency for gathered calls and
     keeps the loop responsive while a REST call is in flight.
+
+    TRANSIENT TRANSPORT FAULT (2026-10-14, production session 7fdd9860):
+    postgrest 2.x pools ONE HTTP/2 connection process-wide; Supabase's
+    gateway kills idle streams, so a warm instance's next READ can die with
+    ``RemoteProtocolError (ConnectionTerminated, stream 17)``.  A READ is
+    replayed ONCE on such a fault (httpcore discards the dead connection;
+    the retry rides a fresh one).  A WRITE is NEVER retried — it may have
+    reached Postgres before the drop, and a blind retry could duplicate a
+    row; it surfaces to the agent, which classifies it as an infrastructure
+    failure and tells the user nothing was recorded.
     """
-    return await asyncio.to_thread(query.execute)
+
+    def _run():
+        try:
+            return query.execute()
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if not (
+                _is_retryable_transport(exc)
+                and _SELECT_BUILDERS
+                and isinstance(query, _SELECT_BUILDERS)
+            ):
+                raise
+            log.warning(
+                "database.transport_error_retry",
+                error=str(exc)[:200],
+                error_type=type(exc).__name__,
+            )
+            return query.execute()
+
+    return await asyncio.to_thread(_run)
 
 
 # ---- SELECT helpers -------------------------------------------------------
