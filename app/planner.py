@@ -1007,7 +1007,9 @@ def plan(
         clarification_history = _reuse_learned_answers(
             clarification_history, org_preferences or {}
         )
-        entities = _merge_clarification_answers(entities, clarification_history)
+        entities = _merge_clarification_answers(
+            entities, clarification_history, intent=intent
+        )
         if not nature_before_merge and entities.get("transaction_nature"):
             # the nature came from an explicit user answer
             # to the consolidated decision tree - logged for the audit trail.
@@ -2327,6 +2329,7 @@ def _creation_name_from_answer(answer: str) -> Optional[str]:
 def _merge_clarification_answers(
     entities: Dict[str, Any],
     qa_history: List[Dict[str, str]],
+    intent: str = "",
 ) -> Dict[str, Any]:
     """Fold prior clarification answers into the entity set.
 
@@ -2359,7 +2362,9 @@ def _merge_clarification_answers(
         # be reworded freely.  Unknown fields fall through to the keyword
         # chain below (never guessed).
         field_tag = str(qa.get("field") or "").strip()
-        if field_tag and _merge_field_answer(merged, field_tag, answer):
+        if field_tag and _merge_field_answer(
+            merged, field_tag, answer, intent=intent
+        ):
             continue
 
         # NON-ENTITY TAG: an answer to a plan-incomplete / model-failure
@@ -2386,7 +2391,7 @@ def _merge_clarification_answers(
         # every round because this route did not exist).
         _bare = (qa.get("question") or "").strip()
         if re.fullmatch(r"[a-z][a-z0-9_]{2,40}", _bare):
-            if _merge_field_answer(merged, _bare, answer):
+            if _merge_field_answer(merged, _bare, answer, intent=intent):
                 continue
 
         # DEPRECIATION-POLICY ROUND: the consolidated "useful life / method /
@@ -2842,7 +2847,7 @@ def _is_catalog_chip(value: Any) -> bool:
 
 
 def _merge_field_answer(
-    merged: Dict[str, Any], field_name: str, answer: str
+    merged: Dict[str, Any], field_name: str, answer: str, intent: str = ""
 ) -> bool:
     """Route a FIELD-TAGGED clarification answer into the entity set.
 
@@ -2944,14 +2949,42 @@ def _merge_field_answer(
         return True
 
     if field == "transaction_nature":
+        # FAMILY GUARD (production 2026-10-14, session ae043ec3): this
+        # field-tagged / bare-question route accepted ANY canonical nature,
+        # so an authored "transaction_nature" chip of INVENTORY landed on a
+        # SALE (sale family: GOODS / SERVICE / ASSET_DISPOSAL / OTHER_INCOME
+        # — INVENTORY is the PURCHASE family's value).  The deterministic
+        # invoice fast path (GOODS|SERVICE only) then refused the COMPLETE
+        # plan, which fell to the model, looped in lookups, and dead-ended
+        # with "please resend".  A family-invalid value is never stored and
+        # never translated: the family's own nature question re-asks and
+        # keeps owning the decision.  ``intent=""`` (legacy callers) keeps
+        # the unguarded behaviour — only the planner's own merge is family-
+        # aware.
+        _family = accepted_nature_values(intent) if intent else ()
+        # The family's OWN canonical values are the authority when known —
+        # ``_NATURE_VALUES`` below doesn't even contain GOODS/ASSET_DISPOSAL
+        # (the sale family's values), so a global-set membership test can
+        # never validate a sale answer.  Without an intent the legacy global
+        # set stands, unchanged for every existing caller.
+        _allowed = tuple(_family) if _family else tuple(_NATURE_VALUES)
         candidate = low.replace(" ", "_").upper()
-        if candidate in _NATURE_VALUES:
+        if candidate in _allowed:
             merged["transaction_nature"] = candidate
             return True
-        for nature in _NATURE_VALUES:  # "a fixed asset" / "the service"
+        for nature in _allowed:  # "a fixed asset" / "the service"
             if nature.lower().replace("_", " ") in low:
                 merged["transaction_nature"] = nature
                 return True
+        if _family and candidate in _NATURE_VALUES:
+            # Canonical, but for ANOTHER family — deliberately left unset so
+            # the deterministic family question re-asks (never guessed).
+            log.info(
+                "planner.nature_answer_outside_family",
+                intent=intent,
+                family=sorted(_family),
+                value=candidate,
+            )
         return True  # unresolved → re-asked
 
     # Loan contract answers (record_loan floor round): routed by field tag

@@ -4721,29 +4721,65 @@ async def execute(
             if _plan_performs_no_financial_mutation(
                 intent=execution_plan.intent, calls=planned_tool_calls
             ):
-                # A LOOKUP-ONLY plan is not impossible — it is UNFINISHED.
-                # Read-only calls mutate nothing, so run them and give the
-                # model one bounded round to finish the plan with what it
-                # found, instead of bouncing the user with a question about
-                # fields that have nothing to do with the real blocker
-                # (production 2026-10-01, building session 6b78909c).
-                _c_calls, _c_text, _c_evidence = await _continue_lookup_only_plan(
-                    client=client,
-                    session_id=session_id,
-                    execution_plan=execution_plan,
-                    planned_tool_calls=planned_tool_calls,
-                    context=context,
-                    user_message=user_message,
-                    organization_id=organization_id,
-                    user_id=user_id,
-                    auth=auth,
-                    excluded_tools=excluded_tools,
-                )
-                if _c_calls is not None:
-                    planned_tool_calls = _c_calls
-                    llm_text = _c_text or llm_text
-                _continuation_text = _c_text
-                _continuation_evidence = _c_evidence
+                # ---- DETERMINISTIC PROMOTION FLOOR (systemic) --------------
+                # A recording plan that is complete must NEVER dead-end in
+                # lookups (production 2026-10-14, session ae043ec3: every
+                # value known — customer confirmed, amount, date, item, qty —
+                # yet the model planned search_customer/search_product in BOTH
+                # rounds and the gate below bounced the run with "please
+                # resend").  Before spending the lookup-continuation round,
+                # promote the plan to its own deterministic write: the fast-
+                # path builders gate THEMSELVES (None = not resolved), so
+                # nothing is guessed and an incomplete plan keeps its exact
+                # old behaviour (continuation → the question below).
+                try:
+                    _promoted = await _deterministic_mutation_calls(
+                        organization_id=organization_id,
+                        execution_plan=execution_plan,
+                        classification=classification,
+                    )
+                except Exception as exc:  # noqa: BLE001 — the floor never breaks a run
+                    log.warning(
+                        "agent.deterministic_promotion_failed",
+                        session_id=str(session_id),
+                        error=str(exc)[:200],
+                    )
+                    _promoted = None
+                if _promoted:
+                    planned_tool_calls = _promoted
+                    llm_text = ""
+                    _continuation_text = None
+                    _continuation_evidence = []
+                    await _log_step(session_id, "DETERMINISTIC_EXECUTION", {
+                        "intent": execution_plan.intent,
+                        "bypass_llm": True,
+                        "source": "lookup_only_fallback",
+                        "tools": [tc.tool_name for tc in planned_tool_calls],
+                    })
+                else:
+                    # A LOOKUP-ONLY plan is not impossible — it is UNFINISHED.
+                    # Read-only calls mutate nothing, so run them and give the
+                    # model one bounded round to finish the plan with what it
+                    # found, instead of bouncing the user with a question about
+                    # fields that have nothing to do with the real blocker
+                    # (production 2026-10-01, building session 6b78909c).
+                    _c_calls, _c_text, _c_evidence = await _continue_lookup_only_plan(
+                        client=client,
+                        session_id=session_id,
+                        execution_plan=execution_plan,
+                        planned_tool_calls=planned_tool_calls,
+                        context=context,
+                        user_message=user_message,
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        auth=auth,
+                        excluded_tools=excluded_tools,
+                    )
+                    if _c_calls is not None:
+                        planned_tool_calls = _c_calls
+                        llm_text = _c_text or llm_text
+                    _continuation_text = _c_text
+                    _continuation_evidence = _c_evidence
             if _plan_performs_no_financial_mutation(
                 intent=execution_plan.intent, calls=planned_tool_calls
             ):
@@ -6918,10 +6954,54 @@ async def _continue_lookup_only_plan(
     except Exception:  # noqa: BLE001 — evidence is best-effort
         log.warning("agent.lookup_evidence_attach_failed", session_id=str(session_id))
 
+    # EXECUTION DIRECTIVE (2026-10-14, session ae043ec3): even with the
+    # evidence attached, a cautious model re-planned the SAME lookups ("I'll
+    # start by checking the live records…") and the run dead-ended at the
+    # completeness gate.  When every required value is known, this bounded
+    # round is told exactly that — the lookups already ran, the facts are
+    # final, and the WRITE call (from the planner's own tool set) is the
+    # only acceptable proposal.  Intents WITHOUT a deterministic builder
+    # (quotation, credit note, …) depend on this round to land on execution;
+    # with a builder the promotion floor above already succeeded and this
+    # function was never entered.
+    _msg = user_message
+    _ents = dict(getattr(execution_plan, "extracted_entities", None) or {})
+    _still_missing = [
+        f
+        for f in (getattr(execution_plan, "missing_fields", None) or [])
+        if _ents.get(f) in (None, "", [], {})
+    ]
+    if not _still_missing:
+        _write_tools = [
+            t
+            for t in (getattr(execution_plan, "potential_tools", None) or [])
+            if t in FINANCIAL_WRITE_TOOLS and t not in (excluded_tools or set())
+        ]
+        if _write_tools:
+            _facts = {
+                k: _ents.get(k)
+                for k in (
+                    "customer_name", "supplier_name", "item_description",
+                    "quantity", "amount", "transaction_date",
+                    "transaction_nature", "payment_method",
+                )
+                if _ents.get(k) not in (None, "", [], {})
+            }
+            _msg = (
+                f"{user_message}\n\n"
+                "[INTERNAL DIRECTIVE — not words from the user] "
+                f"Everything required to record this {execution_plan.intent} "
+                f"is already known ({_facts}) and every lookup has already "
+                f"run (see pre_executed_lookups). Do NOT propose any search "
+                f"or get tool again. Propose the write call now — "
+                f"{' or '.join(_write_tools)} — with arguments built from "
+                "those facts."
+            )
+
     _light = execution_plan.intent in _LIGHT_BUDGET_INTENTS
     result, stall = await _bounded_provider_call(
         client.generate_with_tools(
-            user_message=user_message,
+            user_message=_msg,
             context=context,
             executor=None,
             excluded_tools=excluded_tools or set(),
