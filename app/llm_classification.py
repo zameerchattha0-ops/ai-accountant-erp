@@ -259,7 +259,6 @@ def build_prompt(
     message: Optional[str],
     nature_hint: Optional[str],
     candidates: CandidateSet,
-    rule_hint: Optional[str] = None,
 ) -> str:
     """The fixed-format decision request (facts + candidates + contract)."""
     facts = {
@@ -279,8 +278,6 @@ def build_prompt(
             "NATURE HINT (authoritative — user/system stated, "
             f"do NOT contradict): {nature_hint}"
         )
-    if rule_hint:
-        lines.append(f"DETERMINISTIC HINT (advisory only): {rule_hint}")
     lines += [
         "",
         "NATURE VOCABULARY:",
@@ -306,7 +303,8 @@ def build_prompt(
     lines += [
         "",
         "REPLY WITH ONLY THIS JSON (no markdown, no prose):",
-        '{"nature": "<vocabulary value>", "fit": "EXACT|RELATED|NONE",',
+        '{"nature": "<vocabulary value>", "entity": "<item/subject or null>",',
+        ' "fit": "EXACT|RELATED|NONE",',
         ' "account_id": "<candidate id or null>",',
         ' "confidence": "HIGH|MEDIUM|LOW", "needs_clarification": false,',
         ' "question": "", "options": [],',
@@ -614,11 +612,14 @@ def validate(
 
     # No proposal can reach here: a proposal ALWAYS forced the clarify
     # round above (both legs — RELATED's and NONE's — are answer rounds).
+    # The LLM identifies the entity (item/subject); fall back to the
+    # caller-provided entity when the model omits it.
+    llm_entity = str(payload.get("entity") or "").strip() or None
     return TransactionClassification(
         transaction_nature=nature,
         confidence=confidence,
         source="LLM_DECISION",
-        entity=entity,
+        entity=llm_entity or entity,
         account_hint_id=str(account.get("id")) if account else None,
         account_hint_code=str(account.get("code")) if account else None,
         account_hint_name=str(account.get("name")) if account else None,
@@ -662,26 +663,9 @@ async def decide(
             from app.ai_orchestrator import get_client
 
             client = get_client()
-        rule_hint = None
-        try:
-            from app.classifier import rule_based_nature
-
-            text = " ".join(
-                str(x) for x in (
-                    entities.get("item_description"),
-                    entities.get("description"),
-                    message,
-                ) if x
-            )
-            hint_nature, hint_conf = rule_based_nature(text, entities)
-            if hint_nature:
-                rule_hint = f"{hint_nature} (confidence {hint_conf})"
-        except Exception:  # noqa: BLE001 — advisory only
-            rule_hint = None
-
         prompt = build_prompt(
             intent=intent, entities=entities, message=message,
-            nature_hint=nature_hint, candidates=candidates, rule_hint=rule_hint,
+            nature_hint=nature_hint, candidates=candidates,
         )
         raw = await asyncio.wait_for(
             client.generate_text_light(prompt=prompt),
