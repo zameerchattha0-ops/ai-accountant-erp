@@ -451,15 +451,17 @@ def _expense_fast_path_call(
         "total": float(amount),
         "payment_mode": payment,
     }
-    account_hint = (
-        getattr(classification, "account_hint_id", None)
-        if classification is not None
-        else None
-    )
-    if account_hint:
-        # Purpose-driven expense account hint — the journal debits THIS
-        # expense account (Dr expense, Cr cash/bank).
-        params["account_id"] = str(account_hint)
+    account_id = entities.get("account_id")
+    if not account_id:
+        account_hint = (
+            getattr(classification, "account_hint_id", None)
+            if classification is not None
+            else None
+        )
+        account_id = account_hint
+    if account_id:
+        # The journal debits THIS expense account (Dr expense, Cr cash/bank).
+        params["account_id"] = str(account_id)
     return [ToolCall(tool_name="create_expense", arguments=params)]
 
 
@@ -1161,7 +1163,22 @@ async def _deterministic_mutation_calls(
         if settle_call:
             return settle_call
         # R3.5: the generic-expense fast path (purpose + settlement
-        # confirmed, unambiguous).  None => the ladder continues instead.
+        # confirmed, unambiguous).  Thread a user-resolved account_id into
+        # create_expense so the journal debits the correct expense ledger
+        # (never a silently-defaulted one).
+        if not entities.get("account_id") and entities.get("account_name"):
+            from app.repositories import account_repository as _a_repo
+            _acct_rows = await _a_repo.search_accounts(
+                organization_id, query=str(entities["account_name"]), limit=5
+            ) or []
+            _exact = next(
+                (r for r in _acct_rows
+                 if (r.get("name") or "").strip().lower()
+                 == str(entities["account_name"]).strip().lower()),
+                None,
+            )
+            if _exact:
+                entities["account_id"] = str(_exact["id"])
         return _expense_fast_path_call(entities, classification)
     if execution_plan.intent == "record_receipt":
         # R4.5: the receipt fast path (operation + channel + party

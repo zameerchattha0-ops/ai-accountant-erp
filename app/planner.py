@@ -455,6 +455,27 @@ _CUSTOMER_PATTERNS = [
     re.compile(r"\b" + _NAME + r"\s+(?:returned|returns|refunded)\b", re.IGNORECASE),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Generic party capture â€” any named counterparty that does not already
+# match the supplier / customer patterns above (e.g. "paid Zameer Labs",
+# "paid to Acme Traders", "received from Delta Corp").  Surfaced as a
+# standalone ``party`` entity so the initial LLM call can see the named
+# counterparty even when it does not cleanly fit the supplier/customer
+# regex shapes.
+# ---------------------------------------------------------------------------
+_PARTY_PATTERNS = [
+    re.compile(
+        r"\b(?:paid|payment)\s+to\s+" + _NAME + _NAME_STOP, re.IGNORECASE
+    ),
+    re.compile(
+        r"\breceived\s+from\s+" + _NAME + _NAME_STOP, re.IGNORECASE
+    ),
+    # "paid <Party> <amount>" â€” the name is directly after "paid" and
+    # before a figure (stop on \s+\d so the amount is not swallowed).
+    re.compile(r"\bpaid\s+" + _NAME + r"(?=\s+\d)", re.IGNORECASE),
+]
+
 _ITEM_PATTERNS = [
     re.compile(
         r"\b(?:purchas(?:e|es|ed|ing)|bought|buy(?:ing)?|procured?|acquired?)\s+"
@@ -1261,7 +1282,10 @@ def plan(
             entities["payment_method"] = "CREDIT"
             log.info("planner.expense_settlement_from_text", position="OUTSTANDING")
         elif _PAID_MARKERS_RE.search(msg_lower):
-            entities["payment_method"] = "CASH"
+            # "Paid" states paid-now, but HOW (cash vs bank) is NOT stated
+            # â€” the settlement question must ask explicitly.  Never derive
+            # payment_method from "Paid" alone.
+            entities["settlement_position"] = "PAID_NOW"
             log.info("planner.expense_settlement_from_text", position="PAID_NOW")
 
     nature = entities.get("transaction_nature")
@@ -3237,6 +3261,7 @@ def _extract_entities(msg: str) -> Dict[str, str]:
     for field, patterns in (
         ("supplier_name", _SUPPLIER_PATTERNS),
         ("customer_name", _CUSTOMER_PATTERNS),
+        ("party", _PARTY_PATTERNS),
     ):
         for pat in patterns:
             m = pat.search(msg)
