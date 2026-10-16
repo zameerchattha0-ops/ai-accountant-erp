@@ -1,17 +1,21 @@
 -- P2-⑪ — FORENSIC LATENCY AUDIT → SQL SCORING QUERIES
 -- =====================================================
+-- SCHEMA NOTE (2026-10-16): every table reference is schema-qualified
+-- (ai.execution_steps / ai.execution_sessions / ai.execution_results).
+-- There are NO public.ai_% compatibility views — bare names fail at run
+-- time.  Verified against information_schema via Management API.
 -- Run read-only against the ERP Supabase project. Sources:
---   ai_execution_steps.description    = step marker (RECEIVED, INTERPRETING,
+--   ai.execution_steps.description    = step marker (RECEIVED, INTERPRETING,
 --                                       ACCOUNTING_REASONING, CLIENT_TTFB, …)
---   ai_execution_steps.step_type      = phase (REASON/RETRIEVE/VALIDATE/
+--   ai.execution_steps.step_type      = phase (REASON/RETRIEVE/VALIDATE/
 --                                       CONFIRM/EXECUTE/VERIFY/RESPOND)
---   ai_execution_steps.input_summary  = JSON payload; EVERY row now also
+--   ai.execution_steps.input_summary  = JSON payload; EVERY row now also
 --                                       carries elapsed_ms (ms since
 --                                       session start, P2-⑪)
---   ai_execution_results.result_payload->'timings'
+--   ai.execution_results.result_payload->'timings'
 --                                     = per-request mirror of _phase_elapsed
 --                                       (marker -> {elapsed_ms, …}, P2-⑪)
---   ai_execution_sessions.started_at  = server-side start; cold start BEFORE
+--   ai.execution_sessions.started_at  = server-side start; cold start BEFORE
 --                                       this is visible only via CLIENT_TTFB
 -- NOTE: legacy ACCOUNTING_REASONING rows written before P1-⑤ may hold
 -- JSON sheared by the old 2000-char cap — guarded below with an
@@ -24,7 +28,7 @@ select
   percentile_cont(0.95) within group (order by ttfb) as p95_ms
 from (
   select (input_summary::jsonb->>'ttfb_ms')::numeric as ttfb
-  from ai_execution_steps
+  from ai.execution_steps
   where description = 'CLIENT_TTFB'
     and input_summary is not null
 ) t;
@@ -32,8 +36,8 @@ from (
 -- 2) Stage latency p50/p95: started_at -> key durable markers
 with marks as (
   select s.id, s.started_at, st.description, st.created_at
-  from ai_execution_sessions s
-  join ai_execution_steps st on st.execution_session_id = s.id
+  from ai.execution_sessions s
+  join ai.execution_steps st on st.execution_session_id = s.id
   where st.description in (
     'INTERPRETING', 'PLANNING', 'CONTEXT_LOADING', 'CLASSIFICATION',
     'ACCOUNTING_REASONING', 'AWAITING_CLARIFICATION',
@@ -56,7 +60,7 @@ order by p50_ms desc nulls last;
 select
   coalesce((input_summary::jsonb->>'rounds')::int, 0) as rounds,
   count(*) as accounting_reasoning_rows
-from ai_execution_steps
+from ai.execution_steps
 where description = 'ACCOUNTING_REASONING'
   and input_summary is not null
   and right(input_summary, 1) in ('}', ']')   -- legacy-shear guard
@@ -71,7 +75,7 @@ select
     100.0 * count(*) filter (where description = 'DECISION_REJECTED')
     / nullif(count(distinct execution_session_id), 0), 2
   ) as rejections_per_100_sessions
-from ai_execution_steps;
+from ai.execution_steps;
 
 -- 5) Evidence observability: requested vs seeded (P1-⑤) vs prefetched (P1-⑩)
 select
@@ -80,7 +84,7 @@ select
   count(*) filter (where description = 'EVIDENCE_PREFETCH')   as prefetch_events,
   count(*) filter (where description = 'EVIDENCE_RETURNED')   as returned_events,
   count(distinct execution_session_id) as sessions_with_evidence
-from ai_execution_steps;
+from ai.execution_steps;
 
 -- 6) p50/p95 straight from the per-request phase mirror (preferred:
 --    sub-second precision, includes post-reasoning trims)
@@ -91,7 +95,7 @@ select
     order by (t.value->>'elapsed_ms')::numeric) as p50_ms,
   percentile_cont(0.95) within group (
     order by (t.value->>'elapsed_ms')::numeric) as p95_ms
-from ai_execution_results r,
+from ai.execution_results r,
      lateral jsonb_each(r.result_payload::jsonb->'timings') as t(marker, value)
 where r.result_payload is not null
   and r.result_payload::jsonb ? 'timings'
@@ -104,7 +108,7 @@ select
   t.marker,
   (t.value->>'elapsed_ms')::numeric as elapsed_ms,
   t.value as extra
-from ai_execution_results r,
+from ai.execution_results r,
      lateral jsonb_each(r.result_payload::jsonb->'timings') as t(marker, value)
 where r.result_payload is not null
   and r.result_payload::jsonb ? 'timings'
@@ -119,7 +123,7 @@ select
       and (input_summary::jsonb->>'source') = 'llm_planning'
   ) as planning_llm_calls,
   count(*) filter (where description = 'ACCOUNTING_REASONING') as reasoning_runs
-from ai_execution_steps;
+from ai.execution_steps;
 
 -- 9) WAVE A — SINGLE-OWNER DIVERGENCE METRIC  (E:\Qoder\AUDIT_REPORT.md §8)
 -- -----------------------------------------------------------------------
@@ -197,7 +201,7 @@ with clar as (
     (st.input_summary::jsonb->>'branch')        as branch,
     (st.input_summary::jsonb->>'telemetry')     as telemetry,
     (st.input_summary::jsonb->>'elapsed_ms')::numeric as parked_ms
-  from ai_execution_steps st
+  from ai.execution_steps st
   where st.description = 'AWAITING_CLARIFICATION'
     and st.input_summary is not null
     and right(st.input_summary, 1) = '}'      -- legacy sheared rows guard
@@ -208,7 +212,7 @@ select
   count(distinct clar.execution_session_id)       as sessions,
   round(
     count(*)::numeric
-    / nullif((select count(*) from ai_execution_steps
+    / nullif((select count(*) from ai.execution_steps
               where description = 'RECEIVED'), 0),
     4
   )                                               as park_rate_per_turn,
@@ -230,7 +234,7 @@ with clar as (
     st.execution_session_id as sid,
     coalesce(nullif(st.input_summary::jsonb->>'branch', ''),
              st.input_summary::jsonb->>'source') as owner
-  from ai_execution_steps st
+  from ai.execution_steps st
   where st.description = 'AWAITING_CLARIFICATION'
     and st.input_summary is not null
     and right(st.input_summary, 1) = '}'
@@ -264,7 +268,7 @@ with clar as (
     coalesce(nullif(st.input_summary::jsonb->>'branch', ''),
              st.input_summary::jsonb->>'source') as owner,
     st.input_summary::jsonb->>'required_fields' as required_fields
-  from ai_execution_steps st
+  from ai.execution_steps st
   where st.description = 'AWAITING_CLARIFICATION'
     and st.input_summary is not null
     and right(st.input_summary, 1) = '}'
@@ -296,7 +300,7 @@ with cls as (
   select distinct on (st.execution_session_id)
     st.execution_session_id as sid,
     st.input_summary::jsonb->>'source' as decision_source
-  from ai_execution_steps st
+  from ai.execution_steps st
   where st.description = 'CLASSIFICATION'
     and st.input_summary is not null
     and right(st.input_summary, 1) = '}'
@@ -307,7 +311,7 @@ terminal as (
     st.execution_session_id as sid,
     st.description as outcome,
     st.input_summary::jsonb->>'verified' as verified
-  from ai_execution_steps st
+  from ai.execution_steps st
   where st.description in ('COMPLETED', 'FAILED', 'REJECTED')
     and st.input_summary is not null
     and right(st.input_summary, 1) = '}'

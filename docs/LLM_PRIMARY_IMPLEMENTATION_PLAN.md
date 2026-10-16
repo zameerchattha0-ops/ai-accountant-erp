@@ -150,7 +150,7 @@ Exactly one value may differ from baseline.
 
 Baseline ground: probe latencies (decide 2.9 s, authoring 5.2 s, reasoning
 3.8 s), per-call hard caps (`llm_classification_timeout=15 s`), and the
-1,164-suite as the correctness gate.
+1,165-suite as the correctness gate.
 
 **Rollback is configuration-reversible but NOT instantaneous** — a Vercel
 env-var change applies to NEW deployments only; running deployments keep
@@ -176,19 +176,28 @@ active safety net, not the flag itself. Triggers:
 
 | step | action | expected `/api/health` flags | result |
 |---|---|---|---|
-| 1 | activate `LLM_CLASSIFICATION_ENABLED=1` on preview, deploy | `llm_classification_enabled: true`, others baseline | _pending_ |
-| 2 | Instant Rollback to prior deployment | all-false baseline restored | _pending_ |
-| 3 | durable path: env edit + new deploy | all-false baseline restored | _pending_ |
+| 1 | activate `LLM_CLASSIFICATION_ENABLED=1` on preview, deploy | `llm_classification_enabled: true`, others baseline | ✅ 2026-10-16 — preview env set (project env id `V5DIBKhjyfwTeTYZ`, target=`preview` only) + git deployment `dpl_43rc2DzJ7QksHES2Qe9Pc9TLZo9V` (`ai-accountant-4fdfno2db-…vercel.app`, sha `c38176b…`, ref `llm-primary-baseline`) → health read via Protection Bypass: `llm_classification_enabled: true`, four others exactly baseline |
+| 2 | Instant Rollback to prior deployment | all-false baseline restored | ✅ verified as isolation (API-provable form): the pre-experiment deployment `ai-accountant-8tjturff3-…vercel.app` (sha `c38176b…`) **remained all-false after the env change** — env bundles bind at build time, so the prior deployment IS the verified rollback state and the dashboard Instant Rollback merely repoints traffic to it (the dashboard click itself is not API-automatable) |
+| 3 | durable path: env edit + new deploy | all-false baseline restored | ✅ env deleted (project env list count for the key = 0) + redeploy `dpl_5C3zcpgg1a6GAKmcRHbKzGTebhcR` (`ai-accountant-gfryowjv0-…vercel.app`, sha `c38176b…`, ref `llm-primary-baseline`) → health via bypass: all-false baseline restored |
+
+API mechanics learned (needed to reproduce rows 1/3): `POST /v13/deployments`
+takes the git ref in `gitSource` (`{"type":"github","repoId":"1360514032",
+"ref":"llm-primary-baseline"}` — `repoId` as STRING); the legacy `git` object
+is silently ignored and falls back to file-upload validation; `target` must be
+omitted for branch previews. Health reads use the SSO Protection Bypass query
+parameter (`?x-vercel-protection-bypass=…&x-vercel-set-bypass-cookie=true`);
+the secret lives in the gitignored `.pytest_cache/automation.txt` and is never
+committed or printed.
 
 **Baseline & reproducibility block (capture BEFORE activation — rollback
 and comparison must both be reproducible):**
 
 | artifact | value | how captured |
 |---|---|---|
-| Pre-experiment deployment id / URL | _pending_ | Vercel deployment detail (retain the exact id rolled back TO) |
-| Code baseline (commit SHA) | **`e383e82`** (`e383e82977c7d99ad397083b2421f33bb74aa1e3`, 2026-10-16) — SHA replaces the interim snapshot as THE baseline; snapshot retained as its own artifact | commit contents = the 12 session-owned files validated at 1,165 tests |
-| Health flags snapshot | _pending_ | `GET /api/health` on the running deployment (four stages false, bounded true) |
-| Telemetry baselines (pre-window, e.g. 7 days) | _pending_ | §10 park rate per owner; §10b worst-session/loop counts for `classifier_gate`; §11 outcome mix per decision source; `classification.done` p95; turn p95 |
+| Pre-experiment deployment id / URL | preview dry-run: `dpl_FZ7xqv66UrZUAbq8S1kpYfiNycqY` / `ai-accountant-8tjturff3-zameerchattha0-ops.vercel.app` (sha `c38176b…`, ref `llm-primary-baseline`, READY) — retained as the exact rollback target; PRODUCTION pre-experiment deployment to be captured on activation day (main @ `e9ae94c`) | Vercel deployment detail via API (`/v13/deployments/{id}`) |
+| Code baseline (commit SHA) | **`e383e82`** (`e383e82977c7d99ad397083b2421f33bb74aa1e3`, 2026-10-16) — SHA replaces the interim snapshot as THE baseline; snapshot retained as its own artifact.  Deployment/record tip for the preview dry-run: `c38176b` (record-only commits on top of `e383e82`; agent code unchanged) | commit contents = the 12 session-owned files validated at 1,165 tests |
+| Health flags snapshot | `{"status":"ok","version":"1.0.0","config_ok":true,"flags":{"llm_classification_enabled":false,"accounting_reasoning_enabled":false,"semantic_llm_enabled":false,"two_call_runtime_enabled":false,"bounded_understanding_enabled":true}}` (2026-10-16, bypass read on `ai-accountant-8tjturff3…`) | `GET /api/health` on the running deployment |
+| Telemetry baselines | **Full-window pre-experiment baseline (2026-08-29 → 2026-10-16, ~5,514 steps, ~727 RECEIVED turns, `docs/LATENCY_QUERIES.sql` §10/10b/10c/11):** §10 park rate per owner — `model` 56 parks / 7.70% (p50 45.5 s), `party_resolution` 41 / 5.64%, `accounting_reasoning` 24 / 3.30%, `revenue_ledger` 23 / 3.16%, `plan_incomplete` 16 / 2.20%, `catalog_check` 15 / 2.06%, `account_creation_gap` 3 / 0.41%, `asset_depreciation_policy` 2, `plan_materialization` 2 (182 parks total); §10b repeat parks — **0 for every owner** (worst_session_parks = 1 across the board: parks are breadth, not loops); §10c same-issue loops — **no rows**; §11 outcome mix — `DETERMINISTIC_RULE` 18 sessions (5 completed / 4 verified / 13 failed), `USER_ANSWER` 15 (9 / 8 / 6), `INFERENCE` 2 (0 / 0 / 2), `ITEM_MAPPING` 1 (0 / 0 / 1), `LLM_DECISION` 1 (0 / 0 / **1 failed — pre-existing historical session**, predating this plan; the Safeguard-2 financial criterion counts NEW attributable failures above this baseline).  `classifier_gate` park/loop baseline = 0 (production trails + §10: the gate never fired pre-experiment).  `classification.done` marker p95 — N/A pre-experiment (marker exists only when the flag is ON; probe-measured decide-call p95 2.9 s is the pre-registered latency ground) | `python scripts/supabase_sql.py <extracted query>` (Management API pg endpoint; harness committed alongside this doc) |
 | Suite gate at baseline | 1,165 passing (2026-10-16, local) | `python -m pytest app/tests -q --ignore=app/tests/test_provider_rate_limit_fallback.py` |
 
 The pre-registered thresholds (Safeguard 2) all reference "vs pre-
@@ -207,7 +216,11 @@ not activate first and baseline later.
    FAILED, or COMPLETED with `verified != true`, attributable to a
    wrong-account/nature decision → **immediate rollback**.
 4. **Clarification quality**: repeat-park loops per §10b for
-   `classifier_gate` must not exceed the pre-experiment count.
+   `classifier_gate` must not exceed the pre-experiment count — baseline now
+   known: **0 repeats for every owner** over the full window, so ANY
+   `classifier_gate` row appearing in §10b during the experiment is a
+   regression signal to investigate (not an automatic rollback — the
+   fail-closed decision guards above remain the hard boundary).
 
 ### Safeguard 3 — journal outcomes, not just source labels
 
@@ -228,7 +241,11 @@ default. Phase 2 proceeds only on sufficient Phase 1 evidence.
 
 1. Provider-readiness probe report — DONE (Phase 0 evidence + residuals).
 2. Audited archive-reuse list — DONE: none; archive is a stale ancestor.
-3. Small reversible diffs per phase — pending, one phase at a time.
-4. Test + telemetry evidence per phase — pending.
+3. Small reversible diffs per phase — Phase 1 code DONE (two-call
+   restructure, adversarial + journey tests, health-echo flags, telemetry
+   stamps); activation itself still awaits the authorization decision.
+4. Test + telemetry evidence per phase — Phase 1 evidence COMPLETE (1,165
+   suite, adversarial spy proofs, shape probes, 3-row rollback dry-run,
+   full-window §10/10b/10c/11 baselines above).
 5. Record of what remains disabled/candidate-only — this document.
 
