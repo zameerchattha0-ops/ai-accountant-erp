@@ -296,6 +296,7 @@ frozen line, and the thresholds may not move to fit results.
 Remediation candidates (each requires a NEW pre-registered experiment, not a
 threshold edit): provider keep-warm/prewarm for the classification path;
 timeout-ladder cap so the stage bounds at < 6 s worst-case; then re-run
+under a fresh contract.
 
 ### Rollback executed (2026-10-17, pre-registered durable path)
 
@@ -322,12 +323,6 @@ branch alias now serves the flag-off deployment).  Production: untouched
 throughout (`origin/main` @ `e9ae94c`, prod env never carried the flag).
 Experiment CLOSED.  Re-opening requires a NEW pre-registered experiment
 authorization (keep-warm / timeout-cap remediation candidates in §8).
-
-under a fresh contract.  Production is untouched (`origin/main` @ `e9ae94c`,
-flag never left preview).  Preview rollback: the trigger fired — the
-pre-registered durable path (delete `LLM_CLASSIFICATION_ENABLED` + gitSource
-redeploy, dry-run-proven) is ready and awaits the user's go (kept armed, not
-executed, so the evidence deployment stays re-verifiable until then).
 
 
 
