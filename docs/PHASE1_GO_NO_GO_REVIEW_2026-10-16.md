@@ -202,6 +202,31 @@ Pinning decisions recorded:
 Implementation shipped with the pin (additive telemetry, no behavior
 change): the CLASSIFICATION step now stamps `intent` (same pattern as
 `account_source`), pinned by `TestCriterion1PopulationStamp` in
-`test_two_call_restructure.py`.
+`test_two_call_restructure.py`.  Shipped as `230fcdf` on
+`llm-primary-baseline`; preview redeployed from that sha
+(`dpl_6DHCWL2tkRoFd3hmQS2NtssP1KmU`, health: flag ON, four other flags
+at baseline).
+
+### Batch 1 — RETRO-SCORED (2026-10-17, pinned definition, provisional)
+
+The 24 recorded Batch-1 sessions (`smart1`+`p4fix` execution ids) scored
+via the Appendix SQL with the `pln_intent` fallback join (rows predate
+the `intent` stamp):
+
+- **Population**: 20 eligible of 24 CLASSIFICATION turns — excluded:
+  2 `record_payment` (intent clause), 2 `hints_resolved=false` (proposal-
+  path turns).  Nothing dropped silently.
+- **Fallbacks (pinned numerator)**: 3 — `09eb79ab`/`363da006`
+  (`register_fixed_asset`, source=USER_ANSWER, account_source NULL) and
+  `6baa5313` (`record_expense`, USER_ANSWER NULL — the p1 turn whose
+  confirmed `create_account` early-returns before the decide layer: the
+  conservative eligible-but-fallback class agreed at pinning).
+- **Fallback rate 3/20 = 15.0 %** — exactly AT the rollback line, not
+  above it (line is >15 %).  **n=20 < the 50 floor: provisional, NOT a
+  criterion-1 result.**
+- Stage latency (frozen formula): all 20 eligible < 6 s (0.9–5.7 s).
+- Outcomes: 4 COMPLETED (3 verified, `5d62a516` verified=null), 0 FAILED
+  — criterion 3 untriggered.  IN_PROGRESS rows are the documented
+  non-terminating p4 first-run loops (runner fixed in `a610b5b`).
 
 
