@@ -166,8 +166,32 @@ async def get_current_user(
 
 @app.get("/api/health")
 async def health_check():
-    """Liveness probe — safe to call even when the environment is misconfigured."""
-    return {"status": "ok", "version": "1.0.0", "config_ok": _config_ok}
+    """Liveness probe — safe to call even when the environment is misconfigured.
+
+    Also echoes the EFFECTIVE AI-stage feature flags (booleans only, never
+    secrets) so the Phase 1 activation/rollback verification (checked plan,
+    Safeguard 1) can read the RUNNING deployment's values: a Vercel env-var
+    edit binds to new deployments only, so only the live process can prove
+    which flag state is actually serving traffic.
+    """
+    from app.config import get_settings
+
+    _s = get_settings()
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "config_ok": _config_ok,
+        "flags": {
+            flag: bool(getattr(_s, flag, False))
+            for flag in (
+                "llm_classification_enabled",
+                "accounting_reasoning_enabled",
+                "semantic_llm_enabled",
+                "two_call_runtime_enabled",
+                "bounded_understanding_enabled",
+            )
+        },
+    }
 
 
 @app.get("/api/ai/warm")

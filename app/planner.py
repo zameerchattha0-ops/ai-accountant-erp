@@ -1093,6 +1093,17 @@ def plan(
                         value=str(_pv)[:40],
                     )
                     continue
+            if _pk == "transaction_purpose" and intent != "record_expense":
+                # The purpose-first ladder belongs to the generic expense
+                # path ONLY (it derives nature + description there); a
+                # purpose on any other route is meaningless and must never
+                # leak into that route's entities.
+                log.info(
+                    "planner.purpose_prefill_rejected",
+                    intent=intent,
+                    value=str(_pv)[:40],
+                )
+                continue
             entities[_pk] = _pv
 
     # 2c. NATURE FROM THE USER'S OWN WORDS (deterministic, typo-tolerant).

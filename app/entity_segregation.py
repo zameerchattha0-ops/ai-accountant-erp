@@ -104,6 +104,11 @@ _ALLOWED_FIELDS = frozenset(
         "payment_method",
         "transaction_date",
         "transaction_nature",
+        # Expense purpose (record_expense's purpose-first ladder): WHAT THE
+        # MONEY WAS FOR — mapped to the canonical purpose taxonomy and
+        # keyword-grounded below, so a request that states its purpose
+        # ("Paid for travelling") is never re-asked for it.
+        "transaction_purpose",
         # Loan contract facts (record_loan): the FIRST hit reads the terms
         # the message already states, so the second-run questionnaire asks
         # only what is genuinely missing (never facts the user gave).
@@ -376,6 +381,27 @@ def _ground_fields(
                 continue
             grounded[key] = method
 
+        elif key == "transaction_purpose":
+            # Canonical mapping, KEYWORD-GROUNDED: the model's judgement is
+            # WHICH purpose the request's own wording names — never whether
+            # an unheard purpose may enter.  OTHER/OTHER_DURABLE carry no
+            # keyword pattern and can never be grounded (the deterministic
+            # purpose question owns them).
+            from app.reasoning import purpose_option
+
+            opt = purpose_option(str(raw_value))
+            if opt is None or not opt.keywords:
+                log.info(
+                    "llm_entity_rejected", field=key, reason="unknown_purpose"
+                )
+                continue
+            if not re.search(opt.keywords, normalized):
+                log.info(
+                    "llm_entity_rejected", field=key, reason="keyword_absent"
+                )
+                continue
+            grounded[key] = opt.value
+
         elif key == "transaction_date":
             text = str(raw_value).strip()
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
@@ -496,6 +522,12 @@ async def extract_request_facts(
     failure degrades to ``{}`` so the deterministic regex pipeline behaves
     exactly as before.
 
+    CALL 1 of the two-call split (``app/two_call_contracts.py``): this
+    prompt carries INTAKE requirements only — copy/grounding rules, the
+    nature and purpose vocabularies, route delegation.  Decision rules
+    (treatment, ledger, account, proposal) belong to CALL 2
+    (``app/llm_classification.decide``) and never appear here.
+
     ``intent_values`` (route delegation): when the deterministic ladder
     could not classify the request, the planner offers its own whitelisted
     intents and THIS call identifies the workflow — the returned value is
@@ -541,8 +573,27 @@ async def extract_request_facts(
         if intent_values
         else ""
     )
+    try:
+        # VOCABULARY REUSED, never forked — the purpose values come from
+        # the planner's own taxonomy (_PURPOSE_OPTIONS); options without a
+        # keyword pattern (OTHER) can never be grounded anyway.
+        from app.reasoning import _PURPOSE_OPTIONS
+
+        _purpose_values = ", ".join(
+            str(o.value) for o in _PURPOSE_OPTIONS if o.keywords
+        )
+    except Exception:  # noqa: BLE001 — vocabulary load is best-effort
+        _purpose_values = ""
+    purpose_rule = (
+        "transaction_purpose: for an expense/payment request, WHAT THE MONEY "
+        "IS FOR — one of: " + _purpose_values + ". Use it only when the "
+        "request itself says what the expense was for; OMIT the key "
+        "otherwise (a vague expense keeps its purpose question).\n"
+        if _purpose_values
+        else ""
+    )
     prompt = (
-        f"{_SYSTEM_PROMPT}\n\n{nature_rule}{intent_rule}"
+        f"{_SYSTEM_PROMPT}\n\n{nature_rule}{purpose_rule}{intent_rule}"
         f"User request:\n{msg}\n\nToday's date: {today.isoformat()}\n\n"
         "Extract the facts. Copy every text value verbatim from the request; "
         "omit anything not stated. A misspelling is still the thing it means."

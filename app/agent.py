@@ -2891,6 +2891,35 @@ async def _two_call_turn_response(
     )
 
 
+# ---------------------------------------------------------------------------
+# CLARIFICATION TELEMETRY — a STABLE contract (clarification.v1)
+# ---------------------------------------------------------------------------
+# Every clarification event stamps the same keys, so trail analytics can
+# measure per-owner park rates, repeat rounds and latency against real
+# denominators (RECEIVED = turns; AWAITING_CLARIFICATION = parked turns).
+# *source* is the question's OWNER and follows the EXISTING trail values
+# (bank_accounts_configuration, account_creation_gap, model,
+# plan_incomplete, …) — RENAMING ONE SILENTLY SPLITS THE PRODUCTION
+# METRICS; add, never rename.  *branch* sub-labels the classifier gate's
+# decisions (nature_4way | config_gap | treatment) and is None for owners
+# without sub-branches; coalesce(branch, source) yields every label an
+# analytics consumer needs.  Unknown/absent values are stamped as-is,
+# never dropped — the trail reports reality.
+CLARIFICATION_TELEMETRY_VERSION = "clarification.v1"
+
+
+def _clarification_telemetry(
+    source: str, *, branch: Optional[str] = None, **extra: Any
+) -> Dict[str, Any]:
+    """The stamped payload for one clarification event (contract above)."""
+    return {
+        "source": source,
+        "branch": branch,
+        "telemetry": CLARIFICATION_TELEMETRY_VERSION,
+        **extra,
+    }
+
+
 async def execute(
     *,
     user_message: str,
@@ -3567,6 +3596,68 @@ async def execute(
                     requires_user_input=True,
                 )
 
+        # ---- PHASE 3-early: TRANSACTION CLASSIFICATION (CALL 2 — the ACCOUNT
+        # decision) hoisted ABOVE the clarification gate.  The account-to-hit
+        # and the material-ambiguity decision are identified FIRST, so every
+        # question this turn is grounded in a classified event — previously
+        # any questionnaire turn returned at PHASE 2b and NEVER classified
+        # (the account call was unreachable on clarifying rounds).  Runs
+        # exactly ONCE per turn: PHASE 3b below only reuses it.  Classification
+        # consumes the entity hints only — build_context stores them verbatim
+        # as extracted_entities — so no context is needed yet.  The hints
+        # themselves are computed HERE (plus merged clarification answers and
+        # the resolved entity name) and travel to the context unchanged.
+        entity_hints: Dict[str, Any] = dict(execution_plan.extracted_entities)
+        if execution_plan.entity_name and execution_plan.entity_type:
+            entity_hints.setdefault(
+                f"{execution_plan.entity_type}_name", execution_plan.entity_name
+            )
+        from app.classifier import classify_transaction, _classification_question
+
+        # HINT GATING (Option 3 of the perf split): the account-hint
+        # consumers are the PROCEEDING path (fastpath / Phase-4 prompt /
+        # config-gap question) and the QUESTION authored below.  On a
+        # clarifying turn with no authoring client (hermetic floor) neither
+        # exists — the ~6 round-trips would be trail-only, so they are
+        # skipped.  The NATURE decision is independent of this flag and
+        # always runs (products/COA-item lookups feed the prohibited-set
+        # guard); full per-question laziness is the later Option-2 split.
+        _hints_needed = (
+            _reasoning_calls is None
+            and approved_tool_calls is None
+            and (
+                not execution_plan.requires_clarification
+                or questionnaire_client is not None
+            )
+        )
+        classification = await classify_transaction(
+            organization_id=organization_id,
+            intent=execution_plan.intent,
+            entities=entity_hints,
+            message=user_message,
+            # P1-⑧ (forensic latency report ⑧): skip ONLY the account-hint /
+            # config-gap DB work on proposal/approved paths (its consumers —
+            # fastpath, Phase-4 prompt, config-gap question — do not run
+            # there). Nature-affecting lookups still run: build_event_profile
+            # consumes transaction_nature for the executor's prohibited-set
+            # guard (traced; P0-① kept classification running for this).
+            resolve_account_hints=_hints_needed,
+            # RC-4a: honest provenance — a learned org preference must not
+            # be reported as USER_ANSWER ("the user said so").
+            explicit_nature_source=execution_plan.transaction_nature_source,
+        )
+        execution_plan.classification = classification
+        await _log_step(session_id, "CLASSIFICATION", {
+            "transaction_nature": classification.transaction_nature,
+            "confidence": classification.confidence,
+            "source": classification.source,
+            "account_hint": classification.account_hint_code,
+            "requires_clarification": classification.requires_clarification,
+            # trail queries split hint-fed rounds from hint-skipped ones
+            "hints_resolved": _hints_needed,
+        })
+        _phase_elapsed("classification.done", nature=classification.transaction_nature)
+
         # ---- PHASE 2b: CONSOLIDATED clarification check -------------------
         # Ask ONLY when the planner found genuinely-missing material info
         # AND the clarification budget is not exhausted.  Everything already
@@ -3604,6 +3695,9 @@ async def execute(
                 entities=execution_plan.extracted_entities,
                 history=prior_qa,
                 today=(_preliminary or {}).get("today", ""),
+                # GROUNDING (Option 3): the CALL 2 account decision rides
+                # WITH the question — decided context to name, never to ask.
+                classification=execution_plan.classification,
             )
             if _questionnaire is None or _questionnaire.is_empty():
                 _questionnaire = await build_questionnaire_with_llm(
@@ -3665,10 +3759,41 @@ async def execute(
             # the numbered sub-questions (a None placeholder keeps the
             # alignment when a question has no finite option set).
             question_options = _questionnaire.render_options()
+            # TRAIL: the hint exists for the QUESTION, not for the trail —
+            # record whether this round actually consumed it (present in
+            # the authored context / named in the rendered question), so
+            # quality and latency queries can separate hint-fed rounds
+            # from hint-skipped ones.
+            _hint_name = str(
+                getattr(classification, "account_hint_name", None) or ""
+            ).strip()
+            await _log_step(session_id, "QUESTIONNAIRE", {
+                "fields": list(_asked_fields),
+                # authoring provenance (llm_authored / llm_assisted / floor)
+                # — NOT the clarification owner (that is telemetry.contract's
+                # ``source`` on the AWAITING_CLARIFICATION step below).
+                "authoring_source": str(getattr(_questionnaire, "source", "") or ""),
+                "filled": sorted(_filled),
+                "account_hint_present": bool(_hint_name),
+                "account_hint_cited": bool(_hint_name)
+                and _hint_name.lower() in question.lower(),
+            })
             clarification = await create_clarification(
                 session_id=session_id,
                 question=question,
                 required_fields=_asked_fields,
+            )
+            # TRAIL (clarification.v1): the parking EVENT itself — planner
+            # questionnaires previously returned without ever logging an
+            # AWAITING marker, so per-source rates had no denominator here.
+            await _log_step(
+                session_id,
+                "AWAITING_CLARIFICATION",
+                _clarification_telemetry(
+                    "planner_questionnaire",
+                    required_fields=list(_asked_fields),
+                    question=question[:500],
+                ),
             )
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
@@ -3772,15 +3897,8 @@ async def execute(
         _phase_elapsed("context.start")
         # ---- PHASE 3: CONTEXT LOADING ------------------------------------
         await _update_status(session_id, ExecutionStatus.CONTEXT_LOADING)
-        # All entities extracted from the request (plus merged clarification
-        # answers) flow into the context — Gemini reuses them instead of
-        # re-parsing the raw text.
-        entity_hints: Dict[str, Any] = dict(execution_plan.extracted_entities)
-        if execution_plan.entity_name and execution_plan.entity_type:
-            entity_hints.setdefault(
-                f"{execution_plan.entity_type}_name", execution_plan.entity_name
-            )
-
+        # entity_hints was computed at the classification hoist above — the
+        # same dict, carried unchanged into the context below.
         if approved_tool_calls is not None:
             # P0-①: the frozen approved plan has NO consumer for the domain
             # context — Phase 4 (its only heavy reader) is skipped, and
@@ -3822,9 +3940,10 @@ async def execute(
                 financial_year=_fy_row,
                 accounting_period=_period_row,
             )
-        # the model's own reasoning products travel WITH the
-        # context so every later LLM call reassesses them instead of silently
-        # replacing them with a keyword route.
+        # the classification rode in with the hoist above — its products now
+        # travel WITH the context so every later LLM call reassesses them
+        # instead of silently replacing them with a keyword route.
+        context.classification = classification
         context.preliminary_extraction = dict(_preliminary or {})
         if _reasoning is not None:
             context.live_evidence = [
@@ -3851,46 +3970,11 @@ async def execute(
         })
 
         _phase_elapsed("context.built")
-        # ---- PHASE 3b: INTELLIGENT TRANSACTION CLASSIFICATION (360°) ------
-        # Facts gate first (user answers, ERP configuration).  The JUDGMENT
-        # part — nature and account routing (income vs expense, asset vs
-        # liability, which ledger) — is the LLM decision layer
-        # (app/llm_classification.py); the deterministic rules are its
-        # FALLBACK when the provider is off/unreachable.  If the treatment
-        # is MATERIALLY
-        # AMBIGUOUS (e.g. laptop: fixed asset vs expense) and no authoritative
-        # configuration exists, ASK — never default to a generic expense.
-        from app.classifier import classify_transaction, _classification_question
-
-        classification = await classify_transaction(
-            organization_id=organization_id,
-            intent=execution_plan.intent,
-            entities=context.extracted_entities,
-            message=user_message,
-            # P1-⑧ (forensic latency report ⑧): skip ONLY the account-hint /
-            # config-gap DB work on proposal/approved paths (its consumers —
-            # fastpath, Phase-4 prompt, config-gap question — do not run
-            # there). Nature-affecting lookups still run: build_event_profile
-            # consumes transaction_nature for the executor's prohibited-set
-            # guard (traced; P0-① kept classification running for this).
-            resolve_account_hints=(
-                _reasoning_calls is None and approved_tool_calls is None
-            ),
-            # RC-4a: honest provenance — a learned org preference must not
-            # be reported as USER_ANSWER ("the user said so").
-            explicit_nature_source=execution_plan.transaction_nature_source,
-        )
-        execution_plan.classification = classification
-        context.classification = classification
-        await _log_step(session_id, "CLASSIFICATION", {
-            "transaction_nature": classification.transaction_nature,
-            "confidence": classification.confidence,
-            "source": classification.source,
-            "account_hint": classification.account_hint_code,
-            "requires_clarification": classification.requires_clarification,
-        })
-
-        _phase_elapsed("classification.done", nature=classification.transaction_nature)
+        # ---- PHASE 3b: CLASSIFICATION — computed once, above PHASE 2b ------
+        # The CALL 2 hoist owns the run (account identified BEFORE any
+        # question); its products — already on execution_plan — ride the
+        # context set above, and every later consumer (3c requirements, 3d
+        # impact map, the config-gap gate, Phase 4/5) reads the same object.
         # ---- PHASE 3c: 360° DEPENDENCY GRAPH (requirement gap analysis) ---
         # Every materially relevant dimension gets an explicit resolution
         # state; only genuinely-open user decisions become questions.  An
@@ -4035,6 +4119,18 @@ async def execute(
                     # R3.4: account NAMES only in user-facing text (never
                     # internal codes) and tappable options.
                     question = strip_markdown(question) or question
+                    await _log_step(
+                        session_id,
+                        "AWAITING_CLARIFICATION",
+                        _clarification_telemetry(
+                            "classifier_gate",
+                            branch=(
+                                "treatment" if _contract_ok else "config_gap"
+                            ),
+                            required_fields=["account_configuration"],
+                            question=question[:500],
+                        ),
+                    )
                     clarification = await create_clarification(
                         session_id=session_id,
                         question=question,
@@ -4059,6 +4155,16 @@ async def execute(
                 # R3.4: the 4-way nature decision is tap-to-answer too.
                 nature_options = options_for_question(question)
                 question = strip_markdown(question) or question
+                await _log_step(
+                    session_id,
+                    "AWAITING_CLARIFICATION",
+                    _clarification_telemetry(
+                        "classifier_gate",
+                        branch="nature_4way",
+                        required_fields=["transaction_nature"],
+                        question=question[:500],
+                    ),
+                )
                 clarification = await create_clarification(
                     session_id=session_id,
                     question=question,
@@ -4636,12 +4742,17 @@ async def execute(
                     log.warning("agent.account_gap_clarification_failed",
                                 session_id=str(session_id), error=str(exc)[:200])
                 _opts = options_for_gap(_gap)
-                await _log_step(session_id, "AWAITING_CLARIFICATION", {
-                    "source": "account_creation_gap",
-                    "gap": {"name": _gap.name, "account_type": _gap.account_type,
-                            "source": _gap.source},
-                    "question": _q[:300],
-                })
+                await _log_step(
+                    session_id,
+                    "AWAITING_CLARIFICATION",
+                    _clarification_telemetry(
+                        "account_creation_gap",
+                        required_fields=["account_configuration"],
+                        gap={"name": _gap.name, "account_type": _gap.account_type,
+                             "source": _gap.source},
+                        question=_q[:300],
+                    ),
+                )
                 return AgentResponse(
                     status=ExecutionStatus.AWAITING_CLARIFICATION,
                     execution_id=session_id,

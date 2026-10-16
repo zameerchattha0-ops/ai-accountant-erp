@@ -182,3 +182,146 @@ group by 1, 2
 order by turns desc
 limit 25;
 
+-- 10) CLARIFICATION TELEMETRY (clarification.v1) — per-owner park rate,
+--     branch mix and latency, with REAL denominators.  coalesce(branch,
+--     source) yields every instrumentation label: planner_questionnaire,
+--     classifier_nature_4way, classifier_config_gap, classifier_treatment,
+--     account_creation_gap (plus every pre-existing owner — their source
+--     values are a stability contract and never renamed).  The classifier
+--     GATE is distinguishable from execution PREFLIGHT by source alone.
+--     Rate denominator: RECEIVED = turns.
+with clar as (
+  select
+    st.execution_session_id,
+    (st.input_summary::jsonb->>'source')        as source,
+    (st.input_summary::jsonb->>'branch')        as branch,
+    (st.input_summary::jsonb->>'telemetry')     as telemetry,
+    (st.input_summary::jsonb->>'elapsed_ms')::numeric as parked_ms
+  from ai_execution_steps st
+  where st.description = 'AWAITING_CLARIFICATION'
+    and st.input_summary is not null
+    and right(st.input_summary, 1) = '}'      -- legacy sheared rows guard
+)
+select
+  coalesce(nullif(clar.branch, ''), clar.source) as clarification_owner,
+  count(*)                                        as parked_turns,
+  count(distinct clar.execution_session_id)       as sessions,
+  round(
+    count(*)::numeric
+    / nullif((select count(*) from ai_execution_steps
+              where description = 'RECEIVED'), 0),
+    4
+  )                                               as park_rate_per_turn,
+  percentile_cont(0.5) within group (order by clar.parked_ms) as p50_parked_ms,
+  percentile_cont(0.95) within group (order by clar.parked_ms) as p95_parked_ms
+from clar
+group by 1
+order by parked_turns desc;
+
+-- 10b) REPEAT-PARK profile — GPT review point: distinct sessions alone do
+--      NOT measure repeated rounds.  A source with 3 parked turns across
+--      1 session is a LOOP; the same 3 turns across 3 sessions is breadth.
+--      Per owner: affected sessions, how many parked >= 2 times, the worst
+--      single-session loop, and average parks per affected session.  A low
+--      park rate with high repeat counts still deserves consolidation —
+--      frequency alone must not gate the decision.
+with clar as (
+  select
+    st.execution_session_id as sid,
+    coalesce(nullif(st.input_summary::jsonb->>'branch', ''),
+             st.input_summary::jsonb->>'source') as owner
+  from ai_execution_steps st
+  where st.description = 'AWAITING_CLARIFICATION'
+    and st.input_summary is not null
+    and right(st.input_summary, 1) = '}'
+),
+per_session as (
+  select owner, sid, count(*) as parks
+  from clar
+  group by 1, 2
+)
+select
+  owner,
+  sum(parks)                                        as parked_turns,
+  count(*)                                          as affected_sessions,
+  count(*) filter (where parks >= 2)                as sessions_with_repeat_parks,
+  max(parks)                                        as worst_session_parks,
+  round(avg(parks), 2)                              as avg_parks_per_session
+from per_session
+group by owner
+order by parked_turns desc;
+
+-- 10c) SAME-ISSUE loops — the loops consolidation would actually break:
+--      sessions that parked >= 2 times under the same owner with the SAME
+--      required_fields (e.g. account_configuration asked round after
+--      round).  Field-set granularity is deliberate; the per-event `gap`
+--      and `question` payloads name the specific ledger for drill-down.
+--      required_fields is compared as its JSON text form, which groups
+--      identically for identical field sets.
+with clar as (
+  select
+    st.execution_session_id as sid,
+    coalesce(nullif(st.input_summary::jsonb->>'branch', ''),
+             st.input_summary::jsonb->>'source') as owner,
+    st.input_summary::jsonb->>'required_fields' as required_fields
+  from ai_execution_steps st
+  where st.description = 'AWAITING_CLARIFICATION'
+    and st.input_summary is not null
+    and right(st.input_summary, 1) = '}'
+),
+per_issue as (
+  select owner, required_fields, sid, count(*) as parks
+  from clar
+  group by 1, 2, 3
+)
+select
+  owner,
+  required_fields,
+  count(*)         as sessions_looped,
+  sum(parks)       as total_parks,
+  max(parks)       as worst_session_parks
+from per_issue
+where parks >= 2
+group by 1, 2
+order by sessions_looped desc, total_parks desc;
+
+-- 11) PHASE 1 JOURNAL-OUTCOME VERIFICATION — decision source vs what the
+--     books ACTUALLY got.  A source label proves what the model decided;
+--     this proves the session completed, verified, and did not fail.
+--     Per decision source (LLM_DECISION vs deterministic chain): sessions,
+--     completed, completed-and-verified, failed.  COMPLETED payloads carry
+--     `verified` (production trail evidence).  Run segmented by experiment
+--     window (sessions.started_at) to compare against the baseline.
+with cls as (
+  select distinct on (st.execution_session_id)
+    st.execution_session_id as sid,
+    st.input_summary::jsonb->>'source' as decision_source
+  from ai_execution_steps st
+  where st.description = 'CLASSIFICATION'
+    and st.input_summary is not null
+    and right(st.input_summary, 1) = '}'
+  order by st.execution_session_id, st.step_order desc
+),
+terminal as (
+  select
+    st.execution_session_id as sid,
+    st.description as outcome,
+    st.input_summary::jsonb->>'verified' as verified
+  from ai_execution_steps st
+  where st.description in ('COMPLETED', 'FAILED', 'REJECTED')
+    and st.input_summary is not null
+    and right(st.input_summary, 1) = '}'
+)
+select
+  coalesce(cls.decision_source, '(none)') as decision_source,
+  count(distinct terminal.sid)                                     as sessions,
+  count(distinct terminal.sid) filter (where outcome = 'COMPLETED') as completed,
+  count(distinct terminal.sid) filter (
+    where outcome = 'COMPLETED' and verified = 'true'
+  )                                                                as completed_verified,
+  count(distinct terminal.sid) filter (where outcome = 'FAILED')   as failed
+from terminal
+join cls on cls.sid = terminal.sid
+group by 1
+order by sessions desc;
+

@@ -757,18 +757,25 @@ AUTHORED_FIELDS: frozenset = frozenset(
 
 
 def validate_authored_questions(
-    entries: Any, known: Optional[Dict[str, Any]] = None
+    entries: Any,
+    known: Optional[Dict[str, Any]] = None,
+    applicable: Optional[Sequence[str]] = None,
 ) -> List[QuestionSpec]:
     """Validate an LLM-authored ``questions[]`` against the fixed schema.
 
     Rejections (never repaired): unknown field, empty/oversized text,
-    markdown, or a field already answered in *known*.  Options are
-    normalised; a choice question with no usable options falls back to
-    free text rather than inventing choices.
+    markdown, or a field already answered in *known*.  When *applicable*
+    is given, a field outside the plan's OPEN gaps is dropped too —
+    vocabulary-valid yet NOT_APPLICABLE this round (an irrelevant ask,
+    or a field the system itself DEFAULTS: the planner lists only
+    genuinely open gaps).  Options are normalised; a choice question with
+    no usable options falls back to free text rather than inventing
+    choices.
     """
     if not isinstance(entries, list):
         return []
     ents = known or {}
+    _applicable = set(applicable) if applicable is not None else None
     allowed = {name: spec_for(name) for name in AUTHORED_FIELDS}
     out: List[QuestionSpec] = []
     seen: set = set()
@@ -780,6 +787,8 @@ def validate_authored_questions(
             continue
         if _known(ents.get(field_name)):
             continue  # never ask what the user already stated
+        if _applicable is not None and field_name not in _applicable:
+            continue  # NOT_APPLICABLE this round — outside the open gaps
         question = _clean_text(entry.get("question"), _QUESTION_MAX)
         if not question:
             continue
@@ -901,6 +910,12 @@ _FIELD_GLOSS: Dict[str, str] = {
     "note": "any further detail the user wants recorded",
 }
 
+# CALL 1 (SEMANTIC INTAKE) — question authoring belongs to CALL 1 alone
+# (app/two_call_contracts.py: "Adaptive question authoring belongs to CALL 1
+# alone").  This prompt carries ONLY intake-side instructions: the request,
+# extracted facts, answered history and the field vocabulary — never
+# decision / ledger / treatment rules, which live in CALL 2's prompt
+# (app/llm_classification.build_prompt).
 _AUTHORED_QUESTIONNAIRE_PROMPT = """You are the clarification writer of an accounting agent (assisted ERP).
 
 A request could not be posted yet because material facts are missing.  You
@@ -916,6 +931,8 @@ You are given:
   * KNOWN_FACTS — already extracted from the user's own words (NEVER ask);
   * ANSWERED_HISTORY — Q/A from earlier rounds (NEVER re-ask);
   * FIELD_VOCABULARY — the ONLY field names an answer may route to.
+  * SYSTEM_CONTEXT — the system's OWN already-decided state (identified
+    ledger, nature), when given: wording context only, never a question.
 
 Reply with ONLY this JSON object (no prose, no markdown):
 
@@ -937,7 +954,13 @@ Rules (any violation discards that question):
   4. "field" is what routes the answer into the books — a question whose field
      is not in FIELD_VOCABULARY is dropped;
   5. TODAY (when given) resolves relative wording — never ask for what it
-     already resolves.
+     already resolves;
+  6. only fields in MISSING_MATERIAL_FACTS are open this round — a
+     question for any other field (even a real vocabulary name) is
+     dropped;
+  7. SYSTEM_CONTEXT values (IDENTIFIED_LEDGER / NATURE) are ALREADY
+     DECIDED — never ask about them; you may NAME the ledger inside a
+     question's wording so the user sees what their answer affects.
 """
 
 
@@ -949,6 +972,7 @@ def _authored_questionnaire_prompt(
     entities: Optional[Dict[str, Any]] = None,
     history: Optional[Sequence[Dict[str, str]]] = None,
     today: str = "",
+    classification: Optional[Any] = None,
 ) -> str:
     """Assemble the authoring prompt (request + facts + vocabulary)."""
     vocabulary = []
@@ -963,6 +987,20 @@ def _authored_questionnaire_prompt(
         "ANSWERED_HISTORY": list(history or []),
         "TODAY": today,
     }
+    # GROUNDING (Option 3): the CALL 2 classification rides WITH the
+    # question — the identified ledger/nature is DECIDED context the model
+    # may name inside a question's wording, never one it may ask about.
+    _system: Dict[str, Any] = {}
+    if classification is not None:
+        _hint = str(getattr(classification, "account_hint_name", "") or "").strip()
+        _code = str(getattr(classification, "account_hint_code", "") or "").strip()
+        if _hint:
+            _system["IDENTIFIED_LEDGER"] = f"{_hint} ({_code})" if _code else _hint
+        _nature = str(getattr(classification, "transaction_nature", "") or "").strip()
+        if _nature:
+            _system["NATURE"] = _nature
+    if _system:
+        payload["SYSTEM_CONTEXT"] = _system
     return (
         f"{_AUTHORED_QUESTIONNAIRE_PROMPT}\n"
         "FIELD_VOCABULARY (the only allowed field names):\n"
@@ -980,6 +1018,7 @@ async def author_questionnaire(
     entities: Optional[Dict[str, Any]] = None,
     history: Optional[Sequence[Dict[str, str]]] = None,
     today: str = "",
+    classification: Optional[Any] = None,
 ) -> Optional[Questionnaire]:
     """The provider WRITES the questionnaire for the open material gaps.
 
@@ -997,6 +1036,7 @@ async def author_questionnaire(
         entities=entities,
         history=history,
         today=today,
+        classification=classification,
     )
     try:
         raw = await client.generate_text_light(prompt)
@@ -1009,7 +1049,14 @@ async def author_questionnaire(
     if not payload:
         log.info("questionnaire.author_rejected", reason="unparseable")
         return None
-    specs = validate_authored_questions(payload.get("questions"), entities or {})
+    specs = validate_authored_questions(
+        payload.get("questions"),
+        entities or {},
+        # APPLICABLE = the plan's own open gaps: a question outside them is
+        # irrelevant this round (or names a field the system itself
+        # DEFAULTS) — vocabulary-valid but NOT_APPLICABLE, dropped.
+        applicable=list(missing_fields or ()),
+    )
     if not specs:
         log.info("questionnaire.author_rejected", reason="no_valid_question")
         return None

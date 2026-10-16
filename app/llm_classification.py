@@ -643,7 +643,14 @@ async def decide(
     client: Any = None,
     timeout: Optional[float] = None,
 ) -> Optional[TransactionClassification]:
-    """The full decision round-trip.
+    """The full decision round-trip — CALL 2 (ACCOUNTING DECISION).
+
+    PROMPT SCOPE (two-call split, ``app/two_call_contracts.py``): this call
+    carries DECISION instructions only — nature vocabulary, candidate
+    accounts, treatment ladder, JSON contract.  Fact extraction, missing-
+    material-facts analysis and question authoring belong to CALL 1
+    (``app/entity_segregation.py`` / ``app/questionnaire.py``) and must
+    never appear here; this prompt must never grow intake rules.
 
     NEVER raises except AssertionError (test no-LLM guards stay loud);
     ANY other failure returns ``None`` → deterministic fallback in the
