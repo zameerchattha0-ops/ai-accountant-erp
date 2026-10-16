@@ -296,6 +296,33 @@ frozen line, and the thresholds may not move to fit results.
 Remediation candidates (each requires a NEW pre-registered experiment, not a
 threshold edit): provider keep-warm/prewarm for the classification path;
 timeout-ladder cap so the stage bounds at < 6 s worst-case; then re-run
+
+### Rollback executed (2026-10-17, pre-registered durable path)
+
+The criterion-2 trigger fired, so the experiment's own rollback procedure
+ran (no production action needed — activation was never granted):
+
+1. Preview env `LLM_CLASSIFICATION_ENABLED` (id `nIWVltcZI7K6THSw`,
+   target `[preview]`) deleted via API — HTTP 200, 0 entries remaining
+   for the key.  No other env touched; provider vars (TH_*/QWEN_*)
+   intentionally left in place (harmless without the flag).
+2. gitSource redeploy from branch tip `1d41f6d` (agent code identical to
+   the experiment sha `230fcdf`; docs-only commits on top):
+   **`dpl_78nABfjqcGgK9BNs1zskXM8jt7Pk`**
+   (`ai-accountant-i65r8h122-…vercel.app`), READY.
+3. Health verified (bypass read): all five flags exactly match the
+   pre-experiment baseline snapshot in the plan's Baseline block —
+   `{"llm_classification_enabled":false,"accounting_reasoning_enabled":
+   false,"semantic_llm_enabled":false,"two_call_runtime_enabled":false,
+   "bounded_understanding_enabled":true}`.
+
+Prior flag-ON deployments (`dpl_6DHCWL2…`, `dpl_Epj6Js9…`, `dpl_ML6VDxne…`)
+remain isolated as evidence artifacts (Vercel keeps them immutable; the
+branch alias now serves the flag-off deployment).  Production: untouched
+throughout (`origin/main` @ `e9ae94c`, prod env never carried the flag).
+Experiment CLOSED.  Re-opening requires a NEW pre-registered experiment
+authorization (keep-warm / timeout-cap remediation candidates in §8).
+
 under a fresh contract.  Production is untouched (`origin/main` @ `e9ae94c`,
 flag never left preview).  Preview rollback: the trigger fired — the
 pre-registered durable path (delete `LLM_CLASSIFICATION_ENABLED` + gitSource

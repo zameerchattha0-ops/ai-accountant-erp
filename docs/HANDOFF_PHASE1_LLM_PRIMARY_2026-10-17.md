@@ -108,9 +108,14 @@ Plus: manual accounting review of ≥ 10 LLM_DECISION sessions.
 > 14-session manual review done, final scoring recorded in the go/no-go
 > doc §8: **criterion 2 rollback line FIRED** (stage p95 7.1 s cold-
 > included vs 6 s) → **NO-GO for production activation**; warm p95 4.7 s,
-> fallback 5.6 %, criteria 1/2b/3/4 pass.  Preview rollback path armed
-> (delete env + redeploy), not executed.  Item 6 boundary HELD throughout
-> (origin/main @ e9ae94c, flag never left preview).
+> fallback 5.6 %, criteria 1/2b/3/4 pass.  **Rollback EXECUTED 2026-10-17**
+> (pre-registered durable path): preview env `LLM_CLASSIFICATION_ENABLED`
+> deleted (id `nIWVltcZI7K6THSw`, HTTP 200, 0 remaining) + gitSource
+> redeploy `dpl_78nABfjqcGgK9BNs1zskXM8jt7Pk` @ `1d41f6d` READY → health
+> flags byte-identical to the pre-experiment all-false baseline.  Flag-ON
+> deployments retained as immutable evidence.  Experiment CLOSED;
+> re-opening = new pre-registered authorization.  Item 6 boundary HELD
+> throughout (origin/main @ e9ae94c, flag never left preview).
 
 1. **Pin criterion-1 population with GPT** (go/no-go doc §Batch 1):
    proposal = eligible ⇔ intent ∉ `_PAYMENT_INTENTS` AND
