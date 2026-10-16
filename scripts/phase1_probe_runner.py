@@ -26,16 +26,57 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".pytest_cache"
 
-# probe: (id, message, canned clarify answers list)
+
+def _env(key: str) -> str:
+    for line in (ROOT / ".env").read_text(encoding="utf-8-sig").splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise SystemExit(f"{key} missing from .env")
+
+
+def login() -> str:
+    """Fresh ES256 access token via password grant (never printed)."""
+    creds = json.loads((CACHE / "probe_login.json").read_text(encoding="utf-8"))
+    url = _env("SUPABASE_URL")
+    anon = _env("SUPABASE_ANON_KEY")
+    req = urllib.request.Request(
+        f"{url}/auth/v1/token?grant_type=password",
+        data=json.dumps(creds).encode(), method="POST",
+        headers={"apikey": anon, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        tok = json.loads(resp.read().decode())
+    return tok["access_token"]
+
+# probe: (id, message, per-field answer prefs).  Pref "~regex" = first
+# option label matching; any other string = free-text fallback; absent
+# field = first option, else NUMERIC_DEFAULTS, else "yes".
+from datetime import date as _date  # noqa: E402
+
+_NUM_DEFAULTS = {
+    "amount": "1200",  # probe sandbox values when the message states none
+    "salvage_value": "0",
+    "useful_life_years": "60",
+    "transaction_date": _date.today().isoformat(),
+}
 SMOKE = [
     ("p1-ordinary-expense",
-     "I spent 450 at Staples on office supplies today.", []),
+     "I spent 450 at Staples on office supplies today.",
+     {"transaction_purpose": "~something else",
+      "settlement_position": "~paid now.*cash"}),
     ("p2-van-purchase",
-     "Bought a delivery van for 8,500 cash from Quick Motors yesterday.", []),
+     "Bought a delivery van for 8,500 cash from Quick Motors yesterday.",
+     {"transaction_purpose": "~equipment",
+      "settlement_position": "~paid now.*cash",
+      "amount": "8500"}),
     ("p3-vague-payment",
-     "Paid some money to Ali yesterday.", ["4,000 for consulting work"]),
+     "Paid some money to Ali yesterday.",
+     {"transaction_purpose": "Consulting services",
+      "settlement_position": "~paid now", "amount": "4000"}),
     ("p4-credit-laptop",
-     "I bought a laptop from ABC Computers on credit.", ["1,200"]),
+     "I bought a laptop from ABC Computers on credit.",
+     {"transaction_purpose": "~equipment",
+      "settlement_position": "~payable",
+      "amount": "1200"}),
 ]
 
 
@@ -47,17 +88,18 @@ def _parse_set_cookie(header: str) -> str:
     return ""
 
 
-def call(url: str, token: str, bypass: str, path: str, body: dict,
-         state: dict) -> tuple[int, dict]:
+def call(url: str, bypass: str, path: str, body: dict,
+         state: dict, _retry: bool = True) -> tuple[int, dict]:
     """POST with Vercel SSE-protection handling: first POST → 307 with a
     _vercel_jwt Set-Cookie; resend to the BARE path (redirect Location)
-    carrying the cookie — the query param alone never clears SSE protection."""
+    carrying the cookie — the query param alone never clears SSE
+    protection.  A 401 refreshes the access token once and retries."""
     full = (f"{url}{path}?x-vercel-protection-bypass={bypass}"
             "&x-vercel-set-bypass-cookie=true")
     bare = f"{url}{path}"
 
     def _send(target: str, cookie: str) -> tuple[int, dict, str]:
-        headers = {"Authorization": f"Bearer {token}",
+        headers = {"Authorization": f"Bearer {state['token']}",
                    "Content-Type": "application/json"}
         if cookie:
             headers["Cookie"] = cookie
@@ -80,7 +122,42 @@ def call(url: str, token: str, bypass: str, path: str, body: dict,
         if sc:
             state["cookie"] = sc
         code, parsed, _ = _send(bare, state.get("cookie", ""))
+    if code == 401 and _retry:
+        state["token"] = login()
+        state.pop("cookie", None)
+        return call(url, bypass, path, body, state, _retry=False)
     return code, parsed
+
+
+def build_answers(body: dict, prefs: dict) -> list[dict]:
+    """Field-routed answers for the FIXED-FORMAT questionnaire: one
+    {field, answer} per open question, preferring the probe's per-field
+    option-regex or free-text preference (see SMOKE)."""
+    import re as _re
+
+    qs = (body.get("questionnaire") or {}).get("questions") or []
+    out: list[dict] = []
+    for q in qs:
+        field = str(q.get("field") or "answer")
+        opts = [o for o in (q.get("options") or []) if isinstance(o, dict)]
+        pref = prefs.get(field)
+        value = None
+        if isinstance(pref, str) and pref.startswith("~"):
+            pat = _re.compile(pref[1:], _re.I)
+            for o in opts:
+                if pat.search(str(o.get("label") or "")):
+                    value = o.get("value")
+                    break
+        if value is None and opts:
+            value = opts[0].get("value")
+        if value is None and isinstance(pref, str):
+            value = pref
+        if value is None and field in _NUM_DEFAULTS:
+            value = _NUM_DEFAULTS[field]
+        if value is None:
+            value = "yes"
+        out.append({"field": field, "answer": str(value)})
+    return out
 
 
 def trim(stage: dict) -> dict:
@@ -97,37 +174,44 @@ def main() -> int:
     ap.add_argument("--batch", default="smoke")
     ap.add_argument("--delay", type=float, default=5.0)
     ap.add_argument("--max-probes", type=int, default=4)
+    ap.add_argument("--only", default="",
+                    help="comma-separated probe ids (e.g. p4-credit-laptop)")
     args = ap.parse_args()
 
-    token = (CACHE / "probe_bearer.txt").read_text(encoding="utf-8").strip()
-    state: dict = {}
+    state: dict = {"token": login()}
     results: list[dict] = []
+    probes = ([p for p in SMOKE if p[0] in args.only.split(",")]
+              if args.only else SMOKE[: args.max_probes])
 
-    for pid, message, answers in SMOKE[: args.max_probes]:
+    for pid, message, prefs in probes:
         rec: dict = {"probe": pid, "message": message, "stages": []}
         t0 = time.time()
-        code, body = call(args.url, token, args.bypass, "/api/ai/execute",
+        code, body = call(args.url, args.bypass, "/api/ai/execute",
                           {"message": message}, state)
         rec["stages"].append({"endpoint": "execute", "http": code, **trim(body)})
         print(f"[{pid}] execute HTTP {code} status={body.get('status')} "
               f"q={str(body.get('question'))[:60]!r}")
 
-        answer_i = 0
-        for _ in range(4):
+        for _ in range(6):
             status = body.get("status")
             sid = body.get("execution_id")
             if status == "AWAITING_CLARIFICATION" and sid:
-                ans = answers[answer_i] if answer_i < len(answers) else "cash"
-                answer_i += 1
+                routed = build_answers(body, prefs)
+                payload = {"session_id": sid,
+                           "answer": routed[0]["answer"] if routed else "yes",
+                           "answers": routed or None}
                 time.sleep(args.delay)
-                code, body = call(args.url, token, args.bypass, "/api/ai/clarify",
-                                  {"session_id": sid, "answer": ans}, state)
+                code, body = call(args.url, args.bypass, "/api/ai/clarify",
+                                  payload, state)
                 rec["stages"].append({"endpoint": "clarify", "http": code,
-                                      "sent": ans, **trim(body)})
-                print(f"[{pid}] clarify HTTP {code} status={body.get('status')}")
+                                      "sent": payload["answer"],
+                                      "sent_fields": [a["field"] for a in routed],
+                                      **trim(body)})
+                print(f"[{pid}] clarify HTTP {code} status={body.get('status')} "
+                      f"fields={[a['field'] for a in routed]}")
             elif status == "AWAITING_CONFIRMATION" and sid:
                 time.sleep(args.delay)
-                code, body = call(args.url, token, args.bypass, "/api/ai/confirm",
+                code, body = call(args.url, args.bypass, "/api/ai/confirm",
                                   {"session_id": sid, "approved": True}, state)
                 rec["stages"].append({"endpoint": "confirm", "http": code,
                                       "sent": "approved=True", **trim(body)})

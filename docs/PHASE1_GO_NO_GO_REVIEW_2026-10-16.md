@@ -35,14 +35,44 @@ ground). The n=14 completed-turn sample is thin: 2b is recorded as an
 operational guardrail, and the review explicitly does not treat a single
 2b breach as fraud-evidence — it triggers investigation with §11 context.
 
+**Frozen measurement contract for criterion 2 (pinned 2026-10-16 by GPT
+review — before p2–p4 scoring, thresholds unchanged):**
+
+| item | decision |
+|---|---|
+| primary metric | classification-stage wall-clock latency |
+| start boundary | entry into the classification stage |
+| end boundary | the corresponding `classification.done` event |
+| included | all elapsed time inside that stage, incl. model call + stage overhead |
+| excluded | unrelated work before/after the classification stage |
+| threshold | p95 > 6 s → rollback (UNCHANGED) |
+| separate guard | end-to-end turn p95 up > 20% vs pre-experiment baseline → rollback |
+
+The 2.9 s decide-call probe is **diagnostic only** — never the operand.
+Operational formula (revised 2026-10-16 after finding the results-mirror
+`timings` dict gets OVERWRITTEN by later classification passes — a ping
+turn showed mirror `classification.done`=140.5 s vs its CLASSIFICATION
+step at 13.0 s; `ai.execution_steps` is therefore authoritative):
+`stage_ms = CLASSIFICATION_step.elapsed_ms − PLANNING_step.elapsed_ms`
+(both from `input_summary.elapsed_ms`, ms since session start; the
+PLANNING step is written at planner completion = hoist-stage entry, the
+CLASSIFICATION step at `classification.done`).  Sessions missing either
+step are reported as UNMEASURED, never silently dropped.  First two
+measurable flag-ON turns: 2.8 s and 4.9 s (both < 6 s; n=2 — NOT a p95).
+Cold and warm observations are recorded SEPARATELY; the acceptance p95 is
+computed over the full eligible-turn population as measured — any
+cold-start exclusion would require explicit pre-scoring justification and
+is NOT in force.
+
 **Option A finding (2026-10-16, live probes, deployment `dpl_ML6VDxne…`):**
-criterion 2's operand is ambiguous — `classification.done` is the FULL
+criterion 2's operand was ambiguous — `classification.done` is the FULL
 stage (DB hint resolution + LLM consult), not the decide CALL the 2.9 s
 ground measured.  Live cold-start turns measured 7.4 / 10.2 / 12.0 s for
 the stage while the LLM decision was successfully used
-(`account_source=LLM_DECISION`).  Before activation, Option A must collect
-warm-turn stage p95 and GPT must pin whether 6 s applies to the stage or
-the call — the threshold itself was not changed unilaterally.
+(`account_source=LLM_DECISION`).  These are WARNING SIGNALS, not a p95
+result: n=3 cold observations cannot establish the required percentile.
+Per the frozen contract above they are retained in the cold bucket and the
+warm population will decide.
 
 ## 4. Sample-size determination (how much traffic the experiment needs)
 
@@ -73,6 +103,34 @@ run's evidence-grade target n=100; interim reviews at n=25 / 50 / 100;
 of activation, the experiment cannot answer criterion 1 and must return to
 this review instead of lingering. Safeguard 3's manual sample (≥10
 `LLM_DECISION` sessions) is feasible at either n.
+
+### Batch 1 — provisional results (2026-10-16, sandbox, UNSCORED)
+
+Four scripted probes, 20 classify-bearing turns on preview deployment
+`dpl_ML6VDxne…` (flag ON, sha `e8790cb`).  **Nothing here is scored**: the
+criterion-1 *population* is not yet pinned (below).
+
+- **Stage latency (frozen contract, v2 formula)**: min 923 ms, median ≈3.4 s,
+  max 5689 ms — **20/20 under the 6 s line** (n=20 < n=50 floor; not a p95
+  result).  Cold-start turns from earlier remain in their own bucket.
+- **Provenance**: `account_source=LLM_DECISION` on 14/20; null on 6/20.
+  Of the nulls, 2 are payment-intent turns the code never consults the
+  layer for (`_PAYMENT_INTENTS` early return, nature null/INFERENCE) —
+  excluding those by that code rule: 4/18 = 22% provisional, **against an
+  un-pinned population**.
+- **Outcomes**: 3 COMPLETED (p1 + p2 verified=true, p3 verified field
+  null), 0 FAILED — criterion 3 untriggered.  p4's first run never
+  terminated (runner sent `"yes"` for `amount`/`transaction_date` →
+  planner `plan_incomplete` loop ×4; runner fixed with numeric defaults +
+  `--only`; rerun in progress).
+- **Open operand — criterion-1 population (MUST be pinned before n=50)**:
+  "decision-eligible turn" is undefined in the plan.  PROPOSAL (code-
+  derived, submitted for GPT pinning, nothing adopted): eligible ⇔ intent
+  ∉ `_PAYMENT_INTENTS` AND the classification call ran with
+  `resolve_account_hints=true`; to make this OBSERVABLE from telemetry,
+  the CLASSIFICATION step would also need to carry `execution_plan.intent`
+  (small additive stamp, same pattern as `account_source`) — awaiting
+  approval, NOT implemented unilaterally.
 
 ## 5. Environment and traffic reality (the actual decision)
 
