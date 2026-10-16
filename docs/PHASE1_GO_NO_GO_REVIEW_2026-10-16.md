@@ -35,6 +35,15 @@ ground). The n=14 completed-turn sample is thin: 2b is recorded as an
 operational guardrail, and the review explicitly does not treat a single
 2b breach as fraud-evidence — it triggers investigation with §11 context.
 
+**Option A finding (2026-10-16, live probes, deployment `dpl_ML6VDxne…`):**
+criterion 2's operand is ambiguous — `classification.done` is the FULL
+stage (DB hint resolution + LLM consult), not the decide CALL the 2.9 s
+ground measured.  Live cold-start turns measured 7.4 / 10.2 / 12.0 s for
+the stage while the LLM decision was successfully used
+(`account_source=LLM_DECISION`).  Before activation, Option A must collect
+warm-turn stage p95 and GPT must pin whether 6 s applies to the stage or
+the call — the threshold itself was not changed unilaterally.
+
 ## 4. Sample-size determination (how much traffic the experiment needs)
 
 Decision-eligible turns = turns whose intent matches the CALL 2 gate
