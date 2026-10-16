@@ -299,7 +299,12 @@ order by sessions_looped desc, total_parks desc;
 with cls as (
   select distinct on (st.execution_session_id)
     st.execution_session_id as sid,
-    st.input_summary::jsonb->>'source' as decision_source
+    -- account_source (Phase 1 telemetry contract, 2026-10-16) marks "the
+    -- model's validated account decision was USED"; legacy rows predate the
+    -- field and fall back to `source`.  `source` alone is insufficient on
+    -- explicit-nature turns, where it keeps the nature's honest provenance.
+    coalesce(st.input_summary::jsonb->>'account_source',
+             st.input_summary::jsonb->>'source') as decision_source
   from ai.execution_steps st
   where st.description = 'CLASSIFICATION'
     and st.input_summary is not null

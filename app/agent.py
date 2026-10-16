@@ -3651,6 +3651,10 @@ async def execute(
             "transaction_nature": classification.transaction_nature,
             "confidence": classification.confidence,
             "source": classification.source,
+            # Phase 1 experiment signal: did the MODEL's validated account
+            # decision actually get used?  `source` alone cannot answer this
+            # (explicit-nature turns keep the nature's provenance).
+            "account_source": classification.account_source,
             "account_hint": classification.account_hint_code,
             "requires_clarification": classification.requires_clarification,
             # trail queries split hint-fed rounds from hint-skipped ones

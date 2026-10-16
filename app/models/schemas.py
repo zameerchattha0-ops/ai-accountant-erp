@@ -493,6 +493,14 @@ class TransactionClassification(BaseModel):
     candidate_accounts: Optional[List[str]] = None
     confidence: str = "LOW"  # HIGH | MEDIUM | LOW
     source: str = "INFERENCE"  # USER_ANSWER | ERP_CONFIGURATION | ITEM_MAPPING | DETERMINISTIC_RULE | INFERENCE
+    # Phase 1 telemetry contract: provenance of the ACCOUNT decision.
+    # "LLM_DECISION" when the model's validated account pick was actually
+    # USED, regardless of where the NATURE came from.  On explicit-nature
+    # turns `source` keeps the nature's honest provenance (USER_ANSWER /
+    # PREFERENCE / …), so `source` alone can never answer "did the LLM
+    # decide?" — experiment criteria read this field instead.  None =
+    # deterministic fallback (layer off / unreachable / reply rejected).
+    account_source: Optional[str] = None  # LLM_DECISION | None
     entity: Optional[str] = None  # the item/subject being classified (e.g. "laptop")
     account_hint_id: Optional[str] = None  # COA account resolved for the nature (validated by the engine)
     account_hint_code: Optional[str] = None

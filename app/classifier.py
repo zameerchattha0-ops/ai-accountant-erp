@@ -830,6 +830,7 @@ async def classify_transaction(
                 message=message, nature_hint=FIXED_ASSET,
             )
             if decision is not None:
+                decision.account_source = "LLM_DECISION"
                 return decision
         account = (
             await _search_account_by_nature(organization_id, FIXED_ASSET, item)
@@ -891,6 +892,12 @@ async def classify_transaction(
                 # Keep the honest provenance of the USER's nature choice —
                 # only the account came from the model.
                 decision.source = explicit_source
+                # …but the ACCOUNT provably came from the model: stamp it,
+                # or the CLASSIFICATION step can never show LLM_DECISION on
+                # exactly this (most common) turn type and the Phase 1
+                # fallback-rate criteria would misread it as a rule-chain
+                # result.  account_source is the experiment's signal.
+                decision.account_source = "LLM_DECISION"
                 decision.confidence = "HIGH"
                 if decision.account_hint_id or decision.requires_clarification:
                     return decision
@@ -1004,6 +1011,7 @@ async def classify_transaction(
             message=message, nature_hint=None,
         )
         if decision is not None:
+            decision.account_source = "LLM_DECISION"
             return decision
 
     # --- 3+4. DETERMINISTIC_RULES (incl. COA item mapping for natures). ---

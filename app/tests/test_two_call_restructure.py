@@ -877,6 +877,10 @@ class TestPhase1ClassificationFlagOn:
             "with the flag ON the model decides nature+account — ahead of "
             "any question (Fix B hoist)"
         )
+        assert cls["account_source"] == "LLM_DECISION", (
+            "the step must also stamp the ACCOUNT-decision provenance — "
+            "the Phase 1 experiment's measurable signal"
+        )
         assert cls["account_hint"] == "1520"
         q_rows = [
             d for _, s, d in recorded["steps"] if s == "QUESTIONNAIRE"
@@ -922,6 +926,97 @@ class TestPhase1ClassificationFlagOn:
             "an unparseable decision must degrade to the deterministic "
             "chain — never block, never half-apply"
         )
+        assert cls.get("account_source") is None, (
+            "a degraded turn must never claim the model decided"
+        )
+
+
+class TestAccountSourceTelemetry:
+    """account_source (Phase 1 telemetry contract, 2026-10-16).
+
+    Found live during Option A preview probes: on explicit-nature turns
+    classifier.py keeps `source` as the nature's honest provenance
+    (USER_ANSWER / PREFERENCE / …) even when the model's validated account
+    pick is USED — so the CLASSIFICATION step could never show LLM_DECISION
+    on the most common turn type, and the registered fallback-rate criterion
+    was unmeasurable.  `account_source` closes that gap.
+    """
+
+    @staticmethod
+    def _patch_layer(monkeypatch, decision_json):
+        from app.config import get_settings
+        from app.llm_classification import CandidateSet
+
+        monkeypatch.setattr(get_settings(), "llm_classification_enabled", True)
+
+        async def _cands(org):
+            return CandidateSet(accounts=[{
+                "id": "a1", "code": "6100", "name": "Office Expense",
+                "account_type": "EXPENSE",
+            }], headings=[])
+
+        monkeypatch.setattr("app.llm_classification.gather_candidates", _cands)
+        monkeypatch.setattr(
+            "app.classifier._search_account_by_nature",
+            _AM(return_value=None),
+        )
+
+        class _Client:
+            async def generate_text_light(self, prompt):
+                return decision_json
+
+        monkeypatch.setattr("app.ai_orchestrator.get_client", lambda: _Client())
+
+    @pytest.mark.asyncio
+    async def test_explicit_nature_keeps_provenance_and_stamps_account_source(
+        self, monkeypatch
+    ):
+        import json as _json
+
+        from app.classifier import classify_transaction
+
+        self._patch_layer(monkeypatch, _json.dumps({
+            "nature": "OPERATING_EXPENSE", "entity": "office supplies",
+            "fit": "EXACT", "account_id": "a1", "confidence": "HIGH",
+            "needs_clarification": False, "question": "", "options": [],
+            "propose_account": None, "rationale": "office supplies expense",
+        }))
+        result = await classify_transaction(
+            organization_id=ORG,
+            intent="record_expense",
+            entities={"transaction_nature": "OPERATING_EXPENSE"},
+            message="I spent 450 at Staples on office supplies today",
+            resolve_account_hints=True,
+            explicit_nature_source="USER_ANSWER",
+        )
+        assert result.source == "USER_ANSWER", (
+            "the nature's honest provenance must not be overwritten"
+        )
+        assert result.account_source == "LLM_DECISION", (
+            "the ACCOUNT provably came from the model — the experiment's "
+            "signal must be stamped regardless of nature provenance"
+        )
+        assert result.account_hint_code == "6100"
+
+    @pytest.mark.asyncio
+    async def test_rejected_decision_never_claims_the_model_decided(
+        self, monkeypatch
+    ):
+        from app.classifier import classify_transaction
+
+        self._patch_layer(monkeypatch, "not json at all")
+        result = await classify_transaction(
+            organization_id=ORG,
+            intent="record_expense",
+            entities={"transaction_nature": "OPERATING_EXPENSE"},
+            message="I spent 450 at Staples on office supplies today",
+            resolve_account_hints=True,
+            explicit_nature_source="USER_ANSWER",
+        )
+        assert result.account_source is None, (
+            "a degraded turn must never claim the model decided"
+        )
+        assert result.source == "USER_ANSWER"
 
 
 

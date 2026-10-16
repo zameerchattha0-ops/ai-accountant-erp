@@ -205,9 +205,17 @@ experiment" values — they are UNDEFINED until this block is filled; do
 not activate first and baseline later.
 
 1. **Fallback rate**: fraction of decision-eligible turns where the flag
-   is ON but `CLASSIFICATION.source != LLM_DECISION` — measured over ≥50
-   eligible turns: **> 15% → roll back** (the layer isn't earning its
-   keep), investigate `llm_classification.reject/unavailable` reasons.
+   is ON but the ACCOUNT decision was not the model's — measured as
+   `COALESCE(CLASSIFICATION.account_source, CLASSIFICATION.source) !=
+   LLM_DECISION` over ≥50 eligible turns: **> 15% → roll back** (the layer
+   isn't earning its keep), investigate `llm_classification.reject/
+   unavailable` reasons.  Measurement-only amendment 2026-10-16: Option A
+   probes exposed that `source` alone can never show `LLM_DECISION` on
+   explicit-nature turns (it keeps the nature's honest provenance by
+  design — classifier.py RC-4a), so the classifier now stamps
+  `account_source` into the CLASSIFICATION step when the model's validated
+  account pick is used.  Threshold UNCHANGED; no experiment data had been
+  scored against it.
 2. **Latency**: classification-stage p95 (phase timings,
    `classification.done`) **> 6 s → roll back**; end-to-end turn p95 up
    **> 20% vs pre-experiment → roll back**.
