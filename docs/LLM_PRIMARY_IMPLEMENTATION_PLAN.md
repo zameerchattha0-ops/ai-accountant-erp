@@ -87,6 +87,22 @@ router syntax, never reworded). (b) LLM assist at party/settlement/
 config-gap gates under the same validators. Call only on ambiguity;
 explicit user facts are never overwritten by inference.
 
+(c) **Fallback-to-clarify at the judgment zone** (design note 2026-10-17,
+discussed mid-Phase-1 — NOT implemented, gated on the Phase 1 decision):
+when the decide layer is OFF/unreachable/rejected and the deterministic
+chain is about to decide a MATERIAL/DURABLE item it cannot anchor
+authoritatively (the residual 4b first-match COA surface), classify
+returns `requires_clarification=True` — a route-confirmation questionnaire
+(fixed asset vs inventory vs consumable vs service) — instead of a
+rule-chain pick.  Rides the existing questionnaire + merge-validation
+machinery; never overwrites an explicit user treatment; budgeted by
+MAX_CLARIFICATION_ROUNDS; the new park owner must be registered for §10b
+watch (baseline 0).  Why not Phase 1: it changes criterion-1 semantics
+(ask-turns count as fallback under the pinned population), and the
+deterministic floor must keep posting well-matched rules during provider
+outages — confirm only where the chain is genuinely uncertain.
+
+
 Questionnaire ownership stays CALL 1 (`two_call_contracts.py`:
 CALL2_FORBIDDEN includes questionnaire) with the decision feeding it as
 `SYSTEM_CONTEXT` — already built this session.

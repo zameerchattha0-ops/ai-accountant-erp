@@ -228,5 +228,79 @@ the `intent` stamp):
 - Outcomes: 4 COMPLETED (3 verified, `5d62a516` verified=null), 0 FAILED
   — criterion 3 untriggered.  IN_PROGRESS rows are the documented
   non-terminating p4 first-run loops (runner fixed in `a610b5b`).
+- Deep-dive `5d62a516` (p3-vague): the probe's default answer routed the
+  vague payment to FIXED_ASSET (probe artifact, not a model error); the
+  layer stamped account_source=LLM_DECISION with requires_clarification
+  and the turn completed INFORMATIONALLY (0 mutations, 4 search tools) —
+  the ambiguity was asked, nothing was posted.  Fail-safe confirmed.
+
+### Batch 2 — scored (2026-10-17, pinned definition, deployment `230fcdf`)
+
+18 sessions (`b2`); the new `intent` stamp was live (no PLANNING join
+needed):
+
+- **Population**: 13 eligible of 18 — excluded 4 `record_payment`
+  (intent clause) + 1 `hints_resolved=false`.
+- **Fallbacks: 0/13** — every eligible turn shows
+  `COALESCE(account_source, source)=LLM_DECISION`.
+- Stage latency: 0.5–4.4 s (all eligible < 6 s).
+- Outcomes: 3 COMPLETED (2 verified=true — `1ad3afcb` fixed-asset rerun,
+  `a75581f0` p1 rerun; `e6238ad4` verified=null informational payment
+  turn), 0 FAILED.
+
+**Cumulative eligible turns: 20 (B1) + 13 (B2) = 33; fallbacks 3 → 9.1 %**
+(provisional, n < 50).
+
+## 8. FINAL SCORING (2026-10-17, all batches, frozen thresholds — none moved)
+
+Full flag-ON window 2026-10-16 19:18Z → 21:45Z, deployments `dpl_ML6VDxne…`
+(pre-instrument, sha < `e8790cb`) + `dpl_6DHCWL2…` (`230fcdf`): **85
+CLASSIFICATION turns** (smoke4/5 11, verify1 3, Batch 1 24, B2 18, B3 14,
+B4 15).  Pinned population: **65 eligible** (excluded 7 `hints_resolved=false`
++ 13 payment intents — exclusions listed per batch above, none silent).
+
+A turn was found that the prior records missed: `035fadff` (smoke4's first
+turn) — provider stall on a cold deployment → timeout ladder → deterministic
+fallback: **stage 128.7 s, turn 145.6 s**, 0 mutations, informational
+completion.  Also `266e316d` stage 45.1 s.  Both predate the `account_source`
+instrument (`e8790cb` committed 20:03:23Z; key-presence test on payloads
+cleanly splits the eras).  The earlier "cold bucket 7.4–12.0 s" note
+understated the true cold tail because it did not include these turns.
+
+| # | criterion | operand (frozen method `percentile_cont`) | result |
+|---|---|---|---|
+| 1 | fallback ≤ 15 % over ≥ 50 eligible | **3/54 = 5.6 %** (measurable era; 11 pre-instrument eligible turns = UNMEASURED-NUMERATOR per the contract's UNMEASURED clause — `source` cannot answer the question pre-`account_source`, which is exactly why the amendment exists) | ✅ PASS |
+| 2 | stage p95 ≤ 6 s, full eligible population, cold included (exclusion NOT in force) | p95 = **7 125 ms** (n=65, 61st/62nd values 6 996/7 157) | ❌ **ROLLBACK LINE FIRED** (> 6 s) |
+| 2b | COMPLETED-turn p95 ≤ 76.8 s | 68.2 s (n=16; the 145.6 s outlier is the same cold stall) | ✅ PASS |
+| 3 | 0 new FAILED / unverified-attributable LLM_DECISION | 0 FAILED; both unverified LLM_DECISION completions (`5d62a516`, `2d7e74ad`) 0-mutation informational — nothing to attribute | ✅ PASS |
+| 4 | classifier_gate repeat-park loops = 0 | §10b over window: no `classifier_gate` row; every owner worst_session_parks = 1 | ✅ PASS |
+
+Manual accounting review (Safeguard 3, ≥ 10 sessions — 14 done): 9 journals
+JE-000146…154, ALL POSTED, balanced, correct accounts vs substance (supplies→
+6100/6191 expense-cash ×4; van→1501 Vehicles/Bank ×4; credit laptop→1500
+Computer Equipment/trade payable ×1); ambiguity turns (`5d62a516`,
+`2d7e74ad`) and the provider-stall turn (`035fadff`) posted **nothing** —
+fail-safe held on every risky path.  One non-LLM observation recorded: the
+p2 runs credit Bank (1013) despite "cash" in the message — settlement
+routing (engine-owned), consistent with the pre-experiment behavior and
+outside the decide layer's authority.
+
+**Verdict: NO-GO for production activation under the pre-registered
+thresholds.**  Criterion 2's rollback line fired on the contract as frozen
+(full eligible population, cold included, `percentile_cont`, 6 s unchanged):
+p95 7.1 s.  The breach is exclusively a **cold-start pathology** — the warm
+population (n=54) has p95 **4.7 s**, fallback 5.6 %, correctness clean, zero
+loops.  The layer works; the first-turns-after-deploy tail does not meet the
+frozen line, and the thresholds may not move to fit results.
+
+Remediation candidates (each requires a NEW pre-registered experiment, not a
+threshold edit): provider keep-warm/prewarm for the classification path;
+timeout-ladder cap so the stage bounds at < 6 s worst-case; then re-run
+under a fresh contract.  Production is untouched (`origin/main` @ `e9ae94c`,
+flag never left preview).  Preview rollback: the trigger fired — the
+pre-registered durable path (delete `LLM_CLASSIFICATION_ENABLED` + gitSource
+redeploy, dry-run-proven) is ready and awaits the user's go (kept armed, not
+executed, so the evidence deployment stays re-verifiable until then).
+
 
 

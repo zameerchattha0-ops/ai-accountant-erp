@@ -102,6 +102,16 @@ Plus: manual accounting review of ≥ 10 LLM_DECISION sessions.
 - Never `Stop-Process python` broadly while background runs are live.
 
 ## 5. OPEN ITEMS (exact next steps, in order)
+> **STATUS 2026-10-17 (end of run): items 1–5 COMPLETE** — population
+> pinned by user (intent ∉ _PAYMENT_INTENTS AND hints_resolved=true),
+> `intent` stamp shipped (`230fcdf`), B1–B4 scored (65 eligible turns),
+> 14-session manual review done, final scoring recorded in the go/no-go
+> doc §8: **criterion 2 rollback line FIRED** (stage p95 7.1 s cold-
+> included vs 6 s) → **NO-GO for production activation**; warm p95 4.7 s,
+> fallback 5.6 %, criteria 1/2b/3/4 pass.  Preview rollback path armed
+> (delete env + redeploy), not executed.  Item 6 boundary HELD throughout
+> (origin/main @ e9ae94c, flag never left preview).
+
 1. **Pin criterion-1 population with GPT** (go/no-go doc §Batch 1):
    proposal = eligible ⇔ intent ∉ `_PAYMENT_INTENTS` AND
    `hints_resolved=true`; requires adding `intent` to the CLASSIFICATION
