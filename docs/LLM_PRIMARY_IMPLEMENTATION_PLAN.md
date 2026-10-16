@@ -186,7 +186,7 @@ and comparison must both be reproducible):**
 | artifact | value | how captured |
 |---|---|---|
 | Pre-experiment deployment id / URL | _pending_ | Vercel deployment detail (retain the exact id rolled back TO) |
-| Code baseline (commit SHA) | _pending_ — **interim artifact: `docs/BASELINE_SNAPSHOT_2026-10-16.md`** (diff hash + per-file SHA1s of the exact uncommitted state validated at 1,165 tests) | `git rev-parse HEAD` once committed; until then the snapshot file is the reference |
+| Code baseline (commit SHA) | **`e383e82`** (`e383e82977c7d99ad397083b2421f33bb74aa1e3`, 2026-10-16) — SHA replaces the interim snapshot as THE baseline; snapshot retained as its own artifact | commit contents = the 12 session-owned files validated at 1,165 tests |
 | Health flags snapshot | _pending_ | `GET /api/health` on the running deployment (four stages false, bounded true) |
 | Telemetry baselines (pre-window, e.g. 7 days) | _pending_ | §10 park rate per owner; §10b worst-session/loop counts for `classifier_gate`; §11 outcome mix per decision source; `classification.done` p95; turn p95 |
 | Suite gate at baseline | 1,165 passing (2026-10-16, local) | `python -m pytest app/tests -q --ignore=app/tests/test_provider_rate_limit_fallback.py` |

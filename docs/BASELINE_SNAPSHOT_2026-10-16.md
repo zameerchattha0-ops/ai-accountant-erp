@@ -1,5 +1,9 @@
 # Baseline snapshot — uncommitted working state (2026-10-16)
 
+> **SUPERSEDED BY COMMIT `e383e82`** (`e383e82977c7d99ad397083b2421f33bb74aa1e3`)
+> — the SHA is now the code baseline; this file is retained as its own
+> artifact so the pre-commit state stays independently verifiable.
+
 Purpose: reproducible identification of the exact source state validated at
 **1,165 passing tests** BEFORE any commit exists — the interim substitute
 for a baseline SHA (checked plan, Baseline & reproducibility block). A
