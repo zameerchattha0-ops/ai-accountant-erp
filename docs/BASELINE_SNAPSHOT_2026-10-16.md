@@ -11,10 +11,27 @@ commit supersedes this file; until then this is the reference artifact.
 
 ## Verification
 
+Diff hash (self-consistent with its capture method — PowerShell `>`
+redirection applies its own encoding; reproduce with the same tooling):
+
 ```powershell
 cd 'e:\Qoder\Ai Accountant\ERP'
 git diff > $env:TEMP\wip_baseline.diff
 git hash-object $env:TEMP\wip_baseline.diff   # must equal: baabde1cac3743462a3351d847bdfc0beee35539
+```
+
+Per-file hashes — BYTE-EXACT against the baseline commit (verified
+2026-10-16: all four OK). NOTE: `git show <sha>:<path> | git hash-object
+--stdin` through a PowerShell pipeline MANGLES bytes (encoding
+conversion) and produces false mismatches — use raw subprocess bytes:
+
+```python
+import subprocess, hashlib
+blob = subprocess.run(
+    ["git", "cat-file", "blob", "e383e82:app/tests/test_llm_adversarial_cases.py"],
+    capture_output=True,
+).stdout
+print(hashlib.sha1(blob).hexdigest())   # 7fff28b1a30f4e69a3397fb1fa563728ad968295
 ```
 
 ## Session-owned changes (the work under this plan)
