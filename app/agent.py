@@ -3659,6 +3659,12 @@ async def execute(
             "requires_clarification": classification.requires_clarification,
             # trail queries split hint-fed rounds from hint-skipped ones
             "hints_resolved": _hints_needed,
+            # Criterion-1 population (pinned 2026-10-17): decision-eligible
+            # ⇔ intent ∉ _PAYMENT_INTENTS AND hints_resolved=true.  Without
+            # the intent on THIS step the scoring SQL cannot tell a payment
+            # early-return from a real fallback — same additive pattern as
+            # account_source; pure telemetry, no behavior change.
+            "intent": execution_plan.intent,
         })
         _phase_elapsed("classification.done", nature=classification.transaction_nature)
 

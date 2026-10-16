@@ -931,6 +931,60 @@ class TestPhase1ClassificationFlagOn:
         )
 
 
+class TestCriterion1PopulationStamp:
+    """`intent` on the CLASSIFICATION step (criterion-1 population, pinned
+    2026-10-17).
+
+    The pinned decision-eligible population is: intent ∉ _PAYMENT_INTENTS
+    AND hints_resolved=true.  Without the plan's intent stamped on THIS
+    step the scoring SQL cannot tell a payment-intent early-return (which
+    never consults the decide layer) from a genuine fallback — the exact
+    ambiguity Batch 1 hit.  Same additive telemetry pattern as
+    account_source: pure observation, zero behavior change.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_classify_step_carries_the_plan_intent(self, monkeypatch):
+        import json as _json
+
+        recorded = _world(monkeypatch)
+
+        class _Author:
+            async def generate_text_light(self, prompt):
+                return _json.dumps({
+                    "intro": "One detail.",
+                    "questions": [{
+                        "field": "transaction_purpose",
+                        "kind": "choice",
+                        "question": "What was this expense for?",
+                        "options": [
+                            {"value": "TRAVEL", "label": "Travel"},
+                            {"value": "RENT", "label": "Rent"},
+                        ],
+                    }],
+                })
+
+        response = await execute(
+            user_message=TRAVELLING,
+            user_id=USER,
+            organization_id=ORG,
+            conversation_id="conv-c1-intent",
+            questionnaire_client=_Author(),
+        )
+        assert response.status == ExecutionStatus.AWAITING_CLARIFICATION
+        cls = [
+            d for _, s, d in recorded["steps"] if s == "CLASSIFICATION"
+        ][0]
+        assert cls["intent"] == "record_expense", (
+            "the CLASSIFICATION step must carry the plan's intent — the "
+            "criterion-1 scoring SQL filters the eligible population on it"
+        )
+        assert cls["hints_resolved"] is True, (
+            "the second eligibility clause is already stamped; together "
+            "with intent it fully determines the pinned population"
+        )
+
+
 class TestAccountSourceTelemetry:
     """account_source (Phase 1 telemetry contract, 2026-10-16).
 

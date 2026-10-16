@@ -168,4 +168,40 @@ separate explicit authorization decision for B. Neither is authorized now.
 - [ ] **user decision:** authorize option A (preview probes), and separately
   option B (merge + production activation). Until both are granted: no flag
   anywhere beyond the cleaned-up preview, `origin/main` untouched.
+- [ ] **user decision:** authorize option A (preview probes), and separately
+  option B (merge + production activation). Until both are granted: no flag
+  anywhere beyond the cleaned-up preview, `origin/main` untouched.
+
+## 7. Criterion-1 population — PINNED (2026-10-17, user pin, before scoring)
+
+The §4 open operand is now closed. Pinned verbatim:
+
+> A probe turn is **decision-eligible** ⇔ `intent ∉ _PAYMENT_INTENTS`
+> (classifier.py: `record_expense_payment, record_payment, record_receipt,
+> record_bank_transfer, record_supplier_payment, record_customer_receipt,
+> record_loan, record_loan_repayment`) **AND** the classification ran with
+> `resolve_account_hints=true` (telemetry: `hints_resolved=true` on the
+> CLASSIFICATION step).  **Fallback** = `COALESCE(account_source, source) !=
+> 'LLM_DECISION'` over the eligible population.  Threshold unchanged: >15% →
+> rollback line.
+
+Pinning decisions recorded:
+
+- **Batch 1 is scored retrospectively** under this definition (user pin) —
+  its 20 turns predate the `intent` stamp, so the scoring SQL joins the
+  PLANNING step's `intent` for those rows.  Nothing is discarded.
+- Early returns inside classify that precede the decide layer (confirmed
+  `create_account`, named-section USER_ANSWER mappings, catalog product
+  matches, item-less requests) remain **eligible-but-fallback** — the
+  conservative reading: it can only raise the measured rate, never
+  manufacture a pass.
+- `hints_resolved=false` turns (proposal/approved paths) are **excluded** —
+  the decide layer is unreachable there; counting them would measure the
+  planner, not the layer.
+
+Implementation shipped with the pin (additive telemetry, no behavior
+change): the CLASSIFICATION step now stamps `intent` (same pattern as
+`account_source`), pinned by `TestCriterion1PopulationStamp` in
+`test_two_call_restructure.py`.
+
 

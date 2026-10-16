@@ -131,7 +131,14 @@ findings in the go/no-go doc as they land; commit+push docs/record work to
 `llm-primary-baseline` (origin/main stays frozen); secrets never printed;
 ask the user (or GPT loop) before threshold/authorization changes.
 
-## Appendix — batch scoring SQL (frozen contract v2)
+## Appendix — batch scoring SQL (frozen contract v2; population columns
+added 2026-10-17 per the criterion-1 pin — stage-latency formula UNCHANGED).
+Eligible-turn filter (criterion 1): `intent NOT IN
+('record_expense_payment','record_payment','record_receipt','record_bank_transfer','record_supplier_payment','record_customer_receipt','record_loan','record_loan_repayment') AND hints_resolved=true`;
+fallback = `COALESCE(account_source, source) != 'LLM_DECISION'`.
+Rows whose CLASSIFICATION payload lacks `intent` (pre-stamp, e.g. Batch 1)
+get it from the session's earliest PLANNING payload via the `pln_intent`
+join — never dropped, never guessed.
 ```sql
 with probe as (
   select s.id as sid, s.started_at from ai.execution_sessions s
@@ -145,21 +152,31 @@ with probe as (
 ), cls as (
   select sid, payload, elapsed_ms as cls_ms from stp where description='CLASSIFICATION'
 ), pln as (
-  select sid, elapsed_ms as plan_ms from stp where description='PLANNING'
+  select sid, elapsed_ms as plan_ms,
+         payload->>'intent' as intent
+  from stp where description='PLANNING'
 ), entry as (
   select c.sid, max(p.plan_ms) as plan_ms
   from cls c join pln p on p.sid = c.sid and p.plan_ms < c.cls_ms group by c.sid
+), pln_intent as (
+  select distinct on (p.sid) p.sid, p.intent
+  from pln p join cls c on c.sid = p.sid
+  where p.intent is not null
+  order by p.sid, p.plan_ms
 ), term as (
   select sid, description as outcome, payload->>'verified' as verified,
          elapsed_ms as turn_ms from stp where description in ('COMPLETED','FAILED')
 )
 select left(c.sid::text,8) as sid, to_char(pr.started_at,'HH24:MI:SS') as started,
+       coalesce(c.payload->>'intent', pi.intent) as intent,
+       c.payload->>'hints_resolved' as hints_resolved,
        c.payload->>'source' as source, c.payload->>'account_source' as account_source,
        c.payload->>'transaction_nature' as nature, c.payload->>'account_hint' as hint,
        case when e.plan_ms is not null then c.cls_ms - e.plan_ms end as stage_ms,
        coalesce(term.outcome,'IN_PROGRESS') as outcome, term.verified, term.turn_ms
 from cls c join probe pr on pr.sid = c.sid
 left join entry e on e.sid = c.sid left join term on term.sid = c.sid
+left join pln_intent pi on pi.sid = c.sid
 order by pr.started_at;
 ```
 
