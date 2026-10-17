@@ -62,6 +62,24 @@ Ceiling history (measured, never silent):
    this workspace), so the number above comes from the Token Harbor fallback
    that actually served the request; the primary entitlement is a separate
    operator action item.
+ * 2026-10-17 (credit note): base=14,213 / primed=19,451 (+186 chars, ~+47
+   input tokens) from the ONE contract added to create_credit_note — it was
+   registered WITHOUT `contract=`, so the contract block never advertised the
+   tool nor its `invoice_number->invoice_id` reference alias, and production
+   "Create Credit note against invoice no.12" attempts (sessions 1063596a /
+   8191f071 / 69897b2d) died at plan_incomplete with no executable spelling
+   shown to the model (same class as the 2026-10-02 fixed-asset contracts).
+   PRIMED ceiling 19,300 → 19,600 WITH the required generation-latency
+   measurement: 6,063 ms for this exact 19.45 KB shape (finish_reason=stop,
+   2,003 answer chars) inside the same 30 s/round timeout — produced by
+   scripts/measure_primed_prompt_latency.py.  Input-side only, static head,
+   prefix-cached after round 1 — same shape as every earlier raise.  HONEST
+   GAP: the primary (qwen3.6-plus) returned HTTP 403 AccessDenied.Unpurchased
+   again — the known entitlement gap from 2026-10-02 — so the number above
+   comes from the Token Harbor fallback (deepseek-v4.1-flash:free) that
+   actually served the request; the primary entitlement remains an operator
+   action item.
+
 
 """
 
@@ -88,19 +106,19 @@ BASE_CEILING = 14_500  # measured 14,076 on 2026-09-28 (Wave A observation
 # contract-primed 17.8 KB prompt inside the same 30 s/round timeout (6-25 s),
 # so a 14.1 KB base stays inside the measured envelope.  Raise only with a
 # fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 19_300  # measured 18,882 on 2026-10-13 (+482 chars / ~120
-# tokens from the FIVE loan-subsystem contracts — record_loan carries the
-# full term/field list the first-call gatherer needs, so trimming it would
-# cost clarification rounds worth far more than the tokens.  +2.6% over the
-# previous 18,400 ceiling stays inside the provider's measured envelope
-# (17.8 s generation inside the 30 s/round timeout leaves ~41% headroom;
-# re-measure with scripts/measure_primed_prompt_latency.py is an A→B gate
-# item).  The previous raise: 18,400 on 2026-10-02 (+405 from the two
-# fixed-asset contracts — see the ceiling history above) and
-# GENERATED in 17,844 ms (finish_reason=stop) inside the 30 s/round timeout,
-# measured by scripts/measure_primed_prompt_latency.py.  The previous raise:
-# 17,811 on 2026-09-28 (Wave A, ~2.1% headroom); its latency re-measurement
-# remains an A→B gate item recorded in E:\Qoder\AUDIT_REPORT.md §8.
+PRIMED_CEILING = 19_600  # measured 19,451 on 2026-10-17 (+186 chars / ~47
+# tokens from the ONE create_credit_note contract — the credit-note
+# invoice_number->invoice_id reference fix; ceiling history above records the
+# 6,063 ms generation-latency measurement for this exact 19.45 KB shape).
+# +2.5% over the previous 19,300 ceiling stays inside the provider's measured
+# envelope (6.1 s generation inside the 30 s/round timeout leaves ~80%
+# headroom; re-measure with scripts/measure_primed_prompt_latency.py is an
+# A→B gate item).  Previous raises: 19,300 on 2026-10-13 (loan contracts,
+# +482 chars — measured 18,882) and 18,400 on 2026-10-02 (+405 from the two
+# fixed-asset contracts, GENERATED in 17,844 ms finish_reason=stop — see the
+# ceiling history above).  The 17,811 measurement of 2026-09-28 (Wave A, ~2.1%
+# headroom) keeps its latency re-measurement as an A→B gate item recorded in
+# E:\Qoder\AUDIT_REPORT.md §8.
 
 MSG = "I received 60000 from FDS Labs Pvt"
 

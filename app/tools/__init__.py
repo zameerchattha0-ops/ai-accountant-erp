@@ -1706,7 +1706,11 @@ register("create_quotation", handler=_create_quotation, read_only=False, descrip
 register("convert_quotation", handler=_convert_quotation, read_only=False, contract=contract_from_callable(quotation_service.convert_quotation), description="Convert an accepted quotation into a sales invoice: creates the invoice linked to the source quotation, posts the receivable journal, and marks the quotation CONVERTED (double conversion is refused)")
 
 # Credit Note
-register("create_credit_note", handler=_create_credit_note, read_only=False, description="Create a credit note")
+# Credit Note — contract mirrors the record_customer_receipt pattern: the
+# signature-derived gate advertises `invoice_number->invoice_id` to the
+# reasoning prompt and lets the declared alias pass validation (resolution
+# itself is DECLARED_REFERENCES, plan_materialization).
+register("create_credit_note", handler=_create_credit_note, read_only=False, contract=contract_from_callable(credit_note_service.create_credit_note), description="Create a credit note")
 
 # Purchase Return
 register("create_purchase_return", handler=_create_purchase_return, read_only=False, description="Create a purchase return")

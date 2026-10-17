@@ -119,6 +119,26 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
             "supplier_id", "supplier", ("supplier_name", "party_name")
         ),
     },
+    "create_credit_note": {
+        "customer_id": ReferenceSpec(
+            "customer_id", "customer", ("customer_name", "party_name")
+        ),
+        # The receipt's production gap (session 3ea794a0: "invoice_number is
+        # not a parameter"), reproduced on the flow where a user speaks an
+        # invoice number MOST: "Create Credit note against invoice no.12"
+        # (sessions 1063596a / 8191f071) and 'Issue credit note against
+        # "INV-000011"' (69897b2d / 89713e4e) all died at plan_incomplete —
+        # intake captured the reference, but nothing could turn it into the
+        # invoice_id the service binds (get_invoice takes ONLY a uuid and no
+        # by-number reader exists).  Declared here the number resolves
+        # read-only, org-scoped, exact-match; same semantics as the receipt:
+        # IF a number is given it must resolve — unresolvable BLOCKS with the
+        # question, never invents, never silently unanchors; absent -> the
+        # note stays unanchored (invoice_id is optional in the service).
+        "invoice_id": ReferenceSpec(
+            "invoice_id", "invoice", ("invoice_number",)
+        ),
+    },
 }
 
 # Line-item references: which key names an item on a document line.  The link is
