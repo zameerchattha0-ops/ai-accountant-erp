@@ -399,10 +399,30 @@ def build_questionnaire(
         base = spec_for(name)
         provided = q_by_field.get(name)
         if provided and provided.strip():
+            text = provided.strip()
+            options = base.options
+            if text != base.question:
+                # The planner may substitute an INTENT-AWARE question for
+                # this field (e.g. the credit-note a/b/c nature question).
+                # The chips must follow the TEXT — production 2026-10-17:
+                # "Create Credit note against invoice no.12" asked a/b/c
+                # (RETURN OF GOODS / PRICE ADJUSTMENT / SERVICE REVERSAL) in
+                # text while the chips showed the bank's purchase 4-way
+                # (Fixed asset / Inventory / Consumable / Service).
+                # options_for_question resolves the family from the text's
+                # own marker; unmatched text keeps the bank defaults.
+                from app.reasoning import options_for_question
+
+                resolved = options_for_question(text)
+                if resolved:
+                    options = tuple(
+                        (str(o.get("value")), str(o.get("label")))
+                        for o in resolved
+                    )
             specs.append(
                 QuestionSpec(
-                    field=name, kind=base.kind, question=provided.strip(),
-                    options=base.options, answer_hint=base.answer_hint,
+                    field=name, kind=base.kind, question=text,
+                    options=options, answer_hint=base.answer_hint,
                     why=base.why,
                 )
             )

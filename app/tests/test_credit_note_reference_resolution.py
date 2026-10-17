@@ -332,18 +332,61 @@ async def test_get_invoice_resolves_by_the_human_number(monkeypatch) -> None:
     assert seen["org"] == str(ORG) and seen["number"] == "INV-000011"
     assert seen["fetched"] == INVOICE_ID
 
-    # 2. unknown number -> honest, named failure; the real fetch never runs
+    # 2. unknown number -> honest, named failure WITH reference candidates
+    #    from the books (references only — never a rendered invoice); the
+    #    real fetch never runs.
+    async def _recent(organization_id, *, customer_id=None, status=None, limit=50):
+        return [
+            {"invoice_number": "INV-000011", "invoice_date": "2026-09-06", "total": 150000.0},
+            {"invoice_number": "INV-000002", "invoice_date": "2026-09-06", "total": 50000.0},
+        ]
+
+    monkeypatch.setattr(invoice_repository, "list_invoices", _recent)
     seen.clear()
-    res = await tools_mod._get_invoice(ORG, invoice_number="INV-999999")
+    res = await tools_mod._get_invoice(ORG, invoice_number="12")
     assert not res.success
-    assert "INV-999999" in (res.error or "")
+    assert "'12'" in (res.error or "")
+    assert "INV-000011" in (res.error or "") and "INV-000002" in (res.error or "")
     assert "fetched" not in seen
 
-    # 3. neither argument -> actionable failure, never KeyError
+    # 3. candidate listing fails -> plain miss error, never a crash
+    async def _boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(invoice_repository, "list_invoices", _boom)
+    res = await tools_mod._get_invoice(ORG, invoice_number="12")
+    assert not res.success
+    assert "Recent invoices" not in (res.error or "")
+
+    # 4. neither argument -> actionable failure, never KeyError
     res = await tools_mod._get_invoice(ORG)
     assert not res.success and "invoice_id or invoice_number" in (res.error or "")
 
-    # 4. the tool description advertises the capability to the model
+    # 5. the tool description advertises the capability to the model
     from app.tools import get_handler
 
     assert "invoice_number" in get_handler("get_invoice")["description"]
+
+
+def test_the_questionnaire_chips_follow_the_intent_aware_text() -> None:
+    """Screenshot bug 2026-10-17: credit-note a/b/c text MUST carry a/b/c
+    chips — never the bank's purchase 4-way."""
+    from app.questionnaire import QUESTION_BANK, build_questionnaire
+    from app.reasoning import nature_question_for_intent
+
+    credit_note_q = nature_question_for_intent("create_credit_note")
+    qn = build_questionnaire(
+        ["transaction_nature"], [credit_note_q], intent="create_credit_note"
+    )
+    spec = next(q for q in qn.questions if q.field == "transaction_nature")
+    assert [o[1] for o in spec.options] == [
+        "Return of goods", "Price adjustment", "Service reversal",
+    ], spec.options
+
+    # the bank's own text keeps the bank's chips (purchase 4-way unchanged)
+    bank_q = QUESTION_BANK["transaction_nature"].question
+    qn2 = build_questionnaire(["transaction_nature"], [bank_q], intent="record_purchase")
+    spec2 = next(q for q in qn2.questions if q.field == "transaction_nature")
+    assert [o[1] for o in spec2.options] == [
+        "Fixed asset", "Inventory (resale stock)", "Consumable / expense", "Service",
+    ]

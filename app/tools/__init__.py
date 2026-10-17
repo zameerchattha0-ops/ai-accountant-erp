@@ -761,14 +761,36 @@ async def _get_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
             organization_id, invoice_number=number
         )
         if not row:
+            # Wire the BOOKS into the retry without rendering anything into
+            # prompts: name the closest REFERENCE candidates (org-scoped,
+            # newest invoices) so the model — or its clarifying question —
+            # can carry a REAL number the user will recognise ("no.12" ->
+            # did you mean INV-000011?).  Numbers + minimal identity only;
+            # the invoice itself only ever arrives as a get_invoice RESULT.
+            try:
+                from app.repositories import invoice_repository
+
+                recent = await invoice_repository.list_invoices(
+                    organization_id, limit=5
+                )
+            except Exception:  # noqa: BLE001 — candidates are best-effort
+                recent = []
+            candidates = "; ".join(
+                f"{r.get('invoice_number')} ({r.get('invoice_date')}, {r.get('total')})"
+                for r in (recent or []) if r.get("invoice_number")
+            )
+            suffix = (
+                f"  Recent invoices in your books: {candidates} — use the "
+                "exact number (e.g. INV-000011) or ask the user which "
+                "invoice they mean; never invent an invoice id."
+                if candidates else
+                " Check the number (e.g. INV-000011) or read the customer "
+                "ledger first; never invent an invoice id."
+            )
             return ToolResult(
                 tool_name="get_invoice",
                 success=False,
-                error=(
-                    f"No invoice numbered {number!r} exists in your books — "
-                    "check the number (e.g. INV-000011) or read the customer "
-                    "ledger first; never invent an invoice id."
-                ),
+                error=f"No invoice numbered {number!r} exists in your books. {suffix}",
             )
         invoice_id = str(row["id"])
     data = await invoice_service.get_invoice(organization_id, invoice_id=uuid.UUID(str(invoice_id)))
