@@ -2496,6 +2496,29 @@ def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
     return prefill
 
 
+def _seed_invoice_reference(preliminary: Any, prefill: Dict[str, Any]) -> None:
+    """Carry the intake's INVOICE reference into the plan (PRELIMINARY literal).
+
+    ``preliminary_extraction`` captured the user's own words — the canonical
+    ``INV-000011`` or the loose "invoice no.12" — but the literal used to die
+    at the PRELIMINARY→PLANNING boundary, so nothing downstream could ever
+    see it: every "credit note against invoice …" turn ended at
+    plan_incomplete (production 2026-10-15/16, sessions 1063596a / 8191f071 /
+    69897b2d / 89713e4e).
+
+    Runs on EVERY path before ``run_planner`` (semantic / bounded understanding
+    / reasoning prefill / none) with setdefault semantics: a value a later
+    stage grounded still wins, and the model's Phase-4 proposal wins over BOTH
+    — its args are what approval-time exact-match resolution validates.  This
+    only guarantees the HINT reaches the planner entities, the Phase-4
+    ``EXTRACTED ENTITIES`` block, and the materialization alias — Python never
+    invents a canonical number.
+    """
+    ref = (((preliminary or {}).get("literals") or {}).get("invoice_number"))
+    if ref and not prefill.get("invoice_number"):
+        prefill["invoice_number"] = str(ref).strip()
+
+
 async def _resolve_gate_questions(
     *,
     organization_id: uuid.UUID,
@@ -3449,6 +3472,11 @@ async def execute(
                 log.warning(
                     "agent.bounded_understanding_failed", error=str(exc)[:200]
                 )
+
+        # PRELIMINARY carry-through: the intake's invoice reference must reach
+        # the plan on every path (see _seed_invoice_reference — production
+        # "credit note against invoice …" turns died without it).
+        _seed_invoice_reference(_preliminary, _ai_prefill)
 
         execution_plan = run_planner(
             user_message,

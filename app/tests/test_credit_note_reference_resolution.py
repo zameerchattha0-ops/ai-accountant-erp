@@ -242,3 +242,108 @@ def test_the_evidence_path_resolves_the_customer_with_zero_queries() -> None:
     assert replacements, "the customer alias should resolve from turn evidence"
     assert call.arguments["customer_id"] == CUSTOMER_ID
     assert "customer_name" not in call.arguments
+
+
+# ---------------------------------------------------------------------------
+# Deeper gaps (diagnosed 2026-10-17, user direction: the LLM FIRST query is
+# now enabled — let IT identify "invoice no.12" and reason to the real
+# "INV-000011"; Python keeps only the exact-match validator).
+# ---------------------------------------------------------------------------
+
+
+def test_preliminary_extraction_captures_loose_and_canonical_references() -> None:
+    """Intake keeps the user's reference — loose AND canonical forms."""
+    from app.accounting_reasoning import preliminary_extraction
+
+    loose = preliminary_extraction(
+        "Create Credit note against invoice no.12"
+    )["literals"]
+    assert loose["document_reference"] == "12"
+    assert loose["invoice_number"] == "12"
+
+    canonical = preliminary_extraction(
+        'Issue credit note against "INV-000011"'
+    )["literals"]
+    assert canonical["document_reference"] == "INV-000011"
+    assert canonical["invoice_number"] == "INV-000011"
+
+    # Strict form: an amount near the word invoice is NOT a reference.
+    assert "invoice_number" not in preliminary_extraction(
+        "Create a credit note against invoice for 50000"
+    )["literals"]
+
+    # Other document kinds keep document_reference but are never seeded as
+    # an invoice number.
+    bill = preliminary_extraction("Record bill BILL-000012")["literals"]
+    assert bill["document_reference"] == "BILL-000012"
+    assert "invoice_number" not in bill
+
+
+def test_the_seed_carries_the_reference_into_the_plan() -> None:
+    """PRELIMINARY -> plan boundary: the literal dies no more."""
+    from app.accounting_reasoning import preliminary_extraction
+    from app.agent import _seed_invoice_reference
+    from app.planner import plan
+
+    preliminary = preliminary_extraction("Create Credit note against invoice no.12")
+    prefill: dict = {}
+    _seed_invoice_reference(preliminary, prefill)
+    assert prefill["invoice_number"] == "12"
+
+    # setdefault semantics: a grounded value from another stage wins.
+    _seed_invoice_reference(preliminary, {"invoice_number": "INV-000011"})
+    # no reference -> no key, no invented value.
+    _seed_invoice_reference({"literals": {}}, prefill={})
+
+    # ...and plan() passes the key through into extracted_entities (generic
+    # setdefault merge — no key whitelist), where the Phase-4 EXTRACTED
+    # ENTITIES block and the materialization alias both read it.
+    p = plan(
+        "Create Credit note against invoice no.12",
+        prefill_entities={"invoice_number": "12"},
+    )
+    assert p.extracted_entities.get("invoice_number") == "12"
+
+
+@pytest.mark.asyncio
+async def test_get_invoice_resolves_by_the_human_number(monkeypatch) -> None:
+    """The by-number reader: exact, org-scoped, never a KeyError guess."""
+    from app import tools as tools_mod
+    from app.repositories import invoice_repository
+    from app.services import invoice_service
+
+    seen = {}
+
+    async def _by_number(organization_id, *, invoice_number: str):
+        seen["org"] = str(organization_id)
+        seen["number"] = invoice_number
+        return {"id": INVOICE_ID, "invoice_number": invoice_number} if invoice_number == "INV-000011" else None
+
+    async def _get(organization_id, *, invoice_id):
+        seen["fetched"] = str(invoice_id)
+        return {"id": str(invoice_id), "invoice_number": "INV-000011"}
+
+    monkeypatch.setattr(invoice_repository, "get_invoice_by_number", _by_number)
+    monkeypatch.setattr(invoice_service, "get_invoice", _get)
+
+    # 1. by number -> exact resolution, org-scoped, canonical id fetched
+    res = await tools_mod._get_invoice(ORG, invoice_number="INV-000011")
+    assert res.success, res.error
+    assert seen["org"] == str(ORG) and seen["number"] == "INV-000011"
+    assert seen["fetched"] == INVOICE_ID
+
+    # 2. unknown number -> honest, named failure; the real fetch never runs
+    seen.clear()
+    res = await tools_mod._get_invoice(ORG, invoice_number="INV-999999")
+    assert not res.success
+    assert "INV-999999" in (res.error or "")
+    assert "fetched" not in seen
+
+    # 3. neither argument -> actionable failure, never KeyError
+    res = await tools_mod._get_invoice(ORG)
+    assert not res.success and "invoice_id or invoice_number" in (res.error or "")
+
+    # 4. the tool description advertises the capability to the model
+    from app.tools import get_handler
+
+    assert "invoice_number" in get_handler("get_invoice")["description"]

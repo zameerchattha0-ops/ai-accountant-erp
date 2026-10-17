@@ -738,7 +738,40 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
     return ToolResult(tool_name="create_invoice", success=True, data=data)
 
 async def _get_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
-    data = await invoice_service.get_invoice(organization_id, invoice_id=uuid.UUID(kw["invoice_id"]))
+    """Fetch by id OR by the human number (the only form a user speaks).
+
+    "invoice no.12" / "INV-000011" resolve read-only, org-scoped, EXACT-match
+    (invoice_repository.get_invoice_by_number) — never a fuzzy guess; a miss
+    returns a named question the model can act on instead of the KeyError
+    this handler used to raise on a number-keyed call (no by-number reader
+    existed — the gap that killed the production credit-note turns).
+    """
+    invoice_id = kw.get("invoice_id")
+    if not invoice_id:
+        number = str(kw.get("invoice_number") or "").strip()
+        if not number:
+            return ToolResult(
+                tool_name="get_invoice",
+                success=False,
+                error="get_invoice needs invoice_id or invoice_number.",
+            )
+        from app.repositories import invoice_repository
+
+        row = await invoice_repository.get_invoice_by_number(
+            organization_id, invoice_number=number
+        )
+        if not row:
+            return ToolResult(
+                tool_name="get_invoice",
+                success=False,
+                error=(
+                    f"No invoice numbered {number!r} exists in your books — "
+                    "check the number (e.g. INV-000011) or read the customer "
+                    "ledger first; never invent an invoice id."
+                ),
+            )
+        invoice_id = str(row["id"])
+    data = await invoice_service.get_invoice(organization_id, invoice_id=uuid.UUID(str(invoice_id)))
     return ToolResult(tool_name="get_invoice", success=True, data=data)
 
 # ===================================================================
@@ -1496,7 +1529,7 @@ register("create_account", handler=_create_account, read_only=False, description
 
 # Invoice
 register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice), description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] — lines are validated and their totals computed by the service (never invent amounts)")
-register("get_invoice", handler=_get_invoice, read_only=True, description="Get invoice details")
+register("get_invoice", handler=_get_invoice, read_only=True, description="Get invoice details — pass invoice_id (uuid) OR invoice_number (the human number, e.g. INV-000011; exact match against this organization's books)")
 
 # Purchase
 register("create_purchase_bill", handler=_create_purchase_bill, read_only=False,

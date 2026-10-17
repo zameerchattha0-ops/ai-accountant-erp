@@ -1738,11 +1738,36 @@ def preliminary_extraction(
         literals["named_parties_or_items_candidates"] = candidates
 
     reference = None
+    invoice_number = None
     for token in re.findall(r"\b(?:INV|BILL|RCPT|PAY|PO|JV)[-/\s]?\d{2,}\b", message, re.I):
         reference = token.strip()
+        # Only an INV-prefixed token IS an invoice number; the other document
+        # kinds keep document_reference alone (a bill ref is never seeded as
+        # an invoice number).
+        if reference.upper().startswith("INV"):
+            invoice_number = reference
         break
+    if not reference:
+        # Loose human phrasing — "invoice no.12" / "invoice number 12" /
+        # "invoice #7". Capture the number as the user's own literal
+        # (labelled PRELIMINARY): the LLM planning stage receives it alongside
+        # the verbatim message and the books, and can reason to the REAL
+        # invoice ("no.12" -> INV-000011); approval-time exact-match
+        # resolution validates whatever number is finally proposed — Python
+        # never guesses a canonical form.  Strict form required (the
+        # no./number/# qualifier) so "invoice for 50000" is never a reference.
+        loose = re.search(
+            r"\binvoice\s+(?:no\.?|number|#)\s*[-#:]?\s*(\d{1,6})\b",
+            message,
+            re.I,
+        )
+        if loose:
+            reference = loose.group(1)
+            invoice_number = reference
     if reference:
         literals["document_reference"] = reference
+    if invoice_number:
+        literals["invoice_number"] = invoice_number
 
     # Candidate subject areas — HINTS ONLY.  They tell the model where to look
     # first; they never decide the treatment, the workflow, or the accounts.
