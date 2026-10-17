@@ -1582,38 +1582,79 @@ def analyze_requirements(
         # the reported bug.  Both wordings keep the words "quantity" and
         # "price" so the answer-merge heuristic (_merge_clarification_answers
         # matches on those keywords) still routes the reply correctly.
+        #
+        # DERIVABLE LINE DETAIL (fix 2026-10-17, production sale session
+        # 7d46349f): "SELL 2 CHAIRS TO GETA LTD FOR 54000" carries the total
+        # AND the quantity — the missing half is arithmetic (54,000 / 2 =
+        # 27,000), not a missing fact.  Treating it as MISSING_AND_REQUIRED
+        # poisoned an otherwise complete request: the continuation plan then
+        # died at the completeness gate and the user hit the "nothing is
+        # missing, please resend" dead-end.  A derivable half is recorded as
+        # a RESOLVED node (never an open question); the final numbers still
+        # pass the confirmation card the user approves.
         if item and (
             entities.get("item_quantity") is None
             or entities.get("item_unit_price") is None
         ):
+            def _num(value: Any) -> Optional[float]:
+                try:
+                    out = float(value)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return None
+                return out if out > 0 else None
+
             has_qty = entities.get("item_quantity") is not None
             has_price = entities.get("item_unit_price") is not None
-            if not has_qty and not has_price:
-                detail = f"'{item}' named without complete line detail"
-                question = (
-                    f"What quantity and unit price apply to '{item}'? "
-                    "(include the discount or tax rate too, if any)"
-                )
-            elif not has_price:
-                detail = f"'{item}' named without a unit price"
-                question = (
-                    f"Unit price for '{item}'? (quantity "
-                    f"{entities.get('item_quantity'):g} already noted — just "
-                    "give the price, plus any discount or tax rate)"
-                )
+            _qty = _num(entities.get("item_quantity"))
+            _price = _num(entities.get("item_unit_price"))
+            _amount = _num(entities.get("amount"))
+            if not has_price and _qty and _amount:
+                nodes.append(DependencyNode(
+                    key="item_line_details", dimension="Line detail",
+                    state=FieldResolutionState.DETERMINISTICALLY_RESOLVABLE,
+                    detail=(
+                        f"unit price {_amount / _qty:,.2f} derived from "
+                        f"amount {_amount:,.2f} / quantity {_qty:g} "
+                        f"for '{item}'"
+                    ),
+                ))
+            elif not has_qty and _price and _amount:
+                nodes.append(DependencyNode(
+                    key="item_line_details", dimension="Line detail",
+                    state=FieldResolutionState.DETERMINISTICALLY_RESOLVABLE,
+                    detail=(
+                        f"quantity {(_amount / _price):g} derived from "
+                        f"amount {_amount:,.2f} / unit price {_price:,.2f} "
+                        f"for '{item}'"
+                    ),
+                ))
             else:
-                detail = f"'{item}' named without a quantity"
-                question = (
-                    f"What quantity of '{item}'? (unit price "
-                    f"{entities.get('item_unit_price'):g} already noted — "
-                    "include any discount or tax rate)"
-                )
-            nodes.append(DependencyNode(
-                key="item_line_details", dimension="Line detail",
-                state=FieldResolutionState.MISSING_AND_REQUIRED,
-                detail=detail,
-                question=question,
-            ))
+                if not has_qty and not has_price:
+                    detail = f"'{item}' named without complete line detail"
+                    question = (
+                        f"What quantity and unit price apply to '{item}'? "
+                        "(include the discount or tax rate too, if any)"
+                    )
+                elif not has_price:
+                    detail = f"'{item}' named without a unit price"
+                    question = (
+                        f"Unit price for '{item}'? (quantity "
+                        f"{entities.get('item_quantity'):g} already noted — just "
+                        "give the price, plus any discount or tax rate)"
+                    )
+                else:
+                    detail = f"'{item}' named without a quantity"
+                    question = (
+                        f"What quantity of '{item}'? (unit price "
+                        f"{entities.get('item_unit_price'):g} already noted — "
+                        "include any discount or tax rate)"
+                    )
+                nodes.append(DependencyNode(
+                    key="item_line_details", dimension="Line detail",
+                    state=FieldResolutionState.MISSING_AND_REQUIRED,
+                    detail=detail,
+                    question=question,
+                ))
 
     # --- 4d. TRANSACTION NATURE --------------
     # Fires for EVERY intent that creates, moves or classifies value,

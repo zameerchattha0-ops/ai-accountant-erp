@@ -4929,6 +4929,7 @@ async def execute(
                     # found, instead of bouncing the user with a question about
                     # fields that have nothing to do with the real blocker
                     # (production 2026-10-01, building session 6b78909c).
+                    _lookup_calls = list(planned_tool_calls)
                     _c_calls, _c_text, _c_evidence = await _continue_lookup_only_plan(
                         client=client,
                         session_id=session_id,
@@ -4946,6 +4947,57 @@ async def execute(
                         llm_text = _c_text or llm_text
                     _continuation_text = _c_text
                     _continuation_evidence = _c_evidence
+                    # ---- BOUNDED RE-PLAN (fix 2026-10-17, sale 7d46349f) ----
+                    # The continuation announced "…then create the invoice" in
+                    # prose but proposed only create_customer — a party-master
+                    # write that cannot deliver record_credit_sale.  ONE
+                    # escalated round demands the financial write explicitly
+                    # (evidence reused, lookups never re-queried); if it still
+                    # fails, the original result stands and the gate + card
+                    # below behave exactly as before.
+                    if (
+                        _c_calls is not None
+                        and _plan_performs_no_financial_mutation(
+                            intent=execution_plan.intent, calls=_c_calls
+                        )
+                        and not [
+                            f
+                            for f in (execution_plan.missing_fields or [])
+                            if (execution_plan.extracted_entities or {}).get(f)
+                            in (None, "", [], {})
+                        ]
+                        and any(
+                            t in FINANCIAL_WRITE_TOOLS
+                            and t not in (excluded_tools or set())
+                            for t in (execution_plan.potential_tools or [])
+                        )
+                    ):
+                        _r_calls, _r_text, _r_evidence = await _continue_lookup_only_plan(
+                            client=client,
+                            session_id=session_id,
+                            execution_plan=execution_plan,
+                            planned_tool_calls=_lookup_calls,
+                            context=context,
+                            user_message=user_message,
+                            organization_id=organization_id,
+                            user_id=user_id,
+                            auth=auth,
+                            excluded_tools=excluded_tools,
+                            previous_calls=_c_calls,
+                            escalated=True,
+                        )
+                        if _r_calls is not None:
+                            if not _plan_performs_no_financial_mutation(
+                                intent=execution_plan.intent, calls=_r_calls
+                            ):
+                                planned_tool_calls = _r_calls
+                                llm_text = _r_text or llm_text
+                            # Even a write-less retry NAMED its missing value —
+                            # prefer that text: the card renders it as the
+                            # question instead of the "resend it" dead-end.
+                            _continuation_text = _r_text or _continuation_text
+                            if _r_evidence:
+                                _continuation_evidence = _r_evidence
             if _plan_performs_no_financial_mutation(
                 intent=execution_plan.intent, calls=planned_tool_calls
             ):
@@ -4978,6 +5030,22 @@ async def execute(
                     )
                     + (f" (and {_remaining} more)" if _remaining else "")
                 )
+                # ---- ROUTE THE REAL OPEN GAPS (fix 2026-10-17, sale 7d46349f)
+                # When the questionnaire is fully answered but REQUIREMENT_
+                # ANALYSIS still holds open user decisions (here: the line
+                # detail), the card MUST ask THOSE.  The "nothing is missing,
+                # please resend" dead-end (kept only for the truly-empty case,
+                # production 2026-10-02 session 5939bf30) left the user with an
+                # answer box and no question while the real gap stayed silent.
+                _open_qs = [q for q in (open_questions or []) if q.get("question")]
+                _open_ask = " ".join(
+                    f"{i + 1}) {q['question']}" for i, q in enumerate(_open_qs[:3])
+                )
+                _required_info = (
+                    list(execution_plan.missing_fields or [])
+                    or [str(q.get("field") or "") for q in _open_qs if q.get("field")]
+                    or ["missing_details"]
+                )
                 # The lookups I just ran are part of the answer: say what they
                 # found (or that they found nothing) instead of pretending the
                 # plan was never started.
@@ -5009,26 +5077,33 @@ async def execute(
                         f"Please answer: {_missing} — or rephrase the request, "
                         "and I will try again."
                         if _missing
-                        else
-                        # NOTHING is missing: the plan simply never contained the
-                        # write step.  Asking for "the remaining details" is a
-                        # dead end the user cannot answer (production 2026-10-02,
-                        # plant session 5939bf30: every value was known and
-                        # REQUIREMENT_ANALYSIS reported open_questions=[], yet the
-                        # run asked for details that did not exist).
-                        "Nothing in your request is missing, so there is no "
-                        "value for you to supply — please resend it, or tell me "
-                        "in your own words how to record it, and I will do that."
+                        else (
+                            # The questionnaire is answered but REQUIREMENT_
+                            # ANALYSIS still holds open decisions — ask THOSE
+                            # (fix 2026-10-17, sale 7d46349f: the line-detail
+                            # gap was silent while the card said nothing was
+                            # missing).
+                            f"Please answer: {_open_ask} — or rephrase the "
+                            "request, and I will try again."
+                            if _open_ask
+                            else
+                            # NOTHING is missing: the plan simply never contained the
+                            # write step.  Asking for "the remaining details" is a
+                            # dead end the user cannot answer (production 2026-10-02,
+                            # plant session 5939bf30: every value was known and
+                            # REQUIREMENT_ANALYSIS reported open_questions=[], yet the
+                            # run asked for details that did not exist).
+                            "Nothing in your request is missing, so there is no "
+                            "value for you to supply — please resend it, or tell me "
+                            "in your own words how to record it, and I will do that."
+                        )
                     )
                 )
                 try:
                     _clarification = await create_clarification(
                         session_id=session_id,
                         question=_question,
-                        required_fields=(
-                            list(execution_plan.missing_fields or [])
-                            or ["missing_details"]
-                        ),
+                        required_fields=_required_info,
                     )
                     _question = _clarification.get("question", _question)
                 except Exception as exc:  # noqa: BLE001 — asking is not optional
@@ -5042,15 +5117,13 @@ async def execute(
                     "intent": execution_plan.intent,
                     "planned_tools": [tc.tool_name for tc in planned_tool_calls],
                     "question": _question[:300],
+                    "open_questions": [q.get("field") for q in _open_qs],
                 })
                 return AgentResponse(
                     status=ExecutionStatus.AWAITING_CLARIFICATION,
                     execution_id=session_id,
                     question=_question,
-                    required_information=(
-                        list(execution_plan.missing_fields or [])
-                        or ["missing_details"]
-                    ),
+                    required_information=_required_info,
                     requires_user_input=True,
                 )
 
@@ -6991,6 +7064,8 @@ async def _continue_lookup_only_plan(
     user_id: uuid.UUID,
     auth: Optional[AuthContext],
     excluded_tools: Optional[set],
+    previous_calls: Optional[Sequence[ToolCall]] = None,
+    escalated: bool = False,
 ) -> Tuple[Optional[List[ToolCall]], str, List[Dict[str, Any]]]:
     """Finish a LOOKUP-ONLY plan instead of asking the user a blind question.
 
@@ -7022,6 +7097,16 @@ async def _continue_lookup_only_plan(
         return None, "", []
     if any(not is_read_only_tool(tc.tool_name) for tc in planned_tool_calls):
         return None, "", []
+    # BOUNDED RE-PLAN (fix 2026-10-17, production sale session 7d46349f):
+    # the FIRST continuation announced "…then create the invoice" in prose
+    # but proposed only create_customer, so the completeness gate bounced a
+    # fully-known request into the "nothing is missing, please resend"
+    # dead-end.  `escalated` is that second round: the lookups already ran
+    # (their evidence is reused, never re-queried) and the directive
+    # explicitly DEMANDS the financial write call.  Exactly one escalated
+    # round exists; a second failure keeps the original result and the gate
+    # + card behave as before.
+    _pre_evidence = list(getattr(context, "pre_executed_lookups", None) or [])
 
     async def _read_only_executor(tool_name: str, args: dict) -> dict:
         if tool_name in (excluded_tools or set()):
@@ -7051,8 +7136,12 @@ async def _continue_lookup_only_plan(
             payload["data"] = result.data
         return payload
 
-    results = await execute_planned_tool_calls(
-        list(planned_tool_calls), _read_only_executor
+    results = (
+        None
+        if escalated and _pre_evidence
+        else await execute_planned_tool_calls(
+            list(planned_tool_calls), _read_only_executor
+        )
     )
 
     # execute_planned_tool_calls returns PLAIN DICTS aligned by index with
@@ -7067,41 +7156,58 @@ async def _continue_lookup_only_plan(
     # then died at this line with no LOOKUP_PREP step ever written).
     evidence: List[Dict[str, Any]] = []
     succeeded: List[str] = []
-    for call, result in zip(planned_tool_calls, results):
-        payload: Dict[str, Any] = result if isinstance(result, dict) else {
-            "success": bool(getattr(result, "success", False)),
-            "error": getattr(result, "error", None),
-            "data": getattr(result, "data", None),
-        }
-        ok = bool(payload.get("success", True))
-        if "data" in payload:
-            records = payload.get("data")
-        else:
-            # the executor merges a dict result's keys into the payload
-            records = {
-                k: v for k, v in payload.items() if k not in ("success", "error")
+    if results is None:
+        # Escalated retry: the first round already ran these lookups — its
+        # evidence (context.pre_executed_lookups) is reused verbatim; no
+        # query is ever repeated on the retry path.
+        for item in _pre_evidence:
+            evidence.append(
+                {
+                    "kind": str(item.get("tool") or ""),
+                    "records": item.get("records"),
+                    "error": item.get("error"),
+                }
+            )
+        succeeded = [e["kind"] for e in evidence if not e.get("error")]
+    else:
+        for call, result in zip(planned_tool_calls, results):
+            payload: Dict[str, Any] = result if isinstance(result, dict) else {
+                "success": bool(getattr(result, "success", False)),
+                "error": getattr(result, "error", None),
+                "data": getattr(result, "data", None),
             }
-        if isinstance(records, dict):
-            records = records.get("records") or records.get("rows") or records
-        if isinstance(records, list):
-            records = records[:25]
-        if ok:
-            succeeded.append(call.tool_name)
-        evidence.append(
-            {
-                "kind": call.tool_name,
-                "records": records if ok else [],
-                "error": None if ok else (payload.get("error") or "lookup failed"),
-            }
-        )
-    await _log_step(session_id, "LOOKUP_PREP", {
-        "intent": execution_plan.intent,
-        "tools": [tc.tool_name for tc in planned_tool_calls],
-        "succeeded": succeeded,
-    })
+            ok = bool(payload.get("success", True))
+            if "data" in payload:
+                records = payload.get("data")
+            else:
+                # the executor merges a dict result's keys into the payload
+                records = {
+                    k: v for k, v in payload.items() if k not in ("success", "error")
+                }
+            if isinstance(records, dict):
+                records = records.get("records") or records.get("rows") or records
+            if isinstance(records, list):
+                records = records[:25]
+            if ok:
+                succeeded.append(call.tool_name)
+            evidence.append(
+                {
+                    "kind": call.tool_name,
+                    "records": records if ok else [],
+                    "error": None if ok else (payload.get("error") or "lookup failed"),
+                }
+            )
+        await _log_step(session_id, "LOOKUP_PREP", {
+            "intent": execution_plan.intent,
+            "tools": [tc.tool_name for tc in planned_tool_calls],
+            "succeeded": succeeded,
+        })
 
     try:
-        context.live_evidence = list(getattr(context, "live_evidence", None) or []) + evidence
+        if not escalated:
+            context.live_evidence = (
+                list(getattr(context, "live_evidence", None) or []) + evidence
+            )
         # The model must be TOLD these calls already ran: this is a PLANNING
         # call (no executor), and the planner's own rules ("search before
         # creating", "search → create → document") otherwise make it re-plan
@@ -7153,16 +7259,39 @@ async def _continue_lookup_only_plan(
                 )
                 if _ents.get(k) not in (None, "", [], {})
             }
-            _msg = (
-                f"{user_message}\n\n"
-                "[INTERNAL DIRECTIVE — not words from the user] "
-                f"Everything required to record this {execution_plan.intent} "
-                f"is already known ({_facts}) and every lookup has already "
-                f"run (see pre_executed_lookups). Do NOT propose any search "
-                f"or get tool again. Propose the write call now — "
-                f"{' or '.join(_write_tools)} — with arguments built from "
-                "those facts."
-            )
+            if escalated:
+                # Escalated round (fix 2026-10-17, sale 7d46349f): the first
+                # continuation announced the invoice in prose but proposed
+                # only create_customer — this directive names its calls and
+                # DEMANDS the write (or an honest "value X is missing" reply,
+                # which the card renders as a real question instead of
+                # executing a hollow plan).
+                _prev = (
+                    ", ".join(tc.tool_name for tc in (previous_calls or []))
+                    or "no tool calls"
+                )
+                _msg = (
+                    f"{user_message}\n\n"
+                    "[INTERNAL DIRECTIVE — not words from the user] Your "
+                    f"previous proposal ({_prev}) contained NO financial "
+                    f"write, so it cannot record this {execution_plan.intent}. "
+                    f"Propose the WRITE call now — {' or '.join(_write_tools)} "
+                    f"— with arguments built from these known facts ({_facts}). "
+                    "Do NOT propose any search or get tool. If a required "
+                    "argument is genuinely unknown, return NO tool calls and "
+                    "name the missing value in your reply."
+                )
+            else:
+                _msg = (
+                    f"{user_message}\n\n"
+                    "[INTERNAL DIRECTIVE — not words from the user] "
+                    f"Everything required to record this {execution_plan.intent} "
+                    f"is already known ({_facts}) and every lookup has already "
+                    f"run (see pre_executed_lookups). Do NOT propose any search "
+                    f"or get tool again. Propose the write call now — "
+                    f"{' or '.join(_write_tools)} — with arguments built from "
+                    "those facts."
+                )
 
     _light = execution_plan.intent in _LIGHT_BUDGET_INTENTS
     result, stall = await _bounded_provider_call(
@@ -7188,7 +7317,10 @@ async def _continue_lookup_only_plan(
     calls = list(result.get("tool_calls", []) or [])
     text = str(result.get("text", "") or "")
     await _log_step(session_id, "PLANNING", {
-        "source": "lookup_continuation_result",
+        "source": (
+            "lookup_continuation_retry_result"
+            if escalated else "lookup_continuation_result"
+        ),
         "intent": execution_plan.intent,
         "tools": [c.tool_name for c in calls],
         "text": text[:400],
