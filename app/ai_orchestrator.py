@@ -126,18 +126,23 @@ def _is_unentitled(exc: Exception) -> bool:
 
 
 class AIOrchestrator:
-    """Dispatches agent LLM calls across an ordered, capability-aware
-    provider chain: Token Harbor (DeepSeek/Mimo, primary) → Qwen → Gemini."""
+    """Dispatches agent LLM calls across the Token Harbor chain ONLY.
+
+    Operator direction 2026-10-17: Qwen and Gemini are REMOVED from every
+    request path — Qwen answers HTTP 403 AccessDenied.Unpurchased on this
+    workspace (measured 2026-10-02), and the Gemini hop produced the
+    uncontrolled cloudflare-HTML-400 failure that killed production sale
+    session 19b2c1c4 (2026-10-17).  Every text/tool/vision request runs
+    deepseek-v4.1-flash:free (thinking OFF) -> mimo-v2.6-flash:free ->
+    mimo-v2.5:free on Token Harbor; no other provider is ever constructed.
+    """
 
     def __init__(self) -> None:
-        self._qwen_clients: Dict[str, Any] = {}  # model -> QwenClient
         self._harbor_clients: Dict[str, Any] = {}  # model -> QwenClient (Token Harbor)
         self._harbor_unavailable: Dict[str, str] = {}  # model -> cached reason
         # (provider, model) pairs that answered HTTP 403 AccessDenied — dead
-        # for the life of this process, never offered again (measured
-        # 2026-10-02: every Qwen model on the workspace).
+        # for the life of this process, never offered again.
         self._unentitled_models: set = set()
-        self._gemini: Optional[Any] = None
         self._health_cache: Dict[str, Any] = {}
         self._health_cached_at: float = 0.0
 
@@ -153,8 +158,10 @@ class AIOrchestrator:
         and key.  Key resolution: env ``TH_API_KEY`` first, Supabase Vault
         second (migration 083 — same service-role-only pattern as Gemini).
         When neither is configured a ProviderError is raised AND CACHED, so
-        an unconfigured environment falls through to the Qwen chain with one
-        cheap miss instead of re-probing the Vault on every request.
+        an unconfigured environment fails honestly with one cheap miss
+        instead of re-probing the Vault on every request — there is no
+        downstream fallback chain any more (2026-10-17: Qwen and Gemini
+        removed from dispatch).
         """
         settings = get_settings()
         if model in self._harbor_clients:
@@ -192,32 +199,24 @@ class AIOrchestrator:
         return self._harbor_clients[model]
 
     def _get_qwen(self, model: Optional[str] = None) -> Any:
-        """Build (once) a QwenClient for *model*. Raises ProviderError
-        if unconfigured. Banned models are refused unconditionally."""
-        settings = get_settings()
-        model = model or settings.qwen_model
-        if model in settings.qwen_banned_set:
-            raise ValueError(f"Model '{model}' is banned from the runtime chain")
-        if model not in self._qwen_clients:
-            from app.qwen_client import QwenClient
+        """REMOVED PATH — Qwen is never dispatched (operator direction
+        2026-10-17).  Kept as an unconditional refusal so a stale caller or
+        cached reference fails honestly instead of resurrecting the chain."""
+        from app.qwen_client import ProviderError
 
-            self._qwen_clients[model] = QwenClient(
-                api_key=settings.qwen_api_key,
-                base_url=settings.qwen_base_url,
-                model=model,
-                temperature=settings.qwen_temperature,
-                max_output_tokens=settings.qwen_max_output_tokens,
-                timeout_seconds=settings.qwen_timeout_seconds,
-            )
-        return self._qwen_clients[model]
+        raise ProviderError(
+            "Qwen is removed from dispatch (2026-10-17): every request goes "
+            "to Token Harbor. Set nothing — the Harbor chain is the chain."
+        )
 
     def _get_gemini(self) -> Any:
-        """Build (once) the GeminiClient. Raises on Vault/config failure."""
-        if self._gemini is None:
-            from app.gemini_client import get_client as get_gemini_client
-
-            self._gemini = get_gemini_client()
-        return self._gemini
+        """REMOVED PATH — Gemini is never dispatched (operator direction
+        2026-10-17); the live Gemini hop failed with an uncontrolled
+        cloudflare-HTML-400 (production session 19b2c1c4)."""
+        raise RuntimeError(
+            "Gemini is removed from dispatch (2026-10-17): every request "
+            "goes to Token Harbor."
+        )
 
     # -------------------------------------------------------------------
     # Chain construction (capability-aware)
@@ -230,38 +229,27 @@ class AIOrchestrator:
         text_chain: Optional[List[str]] = None,
         tier_first: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Ordered candidate list for the request's capability needs.
+        """Ordered candidate list — TOKEN HARBOR ONLY (2026-10-17).
 
-        Each candidate: {"provider", "model", "factory", "capability"}.
-        Text requests traverse the requested Qwen text chain (the standard
-        chain when none is given) then Gemini; vision requests traverse ONLY
-        vision-capable models (an image must never be sent to a text-only
-        model — capability, not fallback).
+        Operator direction: Qwen and Gemini are REMOVED from every request
+        path.  Evidence: the Qwen workspace answers HTTP 403
+        AccessDenied.Unpurchased for every model (measured 2026-10-02), and
+        the Gemini hop produced the uncontrolled cloudflare-HTML-400 that
+        killed production sale session 19b2c1c4 (2026-10-17, stage
+        agent_execute, APIError code 400).  Every text/tool request
+        therefore traverses ``th_text_chain_list`` and every vision request
+        ``th_vision_chain_list`` — nothing else is ever constructed.
 
-        ``text_chain`` is how the MODEL TIERS reach the transport: the
-        accounting-reasoning stage names the deep chain, the mechanical
-        extraction stages name the fast chain. An unknown model name simply
-        produces no candidate for it — the rest of the requested chain, then
-        Gemini, still run.
-
-        ``tier_first`` (default False — no existing caller changes behaviour)
-        skips the Token Harbor primary so an EXPLICITLY requested tier chain
-        runs first. The primary is a THINKING model that spends the output
-        budget on reasoning before any answer tokens; measured live
-        (2026-09-29) it returned empty content on a mechanical intake prompt
-        (finish_reason 'length', 8,466 chars of reasoning, 0 chars of answer,
-        20.4 s). Mechanical callers that name their chain (Stage 3 CALL 1)
-        opt in so the fast tier actually leads; Gemini remains the last
-        resort either way. Ignored when no ``text_chain`` is given.
+        ``text_chain`` / ``tier_first`` are accepted for call-site
+        compatibility and deliberately IGNORED: the requested tier chains
+        name Qwen models, and no request may reach them — the measured
+        Harbor chain (deepseek primary with thinking OFF, then mimo) serves
+        every tier.
         """
         settings = get_settings()
         candidates: List[Dict[str, Any]] = []
 
         if requires_vision:
-            # Token Harbor vision chain — Mimo leads image turns (the user's
-            # image mandate), DeepSeek V4.1's native-multimodal flash follows.
-            # Appended unconditionally: an unconfigured key raises a cached
-            # ProviderError at construction and the chain continues below.
             for model in settings.th_vision_chain_list:
                 candidates.append(
                     {
@@ -271,40 +259,9 @@ class AIOrchestrator:
                         "factory": (lambda m=model: self._get_harbor(m)),
                     }
                 )
-            for model in settings.qwen_vision_chain_list:
-                candidates.append(
-                    {
-                        "provider": "qwen",
-                        "model": model,
-                        "capability": "vision",
-                        "factory": (lambda m=model: self._get_qwen(m)),
-                    }
-                )
-            # Gemini is NOT a vision candidate: GeminiClient.generate_with_tools
-            # does not accept image parts. Document requests must be handled
-            # by the verified vision-capable chain.
         else:
-            # ORDER (2026-10-02 operator direction, backed by measurement):
-            #   1. Token Harbor — DeepSeek V4.1 PRIMARY (thinking OFF) ->
-            #      Mimo 2.6 -> Mimo 2.5 (all free tier, all ANSWERING);
-            #   2. Gemini;
-            #   3. Qwen LAST — every model on that workspace answers HTTP 403
-            #      AccessDenied.Unpurchased (measured 2026-10-02), so it must
-            #      never sit ahead of a provider that works.
-            requested = [m for m in (text_chain or []) if m]
-            # ONE order for every mode.  `tier_first` used to SKIP the Token
-            # Harbor primary because it wasted the budget on hidden reasoning;
-            # that is now solved at the source (th_thinking_off runs the
-            # Harbor chain with thinking OFF), so the requested tier chain no
-            # longer has to lead — and it must NOT lead, because it names Qwen
-            # models that answer 403 AccessDenied.Unpurchased.
             for model in settings.th_text_chain_list:
                 self._offer(candidates, self._harbor_candidate(model))
-            self._offer(candidates, self._gemini_candidate())
-            # Qwen LAST (operator direction 2026-10-02) — dedup against
-            # anything already offered and skip anything known unentitled.
-            for model in (requested or settings.qwen_chain_list):
-                self._offer(candidates, self._qwen_candidate(model))
         return candidates
 
     # -------------------------------------------------------------------
@@ -317,22 +274,6 @@ class AIOrchestrator:
             "model": model,
             "capability": "text_tools",
             "factory": (lambda m=model: self._get_harbor(m)),
-        }
-
-    def _qwen_candidate(self, model: str) -> Dict[str, Any]:
-        return {
-            "provider": "qwen",
-            "model": model,
-            "capability": "text_tools",
-            "factory": (lambda m=model: self._get_qwen(m)),
-        }
-
-    def _gemini_candidate(self) -> Dict[str, Any]:
-        return {
-            "provider": "gemini",
-            "model": None,
-            "capability": "text_tools",
-            "factory": self._get_gemini,
         }
 
     def _offer(
@@ -701,17 +642,16 @@ class AIOrchestrator:
             return self._health_cache
 
         status: Dict[str, Any] = {
-            "primary": settings.ai_primary_provider,
-            "fallback": settings.ai_fallback_provider,
-            "text_chain": settings.qwen_chain_list,
-            "vision_chain": settings.qwen_vision_chain_list,
-            "banned_models": sorted(settings.qwen_banned_set),
+            "primary": "token-harbor",
+            "fallback": "none",
+            "text_chain": settings.th_text_chain_list,
+            "vision_chain": settings.th_vision_chain_list,
             "providers": {},
         }
 
-        # Token Harbor (DeepSeek text + Mimo vision) — PRIMARY when the key
-        # resolves (env TH_API_KEY, else Supabase Vault).  Both models probed
-        # independently, mirroring the Qwen block below.
+        # Token Harbor (DeepSeek text + Mimo vision) — THE chain (operator
+        # direction 2026-10-17: Qwen and Gemini are removed from dispatch;
+        # neither is probed nor reported here).
         harbor_models = list(dict.fromkeys(
             [settings.th_text_model, *settings.th_vision_chain_list]
         ))
@@ -744,52 +684,6 @@ class AIOrchestrator:
         if any(e["configured"] for e in harbor_providers):
             status["primary"] = "token-harbor"
             status["primary_models"] = harbor_models
-
-        # Qwen text chain — each member probed independently.
-        qwen_providers = []
-        for model in settings.qwen_chain_list:
-            try:
-                qwen = self._get_qwen(model)
-                qwen_health = await qwen.health_check()
-                qwen_providers.append(
-                    {
-                        "role": "primary",
-                        "configured": True,
-                        "available": qwen_health["ok"],
-                        "model": model,
-                        "endpoint": qwen.base_url,
-                        "detail": qwen_health["detail"],
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                qwen_providers.append(
-                    {
-                        "role": "primary",
-                        "configured": False,
-                        "available": False,
-                        "model": model,
-                        "detail": str(exc)[:200],
-                    }
-                )
-        status["providers"]["qwen"] = qwen_providers
-
-        # Gemini (fallback)
-        try:
-            gemini = self._get_gemini()
-            status["providers"]["gemini"] = {
-                "role": "fallback",
-                "configured": True,
-                "available": True,
-                "model": gemini.model_name,
-                "detail": "client initialised (Vault key loaded)",
-            }
-        except Exception as exc:  # noqa: BLE001
-            status["providers"]["gemini"] = {
-                "role": "fallback",
-                "configured": False,
-                "available": False,
-                "detail": str(exc)[:200],
-            }
 
         self._health_cache = status
         self._health_cached_at = now
