@@ -116,6 +116,18 @@ Plus: manual accounting review of ≥ 10 LLM_DECISION sessions.
 > deployments retained as immutable evidence.  Experiment CLOSED;
 > re-opening = new pre-registered authorization.  Item 6 boundary HELD
 > throughout (origin/main @ e9ae94c, flag never left preview).
+>
+> **SHIP 2026-10-17 (user-authorized)**: origin/main fast-forwarded
+> e9ae94c → **67eafa3** (two-call hoist + telemetry + intent stamp +
+> credit-note invoice_number/customer ReferenceSpecs + signature-derived
+> create_credit_note contract + PRIMED ceiling 19,600 @ 6,063 ms +
+> intake deep-gap fixes: preliminary `invoice_number` literal incl. loose
+> "invoice no.12", `_seed_invoice_reference` across PRELIMINARY→PLANNING,
+> get_invoice by-number reader).  Production deployment
+> `dpl_3UFJoHYVN4RKoWYgHBabb5jAydHr` READY at sha 67eafa3;
+> **health@ai-accountant-erp.vercel.app = pre-experiment baseline all-false**
+> (llm_classification_enabled=false — Phase 1 NO-GO respected, activation
+> still a separate ungranted decision).  Suite gate: 1178 passed.
 
 1. **Pin criterion-1 population with GPT** (go/no-go doc §Batch 1):
    proposal = eligible ⇔ intent ∉ `_PAYMENT_INTENTS` AND
