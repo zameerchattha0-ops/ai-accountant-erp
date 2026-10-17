@@ -48,3 +48,33 @@ vision) goes to Token Harbor models.
 - Live verification of the sale path after this deploy:
   `.pytest_cache/_sale_verify_20261017.json` (script
   `scripts/_sale_verify_20261017.py`, re-runnable).
+
+## Follow-up commit `4217a10` (2026-10-17) — plan_incomplete dead-end
+
+Production session `7d46349f` (UI turn, WAITING_FOR_USER) exposed three
+stacked defects on the continuation-planning path; all three fixed:
+
+- **C** `app/reasoning.py` — `item_line_details` now DERIVES the missing
+  half (unit price = amount/qty, qty = amount/price) as
+  DETERMINISTICALLY_RESOLVABLE instead of raising a phantom gap.
+- **B** `app/agent.py` card — routes REQUIREMENT_ANALYSIS `open_questions`
+  into the question; the "nothing is missing, please resend" dead-end copy
+  survives only for the truly-empty case (5939bf30).
+- **A** `app/agent.py` — ONE escalated `_continue_lookup_only_plan` round
+  (evidence reused, no re-query, telemetry `lookup_continuation_retry_result`)
+  demands the financial write when the first continuation proposes only
+  party-master steps; second failure falls through to the fixed card.
+
+**Production verification (post-deploy, both paths):**
+- API probe session `1431b9a5` — COMPLETED / VERIFIED "Credit sale and
+  receivable recorded" (4 turns, was 7).
+- USER's own UI re-run session `e45a2807` — REQUIREMENT_ANALYSIS shows
+  `item_line_details: DETERMINISTICALLY_RESOLVABLE, detail "unit price
+  27,000.00 derived from amount 54,000.00 / quantity 2 for 'CHAIRS'",
+  open_questions: []`; PLAN_MATERIALIZATION built
+  `create_invoice(items: qty 2 × unit_price 27000)`; EXECUTING →
+  **COMPLETED, verified=true** — no plan_incomplete park, no dead-end card.
+- Watch-item (pre-existing, separate): CLASSIFICATION labelled the turn
+  `OPERATING_EXPENSE` while RE_EVALUATION merged `GOODS` — nature-label
+  disagreement worth a look; the invoice path executed correctly regardless.
+
