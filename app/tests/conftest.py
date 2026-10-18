@@ -11,6 +11,11 @@ a stub client). The layer's own tests do exactly that.
 import os
 
 os.environ["LLM_CLASSIFICATION_ENABLED"] = "0"
+# The stage-2 enrichment and stage-15 treatment review are also LLM layers:
+# whatever .env enables for the APP, the unit suite stays deterministic and
+# stubs each layer per test (opt-in inside the test body).
+os.environ["LLM_PRELIMINARY_EXTRACTION_ENABLED"] = "0"
+os.environ["TREATMENT_REVIEW_ENABLED"] = "0"
 
 import pytest  # noqa: E402
 
@@ -21,12 +26,16 @@ from app.config import get_settings  # noqa: E402
 get_settings.cache_clear()
 _settings = get_settings()
 _settings.llm_classification_enabled = False
+_settings.llm_preliminary_extraction_enabled = False
+_settings.treatment_review_enabled = False
 
 
 @pytest.fixture(autouse=True)
 def _keep_llm_classification_off_by_default(monkeypatch):
     """Opt-in per test: set the flag True inside the test body/fixture."""
     monkeypatch.setattr(_settings, "llm_classification_enabled", False)
+    monkeypatch.setattr(_settings, "llm_preliminary_extraction_enabled", False)
+    monkeypatch.setattr(_settings, "treatment_review_enabled", False)
 
 
 @pytest.fixture(autouse=True)
