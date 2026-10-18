@@ -19,6 +19,7 @@ import dynamic from "next/dynamic";
 import GeometricShapes from "@/components/background/GeometricShapes";
 import { HERO_TAGLINES } from "@/data/heroTaglines";
 import GlassTaglineCarousel from "@/components/hero/GlassTaglineCarousel";
+import NavyHero from "@/components/hero/NavyHero";
 
 /* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
    the server; renders nothing until the scene is interactive. */
@@ -26,6 +27,20 @@ const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"),
   ssr: false,
   loading: () => null,
 });
+
+/* ------------------------------------------------------------------
+   HERO VARIANT SWITCH — reversible by design (2026-10-14).
+   "navy"  = the premium deep-navy hero (NavyHero.tsx): navy gradient
+             anchor, ~14:1 white headline, teal spent only on the CTA
+             and checks, house-ease staggered entrances.
+   "classic" = the original light glass-clay stage below, preserved
+             VERBATIM (byte-identical) and rendered untouched.
+   Flip back without any code change:
+       NEXT_PUBLIC_HERO_VARIANT=classic   (frontend/.env.local)
+   ------------------------------------------------------------------ */
+const HERO_VARIANT = (
+  process.env.NEXT_PUBLIC_HERO_VARIANT ?? "navy"
+).toLowerCase();
 
 
 /* Premium editorial type: Cinzel = Roman inscriptional display capitals
@@ -656,8 +671,11 @@ export default function WelcomePage() {
       </nav>
 
       {/* ============================================================ */}
-      {/* HERO — surrealist glass-clay light stage                      */}
+      {/* HERO — surrealist glass-clay light stage (classic variant:    */}
+      {/* preserved VERBATIM, rendered only when HERO_VARIANT != navy)  */}
       {/* ============================================================ */}
+      {HERO_VARIANT !== "navy" && (
+      <>
       <section
         ref={heroRef}
         onPointerMove={handlePointerMove}
@@ -954,6 +972,9 @@ export default function WelcomePage() {
           <span className="lp-scrollcue block w-px h-9 bg-gradient-to-b from-teal-500/70 to-transparent" />
         </div>
       </section>
+      </>
+      )}
+      {HERO_VARIANT === "navy" && <NavyHero />}
 
       {/* ============================================================ */}
       {/* FEATURES                                                      */}
