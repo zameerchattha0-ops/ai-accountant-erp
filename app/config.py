@@ -552,6 +552,21 @@ class Settings(BaseSettings):
         default=10.0,
         description="Wall-clock cap for the stage-15 review call.",
     )
+    analytics_agent_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the READ-ONLY analytics agent (app/analytics_agent.py): "
+            "natural-language questions get a targeted, catalog-validated "
+            "read plan (never free SQL, org scope injected by Python), and "
+            "a structured answer whose totals Python computed. Question-form "
+            "messages only; imperatives stay on the mutation pipeline. "
+            "Disabled/provider-down -> the normal pipeline continues."
+        ),
+    )
+    analytics_llm_timeout: float = Field(
+        default=10.0,
+        description="Per-call cap for the analytics planner/synthesizer.",
+    )
     llm_pl_enabled: bool = Field(
         default=False,
         description=(

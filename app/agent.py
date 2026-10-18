@@ -3145,6 +3145,43 @@ async def execute(
             )
         await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
+        # ---- ANALYTICS AGENT (read-only, flag-gated) ----------------------
+        # Odoo-style "ask your books": a question-form message (how much /
+        # what is / show me / list …) with NO imperative verb is routed to
+        # the READ-ONLY analytics agent (catalog-validated targeted queries,
+        # org scope injected by Python, totals computed by Python). Anything
+        # imperative or flag-off continues onto the mutation pipeline below,
+        # completely untouched. Never raises; answer=None falls through.
+        try:
+            from app.analytics_agent import (
+                analytics_gate as _analytics_gate,
+                answer_analytics_question as _analytics_answer,
+                render_markdown as _analytics_render,
+            )
+
+            if _analytics_gate(user_message):
+                _analytics = await _analytics_answer(
+                    organization_id=organization_id,
+                    question=user_message,
+                )
+                await _log_step(
+                    session_id, "ANALYTICS", _analytics["audit"]
+                )
+                if _analytics.get("answer"):
+                    _answer = _analytics["answer"]
+                    await _log_step(session_id, "ANALYTICS_RESULT", {
+                        "answer_type": _answer["answer_type"],
+                        "synth": _answer["synth"],
+                        "results": _answer["results"],
+                    })
+                    return AgentResponse(
+                        status=ExecutionStatus.COMPLETED,
+                        execution_id=session_id,
+                        summary=_analytics_render(_answer),
+                    )
+        except Exception as exc:  # noqa: BLE001 — analytics never breaks a turn
+            log.warning("agent.analytics_failed", error=str(exc)[:200])
+
         _reasoning = None
         # P2-⑫: harvest the background org/period facts (started at entry;
         # normally already finished during the preamble — no added serial

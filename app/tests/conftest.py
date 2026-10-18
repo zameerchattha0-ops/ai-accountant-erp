@@ -16,6 +16,7 @@ os.environ["LLM_CLASSIFICATION_ENABLED"] = "0"
 # stubs each layer per test (opt-in inside the test body).
 os.environ["LLM_PRELIMINARY_EXTRACTION_ENABLED"] = "0"
 os.environ["TREATMENT_REVIEW_ENABLED"] = "0"
+os.environ["ANALYTICS_AGENT_ENABLED"] = "0"
 
 import pytest  # noqa: E402
 
@@ -28,6 +29,7 @@ _settings = get_settings()
 _settings.llm_classification_enabled = False
 _settings.llm_preliminary_extraction_enabled = False
 _settings.treatment_review_enabled = False
+_settings.analytics_agent_enabled = False
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +38,7 @@ def _keep_llm_classification_off_by_default(monkeypatch):
     monkeypatch.setattr(_settings, "llm_classification_enabled", False)
     monkeypatch.setattr(_settings, "llm_preliminary_extraction_enabled", False)
     monkeypatch.setattr(_settings, "treatment_review_enabled", False)
+    monkeypatch.setattr(_settings, "analytics_agent_enabled", False)
 
 
 @pytest.fixture(autouse=True)
