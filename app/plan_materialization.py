@@ -172,6 +172,13 @@ CREATION_TOOL_ROLES: Dict[str, str] = {
 ERROR = "error"
 PREREQUISITE = "prerequisite"
 ALIAS = "alias"
+# Bound from the CONFIRMED accounting treatment (entities / classification) —
+# e.g. transaction_nature and the grounded item lines of an inventory purchase.
+TREATMENT = "treatment"
+
+# Tools whose posting treatment MUST carry the confirmed transaction nature.
+# The deterministic fast path plans exactly this tool for every purchase intent.
+PURCHASE_TREATMENT_TOOLS = frozenset({"create_purchase_bill"})
 
 
 @dataclass
@@ -409,6 +416,151 @@ async def _materialize_items(
             )
 
 
+def _grounded_quantity(entities: Dict[str, Any]) -> Optional[float]:
+    """A quantity the USER stated (or its literal extraction) — never a guess.
+
+    Production 2026-10-18: "Bought 2 tables ON CREDIT …" carried
+    ``item_quantity``/``quantity`` straight from the utterance; a purchase with
+    NO stated quantity must be CLARIFIED, never back-solved from the total.
+    """
+    for key in ("quantity", "item_quantity"):
+        raw = entities.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _grounded_total(args: Dict[str, Any]) -> Optional[float]:
+    for key in ("total", "subtotal"):
+        raw = args.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+async def _apply_purchase_treatment(
+    *,
+    index: int,
+    tool_name: str,
+    args: Dict[str, Any],
+    treatment: Optional[Dict[str, Any]],
+    decisions: List[Decision],
+    blocks: List[str],
+    original: Dict[str, Any],
+) -> None:
+    """Preserve the CONFIRMED accounting treatment through to the tool call.
+
+    Production 2026-10-18 (session a2af6ba1, "Bought 2 tables ON CREDIT FROM
+    SHABBIR FURNITURES"): the classifier answered INVENTORY (HIGH,
+    USER_ANSWER) but the canonical plan carried only ``{notes, total, …}`` —
+    the tool layer never saw the nature, recovered none from the bill text
+    (``tables`` matches neither ``inventory|stock|resale``), and the journal
+    debited General Operating Expense.  The nature is a CONFIRMED fact; it
+    must travel with the call.
+
+    Line synthesis is GROUNDED only: the description and the quantity must
+    come from the user's own confirmed entities.  The unit price is pure
+    arithmetic on grounded values (total / quantity); when the quantity is
+    not grounded this BLOCKS with an explicit question — it never infers a
+    quantity from the total.
+    """
+    if tool_name not in PURCHASE_TREATMENT_TOOLS or not treatment:
+        return
+    nature = str(treatment.get("transaction_nature") or "").strip().upper()
+    if not nature:
+        return
+    if not str(args.get("transaction_nature") or "").strip():
+        args["transaction_nature"] = nature
+        decisions.append(
+            Decision(
+                tool_name=tool_name,
+                index=index,
+                parameter="transaction_nature",
+                role="treatment",
+                requested=nature,
+                status=TREATMENT,
+                original_arguments=dict(original),
+            )
+        )
+    if nature != "INVENTORY":
+        return
+    # An explicit, already-grounded line list is authoritative — never rewritten.
+    existing = args.get("items")
+    if isinstance(existing, list) and any(
+        isinstance(line, dict) and line.get("description") for line in existing
+    ):
+        return
+    entities = dict(treatment.get("entities") or {})
+    description = str(
+        entities.get("item_description") or entities.get("description") or ""
+    ).strip()
+    quantity = _grounded_quantity(entities)
+    total = _grounded_total(args)
+    if not description or quantity is None or total is None:
+        missing = []
+        if not description:
+            missing.append("WHAT item was purchased")
+        if quantity is None:
+            missing.append(f"HOW MANY '{description or 'items'}' were purchased")
+        if total is None:
+            missing.append("the purchase TOTAL")
+        # REFUSAL IS AN AUDITED DECISION, not only a block message: a critical
+        # grounding gap (quantity/description) must stop execution with a
+        # question — it is NEVER filled by inference or by an invalid value.
+        decisions.append(
+            Decision(
+                tool_name=tool_name,
+                index=index,
+                parameter="items",
+                role="line",
+                requested="blocked — ungrounded: " + ", ".join(missing),
+                status=ERROR,
+                original_arguments=dict(original),
+            )
+        )
+        blocks.append(
+            "This purchase is classified as INVENTORY, but the confirmed "
+            "details do not include " + " and ".join(missing) + ". Item lines "
+            "cannot be created without grounded information — please answer to "
+            "continue (no stock item or journal will be recorded until then)."
+        )
+        return
+    unit_price = round(total / quantity, 2)
+    args["items"] = [
+        {
+            "description": description,
+            "quantity": quantity,
+            "unit_price": unit_price,
+        }
+    ]
+    decisions.append(
+        Decision(
+            tool_name=tool_name,
+            index=index,
+            parameter="items",
+            role="line",
+            requested=(
+                f"grounded synthesis: '{description}' x {quantity:g} "
+                f"@ {unit_price:,.2f} (= confirmed total {total:,.2f})"
+            ),
+            status=TREATMENT,
+            original_arguments=dict(original),
+        )
+    )
+
+
 def _batches(
     total: int,
     creation_index: Dict[str, int],
@@ -442,6 +594,7 @@ async def prepare_plan(
     calls: Sequence[ToolCall],
     contracts: Optional[Dict[str, Dict[str, Any]]] = None,
     limit: int = 5,
+    treatment: Optional[Dict[str, Any]] = None,
 ) -> PlanMaterialization:
     """Static, READ-ONLY materialization of an approved plan.
 
@@ -449,6 +602,11 @@ async def prepare_plan(
     references a creation step OF THE SAME APPROVED PLAN will supply, and BLOCKS
     (with an explicit question) on anything else.  Nothing is executed and
     nothing is written here.
+
+    ``treatment`` (optional) carries the CONFIRMED accounting treatment from
+    the classification stage — ``{"intent", "transaction_nature", "entities"}``
+    — so the nature and the grounded item lines travel WITH the tool call
+    instead of being re-derived downstream from the bill's free text.
     """
     from app.tool_contract import validate_arguments
 
@@ -542,6 +700,19 @@ async def prepare_plan(
             blocks.append(
                 _block_message(resolution, tool_name=call.tool_name, name=str(requested))
             )
+
+        # CONFIRMED TREATMENT HAND-OFF: the classifier's nature (and the
+        # grounded item lines it implies) must travel WITH the call — see
+        # _apply_purchase_treatment for the production failure this closes.
+        await _apply_purchase_treatment(
+            index=position,
+            tool_name=call.tool_name,
+            args=args,
+            treatment=treatment,
+            decisions=decisions,
+            blocks=blocks,
+            original=original,
+        )
 
         await _materialize_items(
             organization_id=organization_id,

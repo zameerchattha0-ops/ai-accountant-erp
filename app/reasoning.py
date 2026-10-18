@@ -2110,6 +2110,15 @@ def build_event_profile(
     if intent in _CREDIT_INTENTS:
         affected["party_ledger"] = True
         affected["ar_ap"] = True
+        # CREDIT ACQUISITION/DISPOSAL/DOCUMENT: nothing settles at this event —
+        # settlement is its OWN later event (SETTLEMENT_OUT/IN).  The base
+        # template's cash_bank=True is generic; leaving it set on a credit
+        # purchase tells the model "cash is affected — create cash records",
+        # which invites a fabricated cash line (prompts.py renders True dims
+        # as AFFECTED).  Settlement intents (record_payment/receipt) keep the
+        # template value — their event IS the cash movement.
+        if event not in (EconomicEvent.SETTLEMENT_IN, EconomicEvent.SETTLEMENT_OUT):
+            affected["cash_bank"] = False
     elif intent in _CASH_INTENT_HINTS:
         affected["party_ledger"] = False
         affected["ar_ap"] = False

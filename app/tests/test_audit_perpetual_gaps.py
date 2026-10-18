@@ -105,6 +105,18 @@ def test_purchase_handler_recovers_nature_and_syncs_catalogue(monkeypatch):
     monkeypatch.setattr(tools_mod.inventory_service,
                         "find_or_create_catalogue_product", _sync)
     monkeypatch.setattr(tools_mod, "auto_journal", _auto_journal)
+    # NEW SEAM (posting-boundary invariant, 2026-10-18): the handler now
+    # resolves the Inventory valuation ledger BEFORE any bill/journal write —
+    # stub the read-only resolution so the test never touches the DB.
+    import app.accounting_engine as engine_mod
+
+    async def _inventory_ledger(organization_id, *, hint_account=None):
+        return {"id": str(uuid.uuid4()), "name": "Inventory",
+                "account_type": "ASSET"}
+
+    monkeypatch.setattr(
+        engine_mod, "resolve_inventory_account", _inventory_ledger
+    )
 
     result = asyncio.run(_create_purchase_bill(
         _ORG,

@@ -3126,6 +3126,23 @@ async def execute(
 
         _settings = _get_settings()
         _preliminary = _preliminary_extraction(user_message)
+        # STAGE-2 LLM ENRICHMENT (flag-gated, 2026-10-18): the deterministic
+        # literals are the FLOOR and stay authoritative; the short model call
+        # only fills GAPS (quantity, odd phrasings) under schema validation.
+        # Disabled/unavailable/invalid -> the deterministic extraction ships
+        # unchanged; the audit step is logged only when the model was asked.
+        try:
+            from app.llm_extraction import enrich_preliminary as _enrich_prelim
+
+            _preliminary, _prelim_audit = await _enrich_prelim(
+                user_message=user_message, preliminary=_preliminary
+            )
+            if _prelim_audit.get("llm") not in (None, "skipped_disabled"):
+                await _log_step(session_id, "LITERAL_ENRICHMENT", _prelim_audit)
+        except Exception as exc:  # noqa: BLE001 — enrichment never breaks a turn
+            log.warning(
+                "agent.preliminary_enrichment_failed", error=str(exc)[:200]
+            )
         await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
         _reasoning = None
@@ -5503,10 +5520,26 @@ async def execute(
             )
             from app.tools import tool_contracts as _tool_argument_contracts
 
+            # CONFIRMED TREATMENT HAND-OFF (production 2026-10-18, session
+            # a2af6ba1): the classification's nature and the confirmed entities
+            # must survive into the tool arguments — the accounting engine can
+            # only route an inventory purchase to the Inventory valuation
+            # ledger when it RECEIVES the nature.  Built defensively: nothing
+            # here may ever break the turn.
+            _treatment = {
+                "intent": getattr(execution_plan, "intent", "") or "",
+                "transaction_nature": str(
+                    getattr(classification, "transaction_nature", "") or ""
+                ),
+                "entities": dict(
+                    getattr(execution_plan, "extracted_entities", None) or {}
+                ),
+            }
             materialization = await _prepare_plan(
                 organization_id=organization_id,
                 calls=planned_tool_calls,
                 contracts=_tool_argument_contracts(),
+                treatment=_treatment,
             )
             await _log_step(
                 session_id,
@@ -5544,6 +5577,41 @@ async def execute(
                     question=question,
                     required_information=["resolution"],
                     requires_user_input=True,
+                )
+
+            # ---- STAGE 15: TREATMENT REVIEW (flag-gated, 2026-10-18) --------
+            # An INDEPENDENT bounded reader of the same confirmed facts: it
+            # may FLAG a plan-versus-treatment contradiction and BLOCK with a
+            # question before anything executes.  It never modifies arguments
+            # and never overrides the engine; disabled/unavailable -> skipped
+            # (deterministic safeguards remain authoritative).  Never raises.
+            try:
+                from app.treatment_review import review_plan_treatment as _review
+
+                _treatment_review = await _review(
+                    organization_id=organization_id,
+                    intent=str(getattr(execution_plan, "intent", "") or ""),
+                    classification=classification,
+                    entities=dict(
+                        getattr(execution_plan, "extracted_entities", None) or {}
+                    ),
+                    calls=planned_tool_calls,
+                )
+                await _log_step(
+                    session_id, "TREATMENT_REVIEW", _treatment_review.audit
+                )
+                if _treatment_review.blocked:
+                    # STOP before execution — nothing has been written.
+                    return AgentResponse(
+                        status=ExecutionStatus.AWAITING_CLARIFICATION,
+                        execution_id=session_id,
+                        question=_treatment_review.question[:1500],
+                        required_information=["resolution"],
+                        requires_user_input=True,
+                    )
+            except Exception as exc:  # noqa: BLE001 — review never breaks a turn
+                log.warning(
+                    "agent.treatment_review_failed", error=str(exc)[:200]
                 )
 
             # Execute in dependency order: a call whose id comes from an

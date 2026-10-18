@@ -953,11 +953,65 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
             synced_items.append(item)
         kw["items"] = synced_items
 
+    # ★ INVARIANT PRE-WRITE (production 2026-10-18, session a2af6ba1): an
+    # INVENTORY-classified purchase must be ABLE to debit the Inventory
+    # valuation ledger.  Resolve that ledger BEFORE any bill/journal/stock
+    # write, in three honest steps:
+    #   1. RESOLVE (read-only) — the genuine zero-writes path;
+    #   2. if the chart lacks the ledger, CREATE it as an EXPLICIT, separate
+    #      operation — the result reports inventory_account_created=true
+    #      (a database write is never disguised as a read);
+    #   3. still nothing → fail BEFORE the bill exists: no bill, no journal,
+    #      no stock movement, nothing to roll back.
+    inventory_ledger = None
+    inventory_account_created = False
+    if is_inventory:
+        from app import accounting_engine as _engine
+
+        try:
+            inventory_ledger = await _engine.resolve_inventory_account(
+                organization_id
+            )
+        except Exception as exc:  # noqa: BLE001 — lookup failure ≠ absence
+            log.warning(
+                "tools.create_purchase_bill.inventory_resolve_failed",
+                error=str(exc)[:200],
+            )
+            inventory_ledger = None
+        if not inventory_ledger:
+            try:
+                inventory_ledger = await _engine.ensure_inventory_account(
+                    organization_id
+                )
+                inventory_account_created = inventory_ledger is not None
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "tools.create_purchase_bill.inventory_ensure_failed",
+                    error=str(exc)[:200],
+                )
+                inventory_ledger = None
+        if not inventory_ledger:
+            return ToolResult(
+                tool_name="create_purchase_bill",
+                success=False,
+                error=(
+                    "INVENTORY purchase refused: the chart of accounts has no "
+                    "postable 'Inventory' ASSET ledger and one could not be "
+                    "created. NOTHING was recorded — no bill, no journal, no "
+                    "stock movement. Create an Inventory asset account, then "
+                    "repeat the purchase."
+                ),
+            )
+
     data = await purchase_service.create_purchase_bill(organization_id=organization_id, **kw)
     # C3+C4: Atomic document + journal creation
     amount = float(data.get("total", 0))
     if catalogue_notes:
         data["catalogue_notes"] = catalogue_notes
+    if inventory_account_created:
+        # HONEST WRITE DISCLOSURE: the Inventory ledger creation above WAS a
+        # database write — it is reported, never disguised as a read.
+        data["inventory_account_created"] = True
     if amount > 0:
         journal_result = await auto_journal(
             organization_id=organization_id,
@@ -978,9 +1032,64 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
         # immediately instead of leaving a DRAFT journal that verification
         # would still call "balanced → VERIFIED". Deterministic backend
         # calls — never an LLM decision.
-        # prepare_journal returns {"entry": <row>, ...} — DB contract first.
+        # prepare_journal returns {"entry": <row>, "lines": [...]} — DB contract first.
         prepared = journal_result.get("journal_entry") or {}
         entry = prepared.get("entry") or {}
+        if entry.get("id") and is_inventory:
+            # ★ POSTING INVARIANT (fail closed) — verify the ACTUAL debit line
+            # of the PREPARED entry.  An INVENTORY-classified purchase may
+            # NEVER become a posted operating expense because metadata was
+            # lost somewhere upstream: if the debit is not the Inventory
+            # valuation ledger, this entry is NOT posted, ever.
+            prepared_lines = prepared.get("lines") or []
+            debit_ids = {
+                str(line.get("account_id"))
+                for line in prepared_lines
+                if float(line.get("debit") or 0) > 0
+            }
+            expected = str(inventory_ledger.get("id")) if inventory_ledger else ""
+            if not prepared_lines or expected not in debit_ids:
+                # Cleanup ONLY where supported: a DRAFT entry may be deleted
+                # (the DB guard protects POSTED/reversed entries only).  A
+                # cleanup failure is reported honestly — never swallowed.
+                cleanup = "not attempted"
+                try:
+                    from app.database import delete_one as _delete_one
+
+                    await _delete_one(
+                        "journal_entries",
+                        row_id=uuid.UUID(str(entry["id"])),
+                        organization_id=organization_id,
+                    )
+                    cleanup = "draft deleted"
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    cleanup = f"draft DELETE FAILED: {str(cleanup_exc)[:160]}"
+                    log.warning(
+                        "tools.create_purchase_bill.invariant_draft_cleanup_failed",
+                        entry_id=str(entry.get("id")),
+                        error=str(cleanup_exc)[:200],
+                    )
+                log.warning(
+                    "tools.create_purchase_bill.posting_invariant_refused",
+                    entry_id=str(entry.get("id")),
+                    expected_inventory_account=expected,
+                    prepared_debit_accounts=sorted(debit_ids),
+                    cleanup=cleanup,
+                )
+                return ToolResult(
+                    tool_name="create_purchase_bill",
+                    success=False,
+                    error=(
+                        "POSTING INVARIANT REFUSED: the journal for this "
+                        "INVENTORY purchase would debit "
+                        f"{sorted(debit_ids) or 'no debit line'} instead of the "
+                        f"Inventory valuation ledger {expected or '(unresolved)'}"
+                        f". The entry was NOT posted ({cleanup}). The bill "
+                        "record exists but is NOT journalised or verified — "
+                        "do not treat this transaction as recorded; report it "
+                        "for reconciliation."
+                    ),
+                )
         if entry.get("id"):
             try:
                 entry_id = uuid.UUID(entry["id"])

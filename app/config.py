@@ -516,6 +516,42 @@ class Settings(BaseSettings):
             "parking the request."
         ),
     )
+    llm_preliminary_extraction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the SHORT LLM enrichment of the PRELIMINARY EXTRACTION "
+            "(stage 2, app/llm_extraction.py). The deterministic literal "
+            "regexes stay the FLOOR: the model only FILLS GAPS (quantity, "
+            "odd phrasings) and can never overwrite a literal the rules "
+            "already extracted, never interpret treatment, never choose "
+            "accounts. Disabled/unavailable/invalid -> the deterministic "
+            "extraction ships unchanged."
+        ),
+    )
+    llm_preliminary_extraction_timeout: float = Field(
+        default=8.0,
+        description=(
+            "Wall-clock cap for the stage-2 enrichment call — a slow provider "
+            "degrades to the deterministic extraction, never blocks the turn."
+        ),
+    )
+    treatment_review_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the BOUNDED plan-versus-treatment review (stage 15, "
+            "app/treatment_review.py): a short LLM call that only FLAGS "
+            "contradictions between the confirmed facts (stages 1-5) and the "
+            "canonical plan, and may BLOCK a posting with a question. It "
+            "never invents facts, never modifies arguments, and never "
+            "overrides the accounting engine — the deterministic materializer "
+            "and the posting invariant remain authoritative. Unavailable/"
+            "disabled -> skipped, audited, correctness unaffected."
+        ),
+    )
+    treatment_review_timeout: float = Field(
+        default=10.0,
+        description="Wall-clock cap for the stage-15 review call.",
+    )
     llm_pl_enabled: bool = Field(
         default=False,
         description=(
