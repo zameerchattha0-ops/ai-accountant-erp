@@ -567,6 +567,21 @@ class Settings(BaseSettings):
         default=10.0,
         description="Per-call cap for the analytics planner/synthesizer.",
     )
+    llm_router_enabled: bool = Field(
+        default=False,
+        description=(
+            "LLM-FIRST message routing: EVERY user message is classified by "
+            "a short bounded call into 'analytics' (answer a question from "
+            "existing data) or 'record' (identify nature/accounts and record "
+            "a transaction). The deterministic question/imperative gate is "
+            "the FALLBACK when this is off or the model is unavailable - "
+            "routing never blocks a turn and 'record' wins when uncertain."
+        ),
+    )
+    llm_router_timeout: float = Field(
+        default=6.0,
+        description="Wall-clock cap for the routing call.",
+    )
     llm_pl_enabled: bool = Field(
         default=False,
         description=(

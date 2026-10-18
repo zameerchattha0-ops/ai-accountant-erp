@@ -88,16 +88,9 @@ _IMPERATIVE_RE = re.compile(
 )
 
 
-def analytics_gate(question: str) -> bool:
-    """Deterministic routing gate: question-form AND NOT an imperative.
-
-    The normal mutation pipeline stays untouched for anything imperative -
-    this path can only ever READ.
-    """
-    from app.config import get_settings
-
-    if not getattr(get_settings(), "analytics_agent_enabled", False):
-        return False
+def _pattern_gate(question: str) -> bool:
+    """Pure pattern: question-form AND NOT an imperative. No flags - this is
+    the ROUTING judgement, independent of feature availability."""
     text = (question or "").strip()
     if not text or not _QUESTION_RE.search(text):
         return False
@@ -109,6 +102,16 @@ def analytics_gate(question: str) -> bool:
         text.strip(), flags=re.I,
     )
     return not _IMPERATIVE_RE.search(body)
+
+
+def analytics_gate(question: str) -> bool:
+    """Deterministic gate (feature switch + pattern) - kept as the direct
+    contract and as the documented fallback shape."""
+    from app.config import get_settings
+
+    if not getattr(get_settings(), "analytics_agent_enabled", False):
+        return False
+    return _pattern_gate(question)
 
 
 def validate_plan(payload: Any) -> tuple:
@@ -485,4 +488,71 @@ def render_markdown(answer: Dict[str, Any]) -> str:
             lines.append(f"_{c}_")
     lines.append(f"\n_Data as of {answer.get('data_as_of', '?')}_")
     return "\n".join(lines)
+
+
+
+# ---------------------------------------------------------------------------
+# LLM-FIRST ROUTING: the model classifies EVERY message; the deterministic
+# gate above is only the FALLBACK (flag off / provider down / invalid reply).
+# ---------------------------------------------------------------------------
+
+_ROUTER_RULES = (
+    "You are a message ROUTER for an accounting app. Reply with ONLY JSON:\n"
+    '{"route": "analytics" | "record", "reason": "<one short sentence>"}\n'
+    'RULES: "analytics" = the user ASKS A QUESTION about data that already '
+    'exists (reporting, totals, lists, balances - how much / what is / show '
+    'me / list ...): they want an ANSWER and nothing may be recorded. '
+    '"record" = the user states or commands a BUSINESS TRANSACTION to be '
+    'recorded or modified (bought, sold, paid, received, invoice, expense, '
+    'credit purchase, create, update, delete): the system must identify the '
+    'nature/accounts and record it. Past-tense questions about what already '
+    'happened ("how much did I pay X") are analytics. When genuinely '
+    'uncertain, choose "record" - the recording pipeline has its own '
+    'clarifications and confirmation.'
+)
+
+
+async def route_message(
+    *,
+    question: str,
+    client: Any = None,
+    timeout: Optional[float] = None,
+) -> tuple:
+    """LLM-first routing for every user message -> ("analytics"|"record",
+    audit).  Never raises; falls back to the deterministic gate on flag-off,
+    provider failure, or an invalid reply - so routing NEVER blocks a turn.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    gate = "analytics" if _pattern_gate(question) else "record"
+    audit: Dict[str, Any] = {"stage": "routing", "source": "fallback_gate"}
+    if not getattr(settings, "llm_router_enabled", False):
+        return gate, audit
+    try:
+        if client is None:
+            from app.ai_orchestrator import get_client
+
+            client = get_client()
+        t = timeout or getattr(settings, "llm_router_timeout", 6.0)
+        raw = await asyncio.wait_for(
+            client.generate_text_light(prompt=(
+                f"{_ROUTER_RULES}\n\nMESSAGE: {(question or '')[:1500]}"
+            )),
+            timeout=t,
+        )
+        payload = _extract_json(str(raw or ""))
+        route = str((payload or {}).get("route") or "").strip().lower()
+        if route in ("analytics", "record"):
+            audit = {
+                "stage": "routing", "source": "llm", "route": route,
+                "reason": str((payload or {}).get("reason") or "")[:160],
+            }
+            return route, audit
+        audit["source"] = "fallback_gate_invalid_reply"
+    except Exception as exc:  # noqa: BLE001 - routing never breaks a turn
+        audit["source"] = "fallback_gate_unavailable"
+        audit["error"] = str(exc)[:160]
+        log.warning("routing.llm_unavailable", error=str(exc)[:160])
+    return gate, audit
 

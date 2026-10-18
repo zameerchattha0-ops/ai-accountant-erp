@@ -313,3 +313,91 @@ def test_empty_state_is_honest(monkeypatch):
     assert "No purchase bills" in out["answer"]["headline"]
     assert out["answer"]["caveats"]
 
+
+
+# ---------------------------------------------------------------------------
+# 6 - LLM-FIRST ROUTING (the model decides; gate is FALLBACK only)
+# ---------------------------------------------------------------------------
+
+def test_router_flag_off_uses_deterministic_gate(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=False)
+    route, audit = _run(route_message(
+        question="What is my cash balance?",
+        client=AssertionError("must not be called"),
+    ))
+    assert route == "analytics" and audit["source"] == "fallback_gate"
+    route, _ = _run(route_message(
+        question="Record a purchase of 2 tables",
+        client=AssertionError("must not be called"),
+    ))
+    assert route == "record"
+
+
+def test_router_llm_decides_analytics_over_gate(monkeypatch):
+    """The LLM overrides the gate: an imperative-looking phrasing that is
+    really a report question goes to analytics."""
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient([json.dumps(
+        {"route": "analytics", "reason": "asking for a past total"})])
+    route, audit = _run(route_message(
+        question="How much did I pay Shabbir last week?", client=client))
+    assert route == "analytics"
+    assert audit == {"stage": "routing", "source": "llm",
+                     "route": "analytics",
+                     "reason": "asking for a past total"}
+
+
+def test_router_llm_decides_record_over_gate(monkeypatch):
+    """The LLM overrides the gate the other way: a question-form phrasing
+    that is really a command to record goes to the mutation pipeline."""
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient([json.dumps(
+        {"route": "record", "reason": "wants a new bill recorded"})])
+    route, audit = _run(route_message(
+        question="Can you add the 12000 laptop bill from Nita?", client=client))
+    assert route == "record" and audit["source"] == "llm"
+
+
+def test_router_invalid_reply_falls_back_to_gate(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient(["no json here"])
+    route, audit = _run(route_message(
+        question="Show me my unpaid bills", client=client))
+    assert route == "analytics"
+    assert audit["source"] == "fallback_gate_invalid_reply"
+
+
+def test_router_provider_failure_falls_back_to_gate(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+
+    class _Boom:
+        async def generate_text_light(self, prompt):
+            raise RuntimeError("provider down")
+
+    route, audit = _run(route_message(
+        question="Record an expense of 500", client=_Boom()))
+    assert route == "record"
+    assert audit["source"] == "fallback_gate_unavailable"
+
+
+def test_router_prompt_is_bounded_and_carries_only_the_message(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient([json.dumps({"route": "record", "reason": "x"})])
+    _run(route_message(question="Record 2 tables", client=client))
+    prompt = client.prompts[0]
+    assert "MESSAGE: Record 2 tables" in prompt
+    assert "ONLY JSON" in prompt
+    assert len(prompt) < 3000          # short call: rules + message only
+

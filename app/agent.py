@@ -3145,21 +3145,25 @@ async def execute(
             )
         await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
-        # ---- ANALYTICS AGENT (read-only, flag-gated) ----------------------
-        # Odoo-style "ask your books": a question-form message (how much /
-        # what is / show me / list …) with NO imperative verb is routed to
-        # the READ-ONLY analytics agent (catalog-validated targeted queries,
-        # org scope injected by Python, totals computed by Python). Anything
-        # imperative or flag-off continues onto the mutation pipeline below,
-        # completely untouched. Never raises; answer=None falls through.
+        # ---- ROUTING + ANALYTICS AGENT (flag-gated) ------------------------
+        # LLM-FIRST: EVERY message goes through a short bounded routing call
+        # that decides "analytics" (answer from existing data, READ-ONLY) vs
+        # "record" (identify nature/accounts and record a transaction ->
+        # the unchanged pipeline below). The deterministic question/imperative
+        # gate is the FALLBACK when routing is off or the provider fails, so
+        # routing can never block a turn. Never raises; no answer falls
+        # through to the normal pipeline.
         try:
             from app.analytics_agent import (
-                analytics_gate as _analytics_gate,
                 answer_analytics_question as _analytics_answer,
                 render_markdown as _analytics_render,
+                route_message as _route_message,
             )
 
-            if _analytics_gate(user_message):
+            _route, _route_audit = await _route_message(question=user_message)
+            if _route_audit.get("source") != "fallback_gate":
+                await _log_step(session_id, "ROUTING", _route_audit)
+            if _route == "analytics":
                 _analytics = await _analytics_answer(
                     organization_id=organization_id,
                     question=user_message,
@@ -3179,7 +3183,7 @@ async def execute(
                         execution_id=session_id,
                         summary=_analytics_render(_answer),
                     )
-        except Exception as exc:  # noqa: BLE001 — analytics never breaks a turn
+        except Exception as exc:  # noqa: BLE001 — routing/analytics never breaks a turn
             log.warning("agent.analytics_failed", error=str(exc)[:200])
 
         _reasoning = None
