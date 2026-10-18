@@ -3206,6 +3206,20 @@ async def execute(
                         execution_id=session_id,
                         summary=_analytics_render(_answer),
                     )
+                # A question routed to analytics NEVER falls through to the
+                # RECORDING pipeline (live E2E catch: report questions were
+                # being asked for amounts to "record"). Fail honestly.
+                _why = str(_analytics["audit"].get("error")
+                           or _analytics["audit"].get("llm") or "unavailable")
+                return AgentResponse(
+                    status=ExecutionStatus.FAILED,
+                    execution_id=session_id,
+                    summary=(
+                        "I couldn't prepare that report right now "
+                        f"({_why[:160]}). Nothing was recorded. Please try "
+                        "again in a moment."
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001 — routing/analytics never breaks a turn
             log.warning("agent.analytics_failed", error=str(exc)[:200])
 

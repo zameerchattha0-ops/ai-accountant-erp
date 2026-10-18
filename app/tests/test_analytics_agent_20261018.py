@@ -146,7 +146,41 @@ def test_executor_injects_org_scope(monkeypatch):
                         "order": None, "limit": 10}],
         "answer_shape": "table",
     }))
-    assert captured["filters"]["organization_id"] == f"eq.{_ORG}"
+    # fetch_many applies filters as PLAIN equality - the org id goes in
+    # WITHOUT an operator prefix (production E2E contract, 2026-10-18).
+    assert captured["filters"]["organization_id"] == str(_ORG)
+
+
+def test_executor_normalizes_order_and_exposes_filter_columns(monkeypatch):
+    """E2E catches (2026-10-18): planner says 'bill_date asc' but the seam
+    wants 'bill_date.asc'; and filter columns must be SELECTed or the
+    Python-side trim drops every row."""
+    from app.analytics_agent import execute_plan
+    import app.database as db
+
+    captured = {}
+
+    async def _fetch(table, *, filters, select="*", order=None, limit=100,
+                     offset=0):
+        captured["order"] = order
+        captured["select"] = select
+        return [{"total": 100.0, "bill_date": "2026-10-18"},
+                {"total": 50.0, "bill_date": "2026-09-01"}]
+
+    monkeypatch.setattr(db, "fetch_many", _fetch)
+    results = _run(execute_plan(organization_id=_ORG, plan={
+        "operations": [{
+            "source": "purchase_bills", "columns": ["total"],
+            "filters": [{"col": "bill_date", "op": "between",
+                         "value": ["2026-10-01", "2026-10-31"]}],
+            "aggregate": "sum", "column": "total",
+            "order": "bill_date asc", "limit": 50,
+        }],
+        "answer_shape": "single_value",
+    }))
+    assert captured["order"] == "bill_date.asc"        # seam format
+    assert "bill_date" in captured["select"]           # filter col visible
+    assert results[0]["value"] == 100.0                # only October survived
 
 
 def test_executor_between_window_and_python_trim(monkeypatch):

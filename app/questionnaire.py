@@ -673,7 +673,7 @@ async def build_questionnaire_with_llm(
     allowed: Dict[str, QuestionSpec] = {q.field: q for q in base.questions}
     prompt = _phrasing_prompt(base, entities or {}, context_summary)
     try:
-        raw = await client.generate_text_light(prompt)
+        raw = await client.generate_text_light(prompt=prompt)
     except AssertionError:  # test guards must stay loud
         raise
     except Exception as exc:  # noqa: BLE001 — phrasing is best-effort
@@ -1059,7 +1059,7 @@ async def author_questionnaire(
         classification=classification,
     )
     try:
-        raw = await client.generate_text_light(prompt)
+        raw = await client.generate_text_light(prompt=prompt)
     except AssertionError:  # test guards must stay loud
         raise
     except Exception as exc:  # noqa: BLE001 — authoring is best-effort

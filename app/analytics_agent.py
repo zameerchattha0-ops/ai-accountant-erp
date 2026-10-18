@@ -1,4 +1,4 @@
-"""Analytics agent - Odoo-style "ask your books" (READ-ONLY, 2 LLM calls).
+﻿"""Analytics agent - Odoo-style "ask your books" (READ-ONLY, 2 LLM calls).
 
 Natural-language question -> LLM plans a TARGETED read query against a
 compact DATA CATALOG (never free SQL) -> a deterministic executor runs it
@@ -232,22 +232,6 @@ async def plan_query(*, question: str, today: str,
     return _extract_json(str(raw or ""))
 
 
-def _postgrest_filter(f: Dict[str, Any]) -> Any:
-    col, op, val = f["col"], f["op"], f["value"]
-    if op == "eq":
-        return val
-    if op == "neq":
-        return f"neq.{val}"
-    if op == "ilike":
-        return f"ilike.%{val}%"
-    if op == "gte":
-        return f"gte.{val}"
-    if op == "lte":
-        return f"lte.{val}"
-    if op == "in":
-        items = val if isinstance(val, list) else [val]
-        return "in." + "(" + ",".join(str(x) for x in items[:20]) + ")"
-    return val  # between handled by the executor window + python trim
 
 
 def _aggregate(rows: List[Dict[str, Any]], agg: str,
@@ -273,32 +257,40 @@ def _aggregate(rows: List[Dict[str, Any]], agg: str,
 
 
 async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
-    """Run the validated plan org-scoped. Returns one result per op."""
+    """Run the validated plan org-scoped. Returns one result per op.
+
+    SEAM CONTRACT: app.database.fetch_many applies filters as PLAIN
+    equality only (supabase-py .eq) - operator strings like "eq.x"/"gte.x"
+    would be sent as literal values (production bug caught by the live
+    E2E run, 2026-10-18). So: equality filters pass through as plain
+    values; every OTHER operator is fetched wide and applied in Python.
+    """
     from app.database import fetch_many
 
     results = []
     for op in plan["operations"]:
         # ORG SCOPE INJECTED BY PYTHON - the model can never widen it.
-        filters: Dict[str, Any] = {
-            "organization_id": f"eq.{uuid_str(organization_id)}"
-        }
-        between_trim = None
+        filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+        noneq = []
         for f in op["filters"]:
-            if f["op"] == "between":
-                val = f["value"] if isinstance(f["value"], list) else []
-                if len(val) == 2:
-                    filters[f["col"]] = f"gte.{val[0]}"
-                    between_trim = (f["col"], val[1])
+            if f["op"] == "eq":
+                filters[f["col"]] = f["value"]
             else:
-                filters[f["col"]] = _postgrest_filter(f)
-        select = ",".join(c for c in op["columns"] if c != "*") or "*"
+                noneq.append(f)
+        fetch_limit = MAX_LIMIT if noneq else op["limit"]
+        # The seam must SEE every column the Python-side filters/sort use -
+        # a select of ["total"] plus a bill_date filter trimmed every row
+        # (live E2E catch, 2026-10-18).
+        needed = {c for c in op["columns"] if c != "*"}
+        needed.update(f["col"] for f in op["filters"])
+        if op["order"]:
+            needed.add(op["order"].split()[0].split(".")[0])
+        select = ",".join(sorted(needed)) or "*"
         rows = await fetch_many(
             op["source"], filters=filters, select=select,
-            order=op["order"], limit=op["limit"],
+            order=_norm_order(op["order"]), limit=fetch_limit,
         ) or []
-        if between_trim:
-            col, hi = between_trim
-            rows = [r for r in rows if str(r.get(col) or "") <= str(hi)]
+        rows = _apply_noneq(rows, noneq)[: op["limit"]]
         if op["aggregate"]:
             results.append({
                 "aggregate": op["aggregate"], "column": op["column"],
@@ -313,8 +305,57 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
     return results
 
 
-def uuid_str(value: Any) -> str:
-    return str(value)
+def _norm_order(order: Optional[str]) -> Optional[str]:
+    """Planner emits 'col asc|desc' (prompt format); the fetch_many seam
+    expects 'col.direction'. Live E2E catch, 2026-10-18."""
+    if not order:
+        return None
+    parts = str(order).replace(".", " ").split()
+    col = parts[0]
+    direction = parts[1].lower() if len(parts) > 1 else "asc"
+    if direction not in ("asc", "desc"):
+        direction = "asc"
+    return f"{col}.{direction}"
+
+
+def _apply_noneq(rows: List[Dict[str, Any]],
+                 ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Non-equality operators, evaluated in Python over the fetched rows."""
+    out = rows
+    for f in ops:
+        col, op, val = f["col"], f["op"], f["value"]
+
+        def _num(v: Any) -> Optional[float]:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        if op == "neq":
+            out = [r for r in out if str(r.get(col)) != str(val)]
+        elif op == "ilike":
+            needle = str(val).strip("%").lower()
+            out = [r for r in out
+                   if needle in str(r.get(col) or "").lower()]
+        elif op == "gte":
+            nv = _num(val)
+            out = [r for r in out if (nv is not None and _num(r.get(col)) is not None
+                   and _num(r.get(col)) >= nv)
+                   or str(r.get(col) or "") >= str(val)]
+        elif op == "lte":
+            nv = _num(val)
+            out = [r for r in out if (nv is not None and _num(r.get(col)) is not None
+                   and _num(r.get(col)) <= nv)
+                   or str(r.get(col) or "") <= str(val)]
+        elif op == "in":
+            allowed = {str(x) for x in (val if isinstance(val, list) else [val])}
+            out = [r for r in out if str(r.get(col)) in allowed]
+        elif op == "between" and isinstance(val, list) and len(val) == 2:
+            out = [r for r in out if str(val[0]) <= str(r.get(col) or "")
+                   <= str(val[1])]
+    return out
+
+
 
 
 
@@ -474,7 +515,7 @@ def render_markdown(answer: Dict[str, Any]) -> str:
                          f"`{r['source']}`)")
         else:
             rows = r.get("rows") or []
-            lines.append(f"- `{r['source']}` — {r['row_count']} rows:")
+            lines.append(f"- `{r['source']}` â€” {r['row_count']} rows:")
             if rows:
                 cols = list(rows[0].keys())[:6]
                 lines.append("| " + " | ".join(cols) + " |")
