@@ -146,7 +146,7 @@ def _auto_answer(question: str) -> str:
     if "nature" in low or "is this item" in low:
         return "c"          # consumable/expense - minimal footprint
     if "supplier" in low and ("create" in low or "should i" in low):
-        return "use the existing SHABBIR FURNITURES supplier"
+        return "yes, create it"   # sanction the new supplier ledger
     if "payment" in low or "credit" in low or "cash" in low:
         return "CREDIT"
     if "date" in low:

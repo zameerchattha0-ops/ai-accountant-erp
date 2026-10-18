@@ -3799,8 +3799,20 @@ async def execute(
         # never re-asked here.  ALL independent gaps are gathered into ONE
         # questionnaire — the user answers everything in a single round
         # (360° analysis is mandatory; 360° questioning is minimal).
+        # DETERMINISTIC GUARD (2026-10-18, ALPHA TRADERS session): strip a
+        # classifier-RESOLVED nature from the planner's missing fields —
+        # the model re-listed transaction_nature although USER_ANSWER had
+        # settled it, and the authored questionnaire re-asked the resolved
+        # fact in letterless prose (six dead-ended rounds).  With nothing
+        # left to ask, the turn proceeds to execution instead of parking.
+        from app.questionnaire import drop_resolved_fields as _drop_resolved
+
+        execution_plan.missing_fields = _drop_resolved(
+            execution_plan.missing_fields, classification
+        )
         if (
             execution_plan.requires_clarification
+            and execution_plan.missing_fields
             and len(prior_qa) < MAX_CLARIFICATION_ROUNDS
             and _reasoning_calls is None
             # P0-①: an approved plan is frozen — a questionnaire gap can

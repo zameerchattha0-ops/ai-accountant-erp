@@ -103,36 +103,14 @@ _DURABLE_GOODS = (
 def _match_catalogue(item: str, products) -> "dict | None":
     """Best product match for an item — WORD-LEVEL, singular/plural tolerant.
 
-    The old substring check missed "office chair" against catalogue
-    "chairs" (reported live 2026-10-18: the chair fell through to the LLM
-    and was suggested as FIXED ASSET despite the stock record).  Matching
-    on shared significant words (>=3 chars, 's'-stripped) catches the real
-    synonyms; among multiple hits, stock-tracked products win (they carry
-    the resale answer) and longer overlaps rank higher.
+    Delegates to app.product_matching (shared with the purchase
+    catalogue-sync path) so the classifier question and the bill-line
+    product link ALWAYS agree on what "matches".  See the module docstring
+    for the live 'office chair' vs 'chairs' failure this fixed.
     """
+    from app.product_matching import match_catalogue_product
 
-    def _toks(text) -> set:
-        out = set()
-        for t in re.findall(r"[a-z]+", str(text or "").lower()):
-            t = t.rstrip("s")
-            if len(t) >= 3:
-                out.add(t)
-        return out
-
-    item_toks = _toks(item)
-    if not item_toks:
-        return None
-    best_score = 0
-    best = None
-    for p in products or []:
-        overlap = item_toks & _toks(p.get("name"))
-        if not overlap:
-            continue
-        score = len(overlap) * 2 + (1 if p.get("is_stock_tracked") else 0)
-        if score > best_score:
-            best_score = score
-            best = p
-    return best
+    return match_catalogue_product(item, products)
 
 # Account-name search terms per nature (used against the live COA).
 _ACCOUNT_SEARCH_TERMS = {

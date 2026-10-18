@@ -1029,6 +1029,28 @@ def _authored_questionnaire_prompt(
     )
 
 
+def drop_resolved_fields(
+    missing_fields: Sequence[str], classification: Optional[Any]
+) -> List[str]:
+    """A nature the classifier RESOLVED with authority is never "missing".
+
+    Live failure (2026-10-18, ALPHA TRADERS session): the planner model
+    re-listed ``transaction_nature`` as a missing material fact although
+    the classifier had resolved it (USER_ANSWER, requires_clarification
+    False) — the authored questionnaire then re-asked the resolved fact in
+    letterless prose and dead-ended six clarification rounds.  The
+    classifier's authority hierarchy is the decider; the planner's doubt
+    can never re-open a settled nature.
+    """
+    if (
+        classification is not None
+        and getattr(classification, "transaction_nature", None)
+        and not getattr(classification, "requires_clarification", False)
+    ):
+        return [f for f in (missing_fields or ()) if f != "transaction_nature"]
+    return list(missing_fields or ())
+
+
 async def author_questionnaire(
     *,
     client: Any = None,
@@ -1080,6 +1102,43 @@ async def author_questionnaire(
     if not specs:
         log.info("questionnaire.author_rejected", reason="no_valid_question")
         return None
+    # VERBATIM CLASSIFIER QUESTION (user rule 2026-10-18): when the
+    # classifier parked on a CATALOGUE-HINTED nature question, the model's
+    # rephrasing ("inventory-stocked products for resale, or fixed assets
+    # to be used in the business?") destroyed the catalogue evidence and
+    # the a/b/c/d taps — live ALPHA TRADERS session.  The authored wording
+    # for transaction_nature is REPLACED by the classifier's verbatim
+    # question, with nature-vocabulary options so the answer routes.
+    if (
+        classification is not None
+        and getattr(classification, "catalogue_hint", None)
+        and getattr(classification, "requires_clarification", False)
+    ):
+        from app.reasoning import nature_question_with_hint
+
+        _hinted = nature_question_with_hint(
+            str(getattr(classification, "entity", "") or "this item"),
+            getattr(classification, "catalogue_hint", None),
+        )
+        if _hinted:
+            specs = [
+                QuestionSpec(
+                    field=q.field,
+                    kind=KIND_CHOICE,
+                    question=_hinted,
+                    options=(
+                        ("INVENTORY", "Yes — INVENTORY (resale stock)"),
+                        ("FIXED_ASSET", "No — FIXED ASSET this time"),
+                        ("CONSUMABLE", "Consumable / one-off expense"),
+                        ("SERVICE", "Service"),
+                    ),
+                    answer_hint=q.answer_hint,
+                    why=q.why,
+                )
+                if q.field == "transaction_nature"
+                else q
+                for q in specs
+            ]
     intro = _clean_text(payload.get("intro"), 200) or QUESTIONNAIRE_INTRO
     log.info("questionnaire.authored", fields=[q.field for q in specs])
     return Questionnaire(
