@@ -99,6 +99,41 @@ _DURABLE_GOODS = (
     "generator"
 )
 
+
+def _match_catalogue(item: str, products) -> "dict | None":
+    """Best product match for an item — WORD-LEVEL, singular/plural tolerant.
+
+    The old substring check missed "office chair" against catalogue
+    "chairs" (reported live 2026-10-18: the chair fell through to the LLM
+    and was suggested as FIXED ASSET despite the stock record).  Matching
+    on shared significant words (>=3 chars, 's'-stripped) catches the real
+    synonyms; among multiple hits, stock-tracked products win (they carry
+    the resale answer) and longer overlaps rank higher.
+    """
+
+    def _toks(text) -> set:
+        out = set()
+        for t in re.findall(r"[a-z]+", str(text or "").lower()):
+            t = t.rstrip("s")
+            if len(t) >= 3:
+                out.add(t)
+        return out
+
+    item_toks = _toks(item)
+    if not item_toks:
+        return None
+    best_score = 0
+    best = None
+    for p in products or []:
+        overlap = item_toks & _toks(p.get("name"))
+        if not overlap:
+            continue
+        score = len(overlap) * 2 + (1 if p.get("is_stock_tracked") else 0)
+        if score > best_score:
+            best_score = score
+            best = p
+    return best
+
 # Account-name search terms per nature (used against the live COA).
 _ACCOUNT_SEARCH_TERMS = {
     FIXED_ASSET: [
@@ -363,6 +398,13 @@ def rule_based_nature(
 def _classification_question(classification: TransactionClassification) -> str:
     entity = classification.entity
     subject = f"'{entity}'" if entity else "this item"
+    # CATALOGUE-SHAPED QUESTION (2026-10-18): when the classifier matched a
+    # stock-tracked product, its clarification_reason already carries the
+    # inventory-first question ("record as INVENTORY (consistent with your
+    # stock), or is it a FIXED ASSET this time?") — lead with that.
+    hint = getattr(classification, "catalogue_hint", None)
+    if hint and hint.get("is_stock_tracked") and classification.clarification_reason:
+        return f"For {subject}: {classification.clarification_reason}"
     # The SAME 4-way decision tree the reasoning layer asks — consistent
     # wording across the deterministic and model paths.
     from app.reasoning import NATURE_DECISION_QUESTION
@@ -957,43 +999,73 @@ async def classify_transaction(
             products = await fetch_many(
                 "products",
                 filters={"organization_id": str(organization_id)},
-                select="id,name,is_stock_tracked,revenue_account_id",
-                limit=50,
+                select="id,name,product_code,is_stock_tracked,revenue_account_id",
+                limit=100,
             )
-            for p in products or []:
-                if (p.get("name") or "").lower() in item or item in (p.get("name") or "").lower():
-                    if p.get("is_stock_tracked"):
-                        nature = INVENTORY
-                    elif re.search(_DURABLE_GOODS, item, re.IGNORECASE):
-                        # NO silent guess: a durable catalog product that is
-                        # NOT marked stock-tracked is materially ambiguous —
-                        # fixed asset vs consumable expense vs resale
-                        # inventory vs service.  The catalog flag alone must
-                        # never decide INVENTORY vs OPERATING_EXPENSE.
-                        from app.reasoning import NATURE_DECISION_QUESTION
+            match = _match_catalogue(item, products)
+            if match:
+                hint = {
+                    "name": match.get("name"),
+                    "product_code": match.get("product_code"),
+                    "is_stock_tracked": bool(match.get("is_stock_tracked")),
+                }
+                _purchase_family = {
+                    "record_purchase", "record_cash_purchase",
+                    "record_credit_purchase", "create_purchase_bill",
+                }
+                if hint["is_stock_tracked"] and intent in _purchase_family:
+                    # USER RULE (2026-10-18): a catalogue stock-match SHAPES
+                    # the question but never decides silently — on a PURCHASE
+                    # ask "record as INVENTORY (consistent with your stock),
+                    # or is it a FIXED ASSET this time?"  Sales keep the old
+                    # silent path (selling tracked stock IS inventory).
+                    from app.reasoning import nature_question_with_hint
 
-                        return TransactionClassification(
-                            transaction_nature=None,
-                            confidence="MEDIUM",
-                            source="ERP_CONFIGURATION",
-                            entity=item,
-                            requires_clarification=True,
-                            clarification_reason=(
-                                "Catalog product matched but is not marked "
-                                "stock-tracked while being durable in nature "
-                                f"— {NATURE_DECISION_QUESTION}"
-                            ),
-                        )
-                    else:
-                        nature = OPERATING_EXPENSE
                     return TransactionClassification(
-                        transaction_nature=nature,
+                        transaction_nature=None,
                         confidence="HIGH",
                         source="ERP_CONFIGURATION",
                         entity=item,
-                        requires_clarification=False,
-                        clarification_reason=None,
+                        requires_clarification=True,
+                        clarification_reason=(
+                            nature_question_with_hint(item, hint) or ""
+                        ),
+                        catalogue_hint=hint,
                     )
+                if hint["is_stock_tracked"]:
+                    nature = INVENTORY
+                elif re.search(_DURABLE_GOODS, item, re.IGNORECASE):
+                    # NO silent guess: a durable catalog product that is
+                    # NOT marked stock-tracked is materially ambiguous —
+                    # fixed asset vs consumable expense vs resale
+                    # inventory vs service.  The catalog flag alone must
+                    # never decide INVENTORY vs OPERATING_EXPENSE.
+                    from app.reasoning import NATURE_DECISION_QUESTION
+
+                    return TransactionClassification(
+                        transaction_nature=None,
+                        confidence="MEDIUM",
+                        source="ERP_CONFIGURATION",
+                        entity=item,
+                        requires_clarification=True,
+                        clarification_reason=(
+                            "Catalog product matched but is not marked "
+                            "stock-tracked while being durable in nature "
+                            f"— {NATURE_DECISION_QUESTION}"
+                        ),
+                        catalogue_hint=hint,
+                    )
+                else:
+                    nature = OPERATING_EXPENSE
+                return TransactionClassification(
+                    transaction_nature=nature,
+                    confidence="HIGH",
+                    source="ERP_CONFIGURATION",
+                    entity=item,
+                    requires_clarification=False,
+                    clarification_reason=None,
+                    catalogue_hint=hint,
+                )
         except Exception as exc:  # noqa: BLE001 — config lookup is best-effort
             log.warning("classifier.product_lookup_failed", error=str(exc))
 

@@ -114,6 +114,31 @@ _ITEM_INTAKE_INTENTS = {
 }
 
 # The consolidated four-way nature question (asked, NEVER guessed):
+def nature_question_with_hint(item: str, hint: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The nature question, SHAPED by a catalogue match (user rule 2026-10-18).
+
+    A stock-tracked product matching the purchased item means the honest
+    leading reading is INVENTORY - so the question SAYS so and offers the
+    escape ("or a FIXED ASSET this time?"). The hint only shapes the
+    question; the answer remains the user's per-transaction decision.
+    Returns None when there is no shaping to do (caller keeps its question).
+    """
+    if not hint:
+        return None
+    name = str(hint.get("name") or "").strip()
+    code = str(hint.get("product_code") or "").strip()
+    if not name or not hint.get("is_stock_tracked"):
+        return None  # non-stock matches keep the generic decision tree
+    ref = f"{name} ({code})" if code else name
+    return (
+        f"Your catalogue already tracks '{ref}' as a STOCK item, which "
+        f"matches '{item}'. Record this purchase as an INVENTORY purchase "
+        f"(consistent with your stock)? (a) YES — INVENTORY (resale stock)  "
+        f"(b) NO — it's a FIXED ASSET this time  (c) CONSUMABLE / one-off "
+        f"EXPENSE  (d) SERVICE. Please answer with a, b, c or d."
+    )
+
+
 NATURE_DECISION_QUESTION = (
     "Is this item: (a) a FIXED ASSET (long-term use, to be capitalised), "
     "(b) an INVENTORY-STOCKED PRODUCT (resale stock — catalog flag only, "
@@ -1525,13 +1550,20 @@ def analyze_requirements(
                 kind="CONFIGURATION_GAP",
             ))
         elif needs_clarification:
+            _hinted = nature_question_with_hint(
+                str(entities.get("item_description")
+                    or entities.get("item") or "this item"),
+                getattr(classification, "catalogue_hint", None),
+            )
             nodes.append(DependencyNode(
                 key="account_mapping", dimension="Economic classification",
                 state=FieldResolutionState.AMBIGUOUS,
                 detail=reason,
                 # ITEM INTAKE PROTOCOL — the decision tree is asked
-                # EXPLICITLY, never guessed (master parity prompt §2):
-                question=NATURE_DECISION_QUESTION,
+                # EXPLICITLY, never guessed (master parity prompt §2).
+                # A catalogue stock-match SHAPES the question (2026-10-18):
+                # inventory-first with the fixed-asset escape.
+                question=_hinted or NATURE_DECISION_QUESTION,
             ))
         elif nature:
             nodes.append(DependencyNode(
@@ -1573,7 +1605,14 @@ def analyze_requirements(
                         f"'{item}' is {trigger} — the capital-vs-expense-vs-"
                         "inventory decision must be explicit"
                     ),
-                    question=nature_question_for_intent(intent) or NATURE_DECISION_QUESTION,
+                    question=(
+                        nature_question_with_hint(
+                            str(item),
+                            getattr(classification, "catalogue_hint", None),
+                        )
+                        or nature_question_for_intent(intent)
+                        or NATURE_DECISION_QUESTION
+                    ),
                 ))
         # Line detail capture: a named item needs quantity + unit price in
         # the SAME consolidated round — a bare amount is not enough.  Only

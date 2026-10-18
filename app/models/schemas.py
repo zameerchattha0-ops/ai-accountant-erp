@@ -491,6 +491,12 @@ class TransactionClassification(BaseModel):
     # Suggested existing accounts shown to the user when no dedicated
     # account matches (e.g. 'bonus' → Salaries / Wages / create new).
     candidate_accounts: Optional[List[str]] = None
+    # CATALOGUE HINT (2026-10-18): when the item matches an existing
+    # product, the match rides along so EVERY question composer can shape
+    # the nature question around it ("your catalogue tracks 'chairs' as
+    # stock - inventory, or a fixed asset this time?"). A hint only SHAPES
+    # the question; the nature is still the user's per-transaction answer.
+    catalogue_hint: Optional[Dict[str, Any]] = None
     confidence: str = "LOW"  # HIGH | MEDIUM | LOW
     source: str = "INFERENCE"  # USER_ANSWER | ERP_CONFIGURATION | ITEM_MAPPING | DETERMINISTIC_RULE | INFERENCE
     # Phase 1 telemetry contract: provenance of the ACCOUNT decision.
