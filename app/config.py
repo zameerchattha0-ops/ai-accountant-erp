@@ -572,10 +572,13 @@ class Settings(BaseSettings):
         description=(
             "LLM-FIRST message routing: EVERY user message is classified by "
             "a short bounded call into 'analytics' (answer a question from "
-            "existing data) or 'record' (identify nature/accounts and record "
-            "a transaction). The deterministic question/imperative gate is "
-            "the FALLBACK when this is off or the model is unavailable - "
-            "routing never blocks a turn and 'record' wins when uncertain."
+            "existing data), 'record' (identify nature/accounts and record "
+            "a transaction), or 'clarify' - genuine ambiguity never guesses: "
+            "the router asks ONE targeted question that resolves all "
+            "confusion, and the turn stops until it is answered. The "
+            "deterministic question/imperative gate is the FALLBACK when "
+            "this is off or the model is unavailable - routing never "
+            "blocks a turn."
         ),
     )
     llm_router_timeout: float = Field(

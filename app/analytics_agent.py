@@ -498,17 +498,22 @@ def render_markdown(answer: Dict[str, Any]) -> str:
 
 _ROUTER_RULES = (
     "You are a message ROUTER for an accounting app. Reply with ONLY JSON:\n"
-    '{"route": "analytics" | "record", "reason": "<one short sentence>"}\n'
-    'RULES: "analytics" = the user ASKS A QUESTION about data that already '
-    'exists (reporting, totals, lists, balances - how much / what is / show '
-    'me / list ...): they want an ANSWER and nothing may be recorded. '
-    '"record" = the user states or commands a BUSINESS TRANSACTION to be '
-    'recorded or modified (bought, sold, paid, received, invoice, expense, '
-    'credit purchase, create, update, delete): the system must identify the '
-    'nature/accounts and record it. Past-tense questions about what already '
-    'happened ("how much did I pay X") are analytics. When genuinely '
-    'uncertain, choose "record" - the recording pipeline has its own '
-    'clarifications and confirmation.'
+    '{"route": "analytics" | "record" | "clarify", '
+    '"reason": "<one short sentence>", '
+    '"question": "<one targeted clarifying question>" }\n'
+    'RULES: "analytics" = the user ASKS about data that already exists '
+    '(reporting, totals, lists, balances; past-tense questions like '
+    '"how much did I pay X"): they want an ANSWER and nothing may be '
+    'recorded. "record" = the user clearly states or commands a BUSINESS '
+    'TRANSACTION to be recorded or modified (bought, sold, paid, create, '
+    'invoice, expense...): nature/accounts will be identified and it '
+    'recorded with confirmation. "clarify" = ONLY when the message is '
+    'genuinely torn between the two, too vague to act on, or mixes both '
+    'intents: ask ONE targeted question that names the competing readings '
+    'and resolves ALL ambiguity at once, so the next answer settles the '
+    'route with certainty. Never ask rhetorical or multi-part questions; '
+    'never use "clarify" for a clear message; question is "" unless '
+    'route is "clarify".'
 )
 
 
@@ -518,9 +523,11 @@ async def route_message(
     client: Any = None,
     timeout: Optional[float] = None,
 ) -> tuple:
-    """LLM-first routing for every user message -> ("analytics"|"record",
-    audit).  Never raises; falls back to the deterministic gate on flag-off,
-    provider failure, or an invalid reply - so routing NEVER blocks a turn.
+    """LLM-first routing for every user message ->
+    ("analytics"|"record"|"clarify", audit).  Uncertainty does NOT guess:
+    the model asks ONE targeted clarifying question (audit carries it).
+    Never raises; falls back to the deterministic gate on flag-off,
+    provider failure, or an invalid reply - routing NEVER blocks a turn.
     """
     from app.config import get_settings
 
@@ -549,6 +556,16 @@ async def route_message(
                 "reason": str((payload or {}).get("reason") or "")[:160],
             }
             return route, audit
+        if route == "clarify":
+            target = str((payload or {}).get("question") or "").strip()
+            if 10 <= len(target) <= 500:
+                audit = {
+                    "stage": "routing", "source": "llm", "route": "clarify",
+                    "reason": str((payload or {}).get("reason") or "")[:160],
+                    "question": target,
+                }
+                return "clarify", audit
+            log.warning("routing.clarify_without_question")
         audit["source"] = "fallback_gate_invalid_reply"
     except Exception as exc:  # noqa: BLE001 - routing never breaks a turn
         audit["source"] = "fallback_gate_unavailable"

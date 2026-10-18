@@ -3163,6 +3163,29 @@ async def execute(
             _route, _route_audit = await _route_message(question=user_message)
             if _route_audit.get("source") != "fallback_gate":
                 await _log_step(session_id, "ROUTING", _route_audit)
+            if _route == "clarify":
+                # UNCERTAINTY NEVER GUESSES: the router asked ONE targeted
+                # question; stop before anything runs - after the answer the
+                # next turn routes with certainty.
+                _clarify_q = str(_route_audit.get("question") or "").strip()
+                try:
+                    await create_clarification(
+                        session_id=session_id,
+                        question=_clarify_q,
+                        required_fields=["resolution"],
+                    )
+                except Exception as persist_exc:  # noqa: BLE001
+                    log.warning(
+                        "agent.routing_clarification_persist_failed",
+                        error=str(persist_exc)[:200],
+                    )
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=_clarify_q[:1500],
+                    required_information=["resolution"],
+                    requires_user_input=True,
+                )
             if _route == "analytics":
                 _analytics = await _analytics_answer(
                     organization_id=organization_id,

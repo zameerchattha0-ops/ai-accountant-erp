@@ -401,3 +401,50 @@ def test_router_prompt_is_bounded_and_carries_only_the_message(monkeypatch):
     assert "ONLY JSON" in prompt
     assert len(prompt) < 3000          # short call: rules + message only
 
+
+
+# ---------------------------------------------------------------------------
+# 7 - CLARIFY ROUTE: uncertainty never guesses - ONE targeted question
+# ---------------------------------------------------------------------------
+
+def test_router_clarify_carries_targeted_question(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    target = ("Are you asking how much was paid to Shabbir so far (a "
+              "report), or do you want me to record a new payment to "
+              "Shabbir?")
+    client = _StubClient([json.dumps(
+        {"route": "clarify", "reason": "torn between report and payment",
+         "question": target})])
+    route, audit = _run(route_message(
+        question="shabbir payment", client=client))
+    assert route == "clarify"
+    assert audit["question"] == target
+    assert audit["source"] == "llm" and audit["route"] == "clarify"
+
+
+def test_router_clarify_without_question_falls_back(monkeypatch):
+    """A clarify WITHOUT a usable question can never stall the turn."""
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient([json.dumps(
+        {"route": "clarify", "reason": "torn", "question": "?"})])
+    route, audit = _run(route_message(
+        question="Show me my unpaid bills", client=client))
+    assert route == "analytics"                      # deterministic fallback
+    assert audit["source"] == "fallback_gate_invalid_reply"
+
+
+def test_router_clarify_rejects_oversized_question(monkeypatch):
+    from app.analytics_agent import route_message
+
+    _settings(monkeypatch, llm_router_enabled=True)
+    client = _StubClient([json.dumps(
+        {"route": "clarify", "reason": "x", "question": "y" * 600})])
+    route, audit = _run(route_message(
+        question="Record an expense", client=client))
+    assert route == "record"                         # deterministic fallback
+    assert audit["source"] == "fallback_gate_invalid_reply"
+
