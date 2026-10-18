@@ -30,16 +30,16 @@ const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"),
 
 /* ------------------------------------------------------------------
    HERO VARIANT SWITCH — reversible by design (2026-10-14).
-   "navy"  = the premium deep-navy hero (NavyHero.tsx): navy gradient
-             anchor, ~14:1 white headline, teal spent only on the CTA
-             and checks, house-ease staggered entrances.
-   "classic" = the original light glass-clay stage below, preserved
-             VERBATIM (byte-identical) and rendered untouched.
-   Flip back without any code change:
-       NEXT_PUBLIC_HERO_VARIANT=classic   (frontend/.env.local)
+   "classic" = the original light glass-clay stage below — THE DEFAULT,
+              preserved VERBATIM (byte-identical) and rendered untouched.
+   "navy"  = the premium deep-navy hero (NavyHero.tsx), opt-in only:
+             navy gradient anchor, ~14:1 white headline, teal spent only
+             on the CTA and checks, house-ease staggered entrances.
+   Opt IN to the navy variant (no change to the classic stage):
+       NEXT_PUBLIC_HERO_VARIANT=navy   (frontend/.env.local / Vercel env)
    ------------------------------------------------------------------ */
 const HERO_VARIANT = (
-  process.env.NEXT_PUBLIC_HERO_VARIANT ?? "navy"
+  process.env.NEXT_PUBLIC_HERO_VARIANT ?? "classic"
 ).toLowerCase();
 
 
