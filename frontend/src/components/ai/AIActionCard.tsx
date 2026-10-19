@@ -5,6 +5,7 @@ import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle } from "lucide-reac
 import type { AgentResponse } from "@/lib/types/api";
 import { formatCurrency } from "@/lib/utils/currency";
 import { cn } from "@/lib/utils/cn";
+import { mdToDisplayText } from "@/lib/ai/markdown";
 
 interface Props {
   response: AgentResponse;
@@ -155,7 +156,14 @@ export default function AIActionCard({ response }: Props) {
             )}
           </div>
           {response.summary && (
-            <p className="text-xs text-text-secondary mt-0.5 whitespace-pre-line">{response.summary}</p>
+            /* R3.4a cousin: the analytics card's summary is authored as
+               Markdown (`**`, backticks, `_`, pipe tables) but this <p> has no
+               markdown engine — the raw markers were reaching the user
+               ("**Loss: …**").  Render the known subset to clean text; plain
+               summaries pass through untouched. */
+            <p className="text-xs text-text-secondary mt-0.5 whitespace-pre-line">
+              {mdToDisplayText(response.summary)}
+            </p>
           )}
         </div>
       </div>

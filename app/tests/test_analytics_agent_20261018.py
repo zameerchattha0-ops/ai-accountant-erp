@@ -304,7 +304,9 @@ def test_invented_headline_falls_back_to_deterministic(monkeypatch):
         client=client,
     ))
     assert out["answer"]["synth"] == "fallback"
-    assert "230000.0" in out["answer"]["headline"]      # the REAL number
+    # the REAL number (formatted for the user, never the invented 999999)
+    assert "230,000.00" in out["answer"]["headline"]
+    assert "999999" not in out["answer"]["headline"]
 
 
 def test_plan_rejected_twice_returns_none(monkeypatch):

@@ -589,26 +589,74 @@ def _fallback_answer(question: str, results: List[Any]) -> Dict[str, Any]:
     parts = []
     for r in results:
         if "aggregate" in r:
-            parts.append(f"{r['aggregate']}({r['column'] or 'rows'}) = "
-                         f"{r['value']} over {r['row_count']} rows")
+            parts.append(f"{r['aggregate']} of {r.get('column') or 'rows'} is "
+                         f"{_money(r.get('value'))} across {r['row_count']} "
+                         f"entries")
         else:
-            parts.append(f"{r['source']}: {r['row_count']} rows")
+            parts.append(f"{r.get('source')}: {r['row_count']} entries")
     return {
         "headline": f"Result for '{question[:80]}': " + "; ".join(parts),
         "answer_type": "table",
-        "caveats": ["deterministic fallback (LLM synthesis unavailable)"],
+        "caveats": ["We could not phrase this in one sentence, so the raw "
+                    "totals are listed above - they are read straight from "
+                    "your books."],
         "synth": "fallback",
     }
 
 
 
+def _money(v: Any) -> str:
+    """User-facing money: thousands separators, two decimals (never the raw
+    float repr ``1047000.0`` a business owner has to squint at)."""
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _human_ts(iso: Any) -> str:
+    """``2026-10-19T20:25:08+00:00`` -> ``20 Oct 2026, 2:25 AM UTC``.
+    Unparseable input passes through untouched (never raises)."""
+    from datetime import datetime as _dt
+
+    try:
+        dt = _dt.fromisoformat(str(iso))
+        day = f"{dt.day} {dt.strftime('%b %Y')}"
+        clock = dt.strftime("%I:%M %p").lstrip("0")
+        return f"{day}, {clock} UTC"
+    except (TypeError, ValueError):
+        return str(iso or "?")
+
+
+def _op_label(op: Dict[str, Any]) -> Optional[str]:
+    """Human label for an op, grounded in its VALIDATED plan filters: the
+    account_type it pins (REVENUE -> 'Revenue', EXPENSE -> 'Expenses').
+    Never invented - falls back to None so the caller can use the column."""
+    for f in op.get("filters") or []:
+        if not isinstance(f, dict):
+            continue
+        if f.get("col") == "account_type" and f.get("op") == "eq":
+            t = str(f.get("value") or "").strip().upper()
+            if t == "REVENUE":
+                return "Revenue"
+            if t == "EXPENSE":
+                return "Expenses"
+            if t:
+                return t.capitalize()
+    return None
+
+
 def _computed_answer(*, question: str, results: List[Any],
-                     formula: Optional[str] = "op1_minus_op2"
+                     formula: Optional[str] = "op1_minus_op2",
+                     labels: Optional[List[Optional[str]]] = None
                      ) -> Dict[str, Any]:
     """Deterministic two-aggregate arithmetic (profit = op1 - op2).
 
     The arithmetic happens HERE, never in the model. A wrong-shaped result
-    falls back honestly - no number is ever invented."""
+    falls back honestly - no number is ever invented. The headline speaks the
+    business owner's language (Revenue/Expenses, formatted money) - the
+    credit/debit column names and the arithmetic provenance are NOT user
+    vocabulary (live complaint 2026-10-20)."""
     if (formula != "op1_minus_op2" or len(results) != 2
             or any("aggregate" not in r for r in results)):
         log.warning("analytics.computed_bad_shape")
@@ -621,16 +669,20 @@ def _computed_answer(*, question: str, results: List[Any],
     diff = round(a - b, 2)
     kind = "Profit" if diff >= 0 else "Loss"
     r1, r2 = results[0], results[1]
+    labels = labels or [None, None]
+    lab1 = (labels[0] if len(labels) > 0 else None) or r1.get("column") \
+        or r1.get("source") or "the first total"
+    lab2 = (labels[1] if len(labels) > 1 else None) or r2.get("column") \
+        or r2.get("source") or "the second total"
     headline = (
-        f"{kind}: {r1.get('value')} ({r1.get('column') or r1.get('source')}) "
-        f"minus {r2.get('value')} ({r2.get('column') or r2.get('source')}) "
-        f"= {diff}"
+        f"{kind} of {_money(abs(diff))} - {lab1} {_money(a)} "
+        f"minus {lab2} {_money(b)}"
     )
     return {
         "headline": headline,
         "answer_type": "single_value",
-        "caveats": ["difference computed in Python from the two aggregates "
-                    "(never by the model)"],
+        "caveats": ["Calculated directly from your posted ledger entries - "
+                    "nothing estimated."],
         "synth": "computed",
     }
 
@@ -707,17 +759,25 @@ async def answer_analytics_question(
         if plan.get("answer_shape") == "computed":
             # Deterministic arithmetic path (profit/loss) - no model call
             # needed for the difference; Python already has both numbers.
+            # Labels come from the plan's account_type pins (Revenue /
+            # Expenses) so the headline speaks business, not credit/debit.
+            _op_labels = [
+                _op_label(o) or o.get("column") or o.get("source")
+                for o in plan["operations"]
+            ]
             synth = _computed_answer(
                 question=question, results=results,
-                formula=plan.get("formula"),
+                formula=plan.get("formula"), labels=_op_labels,
             )
         else:
+            _op_labels = None
             synth = await synthesize(question=question, results=results,
                                      today=today, client=client, timeout=t)
         answer = {
             "headline": synth["headline"],
             "answer_type": synth["answer_type"],
             "results": results,
+            "op_labels": _op_labels,
             "caveats": synth["caveats"],
             "period": today,
             "data_as_of": datetime.now(timezone.utc).isoformat(
@@ -737,28 +797,42 @@ async def answer_analytics_question(
 
 
 def render_markdown(answer: Dict[str, Any]) -> str:
-    """Deterministic card rendering for the chat summary."""
-    lines = [f"**{answer.get('headline', '')}**", ""]
+    """Deterministic card rendering for the chat summary.
+
+    MARKDOWN-FREE by design: the chat card renders this into a plain text
+    node with no markdown engine, so raw `**`, backticks and `_` markers were
+    reaching the user verbatim ("**Loss: ...**", live complaint 2026-10-20).
+    Emphasis is carried by wording and line structure instead of markup. The
+    function name is kept (historical import contract) but the OUTPUT is
+    clean display text."""
+    labels = answer.get("op_labels") or []
+    agg_i = 0
+    lines = [answer.get("headline", ""), ""]
     for r in answer.get("results") or []:
         if "aggregate" in r:
-            lines.append(f"- {r['aggregate']}({r['column'] or 'rows'}) = "
-                         f"**{r['value']}** ({r['row_count']} rows from "
-                         f"`{r['source']}`)")
+            # Human label from the plan (Revenue/Expenses) when available;
+            # otherwise the aggregate + column in plain words.
+            label = None
+            if agg_i < len(labels):
+                label = labels[agg_i]
+            agg_i += 1
+            what = label or f"{r.get('aggregate')} of {r.get('column')}"
+            rows = r.get("row_count", 0)
+            lines.append(f"{what}: {_money(r.get('value'))} across {rows} "
+                         f"entries")
         else:
             rows = r.get("rows") or []
-            lines.append(f"- `{r['source']}` â€” {r['row_count']} rows:")
+            lines.append(f"{r.get('source')}: {r.get('row_count')} entries")
             if rows:
                 cols = list(rows[0].keys())[:6]
-                lines.append("| " + " | ".join(cols) + " |")
-                lines.append("|" + "---|" * len(cols))
+                lines.append("  " + " | ".join(cols))
                 for row in rows[:20]:
-                    lines.append("| " + " | ".join(
-                        str(row.get(c, ""))[:40] for c in cols) + " |")
+                    lines.append("  " + " | ".join(
+                        str(row.get(c, ""))[:40] for c in cols))
     if answer.get("caveats"):
         lines.append("")
-        for c in answer["caveats"]:
-            lines.append(f"_{c}_")
-    lines.append(f"\n_Data as of {answer.get('data_as_of', '?')}_")
+        lines.extend(answer["caveats"])
+    lines.append(f"Data as of {_human_ts(answer.get('data_as_of'))}")
     return "\n".join(lines)
 
 

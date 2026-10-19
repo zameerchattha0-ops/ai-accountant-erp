@@ -199,11 +199,26 @@ def test_computed_answer_profit_and_loss():
         question="profit?", results=[_agg(32000, "credit"),
                                      _agg(9000, "debit")])
     assert profit["synth"] == "computed"
-    assert "Profit" in profit["headline"] and "= 23000" in profit["headline"]
+    # Business language + formatted money, no raw float / column jargon.
+    assert profit["headline"].startswith("Profit of 23,000.00")
+    assert "32,000.00" in profit["headline"] and "9,000.00" in profit["headline"]
+    # The provenance caveat speaks to the owner, not the developer.
+    assert all("Python" not in c and "model" not in c
+               for c in profit["caveats"])
     loss = _computed_answer(
         question="profit?", results=[_agg(1000, "credit"),
                                      _agg(9000, "debit")])
-    assert "Loss" in loss["headline"] and "= -8000" in loss["headline"]
+    assert loss["headline"].startswith("Loss of 8,000.00")
+
+
+def test_computed_answer_uses_plan_labels_not_columns():
+    """The plan's account_type pins (REVENUE/EXPENSE) become the user-facing
+    labels - 'Revenue'/'Expenses', never 'credit'/'debit'."""
+    out = _computed_answer(
+        question="profit?", results=[_agg(32000, "credit"), _agg(9000, "debit")],
+        labels=["Revenue", "Expenses"])
+    assert out["headline"] == (
+        "Profit of 23,000.00 - Revenue 32,000.00 minus Expenses 9,000.00")
 
 
 def test_computed_answer_wrong_shape_falls_back():
@@ -259,6 +274,15 @@ def test_answer_pipeline_computed_path_uses_no_synth_call(monkeypatch):
     answer = out["answer"]
     assert answer is not None
     assert answer["synth"] == "computed"
-    assert "Profit" in answer["headline"] and "= 23000" in answer["headline"]
+    # End-to-end: the plan's REVENUE/EXPENSE pins become the user-facing
+    # labels and the money is formatted - no column jargon, no raw floats.
+    assert answer["headline"] == (
+        "Profit of 23,000.00 - Revenue 32,000.00 minus Expenses 9,000.00")
     assert out["audit"]["llm"] == "computed"
     assert len(client.prompts) == 1
+    # The chat summary is MARKDOWN-FREE display text (the card has no
+    # markdown engine - live complaint 2026-10-20).
+    from app.analytics_agent import render_markdown
+    md = render_markdown(answer)
+    assert "**" not in md and "`" not in md and "Data as of" in md
+    assert "Revenue: 32,000.00 across 2 entries" in md
