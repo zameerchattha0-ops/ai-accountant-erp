@@ -2864,6 +2864,14 @@ def _is_control_answer(value: Any) -> bool:
     "Use the existing 'X' account" — these answer gates; they must never be
     stored as an item, party or ledger name (an account proposed as
     "Yes - add to catalog Sales" is exactly what this prevented).
+
+    Plain affirmations with a trailing action are chips too (live
+    2026-10-19: "yes, create it" answered the Party-check gate and became
+    a supplier literally named "yes, create it" instead of confirming the
+    creation of the party the question NAMED).  A decision-shaped reply
+    routes to the gate's confirmation branch; the name stays the one
+    grounded from the request.  Deliberately precise: a genuine name that
+    merely starts with a decision word ("Yes Bank") must still pass.
     """
     text = str(value or "").strip().lower()
     if not text:
@@ -2872,7 +2880,23 @@ def _is_control_answer(value: Any) -> bool:
         ("yes -", "no -", "create '", "create new party", "use the existing")
     ):
         return True
-    return text in ("yes", "no", "y", "n", "ok", "okay")
+    if text in (
+        "yes", "no", "y", "n", "ok", "okay", "yep", "yeah", "sure",
+        "please", "confirm", "confirmed", "go ahead",
+    ):
+        return True
+    # "yes, create it" / "yes please" / "no dont create" / "ok, confirm it"
+    # — a decision word plus a trailing action/politeness tail, nothing
+    # name-shaped in between.
+    return bool(
+        re.fullmatch(
+            r"(?:yes|y|no|n|ok(ay)?|sure|yeah|yep|confirm(?:ed)?)"
+            r"[\s,.!:;-]*"
+            r"(?:create\s*(?:it|them)?|don'?t\s*create|please|go\s*ahead|"
+            r"do\s*it|confirm(?:ed)?(?:\s*(?:it|this))?|thanks?|proceed)?",
+            text,
+        )
+    )
 
 
 def _is_catalog_chip(value: Any) -> bool:
