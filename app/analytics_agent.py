@@ -33,50 +33,127 @@ MAX_ROWS_TO_MODEL = 40
 
 _OPS = ("eq", "neq", "ilike", "gte", "lte", "between", "in")
 _AGGREGATES = ("sum", "count", "avg", "min", "max")
+# Computed answer shapes: exactly which arithmetic Python is allowed to do
+# on aggregate results (never anything else, never by the model).
+_FORMULAS = ("op1_minus_op2",)
 
-# The "RIGHT PATH" map: what the planner may ask for, in its own words.
+# The "RIGHT PATH" map: every business module the planner may target, with
+# LIVE-VERIFIED columns (checked against the database 2026-10-19 — the old
+# catalog carried unverified columns like payments.status guesses).
 CATALOG: Dict[str, Dict[str, Any]] = {
-    "journal_lines": {
-        "desc": "general ledger lines (the books' truth)",
-        "cols": ["debit", "credit", "account_id", "description",
+    # ---- SALES module -------------------------------------------------
+    "invoices": {
+        "desc": "SALES invoices to customers (module: Sales)",
+        "cols": ["invoice_number", "invoice_date", "due_date", "subtotal",
+                 "tax_total", "total", "amount_paid", "status", "customer_id",
+                 "paid_at", "voided_at", "created_at"],
+    },
+    "invoice_items": {
+        "desc": "SALES invoice lines - what was sold (qty/price per line)",
+        "cols": ["invoice_id", "description", "product_id", "quantity",
+                 "unit_price", "discount_amount", "tax_amount", "line_total",
                  "created_at"],
     },
-    "accounts": {
-        "desc": "chart of accounts (codes, names, types)",
-        "cols": ["code", "name", "account_type", "is_active"],
+    "credit_notes": {
+        "desc": "SALES RETURNS (credit notes) issued to customers",
+        "cols": ["credit_note_number", "credit_note_date", "customer_id",
+                 "invoice_id", "subtotal", "tax_total", "total", "reason",
+                 "status", "journal_entry_id", "created_at"],
     },
+    "credit_note_items": {
+        "desc": "SALES RETURN lines (what a customer returned)",
+        "cols": ["credit_note_id", "description", "product_id", "quantity",
+                 "unit_price", "tax_amount", "line_total", "created_at"],
+    },
+    # ---- PURCHASES module ---------------------------------------------
     "purchase_bills": {
-        "desc": "supplier bills (payables); supplier_id refs suppliers",
-        "cols": ["bill_number", "bill_date", "total", "amount_paid",
-                 "status", "notes", "supplier_id"],
+        "desc": "PURCHASES from suppliers (bills/payables)",
+        "cols": ["bill_number", "bill_date", "due_date", "supplier_id",
+                 "supplier_invoice_ref", "subtotal", "tax_total", "total",
+                 "amount_paid", "status", "notes", "paid_at", "voided_at",
+                 "journal_entry_id", "created_at"],
     },
-    "invoices": {
-        "desc": "customer invoices (receivables)",
-        "cols": ["invoice_number", "invoice_date", "total", "status"],
+    "purchase_bill_items": {
+        "desc": "PURCHASE lines - what was bought (qty/price per line)",
+        "cols": ["bill_id", "description", "product_id", "expense_account_id",
+                 "fixed_asset_id", "quantity", "unit_price", "discount_amount",
+                 "tax_amount", "line_total", "created_at"],
     },
-    "payments": {
-        "desc": "recorded payments/receipts",
-        "cols": ["payment_date", "amount", "method", "status"],
+    "purchase_returns": {
+        "desc": "PURCHASE RETURNS (debit notes) sent back to suppliers",
+        "cols": ["return_number", "return_date", "bill_id", "supplier_id",
+                 "subtotal", "tax_total", "total", "reason", "status",
+                 "journal_entry_id", "created_at"],
     },
+    "purchase_return_items": {
+        "desc": "PURCHASE RETURN lines (what was sent back to a supplier)",
+        "cols": ["return_id", "bill_item_id", "description", "product_id",
+                 "quantity", "unit_price", "tax_amount", "line_total",
+                 "created_at"],
+    },
+    # ---- INVENTORY module ---------------------------------------------
     "inventory_movements": {
-        "desc": "stock ledger; quantity>0 in, <0 out; product_id refs "
-                "products",
-        "cols": ["movement_date", "quantity", "unit_cost", "product_id",
-                 "source_type"],
+        "desc": "INVENTORY stock ledger: quantity in/out per product "
+                "(direction IN/OUT)",
+        "cols": ["movement_date", "direction", "quantity", "unit_cost",
+                 "value", "product_id", "source_type", "source_id",
+                 "description", "created_at"],
     },
     "products": {
-        "desc": "catalogue items",
-        "cols": ["name", "product_code", "is_stock_tracked", "is_active"],
+        "desc": "CATALOGUE products (stock-tracked items, prices, costs)",
+        "cols": ["product_code", "name", "unit", "is_stock_tracked",
+                 "unit_price", "cost_price", "is_active", "category_id",
+                 "created_at"],
+    },
+    # ---- PAYMENTS module ----------------------------------------------
+    "payments": {
+        "desc": "PAYMENTS recorded (supplier payments/outflows & transfers)",
+        "cols": ["payment_number", "payment_date", "direction",
+                 "payment_method", "amount", "supplier_id", "expense_id",
+                 "bank_account_id", "cash_account_id", "status", "reference",
+                 "journal_entry_id", "created_at"],
+    },
+    # ---- JOURNAL module -----------------------------------------------
+    "journal_entries": {
+        "desc": "JOURNAL entries (one per posting: JV numbers, totals)",
+        "cols": ["journal_number", "transaction_date", "description",
+                 "reference", "source_type", "total_debit", "total_credit",
+                 "status", "posted_at", "created_at"],
+    },
+    "journal_lines": {
+        "desc": "GENERAL LEDGER lines (the books' truth); account_code/"
+                "account_type are resolved by the system against the chart",
+        "cols": ["entry_id", "account_id", "account_code", "account_type",
+                 "debit", "credit", "description", "customer_id",
+                 "supplier_id", "created_at"],
+    },
+    "accounts": {
+        "desc": "CHART OF ACCOUNTS (codes, names, types)",
+        "cols": ["code", "name", "account_type", "normal_balance",
+                 "is_active", "is_control_account"],
+    },
+    # ---- PARTIES module -----------------------------------------------
+    "customers": {
+        "desc": "CUSTOMER masters",
+        "cols": ["customer_code", "name", "is_active", "credit_limit",
+                 "created_at"],
     },
     "suppliers": {
-        "desc": "supplier masters",
-        "cols": ["name", "supplier_code", "is_active"],
-    },
-    "customers": {
-        "desc": "customer masters",
-        "cols": ["name", "customer_code", "is_active"],
+        "desc": "SUPPLIER masters",
+        "cols": ["supplier_code", "name", "is_active", "credit_limit",
+                 "created_at"],
     },
 }
+
+# Pseudo-columns: REAL values the executor derives (never fetched raw).
+# journal_lines stores account_id (uuid); the planner thinks in account
+# CODES/TYPES ("sum credits on REVENUE accounts") - the system resolves the
+# join deterministically. They are excluded from the DB select and evaluated
+# in Python after the join.
+PSEUDO_COLS: Dict[str, set] = {
+    "journal_lines": {"account_code", "account_type"},
+}
+
 
 
 _QUESTION_RE = re.compile(
@@ -124,8 +201,40 @@ def validate_plan(payload: Any) -> tuple:
     if len(ops) > MAX_OPS:
         return None, [f"too many operations (max {MAX_OPS})"]
     shape = str(payload.get("answer_shape") or "table")
-    if shape not in ("table", "timeseries", "single_value", "list"):
+    if shape not in ("table", "timeseries", "single_value", "list",
+                     "computed"):
         return None, [f"unknown answer_shape {shape!r}"]
+    formula = "op1_minus_op2"
+    if shape == "computed":
+        # Cross-checks: exactly two aggregations, whitelisted formula.
+        # (The profit recipe: op1 - op2, computed HERE, never by the model.)
+        formula = str(payload.get("formula") or "op1_minus_op2")
+        if formula not in _FORMULAS:
+            return None, [f"unknown formula {formula!r}"]
+        if len(ops) != 2:
+            return None, ["computed needs exactly 2 operations"]
+        if not all(isinstance(o, dict) and o.get("aggregate") for o in ops):
+            return None, ["computed needs an aggregate in both operations"]
+        # Deterministic floor for the profit recipe: each journal_lines op
+        # MUST pin an account_type (REVENUE/EXPENSE). Without it, summing
+        # credits vs debits across ALL lines is the balance identity
+        # (always zero) - caught live 2026-10-20 when the model skipped
+        # the recipe's filter.
+        for i, o in enumerate(ops):
+            if str(o.get("source") or "") != "journal_lines":
+                continue
+            pinned = any(
+                str(f.get("col") or "") == "account_type"
+                and str(f.get("op") or "") == "eq"
+                and str(f.get("value") or "").upper() in ("REVENUE", "EXPENSE")
+                for f in (o.get("filters") or [])
+            )
+            if not pinned:
+                return None, [
+                    f"op{i}: computed profit needs a filter "
+                    "col=account_type op=eq value=REVENUE (op1) or "
+                    "EXPENSE (op2) on journal_lines"
+                ]
     clean: List[Dict[str, Any]] = []
     errors: List[str] = []
     for i, raw in enumerate(ops):
@@ -137,7 +246,7 @@ def validate_plan(payload: Any) -> tuple:
         if spec is None:
             errors.append(f"op{i}: unknown source {src!r}")
             continue
-        cols_ok = set(spec["cols"])
+        cols_ok = set(spec["cols"]) | PSEUDO_COLS.get(src, set())
         columns = [str(c) for c in (raw.get("columns") or ["*"])][:12]
         bad = [c for c in columns if c != "*" and c not in cols_ok]
         if bad:
@@ -171,7 +280,8 @@ def validate_plan(payload: Any) -> tuple:
         })
     if errors:
         return None, errors
-    return {"operations": clean, "answer_shape": shape}, []
+    return {"operations": clean, "answer_shape": shape,
+            "formula": formula}, []
 
 
 
@@ -195,19 +305,44 @@ def _catalog_block(today: str) -> str:
 
 
 _PLANNER_RULES = (
-    "You plan READ-ONLY accounting queries. Reply with ONLY JSON:\n"
+    "You plan READ-ONLY accounting queries over the business's database "
+    "modules (Sales, Purchases, Returns, Inventory, Payments, Journal, "
+    "Parties). Reply with ONLY JSON:\n"
     '{"operations": [{"source": "<catalog source>", '
     '"columns": ["<col>", ...] or ["*"], '
     '"filters": [{"col": "<col>", "op": "eq|neq|ilike|gte|lte|between|in", '
     '"value": <scalar or [a,b]>}], '
     '"aggregate": "sum|count|avg|min|max"|null, "column": "<col for '
     'aggregate>", "order": "<col> asc|desc"|null, "limit": <int<=200>}], '
-    '"answer_shape": "table|timeseries|single_value|list"}\n'
+    '"answer_shape": "table|timeseries|single_value|list|computed", '
+    '"formula": "op1_minus_op2"}\n'
     "RULES: at most 3 operations; use explicit dates (YYYY-MM-DD) derived "
     "from TODAY; never invent columns; *_id columns reference another "
     "source - plan a second operation for names if needed; pick the "
     "NARROWEST query that answers the question (targeted path, minimal "
-    "rows)."
+    "rows).\n"
+    "FORMULA (only for answer_shape computed): exactly two aggregate "
+    "operations; the system subtracts op2 from op1 in Python "
+    "(op1_minus_op2). Never use computed for anything else.\n"
+    "MODULE RECIPES (targeted paths - pick the one matching the question):\n"
+    "- PROFIT / LOSS / earnings for a period: op1 = journal_lines, "
+    "aggregate sum, column credit, filter account_type eq REVENUE plus the "
+    "date filters; op2 = journal_lines, aggregate sum, column debit, filter "
+    "account_type eq EXPENSE plus the same date filters; answer_shape "
+    "computed, formula op1_minus_op2. (account_code/account_type are "
+    "resolved automatically against the chart.) NEVER compute profit by "
+    "summing ALL credits vs ALL debits - that is the balance identity and "
+    "always equals zero; the account_type filter is mandatory.\n"
+    "- DOCUMENT-DATE periods (this month / since DATE): prefer document "
+    "modules with their own dates - invoices.invoice_date, "
+    "purchase_bills.bill_date, credit_notes.credit_note_date, "
+    "purchase_returns.return_date, payments.payment_date, "
+    "inventory_movements.movement_date, journal_entries.transaction_date.\n"
+    "- RETURNS: sales returns = credit_notes (+credit_note_items); purchase "
+    "returns/debit notes = purchase_returns (+purchase_return_items).\n"
+    "- INVENTORY on hand: products (is_stock_tracked) + inventory_movements "
+    "per product.\n"
+    "Use computed ONLY for two-aggregate differences like profit."
 )
 
 _SYNTH_RULES = (
@@ -256,6 +391,38 @@ def _aggregate(rows: List[Dict[str, Any]], agg: str,
     return round(max(values), 2)
 
 
+async def _enrich_pseudo_cols(*, source: str, rows: List[Dict[str, Any]],
+                              organization_id: Any) -> List[Dict[str, Any]]:
+    """Deterministic join: journal_lines.account_id -> account_code/type.
+
+    Lets the planner think in ACCOUNT CODES/TYPES (\"sum credits on
+    REVENUE accounts\") while the DB stays the single source of truth.
+    Org-scoped like every other read; never raises."""
+    if source != "journal_lines" or not rows:
+        return rows
+    try:
+        from app.database import fetch_many
+
+        ids = {str(r.get("account_id")) for r in rows if r.get("account_id")}
+        amap: Dict[str, Dict[str, Any]] = {}
+        if ids:
+            accounts = await fetch_many(
+                "accounts",
+                filters={"organization_id": str(organization_id)},
+                select="id,code,account_type", limit=500,
+            ) or []
+            for a in accounts:
+                if str(a.get("id")) in ids:
+                    amap[str(a["id"])] = a
+        for r in rows:
+            acct = amap.get(str(r.get("account_id")) or "")
+            r["account_code"] = (acct or {}).get("code")
+            r["account_type"] = (acct or {}).get("account_type")
+    except Exception as exc:  # noqa: BLE001 - enrichment must never break a read
+        log.warning("analytics.pseudo_join_failed", error=str(exc)[:160])
+    return rows
+
+
 async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
     """Run the validated plan org-scoped. Returns one result per op.
 
@@ -271,25 +438,41 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
     for op in plan["operations"]:
         # ORG SCOPE INJECTED BY PYTHON - the model can never widen it.
         filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+        pseudo = PSEUDO_COLS.get(op["source"], set())
         noneq = []
         for f in op["filters"]:
-            if f["op"] == "eq":
+            # Pseudo-cols are NEVER sent to the database - always Python-side
+            # (after the account join below).
+            if f["op"] == "eq" and f["col"] not in pseudo:
                 filters[f["col"]] = f["value"]
             else:
                 noneq.append(f)
         fetch_limit = MAX_LIMIT if noneq else op["limit"]
-        # The seam must SEE every column the Python-side filters/sort use -
-        # a select of ["total"] plus a bill_date filter trimmed every row
-        # (live E2E catch, 2026-10-18).
-        needed = {c for c in op["columns"] if c != "*"}
-        needed.update(f["col"] for f in op["filters"])
-        if op["order"]:
-            needed.add(op["order"].split()[0].split(".")[0])
+        # The seam must SEE every column the Python-side filters/sort use - a
+        # select of ["total"] plus a bill_date filter trimmed every row (live
+        # E2E catch, 2026-10-18). Pseudo-cols are excluded - they are not DB
+        # columns and PostgREST would reject them.
+        needed = {c for c in op["columns"] if c != "*" and c not in pseudo}
+        needed.update(f["col"] for f in op["filters"] if f["col"] not in pseudo)
+        if pseudo:
+            # The join key MUST be selected or the enrichment sees no
+            # account_id and every row filters to nothing (live catch
+            # 2026-10-20: profit returned 0 rows with a correct plan).
+            needed.add("account_id")
+        order_col = op["order"].split()[0].split(".")[0] if op["order"] else ""
+        if op["order"] and order_col not in pseudo:
+            needed.add(order_col)
         select = ",".join(sorted(needed)) or "*"
         rows = await fetch_many(
             op["source"], filters=filters, select=select,
-            order=_norm_order(op["order"]), limit=fetch_limit,
+            order=_norm_order(op["order"]) if order_col not in pseudo else None,
+            limit=fetch_limit,
         ) or []
+        if pseudo:
+            rows = await _enrich_pseudo_cols(
+                source=op["source"], rows=rows,
+                organization_id=organization_id,
+            )
         rows = _apply_noneq(rows, noneq)[: op["limit"]]
         if op["aggregate"]:
             results.append({
@@ -331,7 +514,13 @@ def _apply_noneq(rows: List[Dict[str, Any]],
             except (TypeError, ValueError):
                 return None
 
-        if op == "neq":
+        if op == "eq":
+            # Pseudo-col equality (account_type on journal_lines) lands
+            # here - the DB can never answer it. Live catch 2026-10-20:
+            # without this branch the profit plan's REVENUE/EXPENSE pin
+            # was silently IGNORED and every line was counted.
+            out = [r for r in out if str(r.get(col)) == str(val)]
+        elif op == "neq":
             out = [r for r in out if str(r.get(col)) != str(val)]
         elif op == "ilike":
             needle = str(val).strip("%").lower()
@@ -413,6 +602,39 @@ def _fallback_answer(question: str, results: List[Any]) -> Dict[str, Any]:
 
 
 
+def _computed_answer(*, question: str, results: List[Any],
+                     formula: Optional[str] = "op1_minus_op2"
+                     ) -> Dict[str, Any]:
+    """Deterministic two-aggregate arithmetic (profit = op1 - op2).
+
+    The arithmetic happens HERE, never in the model. A wrong-shaped result
+    falls back honestly - no number is ever invented."""
+    if (formula != "op1_minus_op2" or len(results) != 2
+            or any("aggregate" not in r for r in results)):
+        log.warning("analytics.computed_bad_shape")
+        return _fallback_answer(question, results)
+    try:
+        a = float(results[0].get("value") or 0)
+        b = float(results[1].get("value") or 0)
+    except (TypeError, ValueError):
+        return _fallback_answer(question, results)
+    diff = round(a - b, 2)
+    kind = "Profit" if diff >= 0 else "Loss"
+    r1, r2 = results[0], results[1]
+    headline = (
+        f"{kind}: {r1.get('value')} ({r1.get('column') or r1.get('source')}) "
+        f"minus {r2.get('value')} ({r2.get('column') or r2.get('source')}) "
+        f"= {diff}"
+    )
+    return {
+        "headline": headline,
+        "answer_type": "single_value",
+        "caveats": ["difference computed in Python from the two aggregates "
+                    "(never by the model)"],
+        "synth": "computed",
+    }
+
+
 async def synthesize(*, question: str, results: List[Any], today: str,
                      client: Any, timeout: float) -> Dict[str, Any]:
     raw = await asyncio.wait_for(
@@ -482,8 +704,16 @@ async def answer_analytics_question(
         audit["llm"] = "planned"
         results = await execute_plan(
             organization_id=organization_id, plan=plan)
-        synth = await synthesize(question=question, results=results,
-                                 today=today, client=client, timeout=t)
+        if plan.get("answer_shape") == "computed":
+            # Deterministic arithmetic path (profit/loss) - no model call
+            # needed for the difference; Python already has both numbers.
+            synth = _computed_answer(
+                question=question, results=results,
+                formula=plan.get("formula"),
+            )
+        else:
+            synth = await synthesize(question=question, results=results,
+                                     today=today, client=client, timeout=t)
         answer = {
             "headline": synth["headline"],
             "answer_type": synth["answer_type"],
@@ -494,7 +724,8 @@ async def answer_analytics_question(
                 timespec="seconds"),
             "synth": synth["synth"],
         }
-        audit["llm"] = "ok" if synth["synth"] == "llm" else "fallback"
+        audit["llm"] = {"llm": "ok", "computed": "computed"}.get(
+            synth["synth"], "fallback")
         audit["plan"] = plan
         return {"answer": answer, "audit": audit}
     except Exception as exc:  # noqa: BLE001 - analytics never breaks a turn
