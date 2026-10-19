@@ -421,6 +421,7 @@ async def _llm_decision(
     entities: Dict[str, Any],
     message: Optional[str],
     nature_hint: Optional[str] = None,
+    org_context: str = "",
 ) -> Optional[TransactionClassification]:
     """Consult the LLM decision layer (app/llm_classification.py).
 
@@ -439,6 +440,7 @@ async def _llm_decision(
             entities=entities,
             message=message,
             nature_hint=nature_hint,
+            org_context=org_context,
         )
     except AssertionError:
         raise
@@ -634,6 +636,7 @@ async def classify_transaction(
     # transaction_nature for the executor's prohibited-tools guard.
     resolve_account_hints: bool = True,
     explicit_nature_source: Optional[str] = None,
+    org_context: str = "",
 ) -> TransactionClassification:
     """Classify the transaction using the authority hierarchy (see module doc).
 
@@ -848,6 +851,7 @@ async def classify_transaction(
             decision = await _llm_decision(
                 organization_id, intent=intent, entities=entities,
                 message=message, nature_hint=FIXED_ASSET,
+                org_context=org_context,
             )
             if decision is not None:
                 decision.account_source = "LLM_DECISION"
@@ -907,6 +911,7 @@ async def classify_transaction(
             decision = await _llm_decision(
                 organization_id, intent=intent, entities=entities,
                 message=message, nature_hint=nature,
+                org_context=org_context,
             )
             if decision is not None:
                 # Keep the honest provenance of the USER's nature choice —
@@ -1059,6 +1064,7 @@ async def classify_transaction(
         decision = await _llm_decision(
             organization_id, intent=intent, entities=entities,
             message=message, nature_hint=None,
+            org_context=org_context,
         )
         if decision is not None:
             decision.account_source = "LLM_DECISION"

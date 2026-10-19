@@ -140,12 +140,17 @@ async def enrich_preliminary(
     preliminary: Dict[str, Any],
     client: Any = None,
     timeout: Optional[float] = None,
+    org_context: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Merge the model's gap-filling literals into the deterministic result.
 
     Returns ``(preliminary, audit)``.  ``audit`` records whether the model
     ran/skipped/failed and every VALIDATION FAILURE - an invalid critical
     value (quantity) is never silently assumed.
+
+    ``org_context`` (2026-10-19, per-business intelligence) is the live
+    org-scoped profile block — it lets the model recognise THIS business's
+    invoice numbers, parties and stock items instead of guessing generically.
     """
     from app.config import get_settings
 
@@ -165,7 +170,14 @@ async def enrich_preliminary(
             client = get_client()
         raw = await asyncio.wait_for(
             client.generate_text_light(
-                prompt=f"{_INSTRUCTION}\n\nUSER MESSAGE:\n{user_message[:2000]}"
+                prompt=(
+                    f"{_INSTRUCTION}\n"
+                    # PER-BUSINESS CONTEXT (2026-10-19): the live profile
+                    # precedes the message so reference numbers ("INV-…"),
+                    # parties and stock items of THIS org are recognisable.
+                    f"{org_context}\n\n"
+                    f"USER MESSAGE:\n{user_message[:2000]}"
+                )
             ),
             timeout=timeout
             or getattr(settings, "llm_preliminary_extraction_timeout", 8.0),

@@ -259,6 +259,7 @@ def build_prompt(
     message: Optional[str],
     nature_hint: Optional[str],
     candidates: CandidateSet,
+    org_context: str = "",
 ) -> str:
     """The fixed-format decision request (facts + candidates + contract)."""
     facts = {
@@ -273,6 +274,12 @@ def build_prompt(
         f"USER MESSAGE: {message or '(none)'}",
         f"FACTS: {facts}",
     ]
+    if org_context:
+        # PER-BUSINESS CONTEXT (2026-10-19): the live org profile — the
+        # model picks nature/accounts knowing THIS chart, catalogue and
+        # parties instead of guessing generically.  Evidence only: the
+        # candidates below remain the only selectable accounts.
+        lines.append(org_context)
     if nature_hint:
         lines.append(
             "NATURE HINT (authoritative — user/system stated, "
@@ -642,6 +649,7 @@ async def decide(
     nature_hint: Optional[str] = None,
     client: Any = None,
     timeout: Optional[float] = None,
+    org_context: str = "",
 ) -> Optional[TransactionClassification]:
     """The full decision round-trip — CALL 2 (ACCOUNTING DECISION).
 
@@ -673,6 +681,7 @@ async def decide(
         prompt = build_prompt(
             intent=intent, entities=entities, message=message,
             nature_hint=nature_hint, candidates=candidates,
+            org_context=org_context,
         )
         raw = await asyncio.wait_for(
             client.generate_text_light(prompt=prompt),

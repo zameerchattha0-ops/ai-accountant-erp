@@ -251,7 +251,28 @@ class TestToolJournalOrchestration:
             monkeypatch.setattr(pr_repo, "mark_open", fake_mark)
 
         handler = tools_mod._TOOL_REGISTRY[tool_name]["handler"]
-        result = await handler(ORG)
+        # 2026-10-19 contract: the return tools REQUIRE substance — the
+        # schema gate refuses a zero-total document before any write, so
+        # the orchestration tests pass a priced line like a real call.
+        if tool_name == "create_credit_note":
+            result = await handler(
+                ORG,
+                customer_id=str(doc.get("customer_id") or CUST),
+                items=[{"description": "returned item", "quantity": 1,
+                        "unit_price": float(doc.get("total") or 0)}],
+                reason="damaged",
+                credit_note_date=str(doc.get("credit_note_date")
+                                     or "2026-09-25"),
+            )
+        else:
+            result = await handler(
+                ORG,
+                supplier_id=str(doc.get("supplier_id") or SUPP),
+                items=[{"description": "returned item", "quantity": 1,
+                        "unit_price": float(doc.get("total") or 0)}],
+                reason="wrong item",
+                return_date=str(doc.get("return_date") or "2026-09-25"),
+            )
         return result, calls, entry_id
 
     @pytest.mark.asyncio
@@ -303,20 +324,16 @@ class TestToolJournalOrchestration:
         assert calls["marked"] == 1
 
     @pytest.mark.asyncio
-    async def test_zero_total_skips_journal_without_failing(self, monkeypatch):
+    async def test_zero_total_is_refused_before_any_write(self, monkeypatch):
+        """2026-10-19 contract change: a zero-total credit note used to be
+        CREATED (DRAFT, no journal, claimed success) — the stage-0 run
+        produced exactly such a hollow document (CRN-000002).  The schema
+        gate now REFUSES it before any write; the user states the amount
+        and the document is recorded properly."""
         from app import tools as tools_mod
 
-        doc = {
-            "id": str(uuid.uuid4()),
-            "credit_note_number": "CN-000002",
-            "credit_note_date": "2026-09-25",
-            "customer_id": str(CUST),
-            "total": 0,
-            "status": "DRAFT",
-        }
-
-        async def fake_service(**kw):
-            return dict(doc)
+        async def fake_service(**kw):  # pragma: no cover — must not run
+            raise AssertionError("a zero-total note never reaches the service")
 
         async def fake_auto_journal(**kw):  # pragma: no cover — must not run
             raise AssertionError("zero-total notes never journal")
@@ -326,9 +343,13 @@ class TestToolJournalOrchestration:
         )
         monkeypatch.setattr(tools_mod, "auto_journal", fake_auto_journal)
         handler = tools_mod._TOOL_REGISTRY["create_credit_note"]["handler"]
-        result = await handler(ORG)
-        assert result.success and result.data["status"] == "DRAFT"
-        assert "journal_posted" not in result.data
+        with pytest.raises(ValueError, match="ZERO amount"):
+            await handler(
+                ORG,
+                customer_id=str(CUST),
+                items=[{"description": "x", "quantity": 1, "unit_price": 0}],
+                reason="damaged",
+            )
 
 
 def _auth():

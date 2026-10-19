@@ -377,6 +377,9 @@ class AgentContext(BaseModel):
     # model's own interpretation/proposal so later stages reassess against it
     # rather than overwriting it with a keyword route.
     preliminary_extraction: Dict[str, Any] = Field(default_factory=dict)
+    # PER-BUSINESS CONTEXT carrier (2026-10-19): the turn's live profile
+    # block rides the context into the lookup-continuation directive.
+    org_profile_text: str = ""
     live_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     # READ-ONLY LOOKUPS THAT ALREADY RAN for this request (the Phase-5
     # lookup-continuation gate executes a lookup-only plan before the model

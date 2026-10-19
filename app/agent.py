@@ -78,6 +78,11 @@ _FAST_PATH_INTENTS = {
     "create_invoice",           # R4.7: resolved single-line invoice
     "record_credit_sale",       # R4.7: resolved credit sale -> invoice
     "register_fixed_asset",     # R5: resolved fixed-asset acquisition
+    # 2026-10-19 (stage-0 return lanes): the return documents get the same
+    # deterministic treatment — the LLM continuation round had rebuilt
+    # their calls with the invoice/bill reference and line prices DROPPED.
+    "create_credit_note",       # resolved customer return -> credit note
+    "create_purchase_return",   # resolved supplier return -> debit note
 }
 
 
@@ -93,6 +98,7 @@ _CUSTOMER_PARTY_INTENTS = {
     "create_quotation",
     "record_receipt",
     "record_cash_sale",
+    "create_credit_note",   # a customer return gates on the CUSTOMER
 }
 
 
@@ -1143,6 +1149,91 @@ async def _link_or_create_catalog_items(
             )
 
 
+def _credit_note_fast_path_call(
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """The credit-note fast path (customer + amount + date resolved).
+
+    The tool-layer normalizer derives the priced line and RESOLVES the
+    invoice reference (invoice_number -> invoice_id), so this builder only
+    gates completeness and passes the facts through untouched — the exact
+    fields the 2026-10-19 continuation round had dropped.  ``None`` => the
+    question ladder / model path handles it.
+    """
+    customer = entities.get("customer_name")
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    if not customer or not amount or not txn_date:
+        return None
+    args: Dict[str, Any] = {
+        "customer_name": str(customer),
+        "credit_note_date": str(txn_date),
+        "amount": float(amount),
+    }
+    for key in ("invoice_number", "invoice_id", "reason"):
+        if entities.get(key):
+            args[key] = entities[key]
+    if entities.get("line_items"):
+        args["items"] = entities["line_items"]
+    elif entities.get("item_description"):
+        args["description"] = str(entities["item_description"])
+        if entities.get("quantity"):
+            args["quantity"] = entities["quantity"]
+    if not (args.get("items") or args.get("description")):
+        return None  # no line substance — never a hollow note
+    return [ToolCall(tool_name="create_credit_note", arguments=args)]
+
+
+async def _purchase_return_fast_path_call(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+) -> Optional[List[ToolCall]]:
+    """The purchase-return (debit note) fast path — the mirror of the
+    credit-note builder with supplier resolution (exact match, or create
+    only after the user confirmed the new party; unresolved => None)."""
+    supplier_name = entities.get("supplier_name")
+    amount = entities.get("amount")
+    txn_date = entities.get("transaction_date")
+    if not supplier_name or not amount or not txn_date:
+        return None
+    from app.services import supplier_service
+
+    rows = await supplier_service.search(
+        organization_id, query=str(supplier_name), limit=5
+    ) or []
+    supplier = next(
+        (
+            r for r in rows
+            if (r.get("name") or "").strip().lower()
+            == str(supplier_name).strip().lower()
+        ),
+        None,
+    )
+    if supplier is None:
+        if not entities.get("supplier_create_confirmed"):
+            return None  # the party gate / model path asks
+        supplier = await supplier_service.create(
+            organization_id, name=str(supplier_name)
+        )
+    args: Dict[str, Any] = {
+        "supplier_id": str(supplier["id"]),
+        "return_date": str(txn_date),
+        "amount": float(amount),
+    }
+    for key in ("bill_number", "bill_id", "reason"):
+        if entities.get(key):
+            args[key] = entities[key]
+    if entities.get("line_items"):
+        args["items"] = entities["line_items"]
+    elif entities.get("item_description"):
+        args["description"] = str(entities["item_description"])
+        if entities.get("quantity"):
+            args["quantity"] = entities["quantity"]
+    if not (args.get("items") or args.get("description")):
+        return None
+    return [ToolCall(tool_name="create_purchase_return", arguments=args)]
+
+
 async def _deterministic_mutation_calls(
     *,
     organization_id: uuid.UUID,
@@ -1195,6 +1286,16 @@ async def _deterministic_mutation_calls(
         # nature + asset name + cost + date + stated payment treatment) —
         # the tool resolves the asset/depreciation/cash-bank accounts itself.
         return _fixed_asset_fast_path_call(entities)
+    if execution_plan.intent == "create_credit_note":
+        # 2026-10-19: the customer-return fast path (party + amount + date
+        # resolved).  The tool normalizer prices the line and resolves the
+        # invoice reference — never the lossy continuation round.
+        return _credit_note_fast_path_call(entities)
+    if execution_plan.intent == "create_purchase_return":
+        # 2026-10-19: the supplier-return (debit note) mirror.
+        return await _purchase_return_fast_path_call(
+            organization_id, entities
+        )
     if execution_plan.intent in ("create_invoice", "record_credit_sale"):
         # R4.7: the invoice fast path (nature goods/service + customer +
         # amount + date resolved) — builds the invoice tool call without
@@ -2983,6 +3084,10 @@ async def execute(
     session_id: Optional[uuid.UUID] = None
     prior_qa: List[Dict[str, str]] = clarification_history or []
     _t0 = time.monotonic()
+    # PER-BUSINESS CONTEXT default (2026-10-19): every consumer below reads
+    # this block; a path that never reaches the profile build simply passes
+    # an empty string (the calls behave exactly as before).
+    _profile_block = ""
     # P2-⑪ (forensic report ⑪): structlog phase timings are LOST on Vercel
     # (runtime-logs 404, DEFECT3) — mirror every marker into a per-request
     # dict carried on this task's context; create_execution_result persists
@@ -3126,6 +3231,24 @@ async def execute(
 
         _settings = _get_settings()
         _preliminary = _preliminary_extraction(user_message)
+        # ---- PER-BUSINESS CONTEXT (one live read-set per turn) -----------
+        # The profile below feeds the extractor, classifier, questionnaire
+        # authorizer and the continuation directive — the "five generic
+        # calls" fix (2026-10-19).  Built ONCE here so every call of this
+        # turn sees the SAME snapshot; rebuilt next turn, so new products,
+        # parties and documents are visible immediately.  Org-filtered
+        # reads only (app.org_context docstring = the isolation contract).
+        from app.org_context import business_profile as _business_profile
+        from app.org_context import render_profile as _render_profile
+
+        try:
+            _org_profile = await _business_profile(organization_id)
+        except Exception as exc:  # noqa: BLE001 — context never breaks a turn
+            log.warning(
+                "agent.org_profile_failed", error=str(exc)[:200]
+            )
+            _org_profile = {}
+        _profile_block = _render_profile(_org_profile)
         # STAGE-2 LLM ENRICHMENT (flag-gated, 2026-10-18): the deterministic
         # literals are the FLOOR and stay authoritative; the short model call
         # only fills GAPS (quantity, odd phrasings) under schema validation.
@@ -3135,7 +3258,8 @@ async def execute(
             from app.llm_extraction import enrich_preliminary as _enrich_prelim
 
             _preliminary, _prelim_audit = await _enrich_prelim(
-                user_message=user_message, preliminary=_preliminary
+                user_message=user_message, preliminary=_preliminary,
+                org_context=_profile_block,
             )
             if _prelim_audit.get("llm") not in (None, "skipped_disabled"):
                 await _log_step(session_id, "LITERAL_ENRICHMENT", _prelim_audit)
@@ -3768,6 +3892,9 @@ async def execute(
             # RC-4a: honest provenance — a learned org preference must not
             # be reported as USER_ANSWER ("the user said so").
             explicit_nature_source=execution_plan.transaction_nature_source,
+            # PER-BUSINESS CONTEXT (2026-10-19): the live profile block the
+            # turn built once at stage 2 — evidence for the decision call.
+            org_context=_profile_block,
         )
         execution_plan.classification = classification
         await _log_step(session_id, "CLASSIFICATION", {
@@ -3843,6 +3970,9 @@ async def execute(
                 # GROUNDING (Option 3): the CALL 2 account decision rides
                 # WITH the question — decided context to name, never to ask.
                 classification=execution_plan.classification,
+                # PER-BUSINESS CONTEXT (2026-10-19): the live profile lets
+                # the authored questions cite THIS business's real records.
+                org_context=_profile_block,
             )
             if _questionnaire is None or _questionnaire.is_empty():
                 _questionnaire = await build_questionnaire_with_llm(
@@ -4090,6 +4220,9 @@ async def execute(
         # instead of silently replacing them with a keyword route.
         context.classification = classification
         context.preliminary_extraction = dict(_preliminary or {})
+        # PER-BUSINESS CONTEXT carrier: the continuation round (a different
+        # function) reads this off the context when it composes its directive.
+        context.org_profile_text = _profile_block
         if _reasoning is not None:
             context.live_evidence = [
                 result.as_dict() for result in (_reasoning.evidence_results or [])
@@ -6269,6 +6402,22 @@ async def execute(
                             tool=tr.tool_name,
                         )
 
+        # ---- DOCUMENT-INTEGRITY RULES (2026-10-19) -----------------------
+        # A successful return document must carry substance, a posted
+        # journal and (when the user named one) its source reference —
+        # balance alone can never prove the document did what was asked.
+        _integrity = _document_integrity_violations(
+            tool_results,
+            entities=execution_plan.extracted_entities or {},
+        )
+        if _integrity:
+            verified = False
+            log.warning(
+                "document_integrity_violated",
+                session_id=str(session_id),
+                violations=_integrity,
+            )
+
         # ---- PHASE 9: COMPLETED ------------------------------------------
         status = ExecutionStatus.COMPLETED if verified else ExecutionStatus.FAILED
         await _update_status(session_id, status)
@@ -7414,6 +7563,14 @@ async def _continue_lookup_only_plan(
                     "customer_name", "supplier_name", "item_description",
                     "quantity", "amount", "transaction_date",
                     "transaction_nature", "payment_method",
+                    # FAITHFUL-CARRY FIX (2026-10-19, stage-0 CN/DN lanes):
+                    # the reference numbers, the line items and the reason
+                    # were MISSING from this whitelist, so the directive
+                    # told the model to build args from facts that excluded
+                    # the very fields it then dropped (credit note without
+                    # invoice_id, items without unit_price).
+                    "invoice_number", "bill_number", "receipt_number",
+                    "line_items", "reason", "description",
                 )
                 if _ents.get(k) not in (None, "", [], {})
             }
@@ -7451,6 +7608,13 @@ async def _continue_lookup_only_plan(
                     "those facts."
                 )
 
+    # PER-BUSINESS CONTEXT (2026-10-19): the turn's live profile rides the
+    # bounded continuation round as clearly-labelled internal context (the
+    # directive above already distinguishes internal text from user words).
+    _org_profile = str(getattr(context, "org_profile_text", "") or "")
+    if _org_profile:
+        _msg = f"{_msg}\n\n[CONTEXT — not words from the user]{_org_profile}"
+
     _light = execution_plan.intent in _LIGHT_BUDGET_INTENTS
     result, stall = await _bounded_provider_call(
         client.generate_with_tools(
@@ -7483,7 +7647,141 @@ async def _continue_lookup_only_plan(
         "tools": [c.tool_name for c in calls],
         "text": text[:400],
     })
+    # FAITHFUL CARRY (2026-10-19): the continuation may REWORD a write call,
+    # never SHRINK it — every reference number, priced line and reason the
+    # plan already held is re-injected when the model omitted it.
+    calls = _carry_forward_write_args(
+        calls, entities=_ents, original=planned_tool_calls,
+    )
     return calls, text, evidence
+
+
+#: Fields of the plan's entities that MUST ride into a return-document call
+#: when the model omitted them (the normalizer in app.tools consumes them —
+#: they never reach the database as raw columns).
+_CARRY_ENTITY_ARGS = {
+    "create_credit_note": {
+        "invoice_number": "invoice_number",
+        "customer_name": "customer_name",
+        "line_items": "items",
+        "item_description": "description",
+        "quantity": "quantity",
+        "amount": "amount",
+        "reason": "reason",
+    },
+    "create_purchase_return": {
+        "bill_number": "bill_number",
+        "supplier_name": "supplier_name",
+        "line_items": "items",
+        "item_description": "description",
+        "quantity": "quantity",
+        "amount": "amount",
+        "reason": "reason",
+    },
+}
+
+
+def _carry_forward_write_args(
+    calls: Sequence[ToolCall],
+    *,
+    entities: Dict[str, Any],
+    original: Sequence[ToolCall],
+) -> List[ToolCall]:
+    """Never let a rebuilt write call lose what the plan already knew.
+
+    * the ORIGINAL plan's arguments for the SAME tool fill any key the
+      continuation dropped (first-plan-wins for absent keys only — a value
+      the model DID send is never overwritten);
+    * the plan's ENTITIES fill the reference/pricing fields for the two
+      return-document tools (invoice_number / bill_number / priced lines /
+      reason / party), which the tool-layer normalizer then resolves into
+      invoice_id / bill_id and line prices.
+
+    Live failure (2026-10-19, stage-0 credit-note lane): the continuation
+    round rebuilt ``create_credit_note`` without ``invoice_id`` and without
+    unit prices — a zero-total note with no invoice reference was created
+    while the user had stated both.
+    """
+    if not calls:
+        return list(calls or ())
+    orig_by_tool: Dict[str, Dict[str, Any]] = {}
+    for oc in original or ():
+        if oc.tool_name not in orig_by_tool:
+            orig_by_tool[oc.tool_name] = dict(oc.arguments or {})
+
+    merged: List[ToolCall] = []
+    for call in calls:
+        args = dict(call.arguments or {})
+
+        def _empty(value: Any) -> bool:
+            return value in (None, "", [], {})
+
+        for key, value in (orig_by_tool.get(call.tool_name) or {}).items():
+            if _empty(args.get(key)) and not _empty(value):
+                args[key] = value
+        for entity_key, arg_key in (
+            _CARRY_ENTITY_ARGS.get(call.tool_name) or {}
+        ).items():
+            value = (entities or {}).get(entity_key)
+            if _empty(args.get(arg_key)) and not _empty(value):
+                args[arg_key] = value
+        merged.append(ToolCall(tool_name=call.tool_name, arguments=args))
+    return merged
+
+
+def _document_integrity_violations(
+    tool_results: Sequence[Any],
+    *,
+    entities: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Deterministic post-write rules for return documents — never an LLM opinion.
+
+    (2026-10-19, stage-0 lanes: the terminal step claimed ``verified: true``
+    for a ZERO-total credit note with no invoice link — a document that
+    reverses nothing while telling the user the receivable was reduced.
+    Balance alone can never prove a document did what the user asked.)
+
+    * a credit note / purchase return that SUCCEEDED must carry a positive
+      total and its journal tie;
+    * when the plan carried a source reference (invoice_number/bill_number),
+      the created document must keep it (invoice_id/bill_id set).
+    """
+    ents = entities or {}
+    violations: List[str] = []
+    for tr in tool_results or ():
+        if not (getattr(tr, "success", False) and isinstance(tr.data, dict)):
+            continue
+        data = tr.data
+        name = getattr(tr, "tool_name", "")
+        if name == "create_credit_note":
+            if float(data.get("total") or 0) <= 0:
+                violations.append(
+                    "credit note recorded a ZERO amount — it reverses nothing"
+                )
+            if not data.get("journal_posted"):
+                violations.append(
+                    "credit note has no posted reversal journal"
+                )
+            if (ents.get("invoice_number") or ents.get("invoice_id")) and not (
+                data.get("invoice_id") or data.get("invoice_number")
+            ):
+                violations.append(
+                    "credit note is not linked to the invoice the user named"
+                )
+        elif name == "create_purchase_return":
+            if float(data.get("total") or 0) <= 0:
+                violations.append(
+                    "debit note recorded a ZERO amount — it reverses nothing"
+                )
+            if not data.get("journal_posted"):
+                violations.append("debit note has no posted reversal journal")
+            if (ents.get("bill_number") or ents.get("bill_id")) and not (
+                data.get("bill_id") or data.get("bill_number")
+            ):
+                violations.append(
+                    "debit note is not linked to the bill the user named"
+                )
+    return violations
 
 
 #: A tool failure that says the VALUE ITSELF has to come from the user

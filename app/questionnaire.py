@@ -993,6 +993,7 @@ def _authored_questionnaire_prompt(
     history: Optional[Sequence[Dict[str, str]]] = None,
     today: str = "",
     classification: Optional[Any] = None,
+    org_context: str = "",
 ) -> str:
     """Assemble the authoring prompt (request + facts + vocabulary)."""
     vocabulary = []
@@ -1007,6 +1008,11 @@ def _authored_questionnaire_prompt(
         "ANSWERED_HISTORY": list(history or []),
         "TODAY": today,
     }
+    if org_context:
+        # PER-BUSINESS CONTEXT (2026-10-19): the live profile — questions
+        # may cite THIS business's real catalogue/parties/documents instead
+        # of guessing; KNOWN_FACTS above remain the authority for facts.
+        payload["YOUR_BUSINESS"] = org_context.strip()
     # GROUNDING (Option 3): the CALL 2 classification rides WITH the
     # question — the identified ledger/nature is DECIDED context the model
     # may name inside a question's wording, never one it may ask about.
@@ -1061,6 +1067,7 @@ async def author_questionnaire(
     history: Optional[Sequence[Dict[str, str]]] = None,
     today: str = "",
     classification: Optional[Any] = None,
+    org_context: str = "",
 ) -> Optional[Questionnaire]:
     """The provider WRITES the questionnaire for the open material gaps.
 
@@ -1079,6 +1086,7 @@ async def author_questionnaire(
         history=history,
         today=today,
         classification=classification,
+        org_context=org_context,
     )
     try:
         raw = await client.generate_text_light(prompt=prompt)

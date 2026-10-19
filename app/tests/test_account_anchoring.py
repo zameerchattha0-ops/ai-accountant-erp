@@ -193,7 +193,8 @@ class TestClassifierEscalates:
         """Python never overrides the model: its deliberate pick stands."""
         from app.models.schemas import TransactionClassification
 
-        async def fake_decision(org, *, intent, entities, message, nature_hint=None):
+        async def fake_decision(org, *, intent, entities, message,
+                                nature_hint=None, org_context="", **_kw):
             return TransactionClassification(
                 transaction_nature=nature_hint or "FIXED_ASSET",
                 confidence="HIGH",

@@ -1409,7 +1409,146 @@ async def _convert_quotation(organization_id: uuid.UUID, **kw) -> ToolResult:
 # CREDIT NOTE TOOLS
 # ===================================================================
 
+async def _normalize_return_args(
+    organization_id: uuid.UUID, kw: Dict[str, Any], *, kind: str
+) -> Dict[str, Any]:
+    """FAITHFUL CARRY + SCHEMA GATE for the two return-document tools.
+
+    (2026-10-19, stage-0 lanes: the executed credit note lost its
+    ``invoice_id`` and line prices — total 0, no reversal journal; the
+    debit note failed with an unresolvable supplier.)
+
+    * ``invoice_number`` / ``bill_number`` are RESOLVED into the uuid the
+      service requires (a reference the user typed must survive to the row);
+    * missing line prices are DERIVED arithmetically from the stated total
+      and quantity (the derivable-half doctrine — arithmetic, never a guess);
+    * a document that would carry a ZERO total is REFUSED before any write,
+      with the exact value the user must state — never a hollow document
+      that claims success while reversing nothing.
+
+    Consumed helper keys are stripped so they never reach the repository.
+    """
+    kw = dict(kw or {})
+
+    def _uuid_ok(value: Any) -> bool:
+        try:
+            uuid.UUID(str(value))
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    # REFERENCE-SHAPED ID FIX (live 2026-10-19): models sometimes write the
+    # document NUMBER into the uuid field ("INV-000014" as invoice_id) —
+    # the service's uuid coercion then died with "badly formed hexadecimal
+    # UUID string" AFTER the validator already approved the call.  A
+    # non-uuid value in *_id is resolved AS the number instead.
+    # Cross-kind hygiene: the other document's reference never rides along.
+    num = ""
+    if kind == "credit_note":
+        kw.pop("bill_id", None)
+        kw.pop("bill_number", None)
+        num = str(kw.pop("invoice_number", "") or "").strip()
+        raw_inv = kw.pop("invoice_id", None)
+        if raw_inv and not _uuid_ok(raw_inv):
+            num = num or str(raw_inv).strip()
+            raw_inv = None
+        if raw_inv:
+            kw["invoice_id"] = str(raw_inv)
+        if not kw.get("invoice_id") and num:
+            from app.database import fetch_many as _fm
+
+            rows = await _fm(
+                "invoices",
+                filters={"organization_id": str(organization_id),
+                         "invoice_number": num},
+                limit=1,
+            ) or []
+            if rows:
+                kw["invoice_id"] = str(rows[0]["id"])
+    else:
+        kw.pop("invoice_id", None)
+        kw.pop("invoice_number", None)
+        bill_no = str(kw.pop("bill_number", "") or "").strip()
+        raw_bill = kw.pop("bill_id", None)
+        if raw_bill and not _uuid_ok(raw_bill):
+            bill_no = bill_no or str(raw_bill).strip()
+            raw_bill = None
+        if raw_bill:
+            kw["bill_id"] = str(raw_bill)
+        if not kw.get("bill_id") and bill_no:
+            from app.database import fetch_many as _fm
+
+            rows = await _fm(
+                "purchase_bills",
+                filters={"organization_id": str(organization_id),
+                         "bill_number": bill_no},
+                limit=1,
+            ) or []
+            if rows:
+                kw["bill_id"] = str(rows[0]["id"])
+
+    amount = kw.pop("amount", None)
+    try:
+        amount = float(amount) if amount is not None else None
+    except (TypeError, ValueError):
+        amount = None
+    qty_raw = kw.pop("quantity", None)
+    description = (
+        kw.pop("item_description", None) or kw.pop("description", None)
+    )
+    items = kw.get("items") or []
+    if not items and description:
+        qty = float(qty_raw) if qty_raw not in (None, "", 0) else 1.0
+        unit_price = (
+            round(amount / qty, 2)
+            if amount and qty and amount > 0
+            else None
+        )
+        items = [{"description": str(description).strip(),
+                  "quantity": qty, "unit_price": unit_price}]
+    priced = []
+    for raw_line in items or ():
+        line = dict(raw_line)
+        if (line.get("unit_price") in (None, "", 0)
+                and amount and amount > 0):
+            line_qty = float(line.get("quantity") or 1) or 1.0
+            line["unit_price"] = round(amount / line_qty, 2)
+        # LINE PARITY (live 2026-10-19, CRN-000003): the credit-note /
+        # purchase-return repositories compute the document total from
+        # ``line_total`` — a line carrying only quantity × unit_price
+        # stored a ZERO-total document while the validator approved the
+        # call.  The invoice service has this parity law; the return lanes
+        # never did.  Compute it here so BOTH tools inherit it.
+        if line.get("line_total") in (None, ""):
+            try:
+                line_qty = float(line.get("quantity") or 0)
+                line_unit = float(line.get("unit_price") or 0)
+            except (TypeError, ValueError):
+                line_qty, line_unit = 0.0, 0.0
+            if line_qty > 0 and line_unit > 0:
+                line["line_total"] = round(line_qty * line_unit, 2)
+        priced.append(line)
+    if priced:
+        kw["items"] = priced
+
+    total = 0.0
+    for line in kw.get("items") or ():
+        try:
+            total += float(line.get("quantity") or 0) * float(
+                line.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            continue
+    if total <= 0:
+        raise ValueError(
+            f"This {kind.replace('_', ' ')} would record a ZERO amount — "
+            "no document was created. State the amount (and quantity if "
+            "more than one unit) and I will record it properly."
+        )
+    return kw
+
+
 async def _create_credit_note(organization_id: uuid.UUID, **kw) -> ToolResult:
+    kw = await _normalize_return_args(organization_id, kw, kind="credit_note")
     data = await credit_note_service.create_credit_note(organization_id=organization_id, **kw)
     # C3+C4 (mirrors create_invoice): a customer return is a real
     # receivable event — the REVERSAL journal (Dr revenue / Cr receivable)
@@ -1469,6 +1608,9 @@ async def _create_credit_note(organization_id: uuid.UUID, **kw) -> ToolResult:
 # ===================================================================
 
 async def _create_purchase_return(organization_id: uuid.UUID, **kw) -> ToolResult:
+    kw = await _normalize_return_args(
+        organization_id, kw, kind="purchase_return"
+    )
     data = await purchase_return_service.create_purchase_return(organization_id=organization_id, **kw)
     # C3+C4 (mirrors create_invoice / create_purchase_bill): a goods
     # return to the supplier is a real payable event — the REVERSAL journal
