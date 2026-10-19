@@ -135,7 +135,8 @@ async def main() -> None:
     cust = str(customers[0].get("name")) if customers else "Geta Ltd"
     p(f"customer for the sale: {cust!r}")
 
-    returns_only = "--returns-only" in sys.argv
+    returns_only = "--returns-only" in sys.argv or "--debit-only" in sys.argv
+    debit_only = "--debit-only" in sys.argv
     if returns_only:
         # Resume the cycle from the RETURN steps: the previous stage-0 run
         # already posted the purchase bill (45,000) and the sale invoice.
@@ -162,13 +163,14 @@ async def main() -> None:
     inv_no = str(invoice.get("invoice_number")) if invoice else ""
 
     # ---- 3. SALES RETURN: credit note OF THAT invoice ---------------------
-    await drive(ctx,
-                f"{cust} returned 1 damaged chair — create a credit note "
-                f"against invoice {inv_no} for 8000 with reason damaged "
-                f"on arrival",
-                "CREDIT-NOTE",
-                {"invoice_no": inv_no, "amount": "8000",
-                 "reason": "Damaged on arrival"})
+    if not debit_only:
+        await drive(ctx,
+                    f"{cust} returned 1 damaged chair — create a credit note "
+                    f"against invoice {inv_no} for 8000 with reason damaged "
+                    f"on arrival",
+                    "CREDIT-NOTE",
+                    {"invoice_no": inv_no, "amount": "8000",
+                     "reason": "Damaged on arrival"})
     cn = await latest(org, "credit_notes")
     p(f">>> latest credit note: {cn.get('credit_note_number') if cn else None} "
       f"invoice_id={cn.get('invoice_id') if cn else None} "

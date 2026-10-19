@@ -747,6 +747,16 @@ async def _get_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
     existed — the gap that killed the production credit-note turns).
     """
     invoice_id = kw.get("invoice_id")
+    # REFERENCE-SHAPED ID (2026-10-19): models pass the document NUMBER in
+    # the id field ("INV-000014") — the uuid coercion below then died with
+    # "badly formed hexadecimal UUID string" (read-only, but the lookup
+    # evidence was lost).  A non-uuid id is resolved AS the number here.
+    if invoice_id:
+        try:
+            uuid.UUID(str(invoice_id))
+        except (ValueError, TypeError):
+            kw["invoice_number"] = kw.get("invoice_number") or str(invoice_id)
+            invoice_id = None
     if not invoice_id:
         number = str(kw.get("invoice_number") or "").strip()
         if not number:
@@ -1181,7 +1191,35 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
     return ToolResult(tool_name="create_purchase_bill", success=True, data=data)
 
 async def _get_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
-    data = await purchase_service.get_purchase_bill(organization_id, bill_id=uuid.UUID(kw["bill_id"]))
+    # REFERENCE-SHAPED ID (2026-10-19, same class as get_invoice): a
+    # non-uuid bill_id ("PUR-000013") resolves READ-ONLY by number instead
+    # of dying inside uuid coercion.
+    bill_id = kw.get("bill_id")
+    if bill_id:
+        try:
+            uuid.UUID(str(bill_id))
+        except (ValueError, TypeError):
+            from app.database import fetch_many as _fm
+
+            rows = await _fm(
+                "purchase_bills",
+                filters={"organization_id": str(organization_id),
+                         "bill_number": str(bill_id).strip()},
+                limit=1,
+            ) or []
+            if not rows:
+                return ToolResult(
+                    tool_name="get_purchase_bill",
+                    success=False,
+                    error=(
+                        f"No purchase bill numbered {str(bill_id)!r} exists "
+                        "in your books."
+                    ),
+                )
+            bill_id = str(rows[0]["id"])
+    data = await purchase_service.get_purchase_bill(
+        organization_id, bill_id=uuid.UUID(str(bill_id))
+    )
     return ToolResult(tool_name="get_purchase_bill", success=True, data=data)
 
 # ===================================================================

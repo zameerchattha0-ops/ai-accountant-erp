@@ -1739,7 +1739,11 @@ def preliminary_extraction(
 
     reference = None
     invoice_number = None
-    for token in re.findall(r"\b(?:INV|BILL|RCPT|PAY|PO|JV)[-/\s]?\d{2,}\b", message, re.I):
+    for token in re.findall(
+        r"\b(?:INV|BILL|PUR|CRN|RET|RCPT|PAY|PO|JV)[-/\s]?\d{2,}\b",
+        message,
+        re.I,
+    ):
         reference = token.strip()
         # Only an INV-prefixed token IS an invoice number; the other document
         # kinds keep document_reference alone (a bill ref is never seeded as
@@ -1768,6 +1772,24 @@ def preliminary_extraction(
         literals["document_reference"] = reference
     if invoice_number:
         literals["invoice_number"] = invoice_number
+    # PUR-prefixed references ARE purchase-bill numbers (2026-10-19: the
+    # debit-note lane must carry bill_number so the return links to its
+    # source bill — "against purchase bill PUR-000013" extracted NOTHING).
+    if reference and reference.upper().startswith(("PUR", "BILL")):
+        literals["bill_number"] = reference
+    # "with reason <text>" — the user's OWN words for the return documents
+    # (2026-10-19: both return tools REQUIRE a reason; neither the planner
+    # nor the semantic stage reliably carried it — the DN execution died
+    # with 'Purchase return requires a reason.').
+    reason_m = re.search(
+        r"\b(?:with\s+)?reason\s+(?:of\s+|:\s*)?([^\.,;!?]+)",
+        message,
+        re.I,
+    )
+    if reason_m:
+        candidate = reason_m.group(1).strip()
+        if 3 <= len(candidate) <= 120:
+            literals["reason"] = candidate
 
     # Candidate subject areas — HINTS ONLY.  They tell the model where to look
     # first; they never decide the treatment, the workflow, or the accounts.

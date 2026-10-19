@@ -322,3 +322,120 @@ def test_integrity_ignores_failed_tool_results():
     )
     assert violations == []
 
+
+
+# --- leftover fixes (2026-10-19, second live round) ------------------------
+DN_MESSAGE = (
+    "We returned 1 defective chair to SHABBIR FURNITURES - create a debit "
+    "note against purchase bill PUR-000013 for 9000 with reason wrong item "
+    "delivered"
+)
+
+
+def test_dn_message_extracts_supplier_name():
+    """The DN lane's supplier was NEVER extracted (the 'we' subject blocked
+    the customer rule; nothing owned 'to <Party>'), forcing the lossy model
+    path every turn."""
+    from app.planner import plan
+
+    p = plan(DN_MESSAGE)
+    assert p.intent == "create_purchase_return"
+    assert (p.extracted_entities or {}).get("supplier_name") == "SHABBIR FURNITURES"
+
+
+def test_dn_message_extracts_bill_number_literal():
+    """'against purchase bill PUR-000013' used to extract NOTHING (PUR was
+    not in the reference alternation)."""
+    from app.accounting_reasoning import preliminary_extraction
+
+    literals = preliminary_extraction(DN_MESSAGE).get("literals") or {}
+    assert literals.get("bill_number") == "PUR-000013"
+    assert literals.get("document_reference") == "PUR-000013"
+    assert literals.get("invoice_number") is None  # a bill ref is never an invoice
+
+
+def test_bill_reference_seed_reaches_the_plan_prefill():
+    from app.agent import _seed_invoice_reference
+
+    prefill: dict = {}
+    _seed_invoice_reference(
+        {"literals": {"bill_number": "PUR-000013"}}, prefill
+    )
+    assert prefill["bill_number"] == "PUR-000013"
+    # invoice seeding unchanged and independent
+    prefill2: dict = {}
+    _seed_invoice_reference(
+        {"literals": {"invoice_number": "INV-000014"}}, prefill2
+    )
+    assert prefill2["invoice_number"] == "INV-000014"
+
+
+def test_reason_literal_is_extracted_from_the_message():
+    from app.accounting_reasoning import preliminary_extraction
+
+    literals = preliminary_extraction(DN_MESSAGE).get("literals") or {}
+    assert literals.get("reason") == "wrong item delivered"
+
+
+def test_fast_paths_never_emit_a_reasonless_document():
+    cn = _credit_note_fast_path_call({
+        "customer_name": "abc technologies", "amount": 8000,
+        "transaction_date": "2026-10-19",
+        "item_description": "damaged chair", "quantity": 1,
+    })
+    assert cn[0].arguments["reason"] == "Return of damaged chair"
+    # the user's own wording always wins over the derived description
+    cn2 = _credit_note_fast_path_call({
+        "customer_name": "abc", "amount": 8000,
+        "transaction_date": "2026-10-19", "item_description": "chair",
+        "reason": "wrong item delivered",
+    })
+    assert cn2[0].arguments["reason"] == "wrong item delivered"
+
+
+@pytest.mark.asyncio
+async def test_get_invoice_resolves_a_number_in_the_id_field(monkeypatch):
+    """get_invoice died inside uuid coercion when the model passed the
+    NUMBER as invoice_id ('badly formed hexadecimal UUID string')."""
+    from app import tools as tools_mod
+
+    async def fake_by_number(_org, *, invoice_number):
+        assert invoice_number == "INV-000014"
+        return {"id": "11111111-9999-4999-8999-000000000009",
+                "invoice_number": "INV-000014"}
+
+    async def fake_get(org_id, *, invoice_id):
+        assert str(invoice_id) == "11111111-9999-4999-8999-000000000009"
+        return {"id": "11111111-9999-4999-8999-000000000009", "total": 24000}
+
+    monkeypatch.setattr(
+        "app.repositories.invoice_repository.get_invoice_by_number",
+        fake_by_number,
+    )
+    monkeypatch.setattr(tools_mod.invoice_service, "get_invoice", fake_get)
+    result = await tools_mod._TOOL_REGISTRY["get_invoice"]["handler"](
+        ORG, invoice_id="INV-000014"
+    )
+    assert result.success and result.data["total"] == 24000
+
+
+@pytest.mark.asyncio
+async def test_get_purchase_bill_resolves_a_number_in_the_id_field(monkeypatch):
+    from app import tools as tools_mod
+
+    async def fake_fetch(table, *, filters=None, **_kw):
+        assert table == "purchase_bills"
+        assert filters.get("bill_number") == "PUR-000013"
+        return [{"id": "22222222-9999-4999-8999-000000000005"}]
+
+    async def fake_get(org_id, *, bill_id):
+        assert str(bill_id) == "22222222-9999-4999-8999-000000000005"
+        return {"id": "22222222-9999-4999-8999-000000000005", "total": 45000}
+
+    monkeypatch.setattr("app.database.fetch_many", fake_fetch)
+    monkeypatch.setattr(tools_mod.purchase_service, "get_purchase_bill", fake_get)
+    result = await tools_mod._TOOL_REGISTRY["get_purchase_bill"]["handler"](
+        ORG, bill_id="PUR-000013"
+    )
+    assert result.success and result.data["total"] == 45000
+

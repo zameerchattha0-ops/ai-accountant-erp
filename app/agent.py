@@ -1173,6 +1173,12 @@ def _credit_note_fast_path_call(
     for key in ("invoice_number", "invoice_id", "reason"):
         if entities.get(key):
             args[key] = entities[key]
+    if not args.get("reason"):
+        # The tool REQUIRES a reason; when the user's wording did not reach
+        # the entities, describe the document truthfully (never invent a cause).
+        args["reason"] = (
+            f"Return of {str(entities.get('item_description') or 'purchased items')}"
+        )
     if entities.get("line_items"):
         args["items"] = entities["line_items"]
     elif entities.get("item_description"):
@@ -1223,6 +1229,12 @@ async def _purchase_return_fast_path_call(
     for key in ("bill_number", "bill_id", "reason"):
         if entities.get(key):
             args[key] = entities[key]
+    if not args.get("reason"):
+        # The tool REQUIRES a reason; a truthful document description when
+        # the user's wording did not reach the entities (never a cause).
+        args["reason"] = (
+            f"Return of {str(entities.get('item_description') or 'purchased items')}"
+        )
     if entities.get("line_items"):
         args["items"] = entities["line_items"]
     elif entities.get("item_description"):
@@ -2618,6 +2630,19 @@ def _seed_invoice_reference(preliminary: Any, prefill: Dict[str, Any]) -> None:
     ref = (((preliminary or {}).get("literals") or {}).get("invoice_number"))
     if ref and not prefill.get("invoice_number"):
         prefill["invoice_number"] = str(ref).strip()
+    # THE BILL TWIN (2026-10-19, debit-note lane): "against purchase bill
+    # PUR-000013" extracts into literals.bill_number and must reach the
+    # planner entities the same way — the purchase-return builder resolves
+    # bill_id from it (exact-match, org-scoped, never invented).
+    bill_ref = (((preliminary or {}).get("literals") or {}).get("bill_number"))
+    if bill_ref and not prefill.get("bill_number"):
+        prefill["bill_number"] = str(bill_ref).strip()
+    # THE REASON TWIN (2026-10-19): "with reason wrong item delivered" is
+    # the user's own wording and BOTH return tools require it — carry it
+    # verbatim so the fast paths never face a reason-less document.
+    reason_ref = (((preliminary or {}).get("literals") or {}).get("reason"))
+    if reason_ref and not prefill.get("reason"):
+        prefill["reason"] = str(reason_ref).strip()
 
 
 async def _resolve_gate_questions(

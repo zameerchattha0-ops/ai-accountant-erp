@@ -382,6 +382,22 @@ _NAME_STOP = (
 _SUPPLIER_PATTERNS = [
     re.compile(r"\bfrom\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
     re.compile(r"\bsupplier\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
+    # "we returned/sent back/gave back … to <Party>" — the goods went TO
+    # the supplier (purchase-return phrasing).  Live 2026-10-19: the debit
+    # note message extracted NO supplier_name at all (the "we" subject
+    # blocked the customer rule and nothing owned the "to <Party>" side),
+    # so the DN lane fell to the lossy model path every turn.  Own stop
+    # set: the sentence's dash ("SHABBIR FURNITURES - create a debit
+    # note…") is not one of _NAME_STOP's boundaries.
+    re.compile(
+        r"\b(?:returned|sent\s+back|gave\s+back)\b[^.]*?\bto\s+"
+        + _NAME
+        + r"(?=\s*[-\u2013\u2014]"
+        + r"|\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|"
+        r"and|at|with|create|against)\b"
+        + r"|[,.!?;]|\s*$|\s+\d)",
+        re.IGNORECASE,
+    ),
 ]
 
 # Action verbs, gerunds and document nouns can never START a party name.

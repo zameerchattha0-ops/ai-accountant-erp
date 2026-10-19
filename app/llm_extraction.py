@@ -205,7 +205,8 @@ async def enrich_preliminary(
     filled: List[str] = []
     for key in (
         "amount", "transaction_date", "item_description", "quantity",
-        "payment_channel", "document_reference", "invoice_number",
+        "payment_channel", "document_reference",
+        "invoice_number", "bill_number", "reason",
     ):
         if key in clean and literals.get(key) is None:
             literals[key] = clean[key]
