@@ -189,6 +189,14 @@ async def health_check():
                 "semantic_llm_enabled",
                 "two_call_runtime_enabled",
                 "bounded_understanding_enabled",
+                # Analytics/routing/extraction/review stack (2026-10-20):
+                # these live only as Vercel env vars, so the RUNNING process
+                # is the only place that can prove they actually bound — the
+                # live LLM-proven profit run depended on all four being on.
+                "llm_router_enabled",
+                "analytics_agent_enabled",
+                "llm_preliminary_extraction_enabled",
+                "treatment_review_enabled",
             )
         },
     }

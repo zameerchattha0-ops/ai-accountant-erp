@@ -322,6 +322,13 @@ class TestHealthFlagEcho:
             "semantic_llm_enabled",
             "two_call_runtime_enabled",
             "bounded_understanding_enabled",
+            # 2026-10-20: the four analytics-stack flags joined the echo so
+            # a live deployment can prove router/analytics/extraction/review
+            # are actually bound (env edits only reach NEW deployments).
+            "llm_router_enabled",
+            "analytics_agent_enabled",
+            "llm_preliminary_extraction_enabled",
+            "treatment_review_enabled",
         }
         # pre-activation baseline (hermetic settings): all AI stages off,
         # the bounded intake floor on.
@@ -330,6 +337,10 @@ class TestHealthFlagEcho:
         assert flags["semantic_llm_enabled"] is False
         assert flags["two_call_runtime_enabled"] is False
         assert flags["bounded_understanding_enabled"] is True
+        assert flags["llm_router_enabled"] is False
+        assert flags["analytics_agent_enabled"] is False
+        assert flags["llm_preliminary_extraction_enabled"] is False
+        assert flags["treatment_review_enabled"] is False
         assert isinstance(body.get("config_ok"), bool)
 
 
