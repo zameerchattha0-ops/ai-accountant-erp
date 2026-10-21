@@ -418,6 +418,10 @@ def _ground_fields(
             if nature not in _NATURES:
                 log.info("llm_entity_rejected", field=key, reason="unknown_nature")
                 continue
+            is_sale = bool(re.search(r"\b(?:sold|sale|sell|invoice|receipt)\b", raw_lower))
+            if is_sale and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET_EXPENSE"):
+                log.info("llm_entity_rejected", field=key, reason="sale_cannot_be_expense", value=nature)
+                continue
             grounded[key] = nature
 
         elif key == "loan_direction":

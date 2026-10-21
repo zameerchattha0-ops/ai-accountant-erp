@@ -570,10 +570,48 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     # product (EXACT name match) first — the COGS engine only values lines
     # carrying product_id, so an unlinked line posted revenue with NO cost.
     items = kw.get("items") or None
-    if items:
+    if not items:
+        raw_qty = kw.get("quantity")
+        try:
+            quantity = float(raw_qty) if raw_qty is not None else 1.0
+        except (TypeError, ValueError):
+            quantity = 1.0
+        if quantity <= 0:
+            quantity = 1.0
+
+        item_desc = description
+        import re
+        m = re.match(
+            r"^(?:sale\s+of|sold|sale)?\s*(?:(\d+(?:\.\d+)?)\s+)?(.+)$",
+            description.strip(),
+            re.IGNORECASE,
+        )
+        if m:
+            try:
+                if m.group(1):
+                    parsed_qty = float(m.group(1))
+                    if parsed_qty > 0 and raw_qty is None:
+                        quantity = parsed_qty
+                if m.group(2) and m.group(2).strip():
+                    item_desc = m.group(2).strip()
+            except (ValueError, TypeError):
+                pass
+
+        candidate_items = [{
+            "description": item_desc,
+            "quantity": quantity,
+            "unit_price": round(amount / quantity, 2),
+        }]
+        try:
+            await _link_products_to_items(organization_id, candidate_items)
+            if candidate_items and candidate_items[0].get("product_id"):
+                items = candidate_items
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tools.record_cash_sale.candidate_link_failed", error=str(exc)[:200])
+    elif items:
         try:
             await _link_products_to_items(organization_id, items)
-        except Exception as exc:  # noqa: BLE001 — never block the sale
+        except Exception as exc:  # noqa: BLE001
             log.warning("tools.record_cash_sale.product_link_failed",
                         error=str(exc)[:200])
     result = await record_cash_sale(
@@ -614,7 +652,7 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     # service cash sale passes no items and simply has no COGS.  Any failure
     # is a warning; the revenue entry already stands (C4).
     if result.get("journal_posted"):
-        cogs_items = kw.get("items") or []
+        cogs_items = items or kw.get("items") or []
         if cogs_items:
             cogs = await prepare_cogs_for_items(
                 organization_id,
@@ -641,27 +679,6 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     if stream:
         result["revenue_stream"] = stream
 
-    if items and result.get("journal_posted"):
-        # PERPETUAL INVENTORY: the POSTED sale triggers cost recognition.
-        # The engine values each stock-tracked line from the stock ledger
-        # (weighted-average cost, catalogue cost_price fallback) and prepares
-        # Dr Cost of Sales / Cr Inventory; _post_cogs_and_issue_stock posts it
-        # and relieves the quantity ledger in that order.  A failure is a
-        # warning — the revenue entry stands (C4).
-        cogs = await prepare_cogs_for_items(
-            organization_id,
-            items=items,
-            transaction_date=transaction_date,
-            description=description,
-        )
-        result.update(cogs)
-        await _post_cogs_and_issue_stock(
-            organization_id,
-            result,
-            source_type="cash_sale",
-            movement_date=transaction_date,
-            description=f"Cash sale {amount:,.2f}",
-        )
     log.info(
         "sale_tool_succeeded",
         organization_id=str(organization_id),

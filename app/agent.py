@@ -1496,15 +1496,15 @@ def _cash_sale_fast_path_call(
 
     amount = entities.get("amount")
 
-    txn_date = entities.get("transaction_date")
+    txn_date = entities.get("transaction_date") or date.today().isoformat()
 
-    if amount is None or not txn_date:
+    if amount is None:
 
         return None
 
     nature = str(entities.get("transaction_nature") or "").upper()
 
-    if nature not in ("GOODS", "SERVICE"):
+    if nature not in ("GOODS", "SERVICE", "INVENTORY"):
 
         return None
 
@@ -1606,7 +1606,7 @@ def _cash_sale_fast_path_call(
 
                 or entities.get("description")
 
-                or ("Goods" if nature == "GOODS" else "Service")
+                or ("Goods" if nature in ("GOODS", "INVENTORY") else "Service")
 
             ),
 
@@ -1846,7 +1846,7 @@ def _invoice_fast_path_call(
 
     nature = str(entities.get("transaction_nature") or "").upper()
 
-    if nature not in ("GOODS", "SERVICE"):
+    if nature not in ("GOODS", "SERVICE", "INVENTORY"):
 
         return None
 
@@ -2140,7 +2140,7 @@ async def _catalog_check_question(
 
     nature = str(entities.get("transaction_nature") or "").upper()
 
-    if nature not in ("GOODS", "SERVICE"):
+    if nature not in ("GOODS", "SERVICE", "INVENTORY"):
 
         return None
 

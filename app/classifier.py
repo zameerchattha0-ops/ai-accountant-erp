@@ -932,7 +932,10 @@ async def classify_transaction(
     explicit = entities.get("transaction_nature")
     if explicit:
         nature = str(explicit).upper()
-        if nature not in NATURES:
+        if intent in ("record_cash_sale", "create_invoice") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET_EXPENSE"):
+            explicit = None
+            nature = None
+        elif nature not in NATURES:
             nature = FIXED_ASSET if "ASSET" in nature else OPERATING_EXPENSE
         # RC-4a (production 2026-09-24, "3 computers" incident): the plan
         # carries the TRUE provenance of the nature (planner:
