@@ -333,6 +333,188 @@ def test_inventory_purchase_posts_inventory_debit_and_receives_stock(monkeypatch
     assert cap["received"] == [2.0]          # stock effect: +2 units
 
 
+def test_a_cash_inventory_purchase_also_receives_units(monkeypatch):
+    """UNITS TRACKING IS SETTLEMENT-AGNOSTIC (2026-10-20): a CASH inventory
+    purchase must receive stock exactly like a credit one.  The receipt block
+    is gated on is_inventory + journal_posted, never on payment_method, so
+    paying cash immediately does not skip the stock ledger."""
+    cap = _stub_handler(monkeypatch, ledger=_INV, journal_debit=_INV["id"])
+
+    from app.tools import _create_purchase_bill
+
+    result = _run(_create_purchase_bill(
+        _ORG,
+        total=230000.0, bill_date="2026-10-20",
+        supplier_id=str(uuid.uuid4()), notes="tables",
+        items=[_bill_rows()],
+        transaction_nature="INVENTORY",
+        payment_method="CASH",
+    ))
+    assert result.success is True
+    assert result.data["journal_posted"] is True
+    assert cap["received"] == [2.0]          # cash STILL receives +2 units
+
+
+# ---------------------------------------------------------------------------
+# 3b - CASH PURCHASE IS ITS OWN DOCUMENT (2026-10-20): no bill, no payable
+# ---------------------------------------------------------------------------
+# THE ACCOUNTING DEFECT: the old path routed cash purchases through
+# create_purchase_bill (writing a purchase_bills row + a payable, then marking
+# it PAID).  A cash purchase is settled now — it must be a DIRECT two-line
+# journal (Dr Inventory/asset/expense, Cr Cash-or-Bank) with NO supplier
+# invoice and NO Accounts-Payable posting.
+
+_CASH = {"id": str(uuid.uuid4()), "name": "Cash", "account_type": "ASSET"}
+
+
+def _stub_cash_handler(monkeypatch, *, inventory=None, expense=None,
+                       cash=None, created_cash=False):
+    """Wire every seam _record_cash_purchase touches. Returns a capture dict."""
+    import app.tools as tools_mod
+    import app.accounting_engine as engine_mod
+
+    cap = {"prepared": None, "validated": [], "posted": [],
+           "received": [], "synced": [], "cash_ensure_calls": 0,
+           "bill_service_calls": 0}
+
+    async def _fake_bill(*a, **k):       # a bill must NEVER be created
+        cap["bill_service_calls"] += 1
+        raise AssertionError("cash purchase must not create a purchase bill")
+
+    async def _ensure_cash(org):
+        cap["cash_ensure_calls"] += 1
+        row = dict(cash or _CASH)
+        if created_cash:
+            row["cash_account_created"] = True
+        return row
+
+    async def _ensure_inventory(org, *, hint_account=None):
+        return inventory
+
+    async def _default(org, account_type, **kw):
+        return expense
+
+    async def _engine_cash_purchase(*, organization_id, asset_account_id,
+                                    cash_account_id, amount, transaction_date,
+                                    description, source_id=None):
+        cap["prepared"] = {
+            "asset_account_id": str(asset_account_id),
+            "cash_account_id": str(cash_account_id),
+            "amount": amount,
+        }
+        return {"entry": {"id": str(uuid.uuid4())}, "lines": [],
+                "total_debit": amount, "total_credit": amount}
+
+    async def _validate(entry_id):
+        cap["validated"].append(str(entry_id))
+
+    async def _post(entry_id):
+        cap["posted"].append(str(entry_id))
+
+    async def _sync(org, *, name, quantity, unit_cost):
+        cap["synced"].append(name)
+        return {"id": str(uuid.uuid4()), "name": name, "product_code": "SKU-C1",
+                "reused": False}
+
+    async def _receive(org, *, product_id, quantity, unit_cost, source_type,
+                       source_id, movement_date, description):
+        cap["received"].append(float(quantity))
+        return {"id": str(uuid.uuid4()), "quantity": quantity}
+
+    monkeypatch.setattr(tools_mod.purchase_service,
+                        "create_purchase_bill", _fake_bill)
+    monkeypatch.setattr(tools_mod, "ensure_cash_account", _ensure_cash)
+    monkeypatch.setattr(tools_mod, "record_cash_purchase", _engine_cash_purchase)
+    monkeypatch.setattr(tools_mod.accounting_service, "validate_journal", _validate)
+    monkeypatch.setattr(tools_mod.accounting_service, "post_journal", _post)
+    monkeypatch.setattr(engine_mod, "ensure_inventory_account", _ensure_inventory)
+    monkeypatch.setattr(engine_mod, "_resolve_default_account", _default)
+    monkeypatch.setattr(tools_mod.inventory_service,
+                        "find_or_create_catalogue_product", _sync)
+    monkeypatch.setattr(tools_mod.inventory_service, "receive_stock", _receive)
+    return cap
+
+
+def _cash_purchase(**extra):
+    from app.tools import _record_cash_purchase
+
+    kwargs = {
+        "amount": 230000.0,
+        "transaction_date": "2026-10-20",
+        "transaction_nature": "INVENTORY",
+        "description": "tables",
+        "items": [{"description": "tables", "quantity": 2.0,
+                   "unit_price": 115000.0}],
+    }
+    kwargs.update(extra)
+    return _run(_record_cash_purchase(_ORG, **kwargs))
+
+
+def test_cash_purchase_posts_dr_inventory_cr_cash_with_no_bill(monkeypatch):
+    """THE FIX: cash purchase = direct Dr Inventory / Cr Cash, NO bill row,
+    NO payable — and the Cash ledger is ensured (resolve-or-create) first."""
+    cap = _stub_cash_handler(monkeypatch, inventory=_INV, cash=_CASH)
+    result = _cash_purchase()
+    assert result.success is True
+    assert cap["bill_service_calls"] == 0        # NEVER a purchase bill
+    assert cap["cash_ensure_calls"] == 1         # Cash ledger ensured first
+    assert cap["prepared"]["asset_account_id"] == _INV["id"]
+    assert cap["prepared"]["cash_account_id"] == _CASH["id"]
+    assert cap["posted"] and cap["validated"]    # auto-validated + posted
+
+
+def test_cash_purchase_receives_stock_units(monkeypatch):
+    """Cash inventory purchases track UNITS too (no bill needed for a receipt)."""
+    cap = _stub_cash_handler(monkeypatch, inventory=_INV, cash=_CASH)
+    result = _cash_purchase()
+    assert result.success is True
+    assert cap["synced"] == ["tables"]           # catalogue product created
+    assert cap["received"] == [2.0]              # stock ledger +2 units
+    assert result.data["stock_received"][0]["quantity"] == 2.0
+
+
+def test_cash_purchase_discloses_a_created_cash_account(monkeypatch):
+    """When the chart had NO Cash ledger, ensure_cash_account CREATES one and
+    the write is disclosed (never disguised as a read)."""
+    cap = _stub_cash_handler(monkeypatch, inventory=_INV, cash=_CASH,
+                             created_cash=True)
+    result = _cash_purchase()
+    assert result.success is True
+    assert result.data.get("cash_account_created") is True
+
+
+def test_cash_purchase_refuses_when_no_cash_ledger_can_be_made(monkeypatch):
+    """No Cash ledger AND create failed -> refuse BEFORE any write."""
+    cap = _stub_cash_handler(monkeypatch, inventory=_INV)
+
+    async def _no_cash(org):
+        cap["cash_ensure_calls"] += 1
+        return None
+
+    monkeypatch.setattr("app.tools.ensure_cash_account", _no_cash)
+    result = _cash_purchase()
+    assert result.success is False
+    assert cap["bill_service_calls"] == 0
+    assert not cap["posted"] and not cap["received"]
+    assert "Cash/Bank" in result.error
+
+
+def test_non_inventory_cash_purchase_debits_the_expense_default(monkeypatch):
+    """A non-resale cash purchase debits the resolved expense/asset default,
+    still credits Cash, and touches neither catalogue nor stock."""
+    expense = {"id": str(uuid.uuid4()), "name": "General Operating Expense",
+               "account_type": "EXPENSE"}
+    cap = _stub_cash_handler(monkeypatch, expense=expense, cash=_CASH)
+    result = _cash_purchase(transaction_nature="OPERATING_EXPENSE",
+                            description="office tea", amount=900.0,
+                            items=None)
+    assert result.success is True
+    assert cap["prepared"]["asset_account_id"] == expense["id"]
+    assert cap["prepared"]["cash_account_id"] == _CASH["id"]
+    assert cap["synced"] == [] and cap["received"] == []
+    assert cap["bill_service_calls"] == 0
+
+
 def test_inventory_account_creation_is_disclosed(monkeypatch):
     """Condition 3: account creation is a WRITE and is reported as such."""
     created = {"id": str(uuid.uuid4()), "name": "Inventory",
@@ -392,8 +574,11 @@ def test_ordinary_expense_purchase_unaffected(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4 - STAGE 2 LLM ENRICHMENT (flag-gated; deterministic floor authoritative)
+# 4 - STAGE 2 LLM EXTRACTION (flag-gated; AUTHORITY-SPLIT 2026-10-20)
 # ---------------------------------------------------------------------------
+# party/item/quantity/reason are LLM-AUTHORITATIVE (model overrides regex);
+# amount/transaction_date stay DETERMINISTIC-FIRST (regex wins, model fills
+# gaps only) so a hallucinated figure/date can never reach the books.
 
 _PRELIM = {
     "label": "PRELIMINARY EXTRACTION",
@@ -438,28 +623,73 @@ def test_stage2_disabled_returns_deterministic_unchanged(monkeypatch):
     assert audit["llm"] == "skipped_disabled"
 
 
-def test_stage2_fills_quantity_gap_but_never_overwrites(monkeypatch):
+def test_stage2_amount_stays_deterministic_but_item_is_llm_authoritative(monkeypatch):
+    """AUTHORITY SPLIT: amount 999 must NOT overwrite the rules' 230000
+    (deterministic-first), while item/quantity/party ARE taken from the model
+    (LLM-authoritative)."""
     from app.llm_extraction import enrich_preliminary
 
     _settings(monkeypatch, llm_preliminary_extraction_enabled=True)
     client = _StubClient(json.dumps({
         "amount": 999.0,               # must NOT overwrite the rules' 230000
-        "quantity": 2,                 # gap filled (the user's literal)
-        "item_description": "tables",
+        "quantity": 2,                 # taken from the model (authoritative)
+        "item_description": "office chairs",
         "payment_channel": "CREDIT",
+        "supplier_name": "SHABBIR FURNITURES",
         "named_parties": ["SHABBIR FURNITURES"],
         "candidate_subject_areas": ["purchases"],
     }))
     merged, audit = _run(enrich_preliminary(
-        user_message="Bought 2 tables for 230000", preliminary=dict(_PRELIM),
-        client=client,
+        user_message="Bought 2 office chairs on credit from SHABBIR FURNITURES for 230000",
+        preliminary=dict(_PRELIM), client=client,
     ))
     assert merged["literals"]["amount"] == 230000.0     # deterministic wins
-    assert merged["literals"]["quantity"] == 2          # gap filled
+    assert merged["literals"]["quantity"] == 2          # model authoritative
+    assert merged["literals"]["item_description"] == "office chairs"
+    assert merged["literals"]["supplier_name"] == "SHABBIR FURNITURES"
     assert merged["literals"]["payment_channel"] == "CREDIT"
     assert "quantity" in audit["filled"]
+    assert "supplier_name" in audit["filled"]
     # extraction, NOT interpretation: no treatment/account keys ever merge
     assert "transaction_nature" not in merged["literals"]
+
+
+def test_stage2_llm_fixes_a_party_swallowed_into_the_item(monkeypatch):
+    """THE UMER-AUTOS FAILURE (2026-10-20): the regex captured the WHOLE
+    phrase 'return to umer autos against damaged motorbikes' as the item,
+    losing the supplier.  The model is now authoritative: it splits the party
+    out and the clean item reaches the literals."""
+    from app.llm_extraction import enrich_preliminary
+
+    _settings(monkeypatch, llm_preliminary_extraction_enabled=True)
+    # the deterministic floor already (wrongly) put the whole phrase in item
+    prelim = {
+        "label": "PRELIMINARY EXTRACTION",
+        "original_request": "purchase return to umer autos against damaged motorbikes",
+        "literals": {"item_description": "return to umer autos against damaged motorbikes"},
+        "candidate_subject_areas": ["purchases"],
+        "note": "Provisional only.",
+        "today": "2026-10-20",
+    }
+    client = _StubClient(json.dumps({
+        "supplier_name": "umer autos",
+        "item_description": "damaged motorbikes",
+        "quantity": None,
+        "amount": None,
+        "reason": "damaged motorbikes",
+        "named_parties": ["umer autos"],
+        "candidate_subject_areas": ["purchases", "payables"],
+    }))
+    merged, audit = _run(enrich_preliminary(
+        user_message="purchase return to umer autos against damaged motorbikes",
+        preliminary=prelim, client=client,
+    ))
+    # the model OVERRIDES the regex-swallowed item and adds the supplier
+    assert merged["literals"]["item_description"] == "damaged motorbikes"
+    assert merged["literals"]["supplier_name"] == "umer autos"
+    assert merged["literals"]["reason"] == "damaged motorbikes"
+    assert "item_description" in audit["overrode_regex"]
+    assert "supplier_name" in audit["filled"]
 
 
 def test_stage2_invalid_quantity_is_recorded_never_assumed(monkeypatch):

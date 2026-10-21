@@ -827,16 +827,80 @@ async def _resolve_cash_account(
     return None
 
 
-async def _resolve_named_postable_account(
-    organization_id: uuid.UUID, name: str
+async def ensure_cash_account(
+    organization_id: uuid.UUID,
 ) -> Optional[Dict[str, Any]]:
-    """Exact-name lookup that refuses grouping (heading) accounts."""
+    """The Cash/Bank ASSET ledger a cash purchase credits — CREATING it when
+    the chart lacks one (2026-10-20).
+
+    Same execution-time self-heal contract as ``ensure_inventory_account`` /
+    ``ensure_cogs_account``: a CASH purchase must not be refused (or silently
+    credit a wrong asset like Accounts Receivable) merely because the chart
+    was seeded without a Cash ledger.  Order:
+      1. the existing Cash/Cash Account/Petty Cash/Bank ledger (by NAME);
+      2. a fuzzy "cash"-named ASSET (never a grouping heading);
+      3. CREATE a top-level "Cash" ASSET ledger and return it, flagged
+         ``cash_account_created`` so the caller discloses the write.
+    Returns None only when resolve AND create both fail — the caller's
+    honest warning then still fires (never a fabricated ledger).
+    """
+    row = await _resolve_cash_account(organization_id)
+    if row is not None:
+        return row
+    try:
+        code = await a_repo.next_available_code(organization_id, "1110")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Cash",
+            account_type="ASSET",
+            normal_balance="DEBIT",
+            parent_account_id=None,
+            description=(
+                "Cash on hand — created on demand when a cash purchase needed "
+                "a cash ledger and the chart had none."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — honest warning, never a crash
+        log.warning(
+            "accounting_engine.cash_account_create_failed",
+            error=str(exc)[:200],
+        )
+        return None
+    created["cash_account_created"] = True
+    log.info(
+        "accounting_engine.cash_account_created",
+        code=str(created.get("code")),
+        name=str(created.get("name")),
+    )
+    return created
+
+
+async def _resolve_named_postable_account(
+    organization_id: uuid.UUID, name: str, expected_type: str = "ASSET"
+) -> Optional[Dict[str, Any]]:
+    """Exact-name lookup that refuses grouping (heading) accounts and verifies account type."""
     from app.services import accounting_service
 
     row = await accounting_service.resolve_account(
-        organization_id, account_name=name
+        organization_id,
+        account_name=name,
+        account_type=expected_type,
+        exact_only=True,
+        required_type=expected_type,
     )
     if not row or row.get("is_active") is False:
+        return None
+    if expected_type and row.get("account_type") != expected_type:
+        log.warning(
+            "authority_split.intercepted",
+            reason="fuzzy_type_mismatch",
+            expected_type=expected_type,
+            actual_type=row.get("account_type"),
+            account_name=name,
+        )
+        return None
+    if row.get("name", "").strip().lower() != name.strip().lower():
         return None
     group_ids = await _grouping_account_ids(organization_id)
     if row.get("id") in group_ids:

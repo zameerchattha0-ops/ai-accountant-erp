@@ -298,22 +298,26 @@ async def find_or_create_catalogue_product(
         if str(row.get("name") or "").strip().lower() == term.lower():
             return {**row, "reused": True}
 
-    # WORD-LEVEL REUSE — the shared matcher the classifier also uses, so
-    # the nature question and the bill-line product link always agree.
+    # LLM CATALOGUE ANALYST (2026-10-20): "is this the SAME product as an
+    # existing entry?" is a semantic judgment, so the model decides reuse-vs-
+    # distinct over the FETCHED candidates.  Python only grounds the answer
+    # (a 1-based index into this list) and keeps the exact-name floor.  The
+    # purchase side fetches the WHOLE catalogue (not a prefix search) so the
+    # analyst sees every plausible candidate, not just token-overlapping ones.
     try:
         from app.database import fetch_many as _fetch_many
-        from app.product_matching import match_catalogue_product
+        from app.catalogue_matching import llm_match_catalogue_item
 
         catalogue = await _fetch_many(
             "products",
             filters={"organization_id": str(organization_id)},
             select="id,name,product_code,is_stock_tracked,cost_price",
-            limit=100,
+            limit=200,
         )
-        match = match_catalogue_product(term, catalogue)
+        match = await llm_match_catalogue_item(term, catalogue)
         if match and match.get("id"):
             log.info(
-                "inventory.product_reused_by_word_match",
+                "inventory.product_reused_by_llm_match",
                 name=term,
                 matched=str(match.get("name")),
                 product_code=match.get("product_code"),
@@ -321,7 +325,7 @@ async def find_or_create_catalogue_product(
             return {**match, "reused": True}
     except Exception as exc:  # noqa: BLE001 — fall through to create
         log.warning(
-            "inventory.word_match_failed", name=term, error=str(exc)[:200]
+            "inventory.llm_match_failed", name=term, error=str(exc)[:200]
         )
 
     category_id = await ensure_inventory_category(organization_id)

@@ -25,21 +25,21 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
 log = structlog.get_logger(__name__)
 
 _CONTRADICTION_KEYS = frozenset(
-    {"nature_vs_plan", "settlement_vs_plan", "amount_vs_plan", "other"}
+    {"nature_vs_plan", "settlement_vs_plan", "amount_vs_plan", "tax_vs_plan", "other"}
 )
 
 _INSTRUCTION = (
     "You are an accounting treatment REVIEWER. You receive CONFIRMED FACTS "
     "and a CANONICAL PLAN (tool calls about to execute). Output STRICT JSON: "
     '{"contradictions": [{"kind": "nature_vs_plan|settlement_vs_plan|'
-    'amount_vs_plan|other", "why": "<one sentence>"}], '
+    'amount_vs_plan|tax_vs_plan|other", "why": "<one sentence>"}], '
     '"missing_material_facts": ["<fact name>"]}. '
     "Flag ONLY direct contradictions between the confirmed facts and the "
     "plan (e.g. nature INVENTORY but the plan carries no nature or no item "
@@ -93,13 +93,73 @@ def _validate_reply(payload: Any) -> tuple:
     return {"flags": flags, "missing": missing}, failures
 
 
-def _facts_block(
+def _budget_treatment_prompt(
+    instruction: str,
+    facts: Dict[str, Any],
+    plan: List[Dict[str, Any]],
+    max_chars: int = 6000,
+) -> str:
+    """Safely structure and budget prompt to guarantee valid JSON and prevent mid-string cuts.
+
+    Allocates character budget:
+    - instruction: always intact
+    - plan: tool calls essential for checking contradiction
+    - facts: confirmed facts, with line items / descriptions truncated if needed
+    """
+    instruction_text = instruction.strip()
+    overhead = len(instruction_text) + 50
+    available_chars = max(1000, max_chars - overhead)
+
+    budgeted_plan = []
+    for call in plan:
+        c = dict(call)
+        args = dict(c.get("arguments") or {})
+        items = args.get("items")
+        if isinstance(items, list) and len(items) > 10:
+            args["items"] = items[:10] + [{"truncated_items_summary": f"{len(items) - 10} more items"}]
+        c["arguments"] = args
+        budgeted_plan.append(c)
+
+    budgeted_facts = dict(facts)
+    desc = budgeted_facts.get("item_description")
+    if isinstance(desc, str) and len(desc) > 200:
+        budgeted_facts["item_description"] = desc[:197] + "..."
+
+    items_facts = budgeted_facts.get("items")
+    if isinstance(items_facts, list) and len(items_facts) > 10:
+        budgeted_facts["items"] = items_facts[:10] + [{"truncated_items_summary": f"{len(items_facts) - 10} more items"}]
+
+    payload = {
+        "confirmed_facts": budgeted_facts,
+        "canonical_plan": budgeted_plan,
+    }
+    payload_json = json.dumps(payload, indent=2, default=str)
+
+    # If payload still exceeds available chars, reduce line items to 5
+    if len(payload_json) > available_chars:
+        for c in budgeted_plan:
+            args = c.get("arguments") or {}
+            items = args.get("items")
+            if isinstance(items, list) and len(items) > 5:
+                args["items"] = items[:5] + [{"truncated_items_summary": f"{len(items) - 5} more items"}]
+        if isinstance(budgeted_facts.get("items"), list) and len(budgeted_facts["items"]) > 5:
+            budgeted_facts["items"] = budgeted_facts["items"][:5] + [{"truncated_items_summary": f"{len(budgeted_facts['items']) - 5} more items"}]
+        payload = {
+            "confirmed_facts": budgeted_facts,
+            "canonical_plan": budgeted_plan,
+        }
+        payload_json = json.dumps(payload, indent=2, default=str)
+
+    return f"{instruction_text}\n\n{payload_json}"
+
+
+def _extract_facts_and_plan(
     *,
     intent: str,
     classification: Any,
     entities: Dict[str, Any],
     calls: Any,
-) -> str:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     nature = str(getattr(classification, "transaction_nature", "") or "")
     source = str(getattr(classification, "source", "") or "")
     facts = {
@@ -111,6 +171,9 @@ def _facts_block(
         "item_description": entities.get("item_description"),
         "quantity": entities.get("quantity") or entities.get("item_quantity"),
         "amount": entities.get("amount"),
+        "subtotal": entities.get("subtotal"),
+        "tax_amount": entities.get("tax_amount") or entities.get("printed_tax"),
+        "tax_code": entities.get("tax_code"),
         "transaction_date": entities.get("transaction_date"),
     }
     plan = [
@@ -122,12 +185,29 @@ def _facts_block(
                 if k
                 in (
                     "transaction_nature", "payment_method", "items", "total",
-                    "subtotal", "amount", "notes", "bill_date",
+                    "subtotal", "amount", "tax_total", "tax_code", "notes", "bill_date",
                 )
             },
         }
         for call in (calls or [])
     ]
+    return facts, plan
+
+
+def _facts_block(
+    *,
+    intent: str,
+    classification: Any,
+    entities: Dict[str, Any],
+    calls: Any,
+) -> str:
+    facts, plan = _extract_facts_and_plan(
+        intent=intent,
+        classification=classification,
+        entities=entities,
+        calls=calls,
+    )
+    return json.dumps({"confirmed_facts": facts, "canonical_plan": plan}, indent=2, default=str)
 
 
 async def review_plan_treatment(
@@ -159,16 +239,70 @@ async def review_plan_treatment(
     )
     if not getattr(settings, "treatment_review_enabled", False):
         return review
+
+    facts, plan = _extract_facts_and_plan(
+        intent=intent,
+        classification=classification,
+        entities=entities,
+        calls=calls,
+    )
+
+    # Authority Split Rule: Deterministic tax deviation check (Python authoritative)
+    subtotal = float(entities.get("subtotal") or entities.get("amount") or 0.0)
+    printed_tax = entities.get("tax_amount") or entities.get("printed_tax")
+    tax_code = entities.get("tax_code")
+    if printed_tax is not None and tax_code and subtotal > 0:
+        try:
+            from app.services import tax_service
+
+            is_mat, computed_tax, diff = tax_service.evaluate_tax_deviation(
+                subtotal=subtotal, printed_tax=float(printed_tax), tax_code=str(tax_code)
+            )
+            if is_mat:
+                log.warning(
+                    "authority_split.intercepted",
+                    reason="tax_deviation",
+                    printed_tax=printed_tax,
+                    computed_tax=computed_tax,
+                    diff=diff,
+                )
+                review.ran = True
+                review.ok = False
+                review.blocked = True
+                review.flags.append(
+                    {
+                        "kind": "amount_vs_plan",
+                        "why": (
+                            f"Printed tax ({printed_tax}) differs from computed tax "
+                            f"({computed_tax}) on tax code '{tax_code}' by {diff:.2f}"
+                        ),
+                    }
+                )
+                review.question = (
+                    f"The printed/entered tax ({printed_tax}) differs from calculated tax ({computed_tax}) "
+                    f"for subtotal {subtotal} under tax code '{tax_code}'. Please clarify the correct tax amount before posting."
+                )
+                review.audit["llm"] = "flagged"
+                review.audit["flags"] = len(review.flags)
+                return review
+        except Exception as tax_exc:  # noqa: BLE001
+            log.warning("treatment_review.tax_check_failed", error=str(tax_exc)[:160])
+
     try:
         if client is None:
             from app.ai_orchestrator import get_client
 
             client = get_client()
-        prompt = (
-            f"{_INSTRUCTION}\n\n{_facts_block(intent=intent, classification=classification, entities=entities, calls=calls)}"
+
+        prompt = _budget_treatment_prompt(
+            instruction=_INSTRUCTION,
+            facts=facts,
+            plan=plan,
+            max_chars=6000,
         )
+
         raw = await asyncio.wait_for(
-            client.generate_text_light(prompt=prompt[:6000]),
+            client.generate_text_light(prompt=prompt),
             timeout=timeout or getattr(settings, "treatment_review_timeout", 10.0),
         )
     except Exception as exc:  # noqa: BLE001 - degrade: correctness unaffected
@@ -176,17 +310,20 @@ async def review_plan_treatment(
         review.audit["error"] = str(exc)[:160]
         log.warning("treatment_review.unavailable", error=str(exc)[:160])
         return review
+
     payload = _extract_json(str(raw or ""))
     if payload is None:
         review.audit["llm"] = "rejected"
         log.warning("treatment_review.reject", reason="unparseable reply")
         return review
+
     parsed, failures = _validate_reply(payload)
     if parsed is None or failures:
         review.audit["llm"] = "rejected"
         review.audit["validation_failures"] = failures
         log.warning("treatment_review.validation", failures=failures)
         return review
+
     review.ran = True
     review.flags = parsed["flags"]
     review.missing = parsed["missing"]
@@ -207,8 +344,3 @@ async def review_plan_treatment(
             "treatment can be recorded (nothing has been written)."
         )
     return review
-
-    return (
-        f"CONFIRMED FACTS:\n{json.dumps(facts, default=str)}\n"
-        f"CANONICAL PLAN:\n{json.dumps(plan, default=str)}"
-    )

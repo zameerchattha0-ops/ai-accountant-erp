@@ -51,12 +51,16 @@ const ENTITY_DETAIL_ROUTES: Record<string, string> = {
 
 const ACTION_ROUTES: Record<string, string> = {
   create_invoice: "/sales/invoices",
-  record_cash_sale: "/sales/invoices",
+  // CASH sale/purchase create NO invoice/bill document — they post a direct
+  // journal (Dr/Cr Cash-or-Bank).  Their record IS the journal entry, so they
+  // link to the Journal page (which drill-throughs to the GL/COA), never to a
+  // payable/receivable document page that does not exist for them.
+  record_cash_sale: "/accounting/journal",
   record_credit_sale: "/sales/invoices",
   create_quotation: "/sales/quotations",
   create_credit_note: "/sales/credit-notes",
   record_credit_purchase: "/purchases/bills",
-  record_cash_purchase: "/purchases/bills",
+  record_cash_purchase: "/accounting/journal",
   create_purchase_return: "/purchases/returns",
   record_expense: "/expenses",
   record_payment: "/payments",

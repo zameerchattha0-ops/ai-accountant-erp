@@ -377,6 +377,11 @@ export default function CataloguePage() {
                   <th className="px-4 py-3 font-medium">
                     {kind === "products" ? "Unit" : "Billed per"}
                   </th>
+                  {kind === "products" && (
+                    <th className="px-4 py-3 font-medium text-right">
+                      Units available
+                    </th>
+                  )}
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="px-4 py-3 font-medium text-right">Actions</th>
                 </tr>
@@ -413,6 +418,29 @@ export default function CataloguePage() {
                         ? item.unit || "—"
                         : item.billing_unit || "—"}
                     </td>
+                    {kind === "products" && (
+                      <td className="px-4 py-3 text-right">
+                        {item.is_stock_tracked ? (
+                          <span
+                            className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium tabular-nums ${
+                              (item.quantity_on_hand ?? 0) > 0
+                                ? "bg-success-100 text-success-700"
+                                : "bg-bg-muted text-text-muted"
+                            }`}
+                            title="Units on hand from the stock ledger"
+                          >
+                            {item.quantity_on_hand ?? 0}
+                          </span>
+                        ) : (
+                          <span
+                            className="text-text-muted"
+                            title="Not stock-tracked — no units concept"
+                          >
+                            —
+                          </span>
+                        )}
+                      </td>
+                    )}
                     <td className="px-4 py-3">
                       <StatusBadge status={statusOf(item)} />
                     </td>

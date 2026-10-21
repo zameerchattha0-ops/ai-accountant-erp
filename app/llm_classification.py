@@ -490,12 +490,24 @@ def validate(
         account = candidates.by_id.get(str(account_id))
         if account is None:
             log.warning(
+                "authority_split.intercepted",
+                reason="candidate_account_out_of_bounds",
+                account_id=str(account_id),
+            )
+            log.warning(
                 "llm_classification.reject",
                 reason="account_id not in candidate set", account_id=str(account_id),
             )
             return None
         a_type = str(account.get("account_type") or "").strip().upper()
         if a_type not in _allowed_account_types(nature):
+            log.warning(
+                "authority_split.intercepted",
+                reason="fuzzy_type_mismatch",
+                nature=nature,
+                account_type=a_type,
+                account=str(account.get("name")),
+            )
             log.warning(
                 "llm_classification.reject",
                 reason="account_type does not fit nature",

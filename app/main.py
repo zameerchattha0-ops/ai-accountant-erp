@@ -1377,11 +1377,32 @@ _REFUSAL = (
 
 # Tiny in-memory rate limiter (per IP): 20 requests / 60 seconds.
 _FOUNDER_RL: Dict[str, deque] = defaultdict(deque)
-_FOUNDER_RL_MAX = 20
+_FOUNDER_RL_MAX = 10
 _FOUNDER_RL_WINDOW = 60.0
 
 
+def _clean_plain_text_reply(text: str) -> str:
+    # Strip script tags
+    text = re.sub(r"(?is)<script.*?>.*?</script>", "", text)
+    # Strip HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Strip code fences ```...```
+    text = re.sub(r"(?s)```.*?```", "", text)
+    text = text.replace("```", "")
+    # Strip markdown headers (#, ##, etc)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    # Clamp character length
+    if len(text) > 1500:
+        text = text[:1500]
+    # Clamp words
+    words = text.split()
+    if len(words) > 250:
+        text = " ".join(words[:250]) + "..."
+    return text.strip()
+
+
 @app.post("/api/public/founder-chat")
+@app.post("/api/founder-chat")
 async def founder_chat(
     payload: Dict[str, Any] = Body(default={"message": "", "history": []}),
     request: Request = None,  # type: ignore[assignment]
@@ -1409,8 +1430,8 @@ async def founder_chat(
     history = payload.get("history") or []
     if not message:
         return {"reply": "Ask me anything about AI Accountant or its founder!"}
-    if len(message) > 600:
-        message = message[:600]
+    if len(message) > 500:
+        message = message[:500]
 
     # Data-shaped questions are refused instantly — never reach the model.
     if _DATA_GUARD_RE.search(message):
@@ -1455,7 +1476,7 @@ async def founder_chat(
     except Exception as exc:  # noqa: BLE001 — availability must never 500
         log.warning("founder_chat.provider_failed", error=str(exc)[:200])
         reply = ""
-    reply = (reply or "").strip()
+    reply = _clean_plain_text_reply(reply or "")
     if not reply:
         reply = (
             "I couldn't reach my brain just now — please try again in a "
@@ -1494,6 +1515,31 @@ async def _catalogue_list(table: str, auth: AuthContext, query: str, status: str
 
     svc = product_service if table == "products" else service_service
     rows = await svc.list_catalog(auth.organization_id, query=query, status=status)
+    if table == "products" and rows:
+        # UNITS AVAILABLE (2026-10-20): attach the live quantity-on-hand from
+        # the perpetual stock ledger so the catalogue shows how many units of
+        # each tracked item are in stock.  Derived at READ time (v_product_stock)
+        # — never cached, so it can never drift after a correction/reversal.
+        # A ledger read failure leaves the field absent (honest "unknown"), and
+        # a stock-tracked item with no movements yet is a true 0 — never a
+        # fabricated number.  This is additive and never blocks the list.
+        from app.services import inventory_service
+        try:
+            _ids = [uuid.UUID(str(r["id"])) for r in rows if r.get("id")]
+            positions = await inventory_service.positions_for_products(
+                auth.organization_id, product_ids=_ids
+            )
+        except Exception as exc:  # noqa: BLE001 — units are additive, never fatal
+            log.warning("api.catalogue.stock_lookup_failed", error=str(exc)[:200])
+            positions = {}
+        for r in rows:
+            pos = positions.get(str(r.get("id")))
+            if pos is None:
+                # No ledger row: a stock-tracked item with no movements is 0;
+                # a non-tracked item has no units concept at all (None).
+                r["quantity_on_hand"] = 0 if r.get("is_stock_tracked") else None
+            else:
+                r["quantity_on_hand"] = float(pos.get("quantity_on_hand") or 0)
     return {
         "items": rows,
         "counts": catalogue_rules.status_counts(rows),

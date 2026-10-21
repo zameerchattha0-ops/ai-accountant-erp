@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { ChevronDown, ChevronRight, Pencil, Plus, Printer, Search, Trash2, Undo2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
@@ -582,7 +583,17 @@ export default function JournalPage() {
                                 {(linesByEntry[e.id] ?? []).map((l) => (
                                   <tr key={l.id} className="border-b border-border-subtle/40 last:border-0">
                                     <td className="px-3 py-2 text-text-muted tabular-nums">{l.line_number}</td>
-                                    <td className="px-3 py-2 text-text-primary">{lineAccountLabel(l)}</td>
+                                    <td className="px-3 py-2">
+                                      {/* COA DRILL-THROUGH: jump to this account's
+                                          General Ledger, which filters by account_id. */}
+                                      <Link
+                                        href={`/accounting/general-ledger?account=${l.account_id}`}
+                                        className="text-ai-700 hover:text-ai-600 hover:underline underline-offset-2"
+                                        title="View this account in the General Ledger"
+                                      >
+                                        {lineAccountLabel(l)}
+                                      </Link>
+                                    </td>
                                     <td className="px-3 py-2 text-text-secondary">{l.description ?? "-"}</td>
                                     <td className="px-3 py-2 text-right text-text-primary tabular-nums">
                                       {l.debit > 0.005 ? formatCurrency(l.debit, e.currency_code) : "-"}

@@ -847,6 +847,51 @@ async def classify_transaction(
         "record_asset_depreciation",
     )
     if intent in _ASSET_LIFECYCLE_INTENTS:
+        # ISSUE-1 FIX (2026-10-21): a PURCHASE re-routed to capitalisation on
+        # a DERIVED nature (not an explicit user answer) must clear the item-
+        # nature analyst's resale-vs-asset check first — never silently
+        # capitalise.  The analyst self-gates: clear cases confirm (no extra
+        # question), genuinely ambiguous ones surface the ask.  An EXPLICIT
+        # "register X as asset" request (no marker) skips this.
+        if entities.get("asset_nature_unconfirmed"):
+            entities.pop("asset_nature_unconfirmed", None)  # consume the flag
+            try:
+                from app.item_nature_analyst import analyse_item_nature
+
+                verdict = await analyse_item_nature(
+                    organization_id=organization_id,
+                    item=item or entity_name or "", intent=intent,
+                    message=message or "", org_context=org_context,
+                )
+            except Exception as exc:  # noqa: BLE001 — analyst never blocks
+                log.warning("classifier.asset_analyst_failed", error=str(exc))
+                verdict = None
+            if verdict is not None and verdict.get("needs_question"):
+                # Genuinely ambiguous — surface the resale-vs-asset ask and
+                # leave the nature UNRESOLVED instead of capitalising.
+                return TransactionClassification(
+                    transaction_nature=None,
+                    confidence=verdict.get("confidence") or "MEDIUM",
+                    source="ERP_CONFIGURATION",
+                    entity=item or entity_name,
+                    requires_clarification=True,
+                    clarification_reason=(
+                        verdict.get("question")
+                        or f"How should '{item or entity_name}' be treated — "
+                           "resale inventory or a fixed asset for business use?"
+                    ),
+                    catalogue_hint=(
+                        {
+                            "name": (verdict.get("matched_product") or {}).get("name"),
+                            "product_code": (verdict.get("matched_product") or {}).get("product_code"),
+                            "is_stock_tracked": bool(
+                                (verdict.get("matched_product") or {}).get("is_stock_tracked")
+                            ),
+                        }
+                        if verdict.get("matched_product") else None
+                    ),
+                )
+            # analyst confirmed (or declined) -> fall through to commit below.
         if resolve_account_hints:
             decision = await _llm_decision(
                 organization_id, intent=intent, entities=entities,
@@ -974,8 +1019,70 @@ async def classify_transaction(
             requires_clarification=False,
         )
 
-    # --- 2. ERP_CONFIGURATION: products/services item mapping. ------------
+    # --- 2. ERP_CONFIGURATION / ITEM-NATURE ANALYST. -----------------------
     if item:
+        # LLM ITEM-NATURE ANALYST (2026-10-20): "resale INVENTORY vs FIXED
+        # ASSET vs both?" is a semantic, purpose-dependent judgment, so the
+        # model analyses the LIVE catalogue + fixed-asset register + the
+        # stated purpose-of-use and routes.  Python only grounds its answer
+        # (indexes into the fetched registers) and forces an ASK on doubt.
+        # The token-match block below stays as the deterministic FALLBACK
+        # when the analyst is disabled/unavailable/invalid.
+        try:
+            from app.item_nature_analyst import analyse_item_nature
+
+            verdict = await analyse_item_nature(
+                organization_id=organization_id,
+                item=item, intent=intent, message=message or "",
+                org_context=org_context,
+            )
+        except Exception as exc:  # noqa: BLE001 — analyst never blocks
+            log.warning("classifier.item_nature_analyst_failed", error=str(exc))
+            verdict = None
+        if verdict is not None:
+            prod = verdict.get("matched_product") or None
+            hint = (
+                {
+                    "name": prod.get("name"),
+                    "product_code": prod.get("product_code"),
+                    "is_stock_tracked": bool(prod.get("is_stock_tracked")),
+                }
+                if prod else None
+            )
+            if verdict.get("needs_question"):
+                # Genuinely ambiguous (e.g. item in BOTH registers with no
+                # stated purpose, or FIXED_ASSET-only needing confirmation):
+                # route the ASK — never a silent guess.
+                return TransactionClassification(
+                    transaction_nature=None,
+                    confidence=verdict.get("confidence") or "MEDIUM",
+                    source="ERP_CONFIGURATION",
+                    entity=item,
+                    requires_clarification=True,
+                    clarification_reason=(
+                        verdict.get("question")
+                        or "How should this item be treated — resale "
+                           "inventory, a fixed asset, a consumable/expense, "
+                           "or a service?"
+                    ),
+                    catalogue_hint=hint,
+                )
+            nature = verdict.get("proposed_nature")
+            if nature:
+                # The analyst routed it (purpose clear / unambiguous record):
+                # INVENTORY_ONLY, or a clear-purpose BOTH/NEITHER.  Return the
+                # nature; the accounting engine resolves the account.
+                return TransactionClassification(
+                    transaction_nature=nature,
+                    confidence=verdict.get("confidence") or "MEDIUM",
+                    source="ITEM_MAPPING",
+                    entity=item,
+                    requires_clarification=False,
+                    clarification_reason=None,
+                    catalogue_hint=hint,
+                )
+            # analyst ran but proposed nothing usable -> fall through to the
+            # deterministic block below.
         try:
             from app.database import fetch_many
 

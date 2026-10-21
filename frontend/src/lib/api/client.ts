@@ -195,6 +195,10 @@ export interface CatalogueItem {
   is_stock_tracked?: boolean;
   unit_price?: number | null;
   cost_price?: number | null;
+  /** Live units on hand from the perpetual stock ledger (products only).
+   *  null = not stock-tracked (no units concept); a tracked item with no
+   *  movements yet is 0. Derived at read time, never cached. */
+  quantity_on_hand?: number | null;
   /** Services */
   billing_unit?: string;
   standard_rate?: number | null;

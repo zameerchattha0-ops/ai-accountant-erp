@@ -105,9 +105,24 @@ async def test_catalogue_hinted_nature_question_is_preserved_verbatim():
 
 
 
-# --- purchase catalogue-sync: word-level REUSE -----------------------------
+# --- purchase catalogue-sync: LLM ANALYST reuse (2026-10-20) ----------------
 @pytest.mark.asyncio
-async def test_purchase_sync_reuses_stock_product_by_word_match(monkeypatch):
+async def test_purchase_sync_reuses_stock_product_via_llm_analyst(monkeypatch):
+    """'Is this the SAME product as an existing entry?' is a SEMANTIC judgment
+    the LLM makes over the FETCHED candidates — the model says 'office chairs'
+    IS catalogue 'chairs', so it reuses (never creates a duplicate)."""
+    from app.config import get_settings
+
+    get_settings().llm_catalogue_match_enabled = True
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            # the fetched list has one candidate (chairs) -> index 1
+            return '{"match_index": 1, "reason": "same product"}'
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
     async def _no_exact(*_a, **_k):
         return []
 
@@ -125,6 +140,47 @@ async def test_purchase_sync_reuses_stock_product_by_word_match(monkeypatch):
     )
     assert row and row["name"] == "chairs"
     assert row["reused"] is True  # honest note in the bill result
+
+
+@pytest.mark.asyncio
+async def test_purchase_sync_creates_when_llm_says_distinct(monkeypatch):
+    """The analyst judging 'office chairs' DISTINCT from 'office desks' means a
+    NEW product — never a silent merge on a shared word."""
+    from app.config import get_settings
+
+    get_settings().llm_catalogue_match_enabled = True
+
+    DESKS = {"id": str(uuid.uuid4()), "name": "office desks",
+             "product_code": "PRD-000099", "is_stock_tracked": True}
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            return '{"match_index": null, "reason": "different good"}'
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _no_exact(*_a, **_k):
+        return []
+
+    async def _catalogue(*_a, **_k):
+        return [DESKS]
+
+    created = []
+
+    async def _create(org, **kw):
+        created.append(kw.get("name"))
+        return {"id": str(uuid.uuid4()), "name": kw.get("name"),
+                "reused": False}
+
+    monkeypatch.setattr(product_service, "search", _no_exact)
+    monkeypatch.setattr("app.database.fetch_many", _catalogue)
+    monkeypatch.setattr(product_service, "create", _create)
+    row = await inventory_service.find_or_create_catalogue_product(
+        uuid.uuid4(), name="office chairs", quantity=1, unit_cost=100,
+    )
+    assert created == ["office chairs"]  # distinct -> a real new product
+    assert row and row.get("reused") is False
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,20 @@ def match_catalogue_product(
     for p in products or ():
         if not isinstance(p, dict):
             continue
-        overlap = item_toks & _toks(p.get("name"))
+        prod_toks = _toks(p.get("name"))
+        if not prod_toks:
+            continue
+        # SUBSET-CONTAINMENT GATE (2026-10-20, per-item tracking): require
+        # full containment in ONE direction — every significant word of the
+        # SHORTER name must appear in the longer.  'office chair' still finds
+        # 'chairs' (chair fully contained), but distinct items that merely
+        # share ONE generic word no longer merge ('office chair' vs 'dining
+        # chair', 'Honda bike' vs 'Yamaha bike', 'Batt Gadget' vs 'Batt
+        # CashUnit').  The old any-overlap rule collapsed such items into a
+        # single product and corrupted per-item stock tracking.
+        if not (prod_toks <= item_toks or item_toks <= prod_toks):
+            continue
+        overlap = item_toks & prod_toks
         if not overlap:
             continue
         score = len(overlap) * 2 + (1 if p.get("is_stock_tracked") else 0)

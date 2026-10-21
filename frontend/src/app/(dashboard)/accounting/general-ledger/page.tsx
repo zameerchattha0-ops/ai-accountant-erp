@@ -92,6 +92,16 @@ export default function GeneralLedgerPage() {
   // the fetched page exactly as returned.
   const visible = useMemo(() => rows ?? [], [rows]);
 
+  // COA DRILL-THROUGH (?account=<id>): the Journal page links each line's
+  // account here so the ledger opens pre-filtered on that account — the
+  // end-to-end chain Journal entry -> account -> General Ledger -> COA.
+  // Read from window.location (the auth/callback pattern) — never
+  // useSearchParams, which would force a Suspense boundary on this page.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("account");
+    if (id) setAccountFilter(id);
+  }, []);
+
   // Page-scoped totals, honestly labelled: a paged ledger footer cannot claim
   // to sum rows the browser never received (the Pagination row below carries
   // the full filtered count).

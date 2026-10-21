@@ -519,13 +519,18 @@ class Settings(BaseSettings):
     llm_preliminary_extraction_enabled: bool = Field(
         default=False,
         description=(
-            "Enable the SHORT LLM enrichment of the PRELIMINARY EXTRACTION "
-            "(stage 2, app/llm_extraction.py). The deterministic literal "
-            "regexes stay the FLOOR: the model only FILLS GAPS (quantity, "
-            "odd phrasings) and can never overwrite a literal the rules "
-            "already extracted, never interpret treatment, never choose "
-            "accounts. Disabled/unavailable/invalid -> the deterministic "
-            "extraction ships unchanged."
+            "Enable the SHORT LLM extraction of the PRELIMINARY facts "
+            "(stage 2, app/llm_extraction.py). AUTHORITY SPLIT (2026-10-20): "
+            "the model is AUTHORITATIVE for party (supplier_name/"
+            "customer_name), item_description, quantity and reason - it may "
+            "override a regex capture (the rules are only the FALLBACK). "
+            "amount and transaction_date stay DETERMINISTIC-FIRST: a literal "
+            "the rules extracted wins and the model only fills their gaps "
+            "(a hallucinated figure/date is the one failure worse than a "
+            "missed one). Never interprets treatment, never chooses accounts. "
+            "Disabled/unavailable/invalid -> the deterministic extraction "
+            "ships unchanged. User confirmation-before-posting stays the "
+            "final safety gate."
         ),
     )
     llm_preliminary_extraction_timeout: float = Field(
@@ -534,6 +539,59 @@ class Settings(BaseSettings):
             "Wall-clock cap for the stage-2 enrichment call — a slow provider "
             "degrades to the deterministic extraction, never blocks the turn."
         ),
+    )
+    llm_catalogue_match_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the LLM catalogue dedup/match analyst (app/"
+            "catalogue_matching.py). 'Is this item the SAME product as an "
+            "existing catalogue entry?' is a SEMANTIC judgment, so the model "
+            "analyzes the FETCHED candidate products and decides reuse-vs-"
+            "distinct; Python only fetches the candidates, GROUNDS the answer "
+            "(the model returns a 1-based index into the fetched list, never "
+            "an invented id), and keeps an EXACT-name floor as the "
+            "disabled/unavailable/invalid fallback. Doubt -> treated as a "
+            "distinct item (never merge on a guess)."
+        ),
+    )
+    llm_catalogue_match_timeout: float = Field(
+        default=8.0,
+        description=(
+            "Wall-clock cap for the catalogue dedup call — a slow provider "
+            "degrades to the exact-name floor, never blocks the purchase/sale."
+        ),
+    )
+    llm_item_nature_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the LLM item-nature analyst (app/item_nature_analyst.py). "
+            "'Where does this item live — resale INVENTORY, a FIXED ASSET, or "
+            "both?' is a semantic, purpose-dependent judgment, so the model "
+            "analyzes the LIVE catalogue + fixed-asset register and the "
+            "stated purpose-of-use, then routes (inventory / fixed asset / "
+            "ask). Python only fetches the registers, GROUNDS the answer "
+            "(1-based indexes into the fetched lists), and forces an ask on "
+            "any doubt — never a silent guess. Disabled/unavailable/invalid "
+            "-> the classifier keeps its deterministic decision tree."
+        ),
+    )
+    llm_item_nature_timeout: float = Field(
+        default=10.0,
+        description=(
+            "Wall-clock cap for the item-nature analyst call — a slow provider "
+            "degrades to the deterministic classifier, never blocks the turn."
+        ),
+    )
+    llm_answer_parsing_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the LLM questionnaire answer parser / packed-reply splitter "
+            "(app/answer_parsing.py). Maps packed human replies to canonical questionnaire fields."
+        ),
+    )
+    llm_answer_parsing_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for the answer parsing call.",
     )
     treatment_review_enabled: bool = Field(
         default=False,

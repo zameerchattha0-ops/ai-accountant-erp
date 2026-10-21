@@ -343,6 +343,45 @@ def test_dn_message_extracts_supplier_name():
     assert (p.extracted_entities or {}).get("supplier_name") == "SHABBIR FURNITURES"
 
 
+def test_llm_authoritative_party_overrides_a_regex_swallowed_item():
+    """2026-10-20 inversion: when the stage-2 model splits the party out of a
+    phrase the regex swallowed into the item, its reading wins and reaches the
+    entities the fast-paths read (supplier_name + a clean item_description)."""
+    from app.planner import plan
+
+    p = plan(
+        "purchase return to umer autos against damaged motorbikes",
+        prefill_entities={
+            "supplier_name": "umer autos",
+            "item_description": "damaged motorbikes",
+            "quantity": 1,
+            "reason": "damaged motorbikes",
+        },
+    )
+    ents = p.extracted_entities or {}
+    assert p.intent == "create_purchase_return"
+    assert ents.get("supplier_name") == "umer autos"
+    assert ents.get("item_description") == "damaged motorbikes"
+    assert ents.get("quantity") == 1
+    assert ents.get("reason") == "damaged motorbikes"
+
+
+def test_an_answered_party_is_never_clobbered_by_the_llm_prefill():
+    """The LLM-authoritative prefill may override a REGEX capture but never a
+    clarification ANSWER — an answered value outranks the model."""
+    from app.planner import plan
+
+    p = plan(
+        "purchase return against damaged motorbikes",
+        clarification_history=[
+            {"question": "supplier_name", "answer": "SHABBIR FURNITURES"},
+        ],
+        prefill_entities={"supplier_name": "umer autos"},
+    )
+    ents = p.extracted_entities or {}
+    assert ents.get("supplier_name") == "SHABBIR FURNITURES"  # answer wins
+
+
 def test_dn_message_extracts_bill_number_literal():
     """'against purchase bill PUR-000013' used to extract NOTHING (PUR was
     not in the reference alternation)."""

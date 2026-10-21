@@ -91,11 +91,6 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
             "supplier_id", "supplier", ("supplier_name", "party_name")
         ),
     },
-    "create_expense": {
-        "supplier_id": ReferenceSpec(
-            "supplier_id", "supplier", ("supplier_name", "payee_name")
-        ),
-    },
     "record_customer_receipt": {
         "customer_id": ReferenceSpec(
             "customer_id", "customer", ("customer_name", "party_name")

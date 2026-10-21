@@ -52,6 +52,31 @@ def test_match_catalogue_ignores_short_common_words():
     assert _match_catalogue("chair", [noisy]) is None
 
 
+# --- SUBSET-CONTAINMENT GATE (2026-10-20, per-item tracking) ----------------
+def test_distinct_items_sharing_one_generic_word_never_merge():
+    """'office chair' must NOT match 'dining chair' — they share only the
+    generic 'chair' but are different products.  The old any-overlap rule
+    merged them into one row and corrupted per-item stock tracking."""
+    dining = {"name": "dining chair", "is_stock_tracked": True}
+    assert _match_catalogue("office chair", [dining]) is None
+
+
+def test_distinct_products_with_a_shared_token_stay_separate():
+    honda = {"name": "Honda bike", "is_stock_tracked": True}
+    yamaha = {"name": "Yamaha bike", "is_stock_tracked": True}
+    assert _match_catalogue("Honda bike", [yamaha]) is None
+    assert _match_catalogue("Honda bike", [honda]) == honda
+
+
+def test_subset_synonym_still_matches_both_directions():
+    chairs = {"name": "chairs", "is_stock_tracked": True}
+    # item longer than product (extra qualifier) -> product fully contained
+    assert _match_catalogue("blue office chair", [chairs]) == chairs
+    # product longer than item (item fully contained in product)
+    office = {"name": "office chair", "is_stock_tracked": True}
+    assert _match_catalogue("chair", [office]) == office
+
+
 # --- question shaper -------------------------------------------------------
 def test_shaped_question_is_inventory_first_with_fixed_asset_escape():
     hint = {"name": "chairs", "product_code": "PRD-000002", "is_stock_tracked": True}
@@ -68,6 +93,173 @@ def test_shaped_question_requires_a_stock_tracked_hint():
     assert nature_question_with_hint(
         "laptop", {"name": "Laptops", "is_stock_tracked": False}
     ) is None
+
+
+# --- LLM ITEM-NATURE ANALYST (2026-10-20) ----------------------------------
+@pytest.mark.asyncio
+async def test_analyst_routes_resale_to_inventory(monkeypatch):
+    """INVENTORY_ONLY + stated resale purpose -> routes to INVENTORY, no ask."""
+    from app.config import get_settings
+
+    get_settings().llm_item_nature_enabled = True
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            return ('{"location": "INVENTORY_ONLY", "inventory_index": 1, '
+                    '"asset_index": null, "purpose": "RESALE", '
+                    '"proposed_nature": "INVENTORY", "confidence": "HIGH", '
+                    '"needs_question": false, "question": "", '
+                    '"reasoning": "resale stock"}')
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _products(*_a, **_k):
+        return [CHAIRS]
+
+    async def _assets(*_a, **_k):
+        return []
+
+    monkeypatch.setattr("app.database.fetch_many", _products)
+    from app.repositories import fixed_asset_repository as far
+    monkeypatch.setattr(far, "list_assets", _assets)
+
+    cls = await classify_transaction(
+        organization_id=uuid.uuid4(),
+        intent="record_purchase",
+        entities={"item_description": "office chair"},
+        message="I bought office chairs to resell in our shop",
+        resolve_account_hints=False,
+    )
+    assert cls.transaction_nature == "INVENTORY"
+    assert cls.requires_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_analyst_asks_when_item_is_in_both_registers(monkeypatch):
+    """Same item in BOTH registers with no stated purpose -> genuinely
+    ambiguous, so it ASKS (never guesses)."""
+    from app.config import get_settings
+
+    get_settings().llm_item_nature_enabled = True
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            return ('{"location": "BOTH", "inventory_index": 1, '
+                    '"asset_index": 1, "purpose": "UNKNOWN", '
+                    '"proposed_nature": null, "confidence": "MEDIUM", '
+                    '"needs_question": true, "question": "Is this bike for '
+                    'resale or business use?", "reasoning": "in both"}')
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _products(*_a, **_k):
+        return [{"id": str(uuid.uuid4()), "name": "bike",
+                 "product_code": "PRD-1", "is_stock_tracked": True}]
+
+    async def _assets(*_a, **_k):
+        return [{"id": str(uuid.uuid4()), "name": "Delivery Bike",
+                 "asset_code": "FA-1", "status": "ACTIVE"}]
+
+    monkeypatch.setattr("app.database.fetch_many", _products)
+    from app.repositories import fixed_asset_repository as far
+    monkeypatch.setattr(far, "list_assets", _assets)
+
+    cls = await classify_transaction(
+        organization_id=uuid.uuid4(),
+        intent="record_purchase",
+        entities={"item_description": "bike"},
+        message="I bought a bike",
+        resolve_account_hints=False,
+    )
+    assert cls.requires_clarification is True
+    assert cls.transaction_nature is None
+    assert "resale" in (cls.clarification_reason or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_analyst_uses_purpose_to_disambiguate(monkeypatch):
+    """Purpose-of-use in the query ('for business use') settles a BOTH-match:
+    an item that is sometimes stock is treated as a FIXED ASSET here."""
+    from app.config import get_settings
+
+    get_settings().llm_item_nature_enabled = True
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            return ('{"location": "BOTH", "inventory_index": 1, '
+                    '"asset_index": 1, "purpose": "BUSINESS_USE", '
+                    '"proposed_nature": "FIXED_ASSET", "confidence": "HIGH", '
+                    '"needs_question": false, "question": "", '
+                    '"reasoning": "business use stated"}')
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _products(*_a, **_k):
+        return [{"id": str(uuid.uuid4()), "name": "bike",
+                 "product_code": "PRD-1", "is_stock_tracked": True}]
+
+    async def _assets(*_a, **_k):
+        return [{"id": str(uuid.uuid4()), "name": "Delivery Bike",
+                 "asset_code": "FA-1", "status": "ACTIVE"}]
+
+    monkeypatch.setattr("app.database.fetch_many", _products)
+    from app.repositories import fixed_asset_repository as far
+    monkeypatch.setattr(far, "list_assets", _assets)
+
+    cls = await classify_transaction(
+        organization_id=uuid.uuid4(),
+        intent="record_purchase",
+        entities={"item_description": "bike"},
+        message="I bought a bike for business use",
+        resolve_account_hints=False,
+    )
+    assert cls.transaction_nature == "FIXED_ASSET"  # purpose settled it
+    assert cls.requires_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_analyst_out_of_range_index_is_never_trusted(monkeypatch):
+    """A grounding violation (index beyond the fetched list) is impossible
+    evidence — treated as no match, never a phantom-product hint."""
+    from app.config import get_settings
+
+    get_settings().llm_item_nature_enabled = True
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            return ('{"location": "INVENTORY_ONLY", "inventory_index": 99, '
+                    '"asset_index": null, "purpose": "RESALE", '
+                    '"proposed_nature": "INVENTORY", "confidence": "LOW", '
+                    '"needs_question": false, "question": "", '
+                    '"reasoning": "phantom index"}')
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _products(*_a, **_k):
+        return [{"id": str(uuid.uuid4()), "name": "chair",
+                 "product_code": "PRD-1", "is_stock_tracked": True}]
+
+    async def _assets(*_a, **_k):
+        return []
+
+    monkeypatch.setattr("app.database.fetch_many", _products)
+    from app.repositories import fixed_asset_repository as far
+    monkeypatch.setattr(far, "list_assets", _assets)
+
+    cls = await classify_transaction(
+        organization_id=uuid.uuid4(),
+        intent="record_purchase",
+        entities={"item_description": "chair"},
+        message="I bought a chair for resale",
+        resolve_account_hints=False,
+    )
+    # the phantom index is discarded -> no hint may reference a product the
+    # analyst did not actually ground.
+    assert cls.catalogue_hint is None
 
 
 # --- classifier behaviour --------------------------------------------------

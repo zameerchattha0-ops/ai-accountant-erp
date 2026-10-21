@@ -1264,6 +1264,7 @@ async def run_reasoning_loop(
 
     from app.config import get_settings
 
+    log.warning("accounting_reasoning.legacy_path_invoked")
     settings = get_settings()
     budget = (
         timeout_seconds

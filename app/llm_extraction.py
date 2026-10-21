@@ -1,14 +1,23 @@
-"""Stage 2 — SHORT LLM enrichment of the PRELIMINARY EXTRACTION (literal only).
+"""Stage 2 — SHORT LLM extraction of the PRELIMINARY facts (literal only).
 
 Production motivation (2026-10-18): the deterministic literal regexes are
 template-bound ("tables", "some dozen", "a couple of ..." slip through), and a
 missed literal later starves the grounded treatment binding of its facts.
 
+AUTHORITY SPLIT (2026-10-20, inversion after the umer-autos failures):
+* LLM-AUTHORITATIVE - party (supplier_name / customer_name),
+  item_description, quantity and reason.  When the model states a valid
+  value it WINS over the regex (which is only the FALLBACK).  These are the
+  interpretation-heavy fields where the regex swallowed the party into the
+  item ("return to umer autos against damaged motorbikes").
+* DETERMINISTIC-FIRST - amount and transaction_date.  A literal the rules
+  extracted still wins; the model only FILLS their gaps.  A hallucinated
+  figure or date is the one failure worse than a missed one, so the regex
+  stays authoritative there and the model never overwrites it.
+
 CONTRACT - extraction, never interpretation (this module may NOT):
 * conclude a transaction NATURE (inventory vs expense), compute a unit price,
   or decide any account - those belong to the later accounting stages;
-* overwrite a literal the deterministic pass already extracted (the rules are
-  the AUTHORITATIVE first pass; the model only FILLS GAPS);
 * invent values: every field must be literally present in the user's words.
 An INVALID model value for a CRITICAL field (quantity) is never assumed: the
 failure is RECORDED in the audit and the field stays unfilled, so a required
@@ -41,7 +50,9 @@ _INSTRUCTION = (
     'only, matching EXACTLY this schema: {"amount": <number|null>, '
     '"transaction_date": "<YYYY-MM-DD>"|null, "item_description": "<string>"'
     '|null, "quantity": <number|null>, "payment_channel": '
-    '"<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null, "named_parties": '
+    '"<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null, "supplier_name": '
+    '"<string>"|null, "customer_name": "<string>"|null, "reason": "<string>"'
+    '|null, "bill_number": "<PUR-000013 style token>"|null, "named_parties": '
     '["<string>", ...] (max 5), "document_reference": "<INV-000012 style '
     'token>"|null, "invoice_number": "<digits>"|null, '
     '"provisional_intent_hint": "<canonical intent or null>", '
@@ -50,8 +61,44 @@ _INSTRUCTION = (
     '...]} RULES: extract ONLY values the user LITERALLY stated; null when '
     'absent; NEVER infer, compute, or guess (e.g. no quantity unless '
     'stated); NEVER decide accounting treatment or accounts; keep the '
-    "request's own wording for items and parties."
+    "request's own wording for items and parties. PARTY vs ITEM (critical): "
+    "the COUNTERPARTY (the business you bought FROM / sold TO / returned "
+    "goods TO) is a PARTY and goes in supplier_name (you bought or returned "
+    "to them) or customer_name (you sold or received from them) — it is "
+    "NEVER part of item_description. item_description is only the GOODS "
+    "(e.g. 'return to umer autos against damaged motorbikes' -> "
+    "supplier_name='umer autos', item_description='damaged motorbikes'). "
+    "reason is the user's own stated cause for a return ('damaged', "
+    "'wrong item delivered'), null when not stated."
 )
+
+# Pronouns / fillers that are never a business counterparty (mirrors the
+# planner's party guard so a model echo of "we"/"them"/"the supplier" can
+# never reach the party gate).
+_NOT_A_PARTY = frozenset({
+    "the", "a", "an", "it", "us", "we", "you", "they", "i", "me", "him",
+    "her", "them", "our", "your", "their", "supplier", "the supplier",
+    "customer", "the customer", "vendor", "client", "party",
+})
+
+
+def _plausible_party(value: str) -> bool:
+    """Shape-only party guard: a real, non-numeric, non-pronoun name.
+
+    Grounding against the live supplier/customer master happens DOWNSTREAM
+    (the party gate); this only rejects obvious non-names so a model echo of
+    a pronoun or an amount/date shape never reaches that gate.
+    """
+    text = (value or "").strip()
+    if len(text) < 2:
+        return False
+    if text.lower().strip(".,") in _NOT_A_PARTY:
+        return False
+    if re.fullmatch(r"(?:rs\.?|pkr|pk)?\s*[\d,]+(?:\.\d+)?", text, re.IGNORECASE):
+        return False  # an amount shape is not a name
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return False  # a date shape is not a name
+    return True
 
 
 def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
@@ -86,9 +133,29 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
             clean["transaction_date"] = str(date)
         else:
             failures.append(f"transaction_date: not ISO ({date!r})")
+            log.warning("authority_split.intercepted", field="transaction_date", reason="untraceable_date", raw_value=str(date)[:40])
     desc = payload.get("item_description")
     if desc is not None and str(desc).strip():
         clean["item_description"] = str(desc).strip()[:120]
+    # LLM-AUTHORITATIVE party + reason + bill (2026-10-20): these are the
+    # interpretation-heavy fields.  Validation here is SHAPE ONLY (a real,
+    # non-numeric, party-like string); the party is GROUNDED against the live
+    # supplier/customer master downstream, never trusted blindly.  A captured
+    # amount/date shape or pronoun is rejected so it can never reach a gate.
+    for party_key in ("supplier_name", "customer_name"):
+        raw_party = payload.get(party_key)
+        if raw_party is not None and str(raw_party).strip():
+            party = str(raw_party).strip()[:80]
+            if _plausible_party(party):
+                clean[party_key] = party
+            else:
+                failures.append(f"{party_key}: not a plausible party ({raw_party!r})")
+    reason = payload.get("reason")
+    if reason is not None and str(reason).strip():
+        clean["reason"] = str(reason).strip()[:160]
+    bill = payload.get("bill_number")
+    if bill is not None and _DOC_REF_RE.fullmatch(str(bill).strip()):
+        clean["bill_number"] = str(bill).strip()
     channel = payload.get("payment_channel")
     if channel is not None:
         norm = str(channel).strip().upper()
@@ -197,26 +264,72 @@ async def enrich_preliminary(
     audit["validation_failures"] = failures
     if failures:
         log.warning("llm_extraction.validation", failures=failures)
-    # DETERMINISTIC-FIRST MERGE: the rules' literals are authoritative; the
-    # model only fills gaps.  Contractual keys (label/original_request/note/
-    # today) are Python-owned and never touched.
+    # AUTHORITY-SPLIT MERGE (2026-10-20 inversion).  Contractual keys
+    # (label/original_request/note/today) stay Python-owned and untouched.
+    #
+    #   LLM-AUTHORITATIVE (party / item / quantity / reason): the model's
+    #     valid value WINS over the regex — these are the interpretation-
+    #     heavy fields where a template regex swallowed the party into the
+    #     item.  The regex runs only as the FALLBACK when the model omits
+    #     them or is disabled/unavailable/invalid.
+    #   DETERMINISTIC-FIRST (amount / date / payment_channel / references):
+    #     a literal the rules extracted still wins (a hallucinated figure or
+    #     date is worse than a missed one); the model only FILLS their gaps.
     merged = dict(preliminary)
     literals = dict(merged.get("literals") or {})
     filled: List[str] = []
+    overridden: List[str] = []
+
+    # --- deterministic-first: regex wins, model fills gaps only ---
     for key in (
-        "amount", "transaction_date", "item_description", "quantity",
-        "payment_channel", "document_reference",
-        "invoice_number", "bill_number", "reason",
+        "amount", "transaction_date", "payment_channel",
+        "document_reference", "invoice_number", "bill_number",
     ):
-        if key in clean and literals.get(key) is None:
+        if key in clean and literals.get(key) is not None and literals.get(key) != clean[key]:
+            reason = "amount_regex_mismatch" if key == "amount" else ("untraceable_date" if key == "transaction_date" else "deterministic_override")
+            log.warning(
+                "authority_split.intercepted",
+                field=key,
+                reason=reason,
+                deterministic=literals.get(key),
+                llm=clean[key],
+            )
+        elif key in clean and literals.get(key) is None:
             literals[key] = clean[key]
             filled.append(key)
+
+    # --- LLM-authoritative: model wins, regex is the fallback ---
+    for key in ("item_description", "quantity", "reason"):
+        if key not in clean:
+            continue
+        prior = literals.get(key)
+        literals[key] = clean[key]
+        if prior is None:
+            filled.append(key)
+        elif prior != clean[key]:
+            overridden.append(key)
+
+    # Party (supplier/customer) is LLM-authoritative and is written straight
+    # into the literals so the prefill -> planner path can carry it to the
+    # party gate (which grounds it against the live master).
+    for key in ("supplier_name", "customer_name"):
+        if key in clean and clean[key]:
+            prior = literals.get(key)
+            literals[key] = clean[key]
+            if prior is None:
+                filled.append(key)
+            elif prior != clean[key]:
+                overridden.append(key)
+
     if clean.get("named_parties") and not literals.get(
         "named_parties_or_items_candidates"
     ):
         literals["named_parties_or_items_candidates"] = clean["named_parties"]
         filled.append("named_parties_or_items_candidates")
     merged["literals"] = literals
+    if overridden:
+        audit["overrode_regex"] = overridden
+        log.info("llm_extraction.overrode_regex", fields=overridden)
     if clean.get("candidate_subject_areas"):
         areas = list(dict.fromkeys(
             list(merged.get("candidate_subject_areas") or [])

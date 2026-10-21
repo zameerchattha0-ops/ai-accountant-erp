@@ -120,15 +120,32 @@ async def resolve_account(
     account_type: Optional[str] = None,
     account_code: Optional[str] = None,
     account_name: Optional[str] = None,
+    exact_only: bool = False,
+    required_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Resolve an account by code or name within the organisation."""
+    target_type = (required_type or account_type or "").strip().upper() or None
+
     if account_code:
-        return await a_repo.get_account_by_code(organization_id, code=account_code)
+        acc = await a_repo.get_account_by_code(organization_id, code=account_code)
+        if acc and target_type and str(acc.get("account_type", "")).upper() != target_type:
+            return None
+        return acc
+
     if account_name:
-        results = await a_repo.search_accounts(organization_id, query=account_name, limit=5)
+        results = await a_repo.search_accounts(
+            organization_id, query=account_name, limit=20 if target_type else 5
+        )
+        if target_type:
+            results = [r for r in results if str(r.get("account_type", "")).upper() == target_type]
+
         # Return exact match if found
         for r in results:
             if r.get("name", "").lower().strip() == account_name.lower().strip():
                 return r
+
+        if exact_only:
+            return None
+
         return results[0] if results else None
     return None

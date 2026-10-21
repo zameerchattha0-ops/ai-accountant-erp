@@ -169,6 +169,63 @@ def test_existing_product_id_is_never_overwritten(monkeypatch):
     assert items[0]["product_id"] == keep
 
 
+# --- LLM CATALOGUE ANALYST (2026-10-20, per-item decrement fix) -------------
+def test_llm_analyst_links_a_differently_worded_sale(monkeypatch):
+    """A sale worded differently than the catalogue ('office chairs' vs the
+    stock-tracked product 'chair') is linked by the LLM analyst (semantic
+    'same product' judgment), so stock is decremented for THAT item."""
+    from app.config import get_settings
+
+    get_settings().llm_catalogue_match_enabled = True
+    chair_id = str(uuid.uuid4())
+
+    class _StubClient:
+        async def generate_text_light(self, prompt):
+            # two tracked candidates -> 'chair' is index 1
+            return '{"match_index": 1, "reason": "same product"}'
+
+    import app.ai_orchestrator as orch
+    monkeypatch.setattr(orch, "get_client", lambda: _StubClient())
+
+    async def _search(organization_id, *, query, limit=25):
+        return [
+            {"id": chair_id, "name": "chair", "is_stock_tracked": True},
+            {"id": str(uuid.uuid4()), "name": "Office Desk",
+             "is_stock_tracked": True},
+        ]
+
+    monkeypatch.setattr("app.tools.product_service.search", _search)
+    items = [{"description": "office chairs", "quantity": 2}]
+    asyncio.run(_link_products_to_items(_ORG, items))
+    assert items[0].get("product_id") == chair_id  # analyst linked
+
+
+def test_word_fallback_never_links_a_non_stock_product(monkeypatch):
+    """The fallback only considers STOCK-TRACKED products — a service/non-stock
+    line must never link (and therefore never issue stock)."""
+    async def _search(organization_id, *, query, limit=25):
+        return [{"id": str(uuid.uuid4()), "name": "chair",
+                 "is_stock_tracked": False}]
+
+    monkeypatch.setattr("app.tools.product_service.search", _search)
+    items = [{"description": "office chairs", "quantity": 1}]
+    asyncio.run(_link_products_to_items(_ORG, items))
+    assert not items[0].get("product_id")  # non-stock -> never linked
+
+
+def test_word_fallback_does_not_cross_distinct_items(monkeypatch):
+    """'Honda bike' must not link to a different tracked product that merely
+    shares the generic word 'bike' (subset gate blocks the cross)."""
+    async def _search(organization_id, *, query, limit=25):
+        return [{"id": str(uuid.uuid4()), "name": "Yamaha bike",
+                 "is_stock_tracked": True}]
+
+    monkeypatch.setattr("app.tools.product_service.search", _search)
+    items = [{"description": "Honda bike", "quantity": 1}]
+    asyncio.run(_link_products_to_items(_ORG, items))
+    assert not items[0].get("product_id")  # distinct -> never linked
+
+
 def test_cash_sale_fast_path_now_carries_items():
     """The COGS trigger is only reachable when the call carries items."""
     calls = _cash_sale_fast_path_call({

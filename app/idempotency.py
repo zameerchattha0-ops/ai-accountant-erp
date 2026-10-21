@@ -44,6 +44,7 @@ FINANCIAL_MUTATION_TOOLS = frozenset({
     "create_quotation",
     "convert_quotation",
     "record_cash_sale",
+    "record_cash_purchase",
     "record_credit_sale",
     "record_sale",
     "record_expense",

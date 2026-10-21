@@ -113,6 +113,84 @@ def validate_attachment(att: AttachmentRef) -> str:
     return f"data:{att.mime_type};base64,{att.data_base64}"
 
 
+_ALLOWED_DOC_TYPES = frozenset({"invoice", "receipt", "bill", "quotation", "other", "unknown"})
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _coerce_optional_float(val: Any) -> Optional[float]:
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        cleaned = re.sub(r"[^\d.-]", "", val)
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _validate_and_sanitize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure extraction output strictly conforms to code-level contracts."""
+    doc_type = str(data.get("document_type") or "").strip().lower()
+    if doc_type not in _ALLOWED_DOC_TYPES:
+        data["reported_document_type"] = doc_type
+        data["document_type"] = "unknown"
+    else:
+        data["document_type"] = doc_type
+
+    uncertainties = list(data.get("uncertainties") or [])
+    date_val = data.get("document_date")
+    if date_val is not None:
+        date_str = str(date_val).strip()
+        if not _DATE_RE.match(date_str):
+            uncertainties.append(f"document_date '{date_val}' could not be normalized to YYYY-MM-DD")
+            data["document_date"] = None
+        else:
+            data["document_date"] = date_str
+
+    for field_name in ("subtotal", "tax_amount", "discount", "total"):
+        raw_val = data.get(field_name)
+        if raw_val is not None:
+            coerced = _coerce_optional_float(raw_val)
+            if coerced is None:
+                uncertainties.append(f"{field_name} '{raw_val}' could not be parsed as a number")
+            data[field_name] = coerced
+
+    raw_conf = data.get("confidence")
+    if raw_conf is not None:
+        coerced_conf = _coerce_optional_float(raw_conf)
+        data["confidence"] = max(0.0, min(1.0, coerced_conf)) if coerced_conf is not None else 0.5
+    else:
+        data["confidence"] = 0.5
+
+    raw_items = data.get("line_items")
+    sanitized_items = []
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            sanitized_items.append({
+                "description": str(item.get("description") or "").strip(),
+                "quantity": _coerce_optional_float(item.get("quantity")),
+                "unit_price": _coerce_optional_float(item.get("unit_price")),
+                "amount": _coerce_optional_float(item.get("amount")),
+            })
+    data["line_items"] = sanitized_items
+
+    for party_key in ("supplier", "customer"):
+        p = data.get(party_key)
+        if not isinstance(p, dict):
+            data[party_key] = {"name": None}
+        else:
+            name_val = p.get("name")
+            data[party_key] = {"name": str(name_val).strip() if name_val else None}
+
+    data["uncertainties"] = [str(u).strip() for u in uncertainties if str(u).strip()]
+    return data
+
+
 def _parse_extraction_json(raw: str) -> Dict[str, Any]:
     """Parse the model's JSON reply, tolerating markdown fences."""
     text = raw.strip()
@@ -129,7 +207,7 @@ def _parse_extraction_json(raw: str) -> Dict[str, Any]:
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("extraction reply is not a JSON object")
-    return data
+    return _validate_and_sanitize_extraction(data)
 
 
 async def extract_document(
@@ -219,7 +297,7 @@ def extraction_to_context_text(data: Dict[str, Any]) -> str:
         ("document_date", "Date"),
         ("currency", "Currency"),
         ("subtotal", "Subtotal"),
-        ("tax_amount", "Tax"),
+        ("tax_amount", "Printed Tax (Advisory)"),
         ("discount", "Discount"),
         ("total", "Total"),
         ("payment_method_hint", "Payment hint"),
