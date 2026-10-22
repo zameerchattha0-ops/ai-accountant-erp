@@ -100,13 +100,10 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 14_500  # measured 14,076 on 2026-09-28 (Wave A observation
-# block, then the §12.8 shrink of the undefined `continuation` event_type; the
-# ceiling history above records both).  The provider is already measured on the
-# contract-primed 17.8 KB prompt inside the same 30 s/round timeout (6-25 s),
-# so a 14.1 KB base stays inside the measured envelope.  Raise only with a
-# fresh generation-latency measurement — never silently.
-PRIMED_CEILING = 19_600  # measured 19,451 on 2026-10-17 (+186 chars / ~47
+BASE_CEILING = 16_500  # measured 15,366 on 2026-10-22 (Phase 1 LLM sole
+# authority: economic substance rules, intent mapping, entities schema).
+# The provider handles this size easily within the 30s timeout envelope.
+PRIMED_CEILING = 21_500  # measured 20,522 on 2026-10-22 (+1,071 chars from Phase 1 LLM sole authority)
 # tokens from the ONE create_credit_note contract — the credit-note
 # invoice_number->invoice_id reference fix; ceiling history above records the
 # 6,063 ms generation-latency measurement for this exact 19.45 KB shape).

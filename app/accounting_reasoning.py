@@ -143,6 +143,16 @@ expense items to their category ledger (Utilities, Rent, Travel…).
 Propose or create accounts at CATEGORY level; the individual item lives on
 the document line, never as its own account.
 
+ECONOMIC SUBSTANCE & INTENT MAPPING:
+- record_expense: Immediate operating outflows (travel, rent, utilities, meals, fuel, office supplies, repairs, software SaaS). Settlement is PAID_NOW; cash/bank account is credited. A supplier ledger is NOT required (informational only; never create a supplier ledger for cash/bank expenses).
+- create_purchase_bill: Purchases of goods or services on vendor credit (settlement is ON_CREDIT). Supplier name is REQUIRED.
+- register_fixed_asset: Acquisition of capital equipment, machinery, computers, and vehicles exceeding the capitalization threshold (e.g. >= 50,000 PKR or >= $500 USD) with useful life > 1 year. Consumables and minor items are NEVER fixed assets.
+- create_invoice: Sales of goods/services to customers on credit terms (ON_CREDIT). Customer name is REQUIRED.
+- record_cash_sale: Immediate point-of-sale customer receipts (PAID_NOW). Customer ledger is optional.
+- record_payment: Disbursing cash/bank funds to settle an existing vendor bill (SETTLE_EXISTING_PAYABLE).
+- record_receipt: Receiving cash/bank funds settling an existing customer invoice (SETTLE_EXISTING_RECEIVABLE).
+- record_bank_transfer: Moving liquidity between two company-owned cash/bank accounts. Zero revenue or expense impact.
+
 CREDIT / DEBIT NOTES:
 A credit note reverses revenue and shrinks the customer receivable; a
 debit note (purchase return) shrinks the supplier payable and reverses the
@@ -215,6 +225,19 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
   ],
   "question": null,
   "decision": {"intent": "<planner intent>", "treatment": "<nature>", "document_nature": "<GOODS|SERVICE|ASSET_DISPOSAL|OTHER_INCOME>"},
+  "entities": {
+    "amount": null,
+    "currency": null,
+    "item_description": null,
+    "transaction_purpose": null,
+    "supplier_name": null,
+    "customer_name": null,
+    "quantity": null,
+    "payment_method": "CASH|BANK|CREDIT",
+    "settlement_position": "PAID_NOW|ON_CREDIT|SETTLE_EXISTING_PAYABLE|SETTLE_EXISTING_RECEIVABLE",
+    "account_name": null,
+    "transaction_date": null
+  },
   "prerequisites": [{"name": "", "status": "present|missing|ambiguous", "resolution": "reuse|create|ask"}],
 OPTIONAL BLOCK: "decision" and "prerequisites" are observation metadata. Use ONLY canonical values (a planner intent, a nature from your own vocabulary) — omit them rather than invent one.
   "proposal": {
@@ -334,6 +357,7 @@ class ReasoningOutcome:
     #: explicit empty list counts as the statement it is).
     stated_disclosures: List[str] = field(default_factory=list)
     refusal: Optional[Dict[str, Any]] = None
+    entities: Dict[str, Any] = field(default_factory=dict)
     #: Wave A observation block (AUDIT_REPORT §7) — parsed and compared against
     #: the legacy intent, but NEVER consumed by execution_plan until Wave B,
     #: once the A→B gate (§8) has measured divergence on real turns.
@@ -362,6 +386,7 @@ class ReasoningOutcome:
         return {
             "status": self.status,
             "understanding": self.understanding,
+            "entities": self.entities,
             "evidence_requested": [r.kind for r in self.evidence_requests],
             "evidence": render_evidence_compact(self.evidence_results),
             "question": self.question,
@@ -962,6 +987,54 @@ def _status_from_decision(parsed: Dict[str, Any]) -> str:
     return UNSUPPORTED
 
 
+def _clean_entities(raw: Any) -> Dict[str, Any]:
+    """Parse and sanitize extracted entities from the LLM reasoning response."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = {}
+
+    amt = raw.get("amount")
+    if amt is not None:
+        try:
+            val = float(str(amt).replace(",", "").strip())
+            if val >= 0:
+                out["amount"] = val
+        except (ValueError, TypeError):
+            pass
+
+    for key in (
+        "item_description",
+        "transaction_purpose",
+        "supplier_name",
+        "customer_name",
+        "account_name",
+        "transaction_date",
+        "payment_method",
+        "settlement_position",
+        "currency",
+        "notes",
+    ):
+        v = raw.get(key)
+        if v is not None:
+            s = str(v).strip()
+            if s and s.lower() not in ("null", "none"):
+                out[key] = s[:200]
+
+    qty = raw.get("quantity")
+    if qty is not None:
+        try:
+            q_val = float(qty)
+            out["quantity"] = int(q_val) if q_val.is_integer() else q_val
+        except (ValueError, TypeError):
+            pass
+
+    # Ensure transaction_purpose has a fallback from item_description if absent
+    if "item_description" in out and "transaction_purpose" not in out:
+        out["transaction_purpose"] = out["item_description"]
+
+    return out
+
+
 def _clean_decision(raw: Any) -> Dict[str, str]:
     """Parse the optional Wave A ``decision`` block (strings only, bounded).
 
@@ -1017,6 +1090,7 @@ def _outcome_from_parsed(parsed: Dict[str, Any], *, rounds: int) -> ReasoningOut
     return ReasoningOutcome(
         status=status,
         understanding=understanding if isinstance(understanding, dict) else {},
+        entities=_clean_entities(parsed.get("entities")),
         evidence_requests=parse_evidence_requests(parsed.get("evidence_requests")),
         question=_clean_question(parsed.get("question")),
         missing_facts=[

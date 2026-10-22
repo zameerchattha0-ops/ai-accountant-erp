@@ -5184,51 +5184,49 @@ def _reasoning_produced_interpretation(reasoning: Any) -> bool:
 
 def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
 
-    """P1-⑥: planner prefill derived from the reasoning outcome + the SAME
+    """Extract entities from the LLM reasoning outcome, supplemented by preliminary literals."""
 
-    deterministic literals both stages saw (preliminary extraction).
-
-
-
-    Only literal, traceable values are passed — never facts invented from
-
-    prose. ``semantic_intent`` is deliberately absent: its sole consumers
-
-    are the AI_PERCEPTION log and planner.py's whitelist (which then falls
-
-    back to its regex intent exactly as the existing reasoning-skip paths
-
-    do today — traced before switching, per the report).
-
-    """
+    prefill: Dict[str, Any] = dict(getattr(reasoning, "entities", None) or {})
 
     literals = (preliminary or {}).get("literals") or {}
 
-    prefill: Dict[str, Any] = {}
 
-    # amount + transaction_date stay deterministic-first (the regex literal
-
-    # is already authoritative for them).  item/party/quantity are now
-
-    # LLM-authoritative in the literals, so they are carried through here to
-
-    # reach the planner entities and the party gate (which grounds the name
-
-    # against the live master).  reason is carried by _seed_invoice_reference.
 
     for key in (
 
         "amount", "transaction_date", "item_description",
 
-        "supplier_name", "customer_name", "quantity",
+        "transaction_purpose", "supplier_name", "customer_name",
+
+        "quantity", "payment_method", "settlement_position", "account_name",
 
     ):
 
-        value = literals.get(key)
+        if key not in prefill or prefill[key] in (None, ""):
 
-        if value is not None and value != "":
+            val = literals.get(key)
 
-            prefill[key] = value
+            if val not in (None, ""):
+
+                prefill[key] = val
+
+
+
+    decision = getattr(reasoning, "decision", None) or {}
+
+    intent = str(decision.get("intent") or "").strip().lower()
+
+    if intent:
+
+        prefill["semantic_intent"] = intent
+
+    treatment = str(decision.get("treatment") or "").strip().upper()
+
+    if treatment:
+
+        prefill["transaction_nature"] = treatment
+
+
 
     return prefill
 
@@ -7558,7 +7556,21 @@ async def execute(
             _treatment = str(_decision.get("treatment") or "").strip().upper()
             if _treatment and is_supported_treatment(_treatment):
                 execution_plan.transaction_nature = _treatment
-                execution_plan.transaction_nature_source = "ACCOUNTING_REASONING" 
+                execution_plan.transaction_nature_source = "ACCOUNTING_REASONING"
+
+            # Merge LLM-extracted entities into the execution plan
+            if hasattr(_reasoning, "entities") and _reasoning.entities:
+                execution_plan.extracted_entities = {
+                    **execution_plan.extracted_entities,
+                    **_reasoning.entities,
+                }
+            # Re-evaluate missing fields based on model intent and authoritative entities
+            from app.planner import _missing_fields
+            _rem_missing = _missing_fields(_model_intent, execution_plan.extracted_entities)
+            execution_plan.missing_fields = _rem_missing
+            if not _rem_missing:
+                execution_plan.requires_clarification = False
+                execution_plan.clarification_questions = []
 
 
 

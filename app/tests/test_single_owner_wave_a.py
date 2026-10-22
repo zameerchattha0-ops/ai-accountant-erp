@@ -423,3 +423,65 @@ class TestWaveBAuthoritativePromotion:
         org_context.invalidate_business_profile(test_org)
         prof3 = await org_context.business_profile(test_org, use_cache=True)
         assert call_count == 12
+
+
+    def test_clean_entities_parsing_and_fallbacks(self):
+        from app.accounting_reasoning import _clean_entities
+        raw = {
+            "amount": " 5,000.50 ",
+            "item_description": "Travel across city",
+            "supplier_name": "  ",
+            "payment_method": "CASH",
+            "quantity": "2",
+        }
+        cleaned = _clean_entities(raw)
+        assert cleaned["amount"] == 5000.50
+        assert cleaned["item_description"] == "Travel across city"
+        assert cleaned["transaction_purpose"] == "Travel across city"  # auto-fallback
+        assert "supplier_name" not in cleaned  # whitespace skipped
+        assert cleaned["payment_method"] == "CASH"
+        assert cleaned["quantity"] == 2
+
+    def test_reasoning_outcome_carries_entities(self):
+        from app.accounting_reasoning import _outcome_from_parsed
+        parsed = {
+            "understanding": {"economic_event": "travel"},
+            "entities": {
+                "amount": 5000,
+                "item_description": "Travel",
+                "payment_method": "CASH",
+                "settlement_position": "PAID_NOW",
+            },
+            "decision": {"intent": "record_expense", "treatment": "OPERATING_EXPENSE"},
+        }
+        outcome = _outcome_from_parsed(parsed, rounds=1)
+        assert outcome.entities["amount"] == 5000.0
+        assert outcome.entities["payment_method"] == "CASH"
+        assert outcome.entities["settlement_position"] == "PAID_NOW"
+        assert outcome.as_dict()["entities"]["item_description"] == "Travel"
+
+    def test_prefill_from_reasoning_merges_llm_and_literals(self):
+        from app.agent import _prefill_from_reasoning
+
+        class FakeOutcome:
+            entities = {
+                "item_description": "Flight Ticket",
+                "payment_method": "BANK",
+                "settlement_position": "PAID_NOW",
+            }
+            decision = {"intent": "record_expense", "treatment": "OPERATING_EXPENSE"}
+
+        preliminary = {
+            "literals": {
+                "amount": 25000.0,
+                "transaction_date": "2026-10-22",
+                "item_description": "Ticket",  # LLM Flight Ticket overrides this
+            }
+        }
+        merged = _prefill_from_reasoning(FakeOutcome(), preliminary)
+        assert merged["item_description"] == "Flight Ticket"
+        assert merged["amount"] == 25000.0
+        assert merged["payment_method"] == "BANK"
+        assert merged["settlement_position"] == "PAID_NOW"
+        assert merged["semantic_intent"] == "record_expense"
+        assert merged["transaction_nature"] == "OPERATING_EXPENSE"
