@@ -501,7 +501,11 @@ def validate(
             )
             return None
         a_type = str(account.get("account_type") or "").strip().upper()
-        if a_type == "REVENUE" and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
+        if (
+            a_type == "REVENUE"
+            and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET")
+            and (nature_hint or "").upper() in ("INVENTORY", "GOODS", "REVENUE", "SERVICE")
+        ):
             log.info(
                 "llm_classification.nature_aligned_to_revenue",
                 prior_nature=nature,

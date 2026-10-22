@@ -229,8 +229,8 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"(?:log|book|add|track|enter|submit|file)[^.\n]*expense",
         r"expense\s+(?:of|for)\s+(?:rs\.?|pkr)?\s*[\d,]",
         r"spent",
-        r"\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b[^.\n]*\b[\d,]+(?:\.\d+)?\b",
-        r"\b[\d,]+(?:\.\d+)?\b[^.\n]*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b",
+        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b[^.\n]*\b[\d,]+(?:\.\d+)?\b",
+        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b[\d,]+(?:\.\d+)?\b[^.\n]*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b",
     ]),
     (
         "record_receipt",
