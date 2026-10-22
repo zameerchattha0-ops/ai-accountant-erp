@@ -20,6 +20,7 @@ import GeometricShapes from "@/components/background/GeometricShapes";
 import { HERO_TAGLINES } from "@/data/heroTaglines";
 import GlassTaglineCarousel from "@/components/hero/GlassTaglineCarousel";
 import NavyHero from "@/components/hero/NavyHero";
+import ExecutiveHero from "@/components/hero/ExecutiveHero";
 
 /* "Ledger" — the hero-stage 3D mascot. Client-only: WebGL never runs on
    the server; renders nothing until the scene is interactive. */
@@ -39,7 +40,7 @@ const HeroRobotStage = dynamic(() => import("@/components/hero/HeroRobotStage"),
        NEXT_PUBLIC_HERO_VARIANT=navy   (frontend/.env.local / Vercel env)
    ------------------------------------------------------------------ */
 const HERO_VARIANT = (
-  process.env.NEXT_PUBLIC_HERO_VARIANT ?? "classic"
+  process.env.NEXT_PUBLIC_HERO_VARIANT ?? "executive"
 ).toLowerCase();
 
 
@@ -575,7 +576,7 @@ export default function WelcomePage() {
             : "bg-transparent py-4",
         )}
       >
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between">
           <Link href="/" className="flex items-center">
             <Image
               src="/ai-accountant-logo.svg"
@@ -674,7 +675,8 @@ export default function WelcomePage() {
       {/* HERO — surrealist glass-clay light stage (classic variant:    */}
       {/* preserved VERBATIM, rendered only when HERO_VARIANT != navy)  */}
       {/* ============================================================ */}
-      {HERO_VARIANT !== "navy" && (
+      {HERO_VARIANT === "executive" && <ExecutiveHero />}
+      {HERO_VARIANT !== "executive" && HERO_VARIANT !== "navy" && (
       <>
       <section
         ref={heroRef}
