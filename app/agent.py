@@ -8136,7 +8136,24 @@ async def execute(
 
             )
 
-            question = _questionnaire.render_text() or "Please provide more details."
+            question = _questionnaire.render_text()
+            if not question or question == "Please provide more details.":
+                if execution_plan.clarification_questions:
+                    question = "\n".join(
+                        f"{i}. {q}" if len(execution_plan.clarification_questions) > 1 else q
+                        for i, q in enumerate(execution_plan.clarification_questions, 1)
+                    )
+                elif execution_plan.missing_fields:
+                    from app.questionnaire import spec_for as _spec_for
+                    _specs = [_spec_for(f) for f in execution_plan.missing_fields]
+                    if len(_specs) == 1:
+                        question = _specs[0].question
+                    else:
+                        question = "Please clarify the following details:\n" + "\n".join(
+                            f"{i}. {s.question}" for i, s in enumerate(_specs, 1)
+                        )
+                else:
+                    question = "Could you please clarify how this transaction should be recorded?"
 
             # offer the learned default inside the question
 
@@ -8163,6 +8180,10 @@ async def execute(
             # alignment when a question has no finite option set).
 
             question_options = _questionnaire.render_options()
+            if not question_options and question:
+                derived = options_for_question(question)
+                if derived:
+                    question_options = [derived]
 
             # TRAIL: the hint exists for the QUESTION, not for the trail —
 

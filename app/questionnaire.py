@@ -127,6 +127,18 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         answer_hint="cash or credit",
         why="Cash settles immediately; credit opens a payable.",
     ),
+    "settlement_position": QuestionSpec(
+        field="settlement_position",
+        kind=KIND_CHOICE,
+        question="How should this be recorded — paid now, payable (pay later), or prepaid?",
+        options=(
+            ("PAID_NOW", "Paid now"),
+            ("OUTSTANDING", "Payable (pay later)"),
+            ("PREPAID", "Prepaid / advance"),
+        ),
+        answer_hint="paid now / payable / prepaid",
+        why="Determines whether to credit cash/bank or accounts payable.",
+    ),
     "supplier_name": QuestionSpec(
         field="supplier_name", kind=KIND_TEXT,
         question=(
@@ -799,16 +811,19 @@ def validate_authored_questions(
     allowed = {name: spec_for(name) for name in AUTHORED_FIELDS}
     out: List[QuestionSpec] = []
     seen: set = set()
+    _PAYMENT_FIELDS = frozenset({"payment_type", "payment_method", "settlement_position"})
     for entry in entries[:12]:
         if not isinstance(entry, dict):
             continue
         field_name = str(entry.get("field") or "").strip()
         if field_name not in allowed or field_name in seen:
             continue
+        # Payment/settlement fields are cross-compatible when settlement is open
+        if _applicable is not None and field_name not in _applicable:
+            if not (_PAYMENT_FIELDS & _applicable and field_name in _PAYMENT_FIELDS):
+                continue  # NOT_APPLICABLE this round — outside the open gaps
         if _known(ents.get(field_name)):
             continue  # never ask what the user already stated
-        if _applicable is not None and field_name not in _applicable:
-            continue  # NOT_APPLICABLE this round — outside the open gaps
         question = _clean_text(entry.get("question"), _QUESTION_MAX)
         if not question:
             continue
@@ -968,7 +983,9 @@ Rules (any violation discards that question):
   1. Ask EVERY missing material fact in this ONE questionnaire — never
      invent fields and never ask anything in KNOWN_FACTS or ANSWERED_HISTORY;
   2. A finite decision gets 2-6 options: "value" is what the answer records
-     ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [];
+     ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [].
+     For payment_type when paid now: offer [{"value": "CASH", "label": "Cash"}, {"value": "BANK", "label": "Bank transfer"}].
+     For settlement_position: offer [{"value": "PAID_NOW", "label": "Paid now"}, {"value": "OUTSTANDING", "label": "Payable (pay later)"}, {"value": "PREPAID", "label": "Prepaid / advance"}].
   3. One sentence per question, plain text — no markdown, no numbering; repeat
      the known facts the question relies on so it needs no outside context;
   4. "field" is what routes the answer into the books — a question whose field

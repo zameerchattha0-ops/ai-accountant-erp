@@ -1071,10 +1071,16 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
         ]
     # the settlement channel (cash vs bank) decides
     # which ledger the money hits.
-    if "in cash, or through the bank" in q:
+    if any(p in q for p in ("in cash, or through the bank", "cash or bank", "cash, or bank", "cash vs bank", "paid in cash or")):
         return [
-            {"value": "a", "label": "Cash"},
-            {"value": "b", "label": "Bank / online"},
+            {"value": "CASH", "label": "Cash"},
+            {"value": "BANK", "label": "Bank transfer"},
+        ]
+    if "paid now" in q and any(w in q for w in ("outstanding", "payable", "prepaid")):
+        return [
+            {"value": "PAID_NOW", "label": "Paid now"},
+            {"value": "OUTSTANDING", "label": "Payable (pay later)"},
+            {"value": "PREPAID", "label": "Prepaid / advance"},
         ]
     if "cash or on credit" in q:
         return [

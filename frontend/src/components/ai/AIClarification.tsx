@@ -62,8 +62,14 @@ function quickOptions(q: string): string[] | null {
   if (/fixed asset/i.test(q) && /inventory/i.test(q)) {
     return ["a", "b", "c", "d"];
   }
+  if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(q)) {
+    return ["CASH", "BANK"];
+  }
   if (/cash or on credit/i.test(q)) {
     return ["CASH", "BANK", "CREDIT"];
+  }
+  if (/paid.*(?:now|or).*outstanding|payable/i.test(q)) {
+    return ["PAID_NOW", "OUTSTANDING", "PREPAID"];
   }
   return null;
 }
@@ -80,6 +86,26 @@ function optionsForSubQuestion(
   const payload = questionOptions?.[index];
   if (payload && payload.length > 0) {
     return payload;
+  }
+  if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(q)) {
+    return [
+      { value: "CASH", label: "Cash" },
+      { value: "BANK", label: "Bank transfer" },
+    ];
+  }
+  if (/paid.*(?:now|or).*outstanding|payable/i.test(q)) {
+    return [
+      { value: "PAID_NOW", label: "Paid now" },
+      { value: "OUTSTANDING", label: "Payable (pay later)" },
+      { value: "PREPAID", label: "Prepaid / advance" },
+    ];
+  }
+  if (/cash or on credit/i.test(q)) {
+    return [
+      { value: "CASH", label: "Cash" },
+      { value: "BANK", label: "Bank" },
+      { value: "CREDIT", label: "On credit" },
+    ];
   }
   const hardcoded = quickOptions(q);
   if (hardcoded) {
