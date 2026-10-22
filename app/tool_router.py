@@ -461,6 +461,72 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             if p.get("required"):
                 required_fields.append(pname)
 
+        if slug == "record_cash_sale":
+            if "items" not in properties:
+                properties["items"] = {
+                    "type": "array",
+                    "description": (
+                        "Stock-tracked goods or services sold. Pass "
+                        "items=[{description, quantity, unit_price, product_id}] so "
+                        "the accounting engine posts the Cost-of-Sales entry "
+                        "(Dr Cost of Sales / Cr Inventory) and relieves the stock ledger "
+                        "at weighted-average cost."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "description": "Item name or description"},
+                            "quantity": {"type": "number", "description": "Quantity sold (>0)"},
+                            "unit_price": {"type": "number", "description": "Selling price per unit"},
+                            "product_id": {"type": "string", "description": "Optional catalogue product UUID if matched"},
+                        },
+                        "required": ["description", "quantity", "unit_price"],
+                    },
+                }
+            if "revenue_account_id" not in properties:
+                properties["revenue_account_id"] = {
+                    "type": "string",
+                    "description": "Optional revenue account UUID to credit directly",
+                }
+        elif slug == "record_cash_purchase":
+            if "amount" not in properties:
+                properties["amount"] = {
+                    "type": "number",
+                    "description": "Total cash amount paid",
+                }
+            if "transaction_date" not in properties:
+                properties["transaction_date"] = {
+                    "type": "string",
+                    "description": "Date of the purchase (YYYY-MM-DD)",
+                }
+            if "description" not in properties:
+                properties["description"] = {
+                    "type": "string",
+                    "description": "What was purchased",
+                }
+            if "transaction_nature" not in properties:
+                properties["transaction_nature"] = {
+                    "type": "string",
+                    "description": "Transaction nature: INVENTORY, FIXED_ASSET, or OPERATING_EXPENSE",
+                }
+            if "items" not in properties:
+                properties["items"] = {
+                    "type": "array",
+                    "description": (
+                        "Purchased items. For INVENTORY, pass items=[{description, quantity, unit_price}] "
+                        "so catalogue products are linked/created and stock units are received."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "description": "Item description or product name"},
+                            "quantity": {"type": "number", "description": "Quantity purchased (>0)"},
+                            "unit_price": {"type": "number", "description": "Unit purchase price"},
+                        },
+                        "required": ["description", "quantity", "unit_price"],
+                    },
+                }
+
         declaration: Dict[str, Any] = {
             "name": slug,
             "description": entry.get("description", slug),

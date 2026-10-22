@@ -570,48 +570,25 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     # product (EXACT name match) first — the COGS engine only values lines
     # carrying product_id, so an unlinked line posted revenue with NO cost.
     items = kw.get("items") or None
-    if not items:
-        raw_qty = kw.get("quantity")
+    if not items and (kw.get("product_id") or kw.get("quantity") or kw.get("item_description")):
+        raw_qty = kw.get("quantity") or 1.0
         try:
             quantity = float(raw_qty) if raw_qty is not None else 1.0
         except (TypeError, ValueError):
             quantity = 1.0
         if quantity <= 0:
             quantity = 1.0
-
-        item_desc = description
-        import re
-        m = re.match(
-            r"^(?:sale\s+of|sold|sale)?\s*(?:(\d+(?:\.\d+)?)\s+)?(.+)$",
-            description.strip(),
-            re.IGNORECASE,
-        )
-        if m:
-            try:
-                if m.group(1):
-                    parsed_qty = float(m.group(1))
-                    if parsed_qty > 0 and raw_qty is None:
-                        quantity = parsed_qty
-                if m.group(2) and m.group(2).strip():
-                    item_desc = m.group(2).strip()
-            except (ValueError, TypeError):
-                pass
-
-        candidate_items = [{
+        item_desc = str(kw.get("item_description") or description)
+        items = [{
             "description": item_desc,
             "quantity": quantity,
             "unit_price": round(amount / quantity, 2),
+            "product_id": kw.get("product_id"),
         }]
-        try:
-            await _link_products_to_items(organization_id, candidate_items)
-            if candidate_items and candidate_items[0].get("product_id"):
-                items = candidate_items
-        except Exception as exc:  # noqa: BLE001
-            log.warning("tools.record_cash_sale.candidate_link_failed", error=str(exc)[:200])
-    elif items:
+    if items:
         try:
             await _link_products_to_items(organization_id, items)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — never block the sale
             log.warning("tools.record_cash_sale.product_link_failed",
                         error=str(exc)[:200])
     result = await record_cash_sale(

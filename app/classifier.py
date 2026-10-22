@@ -310,6 +310,10 @@ def rule_based_nature(
             return True
         return rule_has_typo_hit(text, pattern)
 
+    # 0. Sales: selling an item is a sale of goods / inventory.
+    if re.search(r"\b(?:sold|sale|sell|invoice)\b", text, re.IGNORECASE):
+        return INVENTORY, "HIGH"
+
     # 1. Inventory: explicit resale/stock intent wins.
     if _hit(_INVENTORY_RULES):
         return INVENTORY, "HIGH"

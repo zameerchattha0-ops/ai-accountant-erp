@@ -87,14 +87,15 @@ DECISION_NATURES: frozenset = frozenset(
 
 # nature -> account_types that may legally carry a posting for it.
 _NATURE_ACCOUNT_TYPES: Dict[str, frozenset] = {
-    "INVENTORY": frozenset({"ASSET"}),
+    "INVENTORY": frozenset({"ASSET", "REVENUE"}),
+    "GOODS": frozenset({"ASSET", "REVENUE"}),
     "FIXED_ASSET": frozenset({"ASSET"}),
     "INTANGIBLE_ASSET": frozenset({"ASSET"}),
     "PREPAYMENT": frozenset({"ASSET"}),
     "DEPOSIT_ADVANCE": frozenset({"ASSET"}),
     "OPERATING_EXPENSE": frozenset({"EXPENSE"}),
     "CONSUMABLE": frozenset({"EXPENSE"}),
-    "SERVICE": frozenset({"EXPENSE"}),
+    "SERVICE": frozenset({"EXPENSE", "REVENUE"}),
     "REVENUE": frozenset({"REVENUE"}),
     "LIABILITY": frozenset({"LIABILITY"}),
     "EQUITY": frozenset({"EQUITY"}),
