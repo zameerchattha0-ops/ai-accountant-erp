@@ -299,7 +299,9 @@ class TestDivergenceMetric:
         ]
         # confirmed_intent re-application + FIX-5 reconciliation (both deleted
         # in Wave D); nothing else may author the plan's intent.
-        assert len(writers) == 2, writers
+        # Wave B promotion: _model_intent writer is authoritative
+        assert len(writers) == 3, writers
+        assert "execution_plan.intent = _model_intent" in writers
 
 
 class TestRejectionAtTheShapeBoundary:
@@ -384,3 +386,40 @@ class TestEventTypeDefiniteness:
         assert "continuation" not in self._offered_event_types()
 
 
+
+
+class TestWaveBAuthoritativePromotion:
+    """Wave B promotion tests: LLM intent is authoritative over legacy planner."""
+
+    def test_canonical_intent_promotes(self):
+        from app.accounting_vocabulary import is_canonical_intent
+        assert is_canonical_intent("record_expense")
+        assert is_canonical_intent("create_invoice")
+        assert not is_canonical_intent("do_a_flip")
+
+    @pytest.mark.asyncio
+    async def test_org_context_ttl_cache_and_invalidation(self, monkeypatch):
+        from app import org_context
+
+        call_count = 0
+        async def fake_fetch_many(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return []
+
+        monkeypatch.setattr("app.org_context.fetch_many", fake_fetch_many)
+        test_org = str(uuid.uuid4())
+
+        # First call fetches from DB (6 tables)
+        prof1 = await org_context.business_profile(test_org, use_cache=True)
+        assert call_count == 6
+
+        # Second call within 45s TTL returns cached result, no new fetches
+        prof2 = await org_context.business_profile(test_org, use_cache=True)
+        assert call_count == 6
+        assert prof1 == prof2
+
+        # Invalidation evicts the cache
+        org_context.invalidate_business_profile(test_org)
+        prof3 = await org_context.business_profile(test_org, use_cache=True)
+        assert call_count == 12

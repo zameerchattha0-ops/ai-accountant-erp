@@ -6548,11 +6548,13 @@ async def execute(
 
         from app.org_context import render_profile as _render_profile
 
+        from app.org_context import invalidate_business_profile as _invalidate_business_profile
+
 
 
         try:
 
-            _org_profile = await _business_profile(organization_id)
+            _org_profile = await _business_profile(organization_id, use_cache=True)
 
         except Exception as exc:  # noqa: BLE001 — context never breaks a turn
 
@@ -7533,6 +7535,30 @@ async def execute(
         # (AUDIT_REPORT §8).  Payload carries intents only, never CoT.
 
         await _log_intent_comparison(session_id, _reasoning, execution_plan.intent)
+
+        # ---- WAVE B: MODEL INTENT PROMOTION (Single-Owner Authority) ------
+        # AUDIT_REPORT §7 Wave B: When reasoning yields a canonical intent,
+        # it governs execution_plan.intent over legacy keyword guessing.
+        # Python enforces invariants (balanced journals, valid account UUIDs,
+        # schemas), but the model's canonical reasoned intent guides execution.
+        from app.accounting_vocabulary import is_canonical_intent, is_supported_treatment
+        from app.reasoning import build_event_profile
+        from app.planner import _tools_for_intent
+
+        _decision = getattr(_reasoning, "decision", None) or {}
+        _model_intent = str(_decision.get("intent") or "").strip().lower()
+        if not confirmed_intent and _model_intent and is_canonical_intent(_model_intent):
+            execution_plan.intent = _model_intent
+            if not execution_plan.potential_tools:
+                execution_plan.potential_tools = _tools_for_intent(_model_intent)
+            _ev_prof = build_event_profile(_model_intent)
+            execution_plan.economic_event = _ev_prof.event.value
+            execution_plan.impact_map = dict(_ev_prof.affected)
+            execution_plan.prohibited_actions = [p.as_dict() for p in _ev_prof.prohibited]
+            _treatment = str(_decision.get("treatment") or "").strip().upper()
+            if _treatment and is_supported_treatment(_treatment):
+                execution_plan.transaction_nature = _treatment
+                execution_plan.transaction_nature_source = "ACCOUNTING_REASONING" 
 
 
 
@@ -11395,6 +11421,9 @@ async def execute(
 
             )
 
+            if result.success and not is_read_only_tool(tool_name):
+                _invalidate_business_profile(organization_id)
+
             if tool_name == "create_account":
 
                 if result.success:
@@ -11840,6 +11869,8 @@ async def execute(
                     batch_calls.append(call)
 
                 batch_results = await execute_planned_tool_calls(batch_calls, _executor)
+
+                _invalidate_business_profile(organization_id)
 
                 provided_ids.update(
 
@@ -12956,6 +12987,9 @@ async def execute(
         # ---- PHASE 9: COMPLETED ------------------------------------------
 
         status = ExecutionStatus.COMPLETED if verified else ExecutionStatus.FAILED
+
+        if status == ExecutionStatus.COMPLETED:
+            _invalidate_business_profile(organization_id)
 
         await _update_status(session_id, status)
 
