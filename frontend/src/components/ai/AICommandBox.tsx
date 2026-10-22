@@ -92,9 +92,15 @@ export default function AICommandBox() {
 
   const handleSend = async () => {
     if (!message.trim() && attachments.length === 0) return;
+    const req = buildRequest();
+    setMessage("");
+    setAttachments([]);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
     // The promise chain lives in agentRunStore — sidebar navigation
     // during the run is safe and never orphans the work.
-    await agentRunStore.startRun(buildRequest());
+    await agentRunStore.startRun(req);
   };
 
   // One-click foreground fallback when the queue is not being drained.
