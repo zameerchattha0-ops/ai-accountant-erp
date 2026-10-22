@@ -43,6 +43,8 @@ CANONICAL_FIELD_ENDPOINTS: Dict[str, str] = {
     "asset_name": "Name or identifier of the fixed asset (e.g. Delivery Van).",
     "transaction_nature": "Classification: FIXED_ASSET, INVENTORY, CONSUMABLE, or SERVICE.",
     "capitalization_decision": "CAPITALIZE or EXPENSE.",
+    "settlement_position": "Settlement treatment: PAID_NOW, OUTSTANDING (payable/pay later), PREPAID, or SETTLE_EXISTING_PAYABLE.",
+    "payment_method": "Payment method: CASH, BANK_TRANSFER, CHEQUE, CARD, or CREDIT.",
     "account_name": "Specific ledger account name to post to.",
 }
 
