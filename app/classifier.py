@@ -49,6 +49,11 @@ NATURES = {
     PREPAYMENT, DEPOSIT_ADVANCE, INTANGIBLE_ASSET, OTHER,
 }
 
+_SALE_INTENTS = frozenset({
+    "record_sale", "record_cash_sale", "create_invoice",
+    "create_sale_invoice", "record_receipt",
+})
+
 # Unambiguous operating expenses: never ask asset-vs-expense.
 _EXPENSE_RULES = [
     ("electricity|electric bill|power bill|utility|utilities|water bill|gas bill",
@@ -311,7 +316,8 @@ def rule_based_nature(
         return rule_has_typo_hit(text, pattern)
 
     # 0. Sales: selling an item is a sale of goods / inventory.
-    if re.search(r"\b(?:sold|sale|sell|invoice)\b", text, re.IGNORECASE):
+    _intent = str(entities.get("semantic_intent") or entities.get("intent") or "").lower()
+    if _intent in _SALE_INTENTS or re.search(r"\b(?:sold|sale|sell|invoice)\b", text, re.IGNORECASE):
         return INVENTORY, "HIGH"
 
     # 1. Inventory: explicit resale/stock intent wins.
@@ -936,7 +942,7 @@ async def classify_transaction(
     explicit = entities.get("transaction_nature")
     if explicit:
         nature = str(explicit).upper()
-        if intent in ("record_cash_sale", "create_invoice") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET_EXPENSE"):
+        if intent in _SALE_INTENTS and nature not in (INVENTORY, SERVICE, "REVENUE"):
             explicit = None
             nature = None
         elif nature not in NATURES:
@@ -1175,9 +1181,10 @@ async def classify_transaction(
     # the live candidate set; the deterministic chain below is the FALLBACK
     # when the layer is disabled/unreachable/invalid — never a co-author.
     if resolve_account_hints:
+        _sale_nature_hint = INVENTORY if intent in _SALE_INTENTS else None
         decision = await _llm_decision(
             organization_id, intent=intent, entities=entities,
-            message=message, nature_hint=None,
+            message=message, nature_hint=_sale_nature_hint,
             org_context=org_context,
         )
         if decision is not None:
@@ -1334,6 +1341,14 @@ async def classify_transaction(
 
     # --- 5. INFERENCE: material ambiguity (e.g. laptop with no COA
     # mapping) → ASK.  Never default to a generic expense account.
+    if intent in _SALE_INTENTS:
+        return TransactionClassification(
+            transaction_nature=INVENTORY,
+            confidence="HIGH",
+            source="DETERMINISTIC_RULE",
+            entity=item or entity_name,
+            requires_clarification=False,
+        )
     return TransactionClassification(
         transaction_nature=None,
         confidence="LOW",

@@ -161,6 +161,8 @@ def _extract_facts_and_plan(
     calls: Any,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     nature = str(getattr(classification, "transaction_nature", "") or "")
+    if intent in ("record_sale", "record_cash_sale", "create_invoice", "create_sale_invoice", "record_receipt") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
+        nature = "INVENTORY" if (entities.get("item_description") or entities.get("quantity")) else "REVENUE"
     source = str(getattr(classification, "source", "") or "")
     facts = {
         "intent": intent,

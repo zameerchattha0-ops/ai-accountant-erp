@@ -501,6 +501,13 @@ def validate(
             )
             return None
         a_type = str(account.get("account_type") or "").strip().upper()
+        if a_type == "REVENUE" and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
+            log.info(
+                "llm_classification.nature_aligned_to_revenue",
+                prior_nature=nature,
+                account=str(account.get("name")),
+            )
+            nature = "INVENTORY" if entity else "REVENUE"
         if a_type not in _allowed_account_types(nature):
             log.warning(
                 "authority_split.intercepted",
