@@ -7565,12 +7565,17 @@ async def execute(
                     **_reasoning.entities,
                 }
             # Re-evaluate missing fields based on model intent and authoritative entities
-            from app.planner import _missing_fields
+            from app.planner import _missing_fields, _questions_for_fields
             _rem_missing = _missing_fields(_model_intent, execution_plan.extracted_entities)
             execution_plan.missing_fields = _rem_missing
             if not _rem_missing:
                 execution_plan.requires_clarification = False
                 execution_plan.clarification_questions = []
+            elif not execution_plan.clarification_questions:
+                execution_plan.requires_clarification = True
+                execution_plan.clarification_questions = _questions_for_fields(
+                    _model_intent, _rem_missing, execution_plan.extracted_entities
+                )
 
 
 
