@@ -11811,7 +11811,41 @@ async def execute(
 
                 if _treatment_review.blocked:
 
-                    # STOP before execution — nothing has been written.
+                    # STOP before execution — persist clarification, update status, and park safely.
+
+                    await create_clarification(
+
+                        session_id=session_id,
+
+                        question=_treatment_review.question[:1500],
+
+                        required_fields=["resolution"],
+
+                    )
+
+                    await _update_status(
+
+                        session_id, ExecutionStatus.AWAITING_CLARIFICATION
+
+                    )
+
+                    await _log_step(
+
+                        session_id,
+
+                        "AWAITING_CLARIFICATION",
+
+                        {
+
+                            "source": "treatment_review",
+
+                            "flags": _treatment_review.flags,
+
+                            "question": _treatment_review.question[:500],
+
+                        },
+
+                    )
 
                     return AgentResponse(
 

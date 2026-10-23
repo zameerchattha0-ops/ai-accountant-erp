@@ -45,7 +45,10 @@ _INSTRUCTION = (
     "plan (e.g. nature INVENTORY but the plan carries no nature or no item "
     "lines; CREDIT but the plan settles cash now; a total that differs from "
     "the confirmed amount). Never invent facts. Never suggest accounts. If "
-    "the plan is consistent with the facts, output empty lists."
+    "the plan is consistent with the facts, output empty lists. Note: "
+    "Return document tools (create_credit_note, create_purchase_return) are "
+    "document-level contra reversal vouchers; their lines represent returned goods/services, "
+    "and they do not take a transaction_nature argument."
 )
 
 
@@ -178,22 +181,48 @@ def _extract_facts_and_plan(
         "tax_code": entities.get("tax_code"),
         "transaction_date": entities.get("transaction_date"),
     }
-    plan = [
-        {
-            "tool": getattr(call, "tool_name", ""),
-            "arguments": {
-                k: v
-                for k, v in (getattr(call, "arguments", None) or {}).items()
-                if k
-                in (
-                    "transaction_nature", "payment_method", "items", "total",
-                    "subtotal", "amount", "tax_total", "tax_code", "notes", "bill_date",
-                )
-            },
+    extracted_plan: List[Dict[str, Any]] = []
+    for call in (calls or []):
+        tool_name = getattr(call, "tool_name", "")
+        raw_args = dict(getattr(call, "arguments", None) or {})
+        call_args = {
+            k: v
+            for k, v in raw_args.items()
+            if k in (
+                "transaction_nature", "payment_method", "items", "total",
+                "subtotal", "amount", "tax_total", "tax_code", "notes", "bill_date",
+                "quantity", "description", "item_description", "reason",
+                "credit_note_date", "return_date", "customer_id", "supplier_id",
+                "customer_name", "supplier_name", "invoice_id", "bill_id",
+            )
         }
-        for call in (calls or [])
-    ]
-    return facts, plan
+        # For return tools (credit notes & purchase returns), if items array is not
+        # materialized yet, preserve/synthesize the item line from description/quantity
+        # so the treatment reviewer can see the line item substance.
+        if tool_name in ("create_credit_note", "create_purchase_return") and not call_args.get("items"):
+            desc = call_args.get("description") or call_args.get("item_description") or facts.get("item_description")
+            qty = call_args.get("quantity") or facts.get("quantity")
+            amt = call_args.get("amount") or facts.get("amount")
+            if desc or qty:
+                try:
+                    qty_f = float(qty) if qty not in (None, "", 0) else 1.0
+                except (ValueError, TypeError):
+                    qty_f = 1.0
+                try:
+                    amt_f = float(amt) if amt not in (None, "", 0) else None
+                except (ValueError, TypeError):
+                    amt_f = None
+                unit_price = round(amt_f / qty_f, 2) if (amt_f and qty_f) else amt_f
+                call_args["items"] = [{
+                    "description": str(desc or "Item return").strip(),
+                    "quantity": qty_f,
+                    "unit_price": unit_price,
+                }]
+        extracted_plan.append({
+            "tool": tool_name,
+            "arguments": call_args,
+        })
+    return facts, extracted_plan
 
 
 def _facts_block(

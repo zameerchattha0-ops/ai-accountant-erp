@@ -478,3 +478,77 @@ async def test_get_purchase_bill_resolves_a_number_in_the_id_field(monkeypatch):
     )
     assert result.success and result.data["total"] == 45000
 
+
+# --- treatment review extraction & non-blocking preservation (2026-10-23) ----
+def test_treatment_review_extracts_return_tool_items_faithfully():
+    from app.treatment_review import _extract_facts_and_plan
+
+    calls = [
+        ToolCall(
+            tool_name="create_credit_note",
+            arguments={
+                "amount": 16000.0,
+                "quantity": 2.0,
+                "description": "chairs",
+                "reason": "Return of chairs",
+                "credit_note_date": "2026-10-23",
+                "customer_id": "d46a4a53-4b89-48c7-89da-eec1435edd16",
+            },
+        )
+    ]
+    facts, plan = _extract_facts_and_plan(
+        intent="create_credit_note",
+        classification=SimpleNamespace(transaction_nature="INVENTORY", source="ITEM_MAPPING"),
+        entities={
+            "customer_name": "abc technologies",
+            "quantity": 2.0,
+            "item_description": "chairs",
+            "amount": 16000.0,
+        },
+        calls=calls,
+    )
+    assert len(plan) == 1
+    args = plan[0]["arguments"]
+    assert args["amount"] == 16000.0
+    assert args["quantity"] == 2.0
+    assert args["description"] == "chairs"
+    assert "items" in args
+    assert args["items"][0]["description"] == "chairs"
+    assert args["items"][0]["quantity"] == 2.0
+    assert args["items"][0]["unit_price"] == 8000.0
+
+
+def test_treatment_review_extracts_purchase_return_items_faithfully():
+    from app.treatment_review import _extract_facts_and_plan
+
+    calls = [
+        ToolCall(
+            tool_name="create_purchase_return",
+            arguments={
+                "amount": 50000.0,
+                "description": "office chairs",
+                "reason": "damaged",
+                "return_date": "2026-10-23",
+                "supplier_id": "06793970-dd66-4ea0-8151-b8c6f46e40ab",
+            },
+        )
+    ]
+    facts, plan = _extract_facts_and_plan(
+        intent="create_purchase_return",
+        classification=SimpleNamespace(transaction_nature="INVENTORY", source="ITEM_MAPPING"),
+        entities={
+            "supplier_name": "Iqra Furnitures",
+            "item_description": "office chairs",
+            "amount": 50000.0,
+        },
+        calls=calls,
+    )
+    assert len(plan) == 1
+    args = plan[0]["arguments"]
+    assert args["amount"] == 50000.0
+    assert "items" in args
+    assert args["items"][0]["description"] == "office chairs"
+    assert args["items"][0]["quantity"] == 1.0
+    assert args["items"][0]["unit_price"] == 50000.0
+
+
