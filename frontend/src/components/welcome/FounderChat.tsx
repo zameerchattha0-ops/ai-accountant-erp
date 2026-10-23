@@ -22,7 +22,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 const GREETING: Msg = {
   role: "assistant",
-  text: "Hi! I'm Ledger — ask me anything about AI Accountant or its founder, Zameer Haider. (Informational questions only — your business data lives safely inside the app.)",
+  text: "Hi! I'm Ledger — ask me anything about AI Accountant or its founder, Zameer Haider Chattha. (Informational questions only — your business data lives safely inside the app.)",
 };
 
 /* ---- Mascot Icon ----------------------------------------------------

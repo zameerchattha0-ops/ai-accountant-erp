@@ -718,7 +718,7 @@ export default function WelcomePage() {
 
             <h1
               className="text-brand-navy text-[1.55rem] sm:text-[1.9rem] lg:text-[2.25rem] leading-[1.26] tracking-[0.01em] font-bold max-w-[36rem] lg:pr-6"
-              style={{ fontFamily: "var(--font-bodoni), Georgia, serif" }}
+              style={{ fontFamily: '"IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif' }}
             >
               {/* The rotating sentence IS the headline: these lines are
                   complete sentences, so the old "Your Books," lead-in is
@@ -1146,7 +1146,7 @@ export default function WelcomePage() {
               Contact
             </span>
             <h2 className="bodoni-display text-3xl sm:text-4xl font-bold text-brand-navy mb-4">
-              Built by <span className="text-aurora italic">Zameer Haider</span>
+              Built by <span className="text-aurora italic">Zameer Haider Chattha</span>
             </h2>
             <p className="text-[#3d4b66] text-lg max-w-xl mx-auto">
               Questions, feedback, or a live demo for your business — reach
@@ -1229,7 +1229,7 @@ export default function WelcomePage() {
             />
           </div>
           <p className="text-xs text-text-muted">
-            &copy; {new Date().getFullYear()} AI Accountant. Developed by Zameer Haider.
+            &copy; {new Date().getFullYear()} AI Accountant. Developed by Zameer Haider Chattha.
           </p>
           <div className="flex items-center gap-4 text-xs text-text-muted">
             <a

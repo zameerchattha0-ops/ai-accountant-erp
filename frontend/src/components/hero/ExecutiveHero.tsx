@@ -97,7 +97,7 @@ export default function ExecutiveHero() {
               <h1
                 className="text-slate-900 text-[2.4rem] sm:text-[3.25rem] lg:text-[4rem] xl:text-[4.35rem] leading-[1.08] tracking-tight font-serif font-normal"
                 style={{
-                  fontFamily: "var(--font-fraunces), var(--font-bodoni), Georgia, serif",
+                  fontFamily: '"IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif',
                   animation: "heroRise 0.9s cubic-bezier(0.19,1,0.22,1) 180ms both",
                 }}
               >
@@ -107,7 +107,7 @@ export default function ExecutiveHero() {
                 <br />
                 <span
                   className="italic text-[#0D9488]"
-                  style={{ fontFamily: "var(--font-cormorant), var(--font-fraunces), Georgia, serif" }}
+                  style={{ fontFamily: '"IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), var(--font-cormorant), Georgia, serif' }}
                 >
                   Your
                 </span>{" "}
@@ -204,7 +204,7 @@ export default function ExecutiveHero() {
                 <div className="flex flex-col">
                   <span
                     className="text-2xl sm:text-3xl lg:text-4xl font-bold text-slate-900 tracking-tight font-serif"
-                    style={{ fontFamily: "var(--font-fraunces), var(--font-bodoni), Georgia, serif" }}
+                    style={{ fontFamily: '"IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif' }}
                   >
                     {stat.value}
                   </span>
@@ -253,7 +253,7 @@ export default function ExecutiveHero() {
               </span>
               <h2
                 className="text-2xl sm:text-3xl font-bold text-slate-900 font-serif"
-                style={{ fontFamily: "var(--font-fraunces), var(--font-bodoni), Georgia, serif" }}
+                style={{ fontFamily: '"IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif' }}
               >
                 Accounting that Truly Understands Your Business
               </h2>

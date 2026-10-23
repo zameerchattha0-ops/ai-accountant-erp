@@ -85,6 +85,7 @@
   /* ---- Typography ---- */
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+  --font-serif-display: "IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif;
 
   /* ---- Spacing tokens ---- */
   --spacing-page: 1.5rem;
@@ -401,10 +402,40 @@ body {
   }
 }
 
-/* Display-face utility: every large landing-page heading uses the same
-   Bodoni Moda didone as the hero h1 — one consistent editorial voice. */
+/* IvyBodoni font family definition: checks local system installation (e.g. Adobe Fonts)
+   and falls back to self-hosted high-contrast Bodoni didone. */
+@font-face {
+  font-family: 'IvyBodoni';
+  src: local('IvyBodoni-Regular'), local('IvyBodoni'), local('Ivy Bodoni'), local('ivybodoni'),
+       url('./fonts/Bodoni-Moda-400-normal.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IvyBodoni';
+  src: local('IvyBodoni-Italic'), local('IvyBodoni Italic'), local('Ivy Bodoni Italic'),
+       url('./fonts/Bodoni-Moda-400-italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IvyBodoni';
+  src: local('IvyBodoni-Bold'), local('IvyBodoni Bold'), local('Ivy Bodoni Bold'),
+       url('./fonts/Bodoni-Moda-400-normal.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Display-face utility: every large landing-page heading uses Ivy Bodoni / Bodoni didone — one consistent editorial voice. */
+@utility ivybodoni-display {
+  font-family: "IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif;
+}
+
 @utility bodoni-display {
-  font-family: var(--font-bodoni), Georgia, serif;
+  font-family: "IvyBodoni", "Ivy Bodoni", "ivybodoni", var(--font-bodoni), "Bodoni Moda", Didot, "Bodoni MT", Georgia, serif;
 }
 
 /* Light-sweep that flashes across the surface as the cursor arrives */
