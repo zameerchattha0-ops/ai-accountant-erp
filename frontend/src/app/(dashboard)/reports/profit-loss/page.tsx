@@ -1,11 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
+import { ReportViewToggle, ProfitLossDocument } from "@/components/reports";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
 import {
@@ -90,6 +90,7 @@ export default function ProfitLossPage() {
   const { org, loading: orgLoading } = useOrg();
   const [rows, setRows] = useState<PlStatementRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"screen" | "document">("screen");
 
   const load = useCallback(async () => {
     if (!org) return;
@@ -128,12 +129,10 @@ export default function ProfitLossPage() {
         subtitle="Multi-step statement: Operating Revenue → Cost of Sales → Gross Profit → Operating Expenses → Operating Profit → Other Income / Finance Costs / Tax Expense → Net Profit"
         logoUrl={org?.logo_url}
         actions={
-          <button
-            onClick={() => window.print()}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
-          >
-            <Printer className="w-4 h-4" /> Print
-          </button>
+          <ReportViewToggle
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+          />
         }
       />
 
@@ -148,7 +147,14 @@ export default function ProfitLossPage() {
         />
       ) : (
         <>
-          {/* 1. Operating Revenue */}
+          {/* Document Layout: pristine multi-page accounting document for print & preview */}
+          <div className={cn(viewMode === "screen" ? "hidden print:block" : "block")}>
+            <ProfitLossDocument statement={statement} org={org} />
+          </div>
+
+          {/* Interactive Screen View: hidden in print or when Document view is active */}
+          <div className={cn("space-y-6 print:hidden", viewMode === "document" && "hidden")}>
+            {/* 1. Operating Revenue */}
           <Section
             title="Operating Revenue"
             entries={toEntries(statement.sections.operating_revenue.rows)}
@@ -235,6 +241,7 @@ export default function ProfitLossPage() {
             >
               {formatCurrency(statement.net_profit, currency)}
             </p>
+          </div>
           </div>
         </>
       )}

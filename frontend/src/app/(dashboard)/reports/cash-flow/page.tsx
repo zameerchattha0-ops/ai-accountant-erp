@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import {
@@ -14,6 +13,8 @@ import {
 } from "@/lib/reports/cash-flow";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
+import { ReportViewToggle, CashFlowDocument } from "@/components/reports";
+import { cn } from "@/lib/utils/cn";
 import { ErrorState, TableSkeleton, EmptyState } from "@/components/shared/States";
 
 const inputCls =
@@ -31,6 +32,7 @@ export default function CashFlowReportPage() {
   const { org, loading: orgLoading } = useOrg();
   const [rows, setRows] = useState<CashFlowRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"screen" | "document">("screen");
   const [activeCategory, setActiveCategory] = useState<"ALL" | Category>("ALL");
   // Period scope — defaults to the CURRENT reporting year (shown as editable
   // date inputs, consistent with the P&L's reporting-year scoping).
@@ -120,15 +122,26 @@ export default function CashFlowReportPage() {
         title="Cash Flow Statement"
         subtitle="Classified by operating, investing, and financing activities"
         actions={
-          <button
-            onClick={() => window.print()}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
-          >
-            <Printer className="w-4 h-4" /> Print
-          </button>
+          <ReportViewToggle
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+          />
         }
       />
 
+      {/* Document Layout for Print and Preview */}
+      <div className={cn(viewMode === "screen" ? "hidden print:block" : "block")}>
+        <CashFlowDocument
+          rows={rows ?? []}
+          totals={categoryTotals ?? { OPERATING: 0, INVESTING: 0, FINANCING: 0 }}
+          openingCash={0}
+          fromDate={fromDate}
+          toDate={toDate}
+          org={org}
+        />
+      </div>
+
+      <div className={cn("space-y-6 print:hidden", viewMode === "document" && "hidden")}>
       {/* Period scope — defaults to the current reporting year; editable.
           Screen-only: date pickers have no place on paper. */}
       <div className="flex flex-wrap items-end gap-3 print:hidden">
@@ -289,6 +302,7 @@ export default function CashFlowReportPage() {
           </table>
         </div>
       )}
+      </div>
     </div>
   );
 }

@@ -1,11 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Printer } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
+import { ReportViewToggle, ProjectProfitabilityDocument } from "@/components/reports";
 import StatusBadge from "@/components/shared/StatusBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
@@ -15,6 +15,7 @@ export default function ProjectProfitabilityPage() {
   const { org, loading: orgLoading } = useOrg();
   const [rows, setRows] = useState<ProjectProfitabilityRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"screen" | "document">("screen");
 
   const load = useCallback(async () => {
     if (!org) return;
@@ -38,12 +39,10 @@ export default function ProjectProfitabilityPage() {
         title="Project P&L"
         subtitle="Revenue, cost and margin per project (posted entries only)"
         actions={
-          <button
-            onClick={() => window.print()}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
-          >
-            <Printer className="w-4 h-4" /> Print
-          </button>
+          <ReportViewToggle
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+          />
         }
       />
 
@@ -57,7 +56,17 @@ export default function ProjectProfitabilityPage() {
           hint={"Projects are created via the AI agent (\"Set up a project called Mobile App for XYZ Client\") - their P&L appears here."}
         />
       ) : (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
+        <>
+          {/* Document Layout for Print & Preview */}
+          <div className={cn(viewMode === "screen" ? "hidden print:block" : "block")}>
+            <ProjectProfitabilityDocument
+              rows={rows ?? []}
+              org={org}
+            />
+          </div>
+
+          <div className={cn("space-y-6 print:hidden", viewMode === "document" && "hidden")}>
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
@@ -101,12 +110,14 @@ export default function ProjectProfitabilityPage() {
             </tbody>
           </table>
         </div>
-      )}
 
       <p className="text-xs text-text-muted print:hidden">
         Revenue and costs come from journal lines tagged with the project.
         Tag lines by telling the AI which project a transaction belongs to.
       </p>
+      </div>
+      </>
+      )}
     </div>
   );
 }

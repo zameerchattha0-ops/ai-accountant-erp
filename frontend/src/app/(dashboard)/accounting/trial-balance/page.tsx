@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
+import { ReportViewToggle, TrialBalanceDocument } from "@/components/reports";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
 import type { TrialBalanceRow } from "@/lib/types/entities";
@@ -14,6 +15,7 @@ export default function TrialBalancePage() {
   const { org, loading: orgLoading } = useOrg();
   const [rows, setRows] = useState<TrialBalanceRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"screen" | "document">("screen");
 
   const load = useCallback(async () => {
     if (!org) return;
@@ -37,6 +39,12 @@ export default function TrialBalancePage() {
         title="Trial Balance"
         subtitle="Total debits and credits per account - posted entries only"
         logoUrl={org?.logo_url}
+        actions={
+          <ReportViewToggle
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+          />
+        }
       />
 
       {orgLoading || (!rows && !error) ? (
@@ -50,6 +58,18 @@ export default function TrialBalancePage() {
         />
       ) : (
         <>
+          {/* Document Layout for Print and Preview */}
+          <div className={cn(viewMode === "screen" ? "hidden print:block" : "block")}>
+            <TrialBalanceDocument
+              rows={rows ?? []}
+              totalDebit={totalDebit}
+              totalCredit={totalCredit}
+              balanced={balanced}
+              org={org}
+            />
+          </div>
+
+          <div className={cn("space-y-6 print:hidden", viewMode === "document" && "hidden")}>
           <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -115,6 +135,7 @@ export default function TrialBalancePage() {
             {balanced
               ? "In balance - total debits equal total credits."
               : `Out of balance by ${formatCurrency(totalDebit - totalCredit, currency)}. This should never happen; the database rejects unbalanced postings.`}
+          </div>
           </div>
         </>
       )}

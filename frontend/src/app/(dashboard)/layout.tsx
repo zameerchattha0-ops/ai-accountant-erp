@@ -33,15 +33,15 @@ export default async function DashboardLayout({
   }
 
   return (
-    <div className="relative isolate flex h-screen overflow-hidden bg-bg-primary">
+    <div className="relative isolate flex h-screen overflow-hidden bg-bg-primary print:h-auto print:min-h-0 print:overflow-visible print:block">
       {/* Ambient aura - full-viewport app background (fixed layer, behind
           everything; the sidebar and topbar are translucent so the tint
           shows through them too). */}
       <AmbientAura />
       <Sidebar />
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden print:h-auto print:min-h-0 print:overflow-visible print:block">
         <TopBar />
-        <main className="flex-1 overflow-y-auto p-4 lg:p-6 print:overflow-visible print:p-0">
+        <main className="flex-1 overflow-y-auto p-4 lg:p-6 print:overflow-visible print:h-auto print:p-0 print:block">
           {children}
         </main>
       </div>

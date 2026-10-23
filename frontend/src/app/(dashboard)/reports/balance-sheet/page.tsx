@@ -1,11 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Printer, XCircle } from "lucide-react";
+import { CheckCircle2, XCircle } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import PageHeader from "@/components/shared/PageHeader";
+import { ReportViewToggle, BalanceSheetDocument } from "@/components/reports";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import { cn } from "@/lib/utils/cn";
 import type { StatementRow } from "@/lib/types/entities";
@@ -80,6 +81,7 @@ export default function BalanceSheetPage() {
   const { org, loading: orgLoading } = useOrg();
   const [rows, setRows] = useState<StatementRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"screen" | "document">("screen");
 
   const load = useCallback(async () => {
     if (!org) return;
@@ -152,12 +154,10 @@ export default function BalanceSheetPage() {
         subtitle="Assets, liabilities and equity - posted entries only, as of today"
         logoUrl={org?.logo_url}
         actions={
-          <button
-            onClick={() => window.print()}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
-          >
-            <Printer className="w-4 h-4" /> Print
-          </button>
+          <ReportViewToggle
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+          />
         }
       />
 
@@ -172,7 +172,24 @@ export default function BalanceSheetPage() {
         />
       ) : (
         <>
-          <Section title="Assets" entries={assets} total={totalAssets} totalLabel="Total Assets" currency={currency} />
+          {/* Document Layout for Print and Preview */}
+          <div className={cn(viewMode === "screen" ? "hidden print:block" : "block")}>
+            <BalanceSheetDocument
+              assets={assets}
+              liabilities={liabilities}
+              equity={equity}
+              totalAssets={totalAssets}
+              totalLiabilities={totalLiabilities}
+              totalEquity={totalEquity}
+              currentEarnings={currentEarnings}
+              balanced={balanced}
+              org={org}
+            />
+          </div>
+
+          {/* Interactive Screen View */}
+          <div className={cn("space-y-6 print:hidden", viewMode === "document" && "hidden")}>
+            <Section title="Assets" entries={assets} total={totalAssets} totalLabel="Total Assets" currency={currency} />
 
           <div className="grid gap-6">
             <Section
@@ -220,6 +237,7 @@ export default function BalanceSheetPage() {
                 ? "The balance sheet balances."
                 : `Out of balance by ${formatCurrency(totalAssets - rhs, currency)}. The database rejects unbalanced postings - this should never happen.`}
             </div>
+          </div>
           </div>
         </>
       )}

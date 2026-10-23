@@ -548,19 +548,78 @@ body {
    ============================================================ */
 @media print {
   @page {
-    margin: 14mm;
+    size: A4 portrait;
+    margin: 12mm 14mm 14mm 14mm;
   }
 
-  /* The ambient aura is screen-only decoration. */
-  .ambient-aura {
-    display: none !important;
+  html,
+  body {
+    height: auto !important;
+    min-height: 100% !important;
+    overflow: visible !important;
+    background: #ffffff !important;
   }
 
+  /* Unconstrain viewport clipping wrappers across multi-page financial reports */
+  .h-screen,
+  .overflow-hidden,
+  .overflow-y-auto,
+  .overflow-x-auto {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  /* The ambient aura and dashboard interactive chrome */
+  .ambient-aura,
+  [data-agent-run-dock],
   aside,
   nav,
   header,
   .no-print {
     display: none !important;
+  }
+
+  /* Financial report document multi-page printing rules */
+  .report-document {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    background: transparent !important;
+    page-break-inside: auto !important;
+  }
+
+  .report-section,
+  .report-break-inside-avoid,
+  .break-inside-avoid {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  .report-table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+  }
+
+  .report-table thead {
+    display: table-header-group !important;
+  }
+
+  .report-table tfoot {
+    display: table-footer-group !important;
+  }
+
+  .report-table tr {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  .report-signoff {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
   }
 
   body {
