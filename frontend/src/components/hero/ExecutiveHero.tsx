@@ -70,7 +70,7 @@ export default function ExecutiveHero() {
             className="object-cover object-center lg:object-center select-none pointer-events-none"
           />
           {/* Subtle soft white & warm sunrise veil on copy side to ensure 100% WCAG contrast */}
-          <div className="absolute inset-0 bg-gradient-to-r from-white/95 via-white/80 to-transparent lg:w-[62%] pointer-events-none" />
+          <div className="absolute inset-0 bg-gradient-to-r from-white/95 via-white/85 to-white/70 lg:to-transparent lg:w-[62%] pointer-events-none" />
           <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/90 to-transparent pointer-events-none" />
           <div className="absolute inset-x-0 bottom-0 h-32 bg-gradient-to-t from-white/95 via-white/60 to-transparent pointer-events-none" />
         </div>
@@ -158,9 +158,9 @@ export default function ExecutiveHero() {
                 </button>
               </div>
 
-              {/* Micro-Trust Feature Pills (Desktop row under CTAs) */}
+              {/* Micro-Trust Feature Pills (Responsive: 2-col on mobile, wrap on desktop) */}
               <div
-                className="hidden sm:grid grid-cols-2 lg:flex lg:flex-wrap items-center gap-3 mt-10"
+                className="grid grid-cols-2 lg:flex lg:flex-wrap items-center gap-2.5 sm:gap-3 mt-8 sm:mt-10"
                 style={{ animation: "heroRise 0.9s cubic-bezier(0.19,1,0.22,1) 440ms both" }}
               >
                 {FEATURE_PILLS.map((pill, idx) => {
@@ -168,14 +168,14 @@ export default function ExecutiveHero() {
                   return (
                     <div
                       key={idx}
-                      className="inline-flex items-center gap-2.5 px-3.5 py-2 rounded-full bg-white/80 backdrop-blur-md border border-white shadow-[0_4px_16px_-4px_rgba(15,23,42,0.07)]"
+                      className="inline-flex items-center gap-2 sm:gap-2.5 px-3 sm:px-3.5 py-2 rounded-full bg-white/85 backdrop-blur-md border border-white shadow-[0_4px_16px_-4px_rgba(15,23,42,0.07)]"
                     >
-                      <span className="w-7 h-7 rounded-full bg-teal-50 border border-teal-100/80 text-teal-600 flex items-center justify-center shrink-0">
-                        <Icon className="w-3.5 h-3.5" />
+                      <span className="w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-teal-50 border border-teal-100/80 text-teal-600 flex items-center justify-center shrink-0">
+                        <Icon className="w-3 sm:w-3.5 h-3 sm:h-3.5" />
                       </span>
-                      <div className="text-left text-xs leading-tight">
+                      <div className="text-left text-[11px] sm:text-xs leading-tight">
                         <div className="font-semibold text-slate-900">{pill.title}</div>
-                        <div className="text-[11px] text-slate-500">{pill.subtitle}</div>
+                        <div className="text-[10px] sm:text-[11px] text-slate-500">{pill.subtitle}</div>
                       </div>
                     </div>
                   );
@@ -183,79 +183,8 @@ export default function ExecutiveHero() {
               </div>
             </div>
 
-            {/* RIGHT COLUMN (DESKTOP): The Laptop sits in the master background,
-                with the floating 2D Ledger mascot badge */}
-            <div className="relative hidden lg:block h-full min-h-[480px]">
-              {/* Cute 2D Ledger Mascot Badge — floats on the bottom right of the laptop screen */}
-              <div
-                className="absolute -bottom-6 right-0 xl:right-4 z-20 pointer-events-none select-none"
-                style={{ animation: "floaty 5.5s ease-in-out infinite" }}
-              >
-                <div className="relative">
-                  {/* Cyan neon pulse glow */}
-                  <div className="absolute inset-0 rounded-full blur-xl bg-teal-400/40 animate-pulse pointer-events-none" />
-                  <Image
-                    src="/images/hero/ledger-hologram.webp"
-                    alt="Ledger AI Mascot"
-                    width={138}
-                    height={138}
-                    className="relative z-10 w-28 h-28 xl:w-32 xl:h-32 drop-shadow-[0_12px_28px_rgba(13,148,136,0.4)]"
-                    priority
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* MOBILE ONLY: Dedicated Laptop Showcase Card */}
-            <div className="lg:hidden relative w-full my-4 max-w-lg mx-auto">
-              <div className="relative rounded-2xl overflow-hidden shadow-2xl shadow-slate-900/15 border border-white/70 bg-white/20 backdrop-blur-sm">
-                <Image
-                  src="/images/hero/laptop-showcase.webp"
-                  alt="Ai Accountant ERP Dashboard on Laptop"
-                  width={1050}
-                  height={780}
-                  className="w-full h-auto object-cover"
-                  priority
-                />
-                {/* 2D Mascot Badge in bottom right */}
-                <div
-                  className="absolute bottom-2.5 right-2.5 sm:bottom-4 sm:right-4 z-10 pointer-events-none select-none"
-                  style={{ animation: "floaty 4.5s ease-in-out infinite" }}
-                >
-                  <div className="relative">
-                    <div className="absolute inset-0 rounded-full blur-md bg-teal-400/40 animate-pulse" />
-                    <Image
-                      src="/images/hero/ledger-hologram.webp"
-                      alt="Ledger AI Mascot"
-                      width={64}
-                      height={64}
-                      className="relative z-10 w-14 h-14 sm:w-16 sm:h-16 drop-shadow-md"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Mobile Micro-Trust Pills Carousel / Grid */}
-              <div className="grid grid-cols-2 gap-2.5 mt-5 sm:hidden">
-                {FEATURE_PILLS.map((pill, idx) => {
-                  const Icon = pill.icon;
-                  return (
-                    <div
-                      key={idx}
-                      className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/85 backdrop-blur-md border border-white shadow-sm"
-                    >
-                      <span className="w-6 h-6 rounded-full bg-teal-50 text-teal-600 flex items-center justify-center shrink-0">
-                        <Icon className="w-3 h-3" />
-                      </span>
-                      <div className="text-left text-[11px] leading-tight">
-                        <div className="font-semibold text-slate-900">{pill.title}</div>
-                        <div className="text-[10px] text-slate-500">{pill.subtitle}</div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            {/* RIGHT COLUMN (DESKTOP): Keeps grid space open so laptop in executive background is cleanly framed */}
+            <div className="hidden lg:block h-full min-h-[440px]" aria-hidden="true" />
           </div>
         </div>
 
