@@ -178,6 +178,10 @@ _FAST_PATH_INTENTS = {
     "create_bank_account",
     "create_employee",
     "create_project",
+    "supplier_balance",
+    "generate_supplier_ledger",
+    "customer_balance",
+    "generate_customer_ledger",
 }
 
 
@@ -2529,6 +2533,29 @@ async def _deterministic_mutation_calls(
         return None
 
     entities = execution_plan.extracted_entities or {}
+
+    if execution_plan.intent in ("supplier_balance", "generate_supplier_ledger"):
+        party = entities.get("supplier_name") or entities.get("name")
+        if party and not execution_plan.requires_clarification:
+            return [ToolCall(tool_name="get_supplier_ledger", arguments={"supplier_name": str(party)})]
+
+    if execution_plan.intent in ("customer_balance", "generate_customer_ledger"):
+        party = entities.get("customer_name") or entities.get("name")
+        if party and not execution_plan.requires_clarification:
+            return [ToolCall(tool_name="get_customer_ledger", arguments={"customer_name": str(party)})]
+
+    from app.erp_endpoints import is_operational_task, get_endpoint_for_intent
+    if is_operational_task(execution_plan.intent) and not execution_plan.requires_clarification:
+        endpoint = get_endpoint_for_intent(execution_plan.intent)
+        if endpoint and endpoint.tool_name:
+            args = {}
+            for param in endpoint.required_parameters + endpoint.optional_parameters:
+                val = entities.get(param) or entities.get(param.replace("account_", "").replace("product_", "").replace("customer_", "").replace("supplier_", "").replace("employee_", ""))
+                if val is not None:
+                    args[param] = val
+            if endpoint.name_key and not args.get(endpoint.name_key):
+                args[endpoint.name_key] = entities.get("name") or entities.get(endpoint.name_key)
+            return [ToolCall(tool_name=endpoint.tool_name, arguments=args)]
 
     if execution_plan.intent == "record_expense":
 
@@ -5295,32 +5322,23 @@ def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
 
 
     for key in (
-
         "amount", "transaction_date", "item_description",
-
         "transaction_purpose", "supplier_name", "customer_name",
-
         "quantity", "payment_method", "settlement_position", "account_name", "line_items",
-
+        "account_type", "account_code", "product_name", "service_name", "sales_price",
+        "bank_name", "employee_name", "project_name",
     ):
-
         if key not in prefill or prefill[key] in (None, ""):
-
             val = literals.get(key)
-
             if val not in (None, ""):
-
                 prefill[key] = val
 
-
-
     decision = getattr(reasoning, "decision", None) or {}
-
     intent = str(decision.get("intent") or "").strip().lower()
-
     if intent:
-
         prefill["semantic_intent"] = intent
+    elif (preliminary or {}).get("provisional_intent_hint"):
+        prefill["semantic_intent"] = (preliminary or {}).get("provisional_intent_hint")
 
     treatment = str(decision.get("treatment") or "").strip().upper()
 
@@ -7016,6 +7034,16 @@ async def execute(
         # already confirmed.  Skipped entirely on approved turns.
 
         _prov_hint = (_preliminary or {}).get("provisional_intent_hint") or ""
+        _READ_ONLY_LOOKUPS = frozenset({
+            "supplier_balance", "customer_balance",
+            "generate_supplier_ledger", "generate_customer_ledger",
+            "generate_general_ledger", "generate_trial_balance",
+            "generate_balance_sheet", "generate_profit_loss",
+            "generate_cash_flow", "project_profitability",
+            "list_expenses", "list_bank_accounts", "list_customers",
+            "list_suppliers", "list_employees", "get_chart_of_accounts",
+            "get_recurring_templates",
+        })
         _is_operational = (
             _prov_hint in (
                 "create_account", "get_chart_of_accounts", "create_customer",
@@ -7023,6 +7051,7 @@ async def execute(
                 "create_bank_account", "create_employee", "create_project",
                 "create_recurring_template"
             )
+            or _prov_hint in _READ_ONLY_LOOKUPS
             or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
         )
 
@@ -13267,6 +13296,22 @@ async def execute(
             if isinstance(primary_data, dict):
                 result_summary = format_operational_summary(execution_plan.intent, primary_data)
 
+        if execution_plan.intent in ("supplier_balance", "generate_supplier_ledger"):
+            for res in successful_results:
+                if res.tool_name == "get_supplier_ledger" and isinstance(res.data, dict):
+                    d = res.data
+                    supp_name = d.get("supplier_name") or d.get("name") or (d.get("supplier") or {}).get("name") or execution_plan.extracted_entities.get("supplier_name", "Supplier")
+                    bal = d.get("current_balance") or d.get("balance") or d.get("total_outstanding") or 0.0
+                    result_summary = f"### 📊 Payables Summary: **{supp_name}**\n\n* **Outstanding Balance:** **Rs. {float(bal):,.2f}**\n* **Status:** {'Payable due' if float(bal) > 0 else 'Settled / No pending payables'}\n\n[View Supplier Ledger in Purchases →](/purchases/bills)"
+
+        if execution_plan.intent in ("customer_balance", "generate_customer_ledger"):
+            for res in successful_results:
+                if res.tool_name == "get_customer_ledger" and isinstance(res.data, dict):
+                    d = res.data
+                    cust_name = d.get("customer_name") or d.get("name") or (d.get("customer") or {}).get("name") or execution_plan.extracted_entities.get("customer_name", "Customer")
+                    bal = d.get("current_balance") or d.get("balance") or d.get("total_outstanding") or 0.0
+                    result_summary = f"### 📊 Customer Balance: **{cust_name}**\n\n* **Receivable Balance:** **Rs. {float(bal):,.2f}**\n* **Status:** {'Receivable due' if float(bal) > 0 else 'Fully paid / No pending dues'}\n\n[View Customer Invoices in Sales →](/sales/invoices)"
+
         if not verified and _primary_mutation_failed(
 
             tool_results, intent=execution_plan.intent
@@ -14921,8 +14966,12 @@ def _plan_performs_no_financial_mutation(
 
     """
 
-    if not _intent_tool_names(intent):
+    from app.planner import _TRANSACTION_INTENTS
 
+    if intent not in _TRANSACTION_INTENTS:
+        return False
+
+    if not _intent_tool_names(intent):
         return False
 
     return not any(tc.tool_name in FINANCIAL_WRITE_TOOLS for tc in calls or ())

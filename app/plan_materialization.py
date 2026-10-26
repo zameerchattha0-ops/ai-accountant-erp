@@ -134,6 +134,16 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
             "invoice_id", "invoice", ("invoice_number",)
         ),
     },
+    "get_supplier_ledger": {
+        "supplier_id": ReferenceSpec(
+            "supplier_id", "supplier", ("supplier_name", "party_name", "name")
+        ),
+    },
+    "get_customer_ledger": {
+        "customer_id": ReferenceSpec(
+            "customer_id", "customer", ("customer_name", "party_name", "name")
+        ),
+    },
 }
 
 # Line-item references: which key names an item on a document line.  The link is
