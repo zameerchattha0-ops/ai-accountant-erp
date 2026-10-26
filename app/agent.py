@@ -2561,19 +2561,6 @@ async def _deterministic_mutation_calls(
         if party and not execution_plan.requires_clarification:
             return [ToolCall(tool_name="get_customer_ledger", arguments={"customer_name": str(party)})]
 
-    from app.erp_endpoints import is_operational_task, get_endpoint_for_intent
-    if is_operational_task(execution_plan.intent) and not execution_plan.requires_clarification:
-        endpoint = get_endpoint_for_intent(execution_plan.intent)
-        if endpoint and endpoint.tool_name:
-            args = {}
-            for param in endpoint.required_parameters + endpoint.optional_parameters:
-                val = entities.get(param) or entities.get(param.replace("account_", "").replace("product_", "").replace("customer_", "").replace("supplier_", "").replace("employee_", ""))
-                if val is not None:
-                    args[param] = val
-            if endpoint.name_key and not args.get(endpoint.name_key):
-                args[endpoint.name_key] = entities.get("name") or entities.get(endpoint.name_key)
-            return [ToolCall(tool_name=endpoint.tool_name, arguments=args)]
-
     if execution_plan.intent == "record_expense":
 
         # CA treatment 3 first: a confirmed settle-existing-payable
