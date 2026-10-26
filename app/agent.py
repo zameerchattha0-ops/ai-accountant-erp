@@ -214,6 +214,10 @@ _CUSTOMER_PARTY_INTENTS = {
 
     "create_credit_note",   # a customer return gates on the CUSTOMER
 
+    "customer_balance",
+
+    "generate_customer_ledger",
+
 }
 
 
@@ -428,7 +432,20 @@ async def _party_resolution_question(
 
     entities = execution_plan.extracted_entities or {}
 
-    if execution_plan.intent not in _PARTY_GATE_INTENTS or execution_plan.intent in ("record_expense", "record_bank_transfer"):
+    _READ_ONLY_LOOKUPS_GATE = {
+        "supplier_balance", "customer_balance",
+        "generate_supplier_ledger", "generate_customer_ledger",
+        "generate_general_ledger", "generate_trial_balance",
+        "generate_balance_sheet", "generate_profit_loss",
+        "generate_cash_flow", "project_profitability",
+        "list_expenses", "list_bank_accounts", "list_customers",
+        "list_suppliers", "list_employees", "get_chart_of_accounts",
+    }
+    if (
+        execution_plan.intent not in _PARTY_GATE_INTENTS
+        or execution_plan.intent in ("record_expense", "record_bank_transfer")
+        or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
+    ):
 
         # No recording workflow (unknown/report intent): a party question
 
@@ -13298,19 +13315,29 @@ async def execute(
 
         if execution_plan.intent in ("supplier_balance", "generate_supplier_ledger"):
             for res in successful_results:
-                if res.tool_name == "get_supplier_ledger" and isinstance(res.data, dict):
-                    d = res.data
-                    supp_name = d.get("supplier_name") or d.get("name") or (d.get("supplier") or {}).get("name") or execution_plan.extracted_entities.get("supplier_name", "Supplier")
-                    bal = d.get("current_balance") or d.get("balance") or d.get("total_outstanding") or 0.0
-                    result_summary = f"### 📊 Payables Summary: **{supp_name}**\n\n* **Outstanding Balance:** **Rs. {float(bal):,.2f}**\n* **Status:** {'Payable due' if float(bal) > 0 else 'Settled / No pending payables'}\n\n[View Supplier Ledger in Purchases →](/purchases/bills)"
+                if res.tool_name == "get_supplier_ledger":
+                    supp_name = execution_plan.extracted_entities.get("supplier_name", "Supplier")
+                    bal = 0.0
+                    if isinstance(res.data, list) and res.data:
+                        bal = float(res.data[-1].get("running_balance") or 0.0)
+                        supp_name = res.data[-1].get("supplier_name") or supp_name
+                    elif isinstance(res.data, dict):
+                        bal = float(res.data.get("current_balance") or res.data.get("balance") or 0.0)
+                        supp_name = res.data.get("supplier_name") or res.data.get("name") or supp_name
+                    result_summary = f"### 📊 Payables Summary: **{supp_name}**\n\n* **Outstanding Balance:** **Rs. {bal:,.2f}**\n* **Status:** {'Payable due' if bal > 0 else 'Settled / No pending payables'}\n\n[View Supplier Ledger in Purchases →](/purchases/bills)"
 
         if execution_plan.intent in ("customer_balance", "generate_customer_ledger"):
             for res in successful_results:
-                if res.tool_name == "get_customer_ledger" and isinstance(res.data, dict):
-                    d = res.data
-                    cust_name = d.get("customer_name") or d.get("name") or (d.get("customer") or {}).get("name") or execution_plan.extracted_entities.get("customer_name", "Customer")
-                    bal = d.get("current_balance") or d.get("balance") or d.get("total_outstanding") or 0.0
-                    result_summary = f"### 📊 Customer Balance: **{cust_name}**\n\n* **Receivable Balance:** **Rs. {float(bal):,.2f}**\n* **Status:** {'Receivable due' if float(bal) > 0 else 'Fully paid / No pending dues'}\n\n[View Customer Invoices in Sales →](/sales/invoices)"
+                if res.tool_name == "get_customer_ledger":
+                    cust_name = execution_plan.extracted_entities.get("customer_name", "Customer")
+                    bal = 0.0
+                    if isinstance(res.data, list) and res.data:
+                        bal = float(res.data[-1].get("running_balance") or 0.0)
+                        cust_name = res.data[-1].get("customer_name") or cust_name
+                    elif isinstance(res.data, dict):
+                        bal = float(res.data.get("current_balance") or res.data.get("balance") or 0.0)
+                        cust_name = res.data.get("customer_name") or res.data.get("name") or cust_name
+                    result_summary = f"### 📊 Customer Balance: **{cust_name}**\n\n* **Receivable Balance:** **Rs. {bal:,.2f}**\n* **Status:** {'Receivable due' if bal > 0 else 'Settled / No pending dues'}\n\n[View Customer Invoices in Sales →](/sales/invoices)"
 
         if not verified and _primary_mutation_failed(
 
