@@ -149,3 +149,48 @@ class TestClarificationAnswerParsing:
         assert plan_obj.extracted_entities.get("account_type") == "EXPENSE"
         assert plan_obj.requires_clarification is False
 
+
+class TestLLMAuthoritativeIntent:
+    """Verifies that the live LLM extraction is primary and authoritative over regex templates."""
+
+    def test_llm_provisional_intent_wins_over_regex_fallback(self):
+        """When the LLM identifies a canonical intent, it governs even if keywords are ambiguous."""
+        plan_obj = plan(
+            "check on what is outstanding for shabbir furnitures",
+            prefill_entities={
+                "supplier_name": "shabbir furnitures",
+                "provisional_intent_hint": "supplier_balance",
+            },
+        )
+        assert plan_obj.intent == "supplier_balance"
+        assert "search_supplier" in plan_obj.potential_tools
+        assert "get_supplier_ledger" in plan_obj.potential_tools
+        assert plan_obj.requires_clarification is False
+
+    def test_payables_query_with_supplier_executes_direct_ledger_lookup(self):
+        """'payables for shabbir furnitures?' resolves to supplier_balance without crash."""
+        plan_obj = plan(
+            "payables for shabbir furnitures?",
+            prefill_entities={
+                "supplier_name": "shabbir furnitures",
+                "provisional_intent_hint": "supplier_balance",
+            },
+        )
+        assert plan_obj.intent == "supplier_balance"
+        assert plan_obj.requires_clarification is False
+        assert plan_obj.requires_accounting_engine is False  # Operational/read-only lookup
+
+    def test_payables_query_missing_supplier_prompts_clarification(self):
+        """'what are my payables?' without a named counterparty asks for supplier_name."""
+        plan_obj = plan(
+            "what are my payables?",
+            prefill_entities={
+                "provisional_intent_hint": "supplier_balance",
+            },
+        )
+        assert plan_obj.intent == "supplier_balance"
+        assert plan_obj.requires_clarification is True
+        assert "supplier_name" in plan_obj.missing_fields
+        assert any("supplier" in q.lower() for q in plan_obj.clarification_questions)
+
+

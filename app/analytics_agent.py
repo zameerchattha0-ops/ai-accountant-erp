@@ -445,7 +445,16 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
             # Pseudo-cols are NEVER sent to the database - always Python-side
             # (after the account join below).
             if f["op"] == "eq" and f["col"] not in pseudo:
-                filters[f["col"]] = f["value"]
+                val = f["value"]
+                if str(f["col"]).endswith("_id"):
+                    import uuid
+                    try:
+                        uuid.UUID(str(val))
+                        filters[f["col"]] = val
+                    except (ValueError, TypeError, AttributeError):
+                        log.warning("analytics.invalid_uuid_filter_dropped", col=f["col"], val=val)
+                else:
+                    filters[f["col"]] = val
             else:
                 noneq.append(f)
         fetch_limit = MAX_LIMIT if noneq else op["limit"]

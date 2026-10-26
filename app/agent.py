@@ -6711,7 +6711,13 @@ async def execute(
                 route_message as _route_message,
             )
 
+            from app.planner import _SEMANTIC_INTENTS
             _prov_intent = (_preliminary or {}).get("provisional_intent_hint") or ""
+            _is_erp_intent = _prov_intent in _SEMANTIC_INTENTS
+            _has_erp_entities = any(
+                k in (_preliminary or {}) or k in ((_preliminary or {}).get("literals") or {})
+                for k in ("account_name", "product_name", "bank_name", "employee_name", "supplier_name", "customer_name", "project_name")
+            )
             _is_op_task = (
                 _prov_intent in (
                     "create_account", "get_chart_of_accounts", "create_customer",
@@ -6719,14 +6725,15 @@ async def execute(
                     "create_bank_account", "create_employee", "create_project",
                     "create_recurring_template"
                 )
-                or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
+                or _has_erp_entities
             )
-            if clarification_history or _is_op_task:
+            if clarification_history or _is_op_task or _is_erp_intent:
                 _route = "record"
                 _route_audit = {
-                    "source": "clarification_fast_path" if clarification_history else "operational_fast_path",
+                    "source": "clarification_fast_path" if clarification_history else ("llm_erp_authority" if _is_erp_intent else "operational_fast_path"),
                     "route": "record",
                     "confidence": 1.0,
+                    "intent": _prov_intent,
                 }
             else:
                 _route, _route_audit = await _route_message(question=user_message)
@@ -7373,6 +7380,16 @@ async def execute(
 
 
         _ai_prefill: Dict[str, Any] = {}
+        if _preliminary:
+            _prelim_lits = _preliminary.get("literals") or {}
+            for _k, _v in _prelim_lits.items():
+                if _v is not None:
+                    _ai_prefill[_k] = _v
+            for _k, _v in _preliminary.items():
+                if _v is not None and _k not in ("literals", "original_request"):
+                    _ai_prefill.setdefault(_k, _v)
+            if _preliminary.get("provisional_intent_hint"):
+                _ai_prefill["semantic_intent"] = _preliminary["provisional_intent_hint"]
 
         # P1-⑥ (forensic latency report ⑥): the semantic layer and the
 
@@ -7585,6 +7602,8 @@ async def execute(
         # "credit note against invoice …" turns died without it).
 
         _seed_invoice_reference(_preliminary, _ai_prefill)
+        if (_preliminary or {}).get("provisional_intent_hint") and not _ai_prefill.get("semantic_intent"):
+            _ai_prefill["semantic_intent"] = _preliminary["provisional_intent_hint"]
 
 
 

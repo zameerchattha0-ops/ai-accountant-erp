@@ -269,7 +269,7 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("customer_balance", [r"\bowe(?:s|d|ing)?\b", r"receivable", r"customer.*ledger", r"how much.*\bowe"]),
 
-    ("supplier_balance", [r"supplier.*ledger", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
+    ("supplier_balance", [r"supplier.*ledger", r"\bpayables?\b", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
 
     ("project_profitability", [r"project.*profit", r"profitability"]),
 
@@ -662,7 +662,16 @@ _SEMANTIC_INTENTS = frozenset({
     # Master data / Setup and Operational intents across all ERP modules
     "create_account", "get_chart_of_accounts", "create_customer", "create_supplier",
     "create_product", "create_service", "create_employee", "create_project",
-    "create_recurring_template",
+    "create_recurring_template", "get_recurring_templates", "create_bank_account",
+    "list_bank_accounts", "list_expenses", "list_customers", "list_suppliers",
+    "list_employees", "supplier_balance", "customer_balance",
+    "generate_supplier_ledger", "generate_customer_ledger", "generate_general_ledger",
+    "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
+    "generate_cash_flow", "project_profitability", "record_bank_transfer",
+    "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
+    "record_adjustment", "record_correction", "reverse_journal",
+    "update_product", "delete_product", "update_service", "delete_service",
+    "create_quotation", "convert_quotation",
 })
 
 
@@ -1661,24 +1670,19 @@ def plan(
 
 
 
-    # 1. Identify intent — SEMANTIC FIRST.
+    # 1. Identify intent — LLM / SEMANTIC AUTHORITATIVE FIRST.
+    #    The LLM extraction layer perceives the business act in ERP vocabulary
+    #    ("payables for shabbir furnitures" -> supplier_balance, "create chart of account ..." -> create_account).
+    #    When the LLM yields a canonical intent, it WINS over regex patterns.
+    #    The keyword patterns stay the FALLBACK when the LLM is offline or unconfident.
+    _semantic_intent = (
+        (prefill_entities or {}).get("semantic_intent")
+        or (prefill_entities or {}).get("provisional_intent_hint")
+    )
 
-    #    The LLM semantic layer expresses the business act in ERP vocabulary
-
-    #    ("supplied X with chairs, payment later" -> record_credit_sale).
-
-    #    A whitelist makes any unknown/out-of-vocabulary value fall back to
-
-    #    the keyword extractor, which stays the FALLBACK — never the brain.
-
-    _semantic_intent = (prefill_entities or {}).get("semantic_intent")
-
-    if _semantic_intent in _SEMANTIC_INTENTS:
-
+    if _semantic_intent and _semantic_intent in _SEMANTIC_INTENTS:
         intent = _semantic_intent
-
     else:
-
         intent = _identify_intent(msg_lower)
 
     payment_method = _extract_payment_method(msg_lower)
@@ -3973,6 +3977,12 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 
     if intent == "create_employee" and not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
         missing.append("employee_name")
+
+    if intent in ("supplier_balance", "generate_supplier_ledger") and not (entities.get("supplier_name") or entities.get("name")):
+        missing.append("supplier_name")
+
+    if intent in ("customer_balance", "generate_customer_ledger") and not (entities.get("customer_name") or entities.get("name")):
+        missing.append("customer_name")
 
 
 

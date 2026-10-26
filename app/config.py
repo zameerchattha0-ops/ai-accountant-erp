@@ -626,7 +626,7 @@ class Settings(BaseSettings):
         description="Per-call cap for the analytics planner/synthesizer.",
     )
     llm_router_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "LLM-FIRST message routing: EVERY user message is classified by "
             "a short bounded call into 'analytics' (answer a question from "

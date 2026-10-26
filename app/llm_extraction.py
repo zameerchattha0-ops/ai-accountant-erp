@@ -415,9 +415,7 @@ async def enrich_preliminary(
             + clean["candidate_subject_areas"]
         ))
         merged["candidate_subject_areas"] = areas
-    if clean.get("provisional_intent_hint") and not merged.get(
-        "provisional_intent_hint"
-    ):
+    if clean.get("provisional_intent_hint"):
         merged["provisional_intent_hint"] = clean["provisional_intent_hint"]
         filled.append("provisional_intent_hint")
     audit["llm"] = "ok"

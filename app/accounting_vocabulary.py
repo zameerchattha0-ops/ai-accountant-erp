@@ -182,6 +182,10 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         # with its own intent, field ladder and tool (production 2026-10-01:
         # "Set up a project …" had no intent at all).
         "create_project",
+        "create_account", "get_chart_of_accounts",
+        "create_customer", "create_supplier", "list_customers", "list_suppliers",
+        "create_employee", "list_employees",
+        "create_recurring_template", "get_recurring_templates",
         "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
         "run_payroll",
         # Loans — LLM-delegated routes (planner._SEMANTIC_INTENTS whitelist +
