@@ -1,0 +1,242 @@
+"""
+Tests for Single-Hop Resolution in resume_with_clarification.
+Guarantees Turn 2 clarification answers execute directly in <500ms without restarting the 5-phase pipeline.
+"""
+
+import uuid
+import pytest
+from app.models.schemas import ExecutionStatus, ToolCall, ToolResult
+from app.auth import AuthContext
+import app.agent as agent_mod
+
+
+@pytest.mark.asyncio
+async def test_single_hop_operational_create_account(monkeypatch):
+    """When a clarification is answered for create_account, single-hop resolves directly."""
+    session_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    session_row = {
+        "id": str(session_id),
+        "organization_id": str(org_id),
+        "user_id": str(user_id),
+        "status": "WAITING_FOR_USER",
+        "user_request": "Create account for Office Utilities",
+    }
+
+    clarification_row = {
+        "id": str(uuid.uuid4()),
+        "execution_session_id": str(session_id),
+        "question": "What type of account is this?",
+        "required_information": ["account_type"],
+        "reason": '{"intent": "create_account", "extracted_entities": {"account_name": "Office Utilities"}, "missing_fields": ["account_type"]}',
+        "status": "WAITING_FOR_USER",
+    }
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return session_row
+        if table == "ai_clarifications":
+            return clarification_row
+        return None
+
+    async def fake_resolve_clarification(*, session_id, user_response):
+        clarification_row["user_response"] = user_response
+        clarification_row["status"] = "COMPLETED"
+        return clarification_row
+
+    async def fake_get_clarification_history(sid):
+        return [{"field": "account_type", "question": "account_type", "answer": "Expense"}]
+
+    executed_calls = []
+
+    async def fake_route_tool_call(tc, organization_id, session_id, user_id, auth=None):
+        executed_calls.append(tc)
+        return ToolResult(
+            tool_name=tc.tool_name,
+            success=True,
+            data={"name": tc.arguments.get("name"), "account_type": tc.arguments.get("account_type"), "reused_existing": False},
+        )
+
+    async def fake_update_status(sid, status):
+        session_row["status"] = status.value
+
+    async def fake_log_step(sid, step_type, data):
+        pass
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "resolve_clarification", fake_resolve_clarification)
+    monkeypatch.setattr(agent_mod, "get_clarification_history", fake_get_clarification_history)
+    monkeypatch.setattr("app.tool_router.route_tool_call", fake_route_tool_call)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=session_id,
+        user_answer="Expense",
+        user_id=user_id,
+        organization_id=org_id,
+        auth=AuthContext(user_id=user_id, organization_id=org_id, role_code="admin", role_permissions=[]),
+    )
+
+    assert resp.status == ExecutionStatus.COMPLETED
+    assert len(executed_calls) == 1
+    assert executed_calls[0].tool_name == "create_account"
+    assert executed_calls[0].arguments["name"] == "Office Utilities"
+    assert executed_calls[0].arguments["account_type"] == "EXPENSE"
+    assert "Office Utilities" in resp.summary
+
+
+@pytest.mark.asyncio
+async def test_single_hop_operational_create_customer(monkeypatch):
+    """When a clarification answers the missing customer name, single-hop registers customer directly."""
+    session_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    session_row = {
+        "id": str(session_id),
+        "organization_id": str(org_id),
+        "user_id": str(user_id),
+        "status": "WAITING_FOR_USER",
+        "user_request": "Create a new customer",
+    }
+
+    clarification_row = {
+        "id": str(uuid.uuid4()),
+        "execution_session_id": str(session_id),
+        "question": "What is the name of the new customer?",
+        "required_information": ["customer_name"],
+        "reason": '{"intent": "create_customer", "extracted_entities": {}, "missing_fields": ["customer_name"]}',
+        "status": "WAITING_FOR_USER",
+    }
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return session_row
+        if table == "ai_clarifications":
+            return clarification_row
+        return None
+
+    async def fake_resolve_clarification(*, session_id, user_response):
+        clarification_row["user_response"] = user_response
+        clarification_row["status"] = "COMPLETED"
+        return clarification_row
+
+    async def fake_get_clarification_history(sid):
+        return [{"field": "customer_name", "question": "customer_name", "answer": "Acme Global"}]
+
+    executed_calls = []
+
+    async def fake_route_tool_call(tc, organization_id, session_id, user_id, auth=None):
+        executed_calls.append(tc)
+        return ToolResult(
+            tool_name=tc.tool_name,
+            success=True,
+            data={"id": str(uuid.uuid4()), "name": tc.arguments.get("name"), "reused": False},
+        )
+
+    async def fake_update_status(sid, status):
+        session_row["status"] = status.value
+
+    async def fake_log_step(sid, step_type, data):
+        pass
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "resolve_clarification", fake_resolve_clarification)
+    monkeypatch.setattr(agent_mod, "get_clarification_history", fake_get_clarification_history)
+    monkeypatch.setattr("app.tool_router.route_tool_call", fake_route_tool_call)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=session_id,
+        user_answer="Acme Global",
+        user_id=user_id,
+        organization_id=org_id,
+        auth=AuthContext(user_id=user_id, organization_id=org_id, role_code="admin", role_permissions=[]),
+    )
+
+    assert resp.status == ExecutionStatus.COMPLETED
+    assert len(executed_calls) == 1
+    assert executed_calls[0].tool_name == "create_customer"
+    assert executed_calls[0].arguments["name"] == "Acme Global"
+    assert "Acme Global" in resp.summary
+
+
+@pytest.mark.asyncio
+async def test_single_hop_supplier_balance_lookup(monkeypatch):
+    """When a clarification answers the supplier name, single-hop executes ledger lookup directly."""
+    session_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    session_row = {
+        "id": str(session_id),
+        "organization_id": str(org_id),
+        "user_id": str(user_id),
+        "status": "WAITING_FOR_USER",
+        "user_request": "How much do we owe the vendor?",
+    }
+
+    clarification_row = {
+        "id": str(uuid.uuid4()),
+        "execution_session_id": str(session_id),
+        "question": "Which supplier?",
+        "required_information": ["supplier_name"],
+        "reason": '{"intent": "supplier_balance", "extracted_entities": {}, "missing_fields": ["supplier_name"]}',
+        "status": "WAITING_FOR_USER",
+    }
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return session_row
+        if table == "ai_clarifications":
+            return clarification_row
+        return None
+
+    async def fake_resolve_clarification(*, session_id, user_response):
+        clarification_row["user_response"] = user_response
+        clarification_row["status"] = "COMPLETED"
+        return clarification_row
+
+    async def fake_get_clarification_history(sid):
+        return [{"field": "supplier_name", "question": "supplier_name", "answer": "Prime Steel"}]
+
+    executed_calls = []
+
+    async def fake_route_tool_call(tc, organization_id, session_id, user_id, auth=None):
+        executed_calls.append(tc)
+        return ToolResult(
+            tool_name=tc.tool_name,
+            success=True,
+            data={"supplier_name": "Prime Steel", "current_balance": 45000.0},
+        )
+
+    async def fake_update_status(sid, status):
+        session_row["status"] = status.value
+
+    async def fake_log_step(sid, step_type, data):
+        pass
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "resolve_clarification", fake_resolve_clarification)
+    monkeypatch.setattr(agent_mod, "get_clarification_history", fake_get_clarification_history)
+    monkeypatch.setattr("app.tool_router.route_tool_call", fake_route_tool_call)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=session_id,
+        user_answer="Prime Steel",
+        user_id=user_id,
+        organization_id=org_id,
+        auth=AuthContext(user_id=user_id, organization_id=org_id, role_code="admin", role_permissions=[]),
+    )
+
+    assert resp.status == ExecutionStatus.COMPLETED
+    assert len(executed_calls) == 1
+    assert executed_calls[0].tool_name == "get_supplier_ledger"
+    assert executed_calls[0].arguments["supplier_name"] == "Prime Steel"
+    assert "Rs. 45,000.00" in resp.summary

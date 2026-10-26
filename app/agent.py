@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 
+import json
+
 import re
 
 import uuid
@@ -7538,6 +7540,8 @@ async def execute(
 
             and bool(getattr(_settings, "bounded_understanding_enabled", False))
 
+            and not clarification_history
+
         ):
 
             try:
@@ -8416,6 +8420,12 @@ async def execute(
 
             })
 
+            _clar_snap = json.dumps({
+                "intent": execution_plan.intent,
+                "extracted_entities": execution_plan.extracted_entities,
+                "missing_fields": list(_asked_fields or execution_plan.missing_fields or []),
+                "requires_confirmation": getattr(execution_plan, "requires_confirmation", False),
+            })
             clarification = await create_clarification(
 
                 session_id=session_id,
@@ -8423,6 +8433,8 @@ async def execute(
                 question=question,
 
                 required_fields=_asked_fields,
+
+                reason=_clar_snap,
 
             )
 
@@ -13674,6 +13686,50 @@ def _tag_numbered_answers(
 
 
 
+async def _get_clarification_snapshot(session_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    """Retrieve the snapshot of intent and extracted entities for a pending clarification."""
+    import json
+    try:
+        pending = await fetch_one(
+            "ai_clarifications",
+            filters={"execution_session_id": str(session_id)},
+            select="reason,required_information",
+        )
+        if pending and pending.get("reason"):
+            try:
+                data = json.loads(pending["reason"])
+                if isinstance(data, dict) and data.get("intent"):
+                    return data
+            except Exception as e:
+                log.warning("agent.clarification_snapshot_json_error", error=str(e))
+    except Exception as e:
+        log.warning("agent.clarification_snapshot_fetch_error", error=str(e))
+
+    try:
+        steps = await fetch_many(
+            "ai_execution_steps",
+            filters={"execution_session_id": str(session_id)},
+            select="description,input_summary",
+            order="step_order.desc",
+            limit=10,
+        )
+        for s in steps or []:
+            desc = s.get("description")
+            if desc in ("AWAITING_CLARIFICATION", "PLANNING"):
+                summary = s.get("input_summary")
+                if summary:
+                    try:
+                        data = json.loads(summary)
+                        if isinstance(data, dict) and data.get("intent") and "extracted_entities" in data:
+                            return data
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    return None
+
+
 async def resume_with_clarification(
 
     *,
@@ -13959,6 +14015,201 @@ async def resume_with_clarification(
             ]
 
 
+
+    # ------------------------------------------------------------------
+    # SINGLE-HOP RESOLUTION (Turn 2 Fast-Path: <500ms)
+    # ------------------------------------------------------------------
+    snapshot = await _get_clarification_snapshot(session_id)
+    if snapshot and snapshot.get("intent"):
+        intent = snapshot["intent"]
+        merged_entities = dict(snapshot.get("extracted_entities") or {})
+        missing_fields = list(snapshot.get("missing_fields") or [])
+
+        # Fold answers from history / structured_answers
+        for h in history or []:
+            f_name = h.get("field")
+            f_ans = h.get("answer")
+            if f_name and f_ans not in (None, ""):
+                merged_entities[str(f_name).strip()] = f_ans
+
+        # If a single missing field remains, map user answer directly
+        unfulfilled = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
+        if len(unfulfilled) == 1 and answer:
+            field = unfulfilled[0]
+            if field == "account_type":
+                ans_up = answer.strip().upper()
+                for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+                    if c_type in ans_up:
+                        merged_entities["account_type"] = c_type
+                        break
+                else:
+                    merged_entities["account_type"] = ans_up
+            elif field == "payment_method":
+                ans_up = answer.strip().upper()
+                if "CASH" in ans_up:
+                    merged_entities["payment_method"] = "CASH"
+                elif "BANK" in ans_up or "TRANSFER" in ans_up:
+                    merged_entities["payment_method"] = "BANK"
+                elif any(k in ans_up for k in ("CREDIT", "LATER", "PAYABLE", "RECEIVABLE")):
+                    merged_entities["payment_method"] = "CREDIT"
+                else:
+                    merged_entities["payment_method"] = answer.strip()
+            else:
+                merged_entities[field] = answer.strip()
+
+        # Re-check missing fields
+        still_missing = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
+
+        if not still_missing:
+            from app.erp_endpoints import is_operational_task, format_operational_summary
+
+            single_hop_call: Optional[ToolCall] = None
+
+            if intent == "create_account":
+                acct_name = merged_entities.get("account_name") or merged_entities.get("name")
+                acct_type = str(merged_entities.get("account_type") or "EXPENSE").strip().upper()
+                if acct_name and acct_type:
+                    args: Dict[str, Any] = {
+                        "name": str(acct_name).strip(),
+                        "account_type": acct_type,
+                    }
+                    if merged_entities.get("code") or merged_entities.get("account_code"):
+                        args["code"] = str(merged_entities.get("code") or merged_entities.get("account_code")).strip()
+                    if merged_entities.get("parent_account_name"):
+                        args["parent_account_name"] = str(merged_entities.get("parent_account_name")).strip()
+                    single_hop_call = ToolCall(tool_name="create_account", arguments=args)
+
+            elif intent == "create_customer":
+                cust_name = merged_entities.get("customer_name") or merged_entities.get("name")
+                if cust_name:
+                    args = {"name": str(cust_name).strip()}
+                    for f in ("email", "phone", "tax_number", "notes"):
+                        if merged_entities.get(f):
+                            args[f] = merged_entities[f]
+                    single_hop_call = ToolCall(tool_name="create_customer", arguments=args)
+
+            elif intent == "create_supplier":
+                supp_name = merged_entities.get("supplier_name") or merged_entities.get("name")
+                if supp_name:
+                    args = {"name": str(supp_name).strip()}
+                    for f in ("email", "phone", "tax_number", "notes"):
+                        if merged_entities.get(f):
+                            args[f] = merged_entities[f]
+                    single_hop_call = ToolCall(tool_name="create_supplier", arguments=args)
+
+            elif intent == "create_product":
+                p_name = merged_entities.get("product_name") or merged_entities.get("name")
+                price = merged_entities.get("sales_price") or merged_entities.get("unit_price")
+                if p_name:
+                    single_hop_call = ToolCall(tool_name="create_product", arguments={
+                        "name": str(p_name).strip(),
+                        "unit_price": float(price) if price is not None else 0.0,
+                    })
+
+            elif intent == "create_service":
+                s_name = merged_entities.get("service_name") or merged_entities.get("name")
+                rate = merged_entities.get("standard_rate")
+                if s_name:
+                    single_hop_call = ToolCall(tool_name="create_service", arguments={
+                        "name": str(s_name).strip(),
+                        "standard_rate": float(rate) if rate is not None else 0.0,
+                    })
+
+            elif intent == "create_bank_account":
+                b_acct = merged_entities.get("account_name")
+                b_name = merged_entities.get("bank_name") or ""
+                if b_acct:
+                    single_hop_call = ToolCall(tool_name="create_bank_account", arguments={
+                        "account_name": str(b_acct).strip(),
+                        "bank_name": str(b_name).strip(),
+                    })
+
+            elif intent == "create_employee":
+                e_name = merged_entities.get("employee_name") or merged_entities.get("name")
+                if e_name:
+                    single_hop_call = ToolCall(tool_name="create_employee", arguments={
+                        "full_name": str(e_name).strip(),
+                    })
+
+            elif intent == "create_project":
+                proj_name = merged_entities.get("project_name") or merged_entities.get("name")
+                if proj_name:
+                    single_hop_call = ToolCall(tool_name="create_project", arguments={
+                        "name": str(proj_name).strip(),
+                    })
+
+            elif intent in ("supplier_balance", "generate_supplier_ledger"):
+                party = merged_entities.get("supplier_name") or merged_entities.get("name")
+                if party:
+                    single_hop_call = ToolCall(tool_name="get_supplier_ledger", arguments={"supplier_name": str(party)})
+
+            elif intent in ("customer_balance", "generate_customer_ledger"):
+                party = merged_entities.get("customer_name") or merged_entities.get("name")
+                if party:
+                    single_hop_call = ToolCall(tool_name="get_customer_ledger", arguments={"customer_name": str(party)})
+
+            if single_hop_call is not None:
+                log.info(
+                    "single_hop_clarification_resolution",
+                    session_id=str(session_id),
+                    intent=intent,
+                    tool=single_hop_call.tool_name,
+                )
+                from app.tool_router import route_tool_call
+
+                tool_result = await route_tool_call(
+                    single_hop_call,
+                    organization_id=organization_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    auth=auth,
+                )
+
+                if is_operational_task(intent) and tool_result.success and isinstance(tool_result.data, dict):
+                    result_summary = format_operational_summary(intent, tool_result.data)
+                elif intent in ("supplier_balance", "generate_supplier_ledger") and tool_result.success:
+                    supp_name = merged_entities.get("supplier_name", "Supplier")
+                    bal = 0.0
+                    if isinstance(tool_result.data, list) and tool_result.data:
+                        bal = float(tool_result.data[-1].get("running_balance") or 0.0)
+                        supp_name = tool_result.data[-1].get("supplier_name") or supp_name
+                    elif isinstance(tool_result.data, dict):
+                        bal = float(tool_result.data.get("current_balance") or tool_result.data.get("balance") or 0.0)
+                        supp_name = tool_result.data.get("supplier_name") or tool_result.data.get("name") or supp_name
+                    result_summary = f"### 📊 Payables Summary: **{supp_name}**\n\n* **Outstanding Balance:** **Rs. {bal:,.2f}**\n* **Status:** {'Payable due' if bal > 0 else 'Settled / No pending payables'}\n\n[View Supplier Ledger in Purchases →](/purchases/bills)"
+                elif intent in ("customer_balance", "generate_customer_ledger") and tool_result.success:
+                    cust_name = merged_entities.get("customer_name", "Customer")
+                    bal = 0.0
+                    if isinstance(tool_result.data, list) and tool_result.data:
+                        bal = float(tool_result.data[-1].get("running_balance") or 0.0)
+                        cust_name = tool_result.data[-1].get("customer_name") or cust_name
+                    elif isinstance(tool_result.data, dict):
+                        bal = float(tool_result.data.get("current_balance") or tool_result.data.get("balance") or 0.0)
+                        cust_name = tool_result.data.get("customer_name") or tool_result.data.get("name") or cust_name
+                    result_summary = f"### 📊 Customer Balance: **{cust_name}**\n\n* **Receivable Balance:** **Rs. {bal:,.2f}**\n* **Status:** {'Receivable due' if bal > 0 else 'Settled / No pending dues'}\n\n[View Customer Invoices in Sales →](/sales/invoices)"
+                elif tool_result.success:
+                    result_summary = f"Successfully completed {intent}."
+                else:
+                    result_summary = f"Operation failed: {tool_result.error or 'Unknown error'}"
+
+                final_status = ExecutionStatus.COMPLETED if tool_result.success else ExecutionStatus.FAILED
+                await _update_status(session_id, final_status)
+                await _log_step(session_id, "SINGLE_HOP_EXECUTION", {
+                    "intent": intent,
+                    "tool": single_hop_call.tool_name,
+                    "success": tool_result.success,
+                    "summary": result_summary,
+                })
+
+                return AgentResponse(
+                    status=final_status,
+                    execution_id=session_id,
+                    summary=result_summary,
+                    tool_calls=[single_hop_call],
+                    tool_results=[tool_result],
+                    requires_confirmation=False,
+                    verified=tool_result.success,
+                )
 
     original_request = session.get("user_request", "") or ""
 

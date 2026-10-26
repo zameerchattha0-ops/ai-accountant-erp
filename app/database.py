@@ -683,20 +683,24 @@ async def create_clarification(
     question: str,
     required_fields: Optional[List[str]] = None,
     options: Optional[List[Any]] = None,
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a clarification record and set session to WAITING_FOR_USER."""
     await set_session_phase(
         session_id, phase="AWAITING_CLARIFICATION", status="WAITING_FOR_USER"
     )
+    row_data: Dict[str, Any] = {
+        "execution_session_id": str(session_id),
+        "question": question,
+        "required_information": required_fields or [],
+        "options": options or [],
+        "status": "WAITING_FOR_USER",
+    }
+    if reason:
+        row_data["reason"] = str(reason)
     return await insert_one(
         "ai_clarifications",
-        data={
-            "execution_session_id": str(session_id),
-            "question": question,
-            "required_information": required_fields or [],
-            "options": options or [],
-            "status": "WAITING_FOR_USER",
-        },
+        data=row_data,
     )
 
 
