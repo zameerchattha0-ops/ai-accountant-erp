@@ -113,6 +113,13 @@ _INTENT_TOOLS: dict[str, set[str]] = {
     # invented the call until the DB refused `project_code` (production
     # 2026-10-01, project sessions 500d0aa4 / 03221efb).
     "create_project": {"create_project"},
+    # Master data / Setup and Operational intents
+    "create_account": {"create_account", "search_account", "get_chart_of_accounts"},
+    "get_chart_of_accounts": {"get_chart_of_accounts", "search_account"},
+    "create_customer": {"create_customer", "search_customer"},
+    "create_supplier": {"create_supplier", "search_supplier"},
+    "create_employee": {"create_employee", "search_employee"},
+    "create_recurring_template": {"create_recurring_template", "get_recurring_templates"},
     # Loans (LLM-delegated route; planner._CONFIRMATION_INTENTS gates them).
     # The loan service builds the amortization schedule and posts the opening
     # journal itself; repayment settles one installment BY NUMBER, so the
@@ -143,6 +150,8 @@ def intent_tools(intent: str) -> Set[str]:
 def _lookups_for_intent(intent: str) -> Set[str]:
     """Lookups for the entity types the intent involves."""
     lookups: Set[str] = set()
+    if "account" in intent or "chart" in intent:
+        lookups |= _ACCOUNT_LOOKUPS
     if any(w in intent for w in (
         "purchase", "expense", "payment", "supplier", "return",
     )):

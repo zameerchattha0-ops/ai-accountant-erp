@@ -238,6 +238,9 @@ async def _get_customer(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _create_customer(organization_id: uuid.UUID, **kw) -> ToolResult:
 
+    if "customer_name" in kw and "name" not in kw:
+        kw["name"] = kw.pop("customer_name")
+
     data = await customer_service.create(organization_id, **kw)
 
     return ToolResult(tool_name="create_customer", success=True, data=data)
@@ -277,6 +280,9 @@ async def _get_supplier(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 async def _create_supplier(organization_id: uuid.UUID, **kw) -> ToolResult:
+
+    if "supplier_name" in kw and "name" not in kw:
+        kw["name"] = kw.pop("supplier_name")
 
     data = await supplier_service.create(organization_id, **kw)
 
@@ -354,9 +360,25 @@ async def _create_account(organization_id: uuid.UUID, **kw) -> ToolResult:
 
     # last line of defence.
 
-    requested_code = str(kw.get("code") or "")
+    requested_code = str(kw.get("code") or "").strip()
 
     requested_name = str(kw.get("name") or "").strip()
+
+    _child_type = str(kw.get("account_type") or "").strip().upper()
+
+    if not requested_code or requested_code.upper() == "AUTO":
+        _DEFAULT_STARTING_CODES = {
+            "ASSET": "1500",
+            "LIABILITY": "2100",
+            "EQUITY": "3100",
+            "REVENUE": "4100",
+            "EXPENSE": "6100",
+        }
+        requested_code = _DEFAULT_STARTING_CODES.get(_child_type, "6100")
+        kw["code"] = requested_code
+
+    if not kw.get("normal_balance") and _child_type in _NORMAL_BY_TYPE:
+        kw["normal_balance"] = _NORMAL_BY_TYPE[_child_type]
 
 
 
@@ -3967,6 +3989,17 @@ async def _get_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
 async def _create_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
 
     try:
+        if "name" in kw and "full_name" not in kw:
+            kw["full_name"] = kw.pop("name")
+        if "employee_name" in kw and "full_name" not in kw:
+            kw["full_name"] = kw.pop("employee_name")
+        if "salary" in kw and "basic_salary" not in kw:
+            kw["basic_salary"] = kw.pop("salary")
+        if "date_of_joining" not in kw:
+            from datetime import date
+            kw["date_of_joining"] = date.today().isoformat()
+        if "basic_salary" not in kw:
+            kw["basic_salary"] = 0.0
 
         data = await employee_service.create(organization_id, **kw)
 
@@ -4636,6 +4669,11 @@ async def _search_product(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _create_product(organization_id: uuid.UUID, **kw) -> ToolResult:
 
+    if "sales_price" in kw and "unit_price" not in kw:
+        kw["unit_price"] = kw.pop("sales_price")
+    if "product_name" in kw and "name" not in kw:
+        kw["name"] = kw.pop("product_name")
+
     data = await product_service.create(organization_id, **kw)
 
     return ToolResult(tool_name="create_product", success=True, data=data)
@@ -4651,6 +4689,11 @@ async def _search_service(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 async def _create_service(organization_id: uuid.UUID, **kw) -> ToolResult:
+
+    if "sales_price" in kw and "standard_rate" not in kw:
+        kw["standard_rate"] = kw.pop("sales_price")
+    if "service_name" in kw and "name" not in kw:
+        kw["name"] = kw.pop("service_name")
 
     data = await service_service.create(organization_id, **kw)
 

@@ -168,6 +168,16 @@ _FAST_PATH_INTENTS = {
 
     "create_purchase_return",   # resolved supplier return -> debit note
 
+    # Master data / Setup and Operational intents across all ERP modules
+    "create_account",
+    "get_chart_of_accounts",
+    "create_customer",
+    "create_supplier",
+    "create_product",
+    "create_service",
+    "create_bank_account",
+    "create_employee",
+    "create_project",
 }
 
 
@@ -2617,6 +2627,98 @@ async def _deterministic_mutation_calls(
             organization_id, entities
 
         )
+
+    # Master data / Setup and Operational fast-path calls across all ERP modules
+    if execution_plan.intent == "create_account":
+        acct_name = entities.get("account_name") or entities.get("name")
+        acct_type = entities.get("account_type")
+        if acct_name and acct_type:
+            args: Dict[str, Any] = {
+                "name": str(acct_name).strip(),
+                "account_type": str(acct_type).strip().upper(),
+            }
+            if entities.get("code") or entities.get("account_code"):
+                args["code"] = str(entities.get("code") or entities.get("account_code")).strip()
+            if entities.get("parent_account_name"):
+                args["parent_account_name"] = str(entities.get("parent_account_name")).strip()
+            return [ToolCall(tool_name="create_account", arguments=args)]
+
+    if execution_plan.intent == "get_chart_of_accounts":
+        args = {}
+        if entities.get("account_type"):
+            args["account_type"] = str(entities["account_type"]).strip().upper()
+        return [ToolCall(tool_name="get_chart_of_accounts", arguments=args)]
+
+    if execution_plan.intent == "create_customer":
+        cust_name = entities.get("customer_name") or entities.get("name")
+        if cust_name:
+            args = {"name": str(cust_name).strip()}
+            for f in ("email", "phone", "tax_number", "notes"):
+                if entities.get(f):
+                    args[f] = entities[f]
+            return [ToolCall(tool_name="create_customer", arguments=args)]
+
+    if execution_plan.intent == "create_supplier":
+        supp_name = entities.get("supplier_name") or entities.get("name")
+        if supp_name:
+            args = {"name": str(supp_name).strip()}
+            for f in ("email", "phone", "tax_number", "notes"):
+                if entities.get(f):
+                    args[f] = entities[f]
+            return [ToolCall(tool_name="create_supplier", arguments=args)]
+
+    if execution_plan.intent == "create_product":
+        p_name = entities.get("product_name") or entities.get("name")
+        price = entities.get("sales_price") or entities.get("unit_price")
+        if p_name:
+            args = {
+                "name": str(p_name).strip(),
+                "unit_price": float(price) if price is not None else 0.0,
+            }
+            if entities.get("is_stock_tracked") is not None:
+                args["is_stock_tracked"] = bool(entities["is_stock_tracked"])
+            if entities.get("cost_price") is not None:
+                args["cost_price"] = float(entities["cost_price"])
+            return [ToolCall(tool_name="create_product", arguments=args)]
+
+    if execution_plan.intent == "create_service":
+        s_name = entities.get("service_name") or entities.get("name")
+        rate = entities.get("sales_price") or entities.get("standard_rate")
+        if s_name:
+            args = {
+                "name": str(s_name).strip(),
+                "standard_rate": float(rate) if rate is not None else 0.0,
+            }
+            return [ToolCall(tool_name="create_service", arguments=args)]
+
+    if execution_plan.intent == "create_bank_account":
+        bank_name = entities.get("bank_name")
+        acct_name = entities.get("account_name") or entities.get("name")
+        if bank_name and acct_name:
+            args = {
+                "bank_name": str(bank_name).strip(),
+                "account_name": str(acct_name).strip(),
+            }
+            if entities.get("account_number"):
+                args["account_number_masked"] = str(entities["account_number"]).strip()
+            return [ToolCall(tool_name="create_bank_account", arguments=args)]
+
+    if execution_plan.intent == "create_employee":
+        emp_name = entities.get("employee_name") or entities.get("name") or entities.get("full_name")
+        if emp_name:
+            args = {
+                "full_name": str(emp_name).strip(),
+                "basic_salary": float(entities.get("salary") or entities.get("amount") or 0.0),
+            }
+            return [ToolCall(tool_name="create_employee", arguments=args)]
+
+    if execution_plan.intent == "create_project":
+        proj_name = entities.get("project_name") or entities.get("name")
+        if proj_name:
+            args = {"name": str(proj_name).strip()}
+            if entities.get("budget") or entities.get("amount"):
+                args["budget"] = float(entities.get("budget") or entities.get("amount"))
+            return [ToolCall(tool_name="create_project", arguments=args)]
 
     if execution_plan.intent in ("create_invoice", "record_credit_sale"):
 
@@ -6578,70 +6680,58 @@ async def execute(
 
         # unchanged; the audit step is logged only when the model was asked.
 
-        try:
+        if not clarification_history:
+            try:
+                from app.llm_extraction import enrich_preliminary as _enrich_prelim
 
-            from app.llm_extraction import enrich_preliminary as _enrich_prelim
-
-
-
-            _preliminary, _prelim_audit = await _enrich_prelim(
-
-                user_message=user_message, preliminary=_preliminary,
-
-                org_context=_profile_block,
-
-            )
-
-            if _prelim_audit.get("llm") not in (None, "skipped_disabled"):
-
-                await _log_step(session_id, "LITERAL_ENRICHMENT", _prelim_audit)
-
-        except Exception as exc:  # noqa: BLE001 — enrichment never breaks a turn
-
-            log.warning(
-
-                "agent.preliminary_enrichment_failed", error=str(exc)[:200]
-
-            )
-
+                _preliminary, _prelim_audit = await _enrich_prelim(
+                    user_message=user_message, preliminary=_preliminary,
+                    org_context=_profile_block,
+                )
+                if _prelim_audit.get("llm") not in (None, "skipped_disabled"):
+                    await _log_step(session_id, "LITERAL_ENRICHMENT", _prelim_audit)
+            except Exception as exc:  # noqa: BLE001 — enrichment never breaks a turn
+                log.warning(
+                    "agent.preliminary_enrichment_failed", error=str(exc)[:200]
+                )
         await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
-
-
         # ---- ROUTING + ANALYTICS AGENT (flag-gated) ------------------------
-
         # LLM-FIRST: EVERY message goes through a short bounded routing call
-
         # that decides "analytics" (answer from existing data, READ-ONLY) vs
-
         # "record" (identify nature/accounts and record a transaction ->
-
         # the unchanged pipeline below). The deterministic question/imperative
-
         # gate is the FALLBACK when routing is off or the provider fails, so
-
         # routing can never block a turn. Never raises; no answer falls
-
         # through to the normal pipeline.
-
         try:
-
             from app.analytics_agent import (
-
                 answer_analytics_question as _analytics_answer,
-
                 render_markdown as _analytics_render,
-
                 route_message as _route_message,
-
             )
 
-
-
-            _route, _route_audit = await _route_message(question=user_message)
+            _prov_intent = (_preliminary or {}).get("provisional_intent_hint") or ""
+            _is_op_task = (
+                _prov_intent in (
+                    "create_account", "get_chart_of_accounts", "create_customer",
+                    "create_supplier", "create_product", "create_service",
+                    "create_bank_account", "create_employee", "create_project",
+                    "create_recurring_template"
+                )
+                or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
+            )
+            if clarification_history or _is_op_task:
+                _route = "record"
+                _route_audit = {
+                    "source": "clarification_fast_path" if clarification_history else "operational_fast_path",
+                    "route": "record",
+                    "confidence": 1.0,
+                }
+            else:
+                _route, _route_audit = await _route_message(question=user_message)
 
             if _route_audit.get("source") != "fallback_gate":
-
                 await _log_step(session_id, "ROUTING", _route_audit)
 
             if _route == "clarify":
@@ -6918,14 +7008,22 @@ async def execute(
 
         # already confirmed.  Skipped entirely on approved turns.
 
+        _prov_hint = (_preliminary or {}).get("provisional_intent_hint") or ""
+        _is_operational = (
+            _prov_hint in (
+                "create_account", "get_chart_of_accounts", "create_customer",
+                "create_supplier", "create_product", "create_service",
+                "create_bank_account", "create_employee", "create_project",
+                "create_recurring_template"
+            )
+            or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
+        )
+
         if (
-
             getattr(_settings, "accounting_reasoning_enabled", False)
-
             and not _split_batch_now(user_message)
-
             and approved_tool_calls is None
-
+            and not _is_operational
         ):
 
             # The model may only propose names from the TRUSTED registry, so it
@@ -13143,6 +13241,12 @@ async def execute(
 
 
         result_summary = llm_text or execution_plan.expected_outcome or "Operation completed."
+
+        from app.erp_endpoints import is_operational_task, format_operational_summary
+        if is_operational_task(execution_plan.intent) and successful_results:
+            primary_data = getattr(successful_results[-1], "data", {}) or {}
+            if isinstance(primary_data, dict):
+                result_summary = format_operational_summary(execution_plan.intent, primary_data)
 
         if not verified and _primary_mutation_failed(
 

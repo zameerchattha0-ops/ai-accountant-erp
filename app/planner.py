@@ -513,6 +513,32 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("register_fixed_asset", [r"fixed asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset", r"new.*(?:machinery|generator|delivery van|forklift)"]),
 
+    # Master data / Setup & Configuration intents across all ERP modules
+    ("create_account", [
+        r"(?:create|add|new|setup|open)\b[^.\n]*\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b",
+        r"\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b[^.\n]*\b(?:create|add|new|setup|open)\b",
+        r"\bnew\s+(?:account|ledger)\b",
+    ]),
+    ("get_chart_of_accounts", [
+        r"(?:show|view|list|get|display|fetch|see)\b[^.\n]*\bchart\s+of\s+accounts?\b",
+        r"\bchart\s+of\s+accounts?\b[^.\n]*\b(?:list|summary|view|overview)\b",
+    ]),
+    ("create_customer", [
+        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:customer|client|buyer)\b",
+        r"\bnew\s+(?:customer|client|buyer)\b",
+    ]),
+    ("create_supplier", [
+        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:supplier|vendor|seller)\b",
+        r"\bnew\s+(?:supplier|vendor|seller)\b",
+    ]),
+    ("create_employee", [
+        r"(?:create|add|new|register|hire|onboard)\b[^.\n]*\b(?:employee|staff|worker)\b",
+        r"\bnew\s+(?:employee|staff|worker)\b",
+    ]),
+    ("create_recurring_template", [
+        r"(?:create|add|new|setup)\s+(?:a\s+)?recurring\b",
+    ]),
+
     ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
     ("update_product", [r"update.*product", r"edit.*product", r"change.*product", r"update.*item.*price"]),
     ("delete_service", [r"delete.*service", r"remove.*service"]),
@@ -633,6 +659,10 @@ _SEMANTIC_INTENTS = frozenset({
 
     "record_expense_payment",
 
+    # Master data / Setup and Operational intents across all ERP modules
+    "create_account", "get_chart_of_accounts", "create_customer", "create_supplier",
+    "create_product", "create_service", "create_employee", "create_project",
+    "create_recurring_template",
 })
 
 
@@ -1846,6 +1876,38 @@ def plan(
         if m and m.group(1).strip():
 
             entities["project_name"] = m.group(1).strip()
+
+    # Master data / Setup operational entity integration (LLM-Authoritative)
+    # The intelligent LLM perception stage (app/entity_segregation.py & app/llm_extraction.py)
+    # extracts names, counterparties, banks, employees, and accounts with full natural-language
+    # context. Quoted literals in the user message serve only as a minimal fallback.
+    if prefill_entities:
+        for _k in (
+            "account_name", "account_type", "code", "account_code",
+            "parent_account_name", "product_name", "service_name", "sales_price",
+            "bank_name", "employee_name", "project_name", "customer_name", "supplier_name"
+        ):
+            if prefill_entities.get(_k) is not None:
+                entities.setdefault(_k, prefill_entities[_k])
+
+    if intent in ("create_account", "create_customer", "create_supplier", "create_product", "create_service", "create_employee", "create_project"):
+        target_name_key = {
+            "create_account": "account_name",
+            "create_customer": "customer_name",
+            "create_supplier": "supplier_name",
+            "create_product": "product_name",
+            "create_service": "service_name",
+            "create_employee": "employee_name",
+            "create_project": "project_name",
+        }.get(intent)
+        if target_name_key and not entities.get(target_name_key):
+            q_m = re.search(r"['\"]([^'\"]+)['\"]", msg)
+            if q_m:
+                entities[target_name_key] = q_m.group(1).strip()
+            elif intent == "create_account":
+                m = re.search(r"\b(?:for|called|named)\s+([^,.!?;]+?)(?=\s+(?:under|with|code|parent|in\s+category)\b|[,.!?;]|$)", msg, re.IGNORECASE)
+                if m and m.group(1).strip().lower() not in ("chart of account", "chart of accounts", "account", "ledger"):
+                    entities["account_name"] = m.group(1).strip()
 
 
 
@@ -3215,6 +3277,22 @@ _FIELD_QUESTION = {
 
     "salvage_value": QUESTION_BANK["salvage_value"].question,
 
+    # Master data / Setup and Operational field questions
+    "account_name": "What is the name of the new account you want to create in the Chart of Accounts?",
+    "account_type": (
+        "What type of account is this in the Chart of Accounts? "
+        "Reply with ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE."
+    ),
+    "account_code": (
+        "What account code should be assigned? (Or reply AUTO to automatically "
+        "assign the next available code in this category)."
+    ),
+    "product_name": "What is the name of the product you want to add to the catalogue?",
+    "service_name": "What is the name of the service you want to add to the catalogue?",
+    "sales_price": "What is the selling / sales price for this item?",
+    "bank_name": "What is the name of the bank (e.g. Meezan Bank, HBL, Standard Chartered)?",
+    "employee_name": "What is the full name of the employee to register?",
+    "project_name": "What is the name of the project to set up?",
 }
 
 
@@ -3340,6 +3418,8 @@ def _questions_for_fields(
                 )
             else:
                 questions.append(_FIELD_QUESTION[f])
+        elif f == "account_name" and intent == "create_bank_account":
+            questions.append("What is the account title or name for this bank account (e.g. Current Account, Operations)?")
         else:
             questions.append(_FIELD_QUESTION[f])
 
@@ -3859,6 +3939,40 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
         # derives <STEM>-### when it is absent.
 
         missing.append("project_name")
+
+    # Master data / Setup tasks: Anti-Blind-Assumption Guard
+    if intent == "create_account":
+        if not (entities.get("account_name") or entities.get("name")):
+            missing.append("account_name")
+        if not entities.get("account_type"):
+            missing.append("account_type")
+
+    if intent == "create_customer" and not (entities.get("customer_name") or entities.get("name")):
+        missing.append("customer_name")
+
+    if intent == "create_supplier" and not (entities.get("supplier_name") or entities.get("name")):
+        missing.append("supplier_name")
+
+    if intent == "create_product":
+        if not (entities.get("product_name") or entities.get("name")):
+            missing.append("product_name")
+        if entities.get("sales_price") is None and entities.get("unit_price") is None:
+            missing.append("sales_price")
+
+    if intent == "create_service":
+        if not (entities.get("service_name") or entities.get("name")):
+            missing.append("service_name")
+        if entities.get("sales_price") is None and entities.get("standard_rate") is None:
+            missing.append("sales_price")
+
+    if intent == "create_bank_account":
+        if not entities.get("bank_name"):
+            missing.append("bank_name")
+        if not (entities.get("account_name") or entities.get("name")):
+            missing.append("account_name")
+
+    if intent == "create_employee" and not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
+        missing.append("employee_name")
 
 
 
@@ -4907,6 +5021,12 @@ def _merge_clarification_answers(
         # chain below (never guessed).
 
         field_tag = str(qa.get("field") or "").strip()
+        if not field_tag and qa.get("required_information"):
+            req_info = qa.get("required_information")
+            if isinstance(req_info, list) and len(req_info) == 1:
+                field_tag = str(req_info[0]).strip()
+            elif isinstance(req_info, str):
+                field_tag = req_info.strip()
 
         if field_tag and _merge_field_answer(
 
@@ -4914,6 +5034,15 @@ def _merge_clarification_answers(
 
         ):
 
+            continue
+
+        if "type of account" in question or "account type" in question:
+            for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+                if t.lower() in answer.lower():
+                    merged["account_type"] = t
+                    break
+            else:
+                merged["account_type"] = answer.strip().upper()
             continue
 
 
@@ -5969,6 +6098,40 @@ def _merge_field_answer(
             merged["line_items"] = answer["line_items"]
             merged["amount"] = answer.get("total_amount") or _line_items_total(answer["line_items"])
             return True
+
+    # Master data / Setup and Operational field routing
+    if field == "account_type":
+        for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+            if t.lower() in low:
+                merged["account_type"] = t
+                return True
+        merged["account_type"] = value.upper()
+        return True
+
+    if field in ("account_name", "product_name", "service_name", "employee_name", "bank_name", "project_name"):
+        merged[field] = value.strip(" '\"")
+        return True
+
+    if field in ("sales_price", "unit_price"):
+        amt = _parse_bare_amount(value)
+        if amt is not None:
+            merged[field] = amt
+            merged["sales_price"] = amt
+            merged["unit_price"] = amt
+            return True
+        try:
+            val_f = float(re.sub(r"[^\d.]", "", value))
+            merged[field] = val_f
+            merged["sales_price"] = val_f
+            merged["unit_price"] = val_f
+            return True
+        except ValueError:
+            return False
+
+    if field in ("account_code", "code"):
+        merged["code"] = value.strip(" '\"")
+        merged["account_code"] = value.strip(" '\"")
+        return True
 
     if field == "transaction_date":
 
@@ -7819,6 +7982,12 @@ def _tools_for_intent(intent: str) -> List[str]:
         "create_service": ["search_service", "create_service"],
 
         "create_project": ["search_customer", "create_project"],
+        "create_account": ["search_account", "create_account"],
+        "get_chart_of_accounts": ["get_chart_of_accounts", "search_account"],
+        "create_customer": ["search_customer", "create_customer"],
+        "create_supplier": ["search_supplier", "create_supplier"],
+        "create_employee": ["search_employee", "create_employee"],
+        "create_recurring_template": ["create_recurring_template", "get_recurring_templates"],
 
         # Loans (LLM-delegated route): the service builds the schedule and
 
@@ -8010,6 +8179,13 @@ def _outcome(intent: str) -> str:
         "create_service": "Service added to the catalog",
 
         "create_project": "Project created",
+        "create_account": "Account created in the Chart of Accounts",
+        "get_chart_of_accounts": "Chart of Accounts retrieved",
+        "create_customer": "Customer registered in CRM directory",
+        "create_supplier": "Supplier registered in vendor directory",
+        "create_employee": "Employee registered in personnel roster",
+        "create_bank_account": "Bank account configured",
+        "create_recurring_template": "Recurring template created",
 
         "create_bank_account": "Bank account created with linked GL account",
 

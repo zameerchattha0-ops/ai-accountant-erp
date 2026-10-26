@@ -1022,6 +1022,14 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
     renders these as chips (label shown, value sent); its hardcoded
     field-name switch remains the offline fallback."""
     q = (question or "").lower()
+    if "chart of accounts" in q and ("type of account" in q or "account type" in q):
+        return [
+            {"value": "EXPENSE", "label": "Expense"},
+            {"value": "ASSET", "label": "Asset"},
+            {"value": "LIABILITY", "label": "Liability"},
+            {"value": "REVENUE", "label": "Revenue"},
+            {"value": "EQUITY", "label": "Equity"},
+        ]
     # CONFIGURATION GAP — account-creation confirmation: one-tap YES
     # creates the proposed account, NO keeps the entry open for the user
     # to name (or tap) an existing account.

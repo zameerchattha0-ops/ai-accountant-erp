@@ -58,7 +58,7 @@ _INSTRUCTION = (
     '"provisional_intent_hint": "<canonical intent or null>", '
     '"candidate_subject_areas": ["<one of: fixed_assets,revenue,'
     'receivables,payables,expenses,purchases,loans,equity,tax,bank,cash>", '
-    '..., "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null} RULES: extract ONLY values the user LITERALLY stated; null when '
+    '..., "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null, "account_name": "<string>"|null, "account_type": "<ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE>"|null, "account_code": "<string>"|null, "parent_account_name": "<string>"|null, "product_name": "<string>"|null, "service_name": "<string>"|null, "sales_price": <number|null>, "bank_name": "<string>"|null, "employee_name": "<string>"|null, "project_name": "<string>"|null} RULES: extract ONLY values the user LITERALLY stated; null when '
     'absent; NEVER infer, compute, or guess (e.g. no quantity unless '
     'stated); NEVER decide accounting treatment or accounts; keep the '
     "request's own wording for items and parties. PARTY vs ITEM (critical): "
@@ -74,7 +74,11 @@ _INSTRUCTION = (
     "description, quantity (as a number, e.g. 2, 3), unit_price (if stated, else null), and total_amount (if stated, else null). "
     "Also set item_description to a summary such as 'tables / chairs'. "
     "reason is the user's own stated cause for a return ('damaged', "
-    "'wrong item delivered'), null when not stated."
+    "'wrong item delivered'), null when not stated. "
+    "ERP OPERATIONS & SETUP: For tasks across ERP modules, intelligently extract the exact names stated by the user: "
+    "account_name (Chart of Accounts ledger title), account_type (ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE if stated or clear), "
+    "account_code (numeric code), parent_account_name (heading/grouping), product_name / service_name, sales_price, "
+    "bank_name (e.g. Meezan Bank, HBL), employee_name (personnel full name), project_name (project title). null when absent."
 )
 
 # Pronouns / fillers that are never a business counterparty (mirrors the
@@ -225,6 +229,33 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
             valid_lines.append(clean_item)
         if valid_lines:
             clean["line_items"] = valid_lines
+    for str_key in (
+        "account_name", "account_code", "parent_account_name",
+        "product_name", "service_name", "bank_name", "employee_name",
+        "project_name", "template_name",
+    ):
+        v = payload.get(str_key)
+        if v is not None and str(v).strip():
+            clean[str_key] = str(v).strip()[:120]
+
+    raw_acct_type = payload.get("account_type")
+    if raw_acct_type is not None:
+        at = str(raw_acct_type).strip().upper()
+        if at in ("ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"):
+            clean["account_type"] = at
+        elif "EXPENSE" in at:
+            clean["account_type"] = "EXPENSE"
+        elif "ASSET" in at:
+            clean["account_type"] = "ASSET"
+        elif "LIABILIT" in at:
+            clean["account_type"] = "LIABILITY"
+        elif "REVENUE" in at or "INCOME" in at:
+            clean["account_type"] = "REVENUE"
+        elif "EQUITY" in at:
+            clean["account_type"] = "EQUITY"
+
+    _num("sales_price")
+
     return clean, failures
 
 
@@ -356,7 +387,11 @@ async def enrich_preliminary(
     # Party (supplier/customer) is LLM-authoritative and is written straight
     # into the literals so the prefill -> planner path can carry it to the
     # party gate (which grounds it against the live master).
-    for key in ("supplier_name", "customer_name"):
+    for key in (
+        "supplier_name", "customer_name", "account_name", "account_type",
+        "account_code", "parent_account_name", "product_name", "service_name",
+        "sales_price", "bank_name", "employee_name", "project_name", "template_name",
+    ):
         if key in clean and clean[key]:
             prior = literals.get(key)
             literals[key] = clean[key]
