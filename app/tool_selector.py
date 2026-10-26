@@ -102,7 +102,11 @@ _INTENT_TOOLS: dict[str, set[str]] = {
         "prepare_journal", "validate_journal", "post_journal",
     },
     "create_product": {"create_product"},
+    "update_product": {"update_product", "search_product"},
+    "delete_product": {"delete_product", "search_product"},
     "create_service": {"create_service"},
+    "update_service": {"update_service", "search_service"},
+    "delete_service": {"delete_service", "search_service"},
     # Projects: a non-financial record, so no journal helper and no
     # confirmation gate — but it needs its OWN intent, otherwise the request
     # fell through to intent=unknown, no field ladder existed, and the model

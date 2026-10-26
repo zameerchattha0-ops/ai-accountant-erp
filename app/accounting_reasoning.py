@@ -233,6 +233,9 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
     "supplier_name": null,
     "customer_name": null,
     "quantity": null,
+    "line_items": [
+      {"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}
+    ],
     "payment_method": "CASH|BANK|CREDIT",
     "settlement_position": "PAID_NOW|ON_CREDIT|SETTLE_EXISTING_PAYABLE|SETTLE_EXISTING_RECEIVABLE",
     "account_name": null,
@@ -1027,6 +1030,43 @@ def _clean_entities(raw: Any) -> Dict[str, Any]:
             out["quantity"] = int(q_val) if q_val.is_integer() else q_val
         except (ValueError, TypeError):
             pass
+
+    raw_lines = raw.get("line_items")
+    if isinstance(raw_lines, list) and raw_lines:
+        clean_lines = []
+        for itm in raw_lines:
+            if not isinstance(itm, dict):
+                continue
+            desc = str(itm.get("description") or itm.get("product_name") or itm.get("name") or "").strip()
+            if not desc:
+                continue
+            entry: Dict[str, Any] = {"description": desc[:120]}
+            qty_val = itm.get("quantity")
+            if qty_val is not None:
+                try:
+                    q = float(qty_val)
+                    entry["quantity"] = int(q) if q.is_integer() else q
+                except (ValueError, TypeError):
+                    pass
+            unit_p = itm.get("unit_price") or itm.get("price") or itm.get("rate")
+            if unit_p is not None:
+                try:
+                    p = float(unit_p)
+                    if p >= 0:
+                        entry["unit_price"] = p
+                except (ValueError, TypeError):
+                    pass
+            tot_a = itm.get("total_amount") or itm.get("total") or itm.get("amount")
+            if tot_a is not None:
+                try:
+                    t = float(tot_a)
+                    if t >= 0:
+                        entry["total_amount"] = t
+                except (ValueError, TypeError):
+                    pass
+            clean_lines.append(entry)
+        if clean_lines:
+            out["line_items"] = clean_lines
 
     # Ensure transaction_purpose has a fallback from item_description if absent
     if "item_description" in out and "transaction_purpose" not in out:

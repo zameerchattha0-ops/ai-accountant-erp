@@ -5198,7 +5198,7 @@ def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
 
         "transaction_purpose", "supplier_name", "customer_name",
 
-        "quantity", "payment_method", "settlement_position", "account_name",
+        "quantity", "payment_method", "settlement_position", "account_name", "line_items",
 
     ):
 
@@ -13650,7 +13650,7 @@ async def resume_with_clarification(
 
     try:
 
-        from app.answer_parsing import parse_packed_reply_to_endpoints
+        from app.answer_parsing import parse_packed_reply_to_endpoints, parse_line_items_reply_with_llm
 
         latest_question = ""
 
@@ -13686,6 +13686,26 @@ async def resume_with_clarification(
 
             )
 
+            # Multi-item line pricing resolution via LLM
+            _existing_li = (_preliminary or {}).get('literals', {}).get('line_items')
+            if not _existing_li and history:
+                for _h in reversed(history):
+                    if _h.get('field') == 'line_items' and isinstance(_h.get('answer'), list):
+                        _existing_li = _h['answer']
+                        break
+            _multi_reply_text = str(parsed_endpoints.get('line_items') or parsed_endpoints.get('amount') or answer).strip()
+            if _existing_li or any(_w in _multi_reply_text.lower() for _w in [' each', ' total', ' and ', ' chairs', ' tables', ' units', ' pcs', ' per ']):
+                _parsed_multi = await parse_line_items_reply_with_llm(
+                    user_reply=_multi_reply_text,
+                    existing_items=_existing_li,
+                    client=questionnaire_client,
+                )
+                if _parsed_multi and _parsed_multi.get('line_items'):
+                    history = [
+                        *history,
+                        {'field': 'line_items', 'question': 'line_items', 'answer': _parsed_multi['line_items']},
+                        {'field': 'amount', 'question': 'amount', 'answer': str(_parsed_multi.get('total_amount', ''))},
+                    ]
             if parsed_endpoints:
 
                 for f_name, f_val in parsed_endpoints.items():

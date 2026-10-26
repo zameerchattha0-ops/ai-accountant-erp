@@ -344,3 +344,88 @@ async def find_or_create_catalogue_product(
         )
         return None
 
+
+
+
+async def get_product_unit_tracing(
+    organization_id: uuid.UUID,
+    *,
+    product_id: Optional[uuid.UUID] = None,
+    fiscal_year_start: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Calculate the unit tracing breakdown for products:
+    Closing Stock (t0) = Opening Stock + Purchased (Inward) - Sold (Outward).
+    """
+    filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+    if product_id:
+        filters["product_id"] = str(product_id)
+
+    movements = await fetch_many(
+        "inventory_movements",
+        filters=filters,
+        order_by="movement_date asc, created_at asc",
+        limit=5000,
+    )
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for m in movements:
+        pid = str(m.get("product_id"))
+        if pid not in results:
+            results[pid] = {
+                "opening_quantity": 0.0,
+                "purchased_quantity": 0.0,
+                "sold_quantity": 0.0,
+                "closing_quantity": 0.0,
+                "total_cost": 0.0,
+                "average_cost": 0.0,
+                "valuation": 0.0,
+            }
+        direction = str(m.get("direction") or "").upper()
+        source_type = str(m.get("source_type") or "").lower()
+        qty = float(m.get("quantity") or 0.0)
+        unit_cost = float(m.get("unit_cost") or 0.0)
+        m_date = str(m.get("movement_date") or "")
+
+        is_opening = source_type in ("opening_stock", "opening") or (
+            fiscal_year_start and m_date and m_date < fiscal_year_start
+        )
+
+        if is_opening:
+            results[pid]["opening_quantity"] += qty
+            results[pid]["total_cost"] += (qty * unit_cost)
+        elif direction == "RECEIPT":
+            results[pid]["purchased_quantity"] += qty
+            results[pid]["total_cost"] += (qty * unit_cost)
+        elif direction == "ISSUE":
+            results[pid]["sold_quantity"] += qty
+
+    for pid, data in results.items():
+        data["closing_quantity"] = (
+            data["opening_quantity"] + data["purchased_quantity"] - data["sold_quantity"]
+        )
+        total_inward = data["opening_quantity"] + data["purchased_quantity"]
+        if total_inward > 0 and data["total_cost"] > 0:
+            data["average_cost"] = data["total_cost"] / total_inward
+        else:
+            data["average_cost"] = 0.0
+        data["valuation"] = max(0.0, data["closing_quantity"]) * data["average_cost"]
+
+    return results
+
+
+async def get_product_movements(
+    organization_id: uuid.UUID,
+    *,
+    product_id: uuid.UUID,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return chronological stock movements for product tracing."""
+    return await fetch_many(
+        "inventory_movements",
+        filters={
+            "organization_id": str(organization_id),
+            "product_id": str(product_id),
+        },
+        order_by="movement_date desc, created_at desc",
+        limit=limit,
+    )

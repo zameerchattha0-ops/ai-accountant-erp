@@ -58,7 +58,7 @@ _INSTRUCTION = (
     '"provisional_intent_hint": "<canonical intent or null>", '
     '"candidate_subject_areas": ["<one of: fixed_assets,revenue,'
     'receivables,payables,expenses,purchases,loans,equity,tax,bank,cash>", '
-    '...]} RULES: extract ONLY values the user LITERALLY stated; null when '
+    '..., "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null} RULES: extract ONLY values the user LITERALLY stated; null when '
     'absent; NEVER infer, compute, or guess (e.g. no quantity unless '
     'stated); NEVER decide accounting treatment or accounts; keep the '
     "request's own wording for items and parties. PARTY vs ITEM (critical): "
@@ -68,6 +68,11 @@ _INSTRUCTION = (
     "NEVER part of item_description. item_description is only the GOODS "
     "(e.g. 'return to umer autos against damaged motorbikes' -> "
     "supplier_name='umer autos', item_description='damaged motorbikes'). "
+    "MULTI-ITEM EXTRACTION (CRITICAL): When a request mentions multiple items or goods "
+    "(e.g. '2 tables and 3 chairs from Shabbir Furnitures', '5 laptops at 100000 and 10 keyboards at 2000', "
+    "'bought cement bags and steel rods'), extract each distinct item as an object in 'line_items' with "
+    "description, quantity (as a number, e.g. 2, 3), unit_price (if stated, else null), and total_amount (if stated, else null). "
+    "Also set item_description to a summary such as 'tables / chairs'. "
     "reason is the user's own stated cause for a return ('damaged', "
     "'wrong item delivered'), null when not stated."
 )
@@ -188,6 +193,38 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
         kept_areas = [str(a).strip() for a in areas if str(a).strip() in _AREAS]
         if kept_areas:
             clean["candidate_subject_areas"] = kept_areas[:4]
+    raw_lines = payload.get("line_items")
+    if isinstance(raw_lines, list) and raw_lines:
+        valid_lines = []
+        for itm in raw_lines:
+            if not isinstance(itm, dict):
+                continue
+            desc = str(itm.get("description") or "").strip()
+            if not desc:
+                continue
+            clean_item: Dict[str, Any] = {"description": desc[:120]}
+            qty = itm.get("quantity")
+            if qty is not None:
+                try:
+                    q_num = float(qty)
+                    clean_item["quantity"] = int(q_num) if q_num.is_integer() else q_num
+                except (ValueError, TypeError):
+                    pass
+            unit_price = itm.get("unit_price")
+            if unit_price is not None:
+                try:
+                    clean_item["unit_price"] = float(unit_price)
+                except (ValueError, TypeError):
+                    pass
+            total_amt = itm.get("total_amount")
+            if total_amt is not None:
+                try:
+                    clean_item["total_amount"] = float(total_amt)
+                except (ValueError, TypeError):
+                    pass
+            valid_lines.append(clean_item)
+        if valid_lines:
+            clean["line_items"] = valid_lines
     return clean, failures
 
 
@@ -299,6 +336,13 @@ async def enrich_preliminary(
             filled.append(key)
 
     # --- LLM-authoritative: model wins, regex is the fallback ---
+    if "line_items" in clean and clean["line_items"]:
+        prior_lines = literals.get("line_items")
+        literals["line_items"] = clean["line_items"]
+        if not prior_lines:
+            filled.append("line_items")
+        elif prior_lines != clean["line_items"]:
+            overridden.append("line_items")
     for key in ("item_description", "quantity", "reason"):
         if key not in clean:
             continue

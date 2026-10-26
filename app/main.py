@@ -1527,21 +1527,37 @@ async def _catalogue_list(table: str, auth: AuthContext, query: str, status: str
         # fabricated number.  This is additive and never blocks the list.
         from app.services import inventory_service
         try:
-            _ids = [uuid.UUID(str(r["id"])) for r in rows if r.get("id")]
-            positions = await inventory_service.positions_for_products(
-                auth.organization_id, product_ids=_ids
+            tracing_map = await inventory_service.get_product_unit_tracing(
+                auth.organization_id
             )
-        except Exception as exc:  # noqa: BLE001 — units are additive, never fatal
-            log.warning("api.catalogue.stock_lookup_failed", error=str(exc)[:200])
-            positions = {}
+        except Exception as exc:  # noqa: BLE001 — tracing is additive, never fatal
+            log.warning("api.catalogue.tracing_lookup_failed", error=str(exc)[:200])
+            tracing_map = {}
         for r in rows:
-            pos = positions.get(str(r.get("id")))
-            if pos is None:
-                # No ledger row: a stock-tracked item with no movements is 0;
-                # a non-tracked item has no units concept at all (None).
-                r["quantity_on_hand"] = 0 if r.get("is_stock_tracked") else None
+            pid_str = str(r.get("id"))
+            tr = tracing_map.get(pid_str)
+            if r.get("is_stock_tracked"):
+                if tr:
+                    r["opening_quantity"] = tr["opening_quantity"]
+                    r["purchased_quantity"] = tr["purchased_quantity"]
+                    r["sold_quantity"] = tr["sold_quantity"]
+                    r["quantity_on_hand"] = tr["closing_quantity"]
+                    r["average_cost"] = tr["average_cost"]
+                    r["valuation"] = tr["valuation"]
+                else:
+                    r["opening_quantity"] = 0.0
+                    r["purchased_quantity"] = 0.0
+                    r["sold_quantity"] = 0.0
+                    r["quantity_on_hand"] = 0.0
+                    r["average_cost"] = float(r.get("cost_price") or 0.0)
+                    r["valuation"] = 0.0
             else:
-                r["quantity_on_hand"] = float(pos.get("quantity_on_hand") or 0)
+                r["opening_quantity"] = None
+                r["purchased_quantity"] = None
+                r["sold_quantity"] = None
+                r["quantity_on_hand"] = None
+                r["average_cost"] = None
+                r["valuation"] = None
     return {
         "items": rows,
         "counts": catalogue_rules.status_counts(rows),
@@ -1582,6 +1598,22 @@ async def create_product(
         )
     except ValueError as exc:
         raise _catalogue_error("products", exc)
+    if payload.get("is_stock_tracked") and payload.get("opening_stock") and not item.get("reused"):
+        try:
+            op_qty = float(payload["opening_stock"])
+            op_cost = float(payload.get("cost_price") or payload.get("unit_price") or 0.0)
+            if op_qty > 0:
+                from app.services import inventory_service
+                await inventory_service.receive_stock(
+                    auth.organization_id,
+                    product_id=uuid.UUID(str(item["id"])),
+                    quantity=op_qty,
+                    unit_cost=op_cost,
+                    source_type="opening_stock",
+                    description="Opening stock at initialization",
+                )
+        except Exception as op_err:
+            log.warning("catalogue.opening_stock_failed", error=str(op_err)[:200])
     return {"item": item, "reused": bool(item.get("reused"))}
 
 
@@ -1639,6 +1671,19 @@ async def delete_product(
 
 
 
+
+
+@app.get("/api/catalogue/products/{product_id}/movements")
+async def list_product_movements(
+    product_id: uuid.UUID,
+    limit: int = 100,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Chronological stock movements for product tracing."""
+    from app.services import inventory_service
+    return await inventory_service.get_product_movements(
+        auth.organization_id, product_id=product_id, limit=limit
+    )
 
 @app.get("/api/catalogue/services")
 async def list_catalogue_services(

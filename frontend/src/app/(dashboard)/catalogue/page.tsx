@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Search, Pencil, Trash2, Power, RefreshCw, Package, Wrench } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, Power, RefreshCw, Package, Wrench, History } from "lucide-react";
 import PageHeader from "@/components/shared/PageHeader";
 import Modal from "@/components/shared/Modal";
 import StatusBadge from "@/components/shared/StatusBadge";
@@ -15,8 +15,10 @@ import {
   catalogueList,
   catalogueSetActive,
   catalogueUpdate,
+  catalogueProductMovements,
   type CatalogueItem,
   type CatalogueKind,
+  type StockMovement,
 } from "@/lib/api/client";
 
 const inputCls =
@@ -38,6 +40,7 @@ interface ItemForm {
   // product
   unit: string;
   is_stock_tracked: boolean;
+  opening_stock: string;
   unit_price: string;
   cost_price: string;
   // service
@@ -48,7 +51,7 @@ interface ItemForm {
 
 const EMPTY_FORM: ItemForm = {
   name: "", description: "",
-  unit: "", is_stock_tracked: false, unit_price: "", cost_price: "",
+  unit: "", is_stock_tracked: false, opening_stock: "", unit_price: "", cost_price: "",
   billing_unit: "HOUR", standard_rate: "", cost_rate: "",
 };
 
@@ -81,7 +84,33 @@ export default function CataloguePage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const [confirmDelete, setConfirmDelete] = useState<CatalogueItem | null>(null);
+  const [movementItem, setMovementItem] = useState<CatalogueItem | null>(null);
+  const [movements, setMovements] = useState<StockMovement[] | null>(null);
+  const [loadingMovements, setLoadingMovements] = useState(false);
+
+  useEffect(() => {
+    if (!movementItem) {
+      setMovements(null);
+      return;
+    }
+    setLoadingMovements(true);
+    catalogueProductMovements(movementItem.id)
+      .then((data) => setMovements(data))
+      .catch(() => setMovements([]))
+      .finally(() => setLoadingMovements(false));
+  }, [movementItem]);
+
+  const totalValuation = useMemo(() => {
+    if (kind !== "products" || !items) return 0;
+    return items.reduce((sum, it) => sum + (it.valuation || 0), 0);
+  }, [kind, items]);
+
+  const totalStockUnits = useMemo(() => {
+    if (kind !== "products" || !items) return 0;
+    return items.reduce((sum, it) => sum + (it.quantity_on_hand || 0), 0);
+  }, [kind, items]);
+
+    const [confirmDelete, setConfirmDelete] = useState<CatalogueItem | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rowBusy, setRowBusy] = useState<string | null>(null);
 
@@ -146,6 +175,7 @@ export default function CataloguePage() {
       description: item.description ?? "",
       unit: item.unit ?? "",
       is_stock_tracked: Boolean(item.is_stock_tracked),
+      opening_stock: item.opening_quantity != null ? String(item.opening_quantity) : "",
       unit_price: item.unit_price != null ? String(item.unit_price) : "",
       cost_price: item.cost_price != null ? String(item.cost_price) : "",
       billing_unit: item.billing_unit ?? "HOUR",
@@ -168,6 +198,7 @@ export default function CataloguePage() {
             unit: form.unit.trim() || null,
             is_stock_tracked: form.is_stock_tracked,
             unit_price: form.unit_price === "" ? 0 : Number(form.unit_price),
+            ...(!editing && form.is_stock_tracked && form.opening_stock ? { opening_stock: Number(form.opening_stock) } : {}),
             cost_price: form.cost_price === "" ? null : Number(form.cost_price),
           }
         : {
@@ -299,11 +330,17 @@ export default function CataloguePage() {
       </div>
 
       {/* ---- status strip ------------------------------------------------ */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className={`grid gap-3 ${kind === "products" ? "grid-cols-2 sm:grid-cols-5" : "grid-cols-3"}`}>
         {[
-          { label: "Total", value: counts.total },
-          { label: "Active", value: counts.active },
-          { label: "Inactive", value: counts.inactive },
+          { label: `Total ${noun}s`, value: String(counts.total) },
+          { label: "Active", value: String(counts.active) },
+          { label: "Inactive", value: String(counts.inactive) },
+          ...(kind === "products"
+            ? [
+                { label: "Units on Hand (t₀)", value: String(totalStockUnits) },
+                { label: "Stock Valuation", value: formatCurrency(totalValuation, org?.base_currency_code) },
+              ]
+            : []),
         ].map((card) => (
           <div
             key={card.label}
@@ -378,9 +415,23 @@ export default function CataloguePage() {
                     {kind === "products" ? "Unit" : "Billed per"}
                   </th>
                   {kind === "products" && (
-                    <th className="px-4 py-3 font-medium text-right">
-                      Units available
-                    </th>
+                    <>
+                      <th className="px-3 py-3 font-medium text-right" title="Opening balance">
+                        Opening
+                      </th>
+                      <th className="px-3 py-3 font-medium text-right" title="Purchases during period">
+                        Inward (+)
+                      </th>
+                      <th className="px-3 py-3 font-medium text-right" title="Sales during period">
+                        Outward (-)
+                      </th>
+                      <th className="px-3 py-3 font-medium text-right" title="Closing stock position at t₀">
+                        Closing (t₀)
+                      </th>
+                      <th className="px-3 py-3 font-medium text-right" title="Closing valuation">
+                        Valuation
+                      </th>
+                    </>
                   )}
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="px-4 py-3 font-medium text-right">Actions</th>
@@ -419,33 +470,54 @@ export default function CataloguePage() {
                         : item.billing_unit || "—"}
                     </td>
                     {kind === "products" && (
-                      <td className="px-4 py-3 text-right">
-                        {item.is_stock_tracked ? (
-                          <span
-                            className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium tabular-nums ${
-                              (item.quantity_on_hand ?? 0) > 0
-                                ? "bg-success-100 text-success-700"
-                                : "bg-bg-muted text-text-muted"
-                            }`}
-                            title="Units on hand from the stock ledger"
-                          >
-                            {item.quantity_on_hand ?? 0}
-                          </span>
-                        ) : (
-                          <span
-                            className="text-text-muted"
-                            title="Not stock-tracked — no units concept"
-                          >
-                            —
-                          </span>
-                        )}
-                      </td>
+                      <>
+                        <td className="px-3 py-3 text-right text-xs tabular-nums text-text-secondary">
+                          {item.is_stock_tracked ? (item.opening_quantity ?? 0) : "—"}
+                        </td>
+                        <td className="px-3 py-3 text-right text-xs tabular-nums text-success-600 font-medium">
+                          {item.is_stock_tracked ? `+${item.purchased_quantity ?? 0}` : "—"}
+                        </td>
+                        <td className="px-3 py-3 text-right text-xs tabular-nums text-error-600 font-medium">
+                          {item.is_stock_tracked ? `-${item.sold_quantity ?? 0}` : "—"}
+                        </td>
+                        <td className="px-3 py-3 text-right">
+                          {item.is_stock_tracked ? (
+                            <span
+                              className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-semibold tabular-nums ${
+                                (item.quantity_on_hand ?? 0) > 0
+                                  ? "bg-success-100 text-success-800"
+                                  : "bg-bg-muted text-text-muted"
+                              }`}
+                              title="Closing units on hand at t₀ = Opening + Inward - Outward"
+                            >
+                              {item.quantity_on_hand ?? 0}
+                            </span>
+                          ) : (
+                            <span className="text-text-muted" title="Not stock-tracked">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3 text-right text-xs tabular-nums font-medium text-text-primary">
+                          {item.is_stock_tracked
+                            ? formatCurrency(Number(item.valuation ?? 0), org?.base_currency_code)
+                            : "—"}
+                        </td>
+                      </>
                     )}
                     <td className="px-4 py-3">
                       <StatusBadge status={statusOf(item)} />
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1.5">
+                        {kind === "products" && item.is_stock_tracked && (
+                          <button
+                            onClick={() => setMovementItem(item)}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-ai-600 hover:border-ai-300 transition-colors"
+                            title="Stock Movement Ledger (Tracing)"
+                          >
+                            <History className="w-3.5 h-3.5" />
+                            History
+                          </button>
+                        )}
                         <button
                           onClick={() => openEdit(item)}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-ai-300 transition-colors"
@@ -618,6 +690,27 @@ export default function CataloguePage() {
             </div>
           )}
 
+          {kind === "products" && form.is_stock_tracked && !editing && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs font-medium text-text-secondary">
+                  Initial opening stock (units)
+                </label>
+                <input
+                  className={`${inputCls} mt-1.5`}
+                  type="number"
+                  min={0}
+                  placeholder="0"
+                  value={form.opening_stock}
+                  onChange={(e) => setForm({ ...form, opening_stock: e.target.value })}
+                />
+              </div>
+              <div className="flex items-center text-xs text-text-muted pt-5">
+                Initial units on hand at t₀ before purchases or sales
+              </div>
+            </div>
+          )}
+
           <div>
             <label className="text-xs font-medium text-text-secondary">
               Description
@@ -706,6 +799,101 @@ export default function CataloguePage() {
                 {rowBusy ? "Deleting…" : "Delete"}
               </button>
             )}
+          </div>
+        </div>
+      </Modal>
+
+      {/* ---- stock movement history modal ------------------------------- */}
+      <Modal
+        open={movementItem !== null}
+        onClose={() => setMovementItem(null)}
+        title={`Stock Movements: ${movementItem?.name || ""}`}
+      >
+        <div className="space-y-4">
+          <p className="text-xs text-text-muted -mt-2">
+            Chronological perpetual inventory ledger for code {movementItem ? codeOf(movementItem) : ""}
+          </p>
+          <div className="grid grid-cols-4 gap-2 bg-bg-muted/50 p-3 rounded-xl text-center text-xs">
+            <div>
+              <p className="text-text-muted">Opening</p>
+              <p className="font-semibold text-text-primary">{movementItem?.opening_quantity ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-text-muted">Purchased (+)</p>
+              <p className="font-semibold text-success-600">+{movementItem?.purchased_quantity ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-text-muted">Sold (-)</p>
+              <p className="font-semibold text-error-600">-{movementItem?.sold_quantity ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-text-muted">Closing (t₀)</p>
+              <p className="font-bold text-brand-navy">{movementItem?.quantity_on_hand ?? 0}</p>
+            </div>
+          </div>
+
+          {loadingMovements ? (
+            <div className="py-8 text-center text-sm text-text-muted">
+              Loading movements from stock ledger…
+            </div>
+          ) : !movements || movements.length === 0 ? (
+            <div className="py-8 text-center text-sm text-text-muted">
+              No stock movements recorded yet for this product.
+            </div>
+          ) : (
+            <div className="max-h-80 overflow-y-auto rounded-xl border border-border-subtle">
+              <table className="w-full text-xs">
+                <thead className="bg-bg-muted text-text-muted sticky top-0">
+                  <tr className="border-b border-border-subtle text-left">
+                    <th className="p-2.5">Date</th>
+                    <th className="p-2.5">Direction</th>
+                    <th className="p-2.5 text-right">Qty</th>
+                    <th className="p-2.5 text-right">Unit Cost</th>
+                    <th className="p-2.5 text-right">Value</th>
+                    <th className="p-2.5">Source / Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {movements.map((m) => (
+                    <tr key={m.id} className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/30">
+                      <td className="p-2.5 text-text-secondary whitespace-nowrap">
+                        {m.movement_date || new Date(m.created_at).toLocaleDateString()}
+                      </td>
+                      <td className="p-2.5">
+                        <span className={`inline-block px-1.5 py-0.5 rounded font-semibold text-[10px] ${
+                          m.direction === "RECEIPT"
+                            ? "bg-success-100 text-success-700"
+                            : "bg-amber-100 text-amber-700"
+                        }`}>
+                          {m.direction}
+                        </span>
+                      </td>
+                      <td className="p-2.5 text-right font-medium tabular-nums">
+                        {m.direction === "RECEIPT" ? `+${m.quantity}` : `-${m.quantity}`}
+                      </td>
+                      <td className="p-2.5 text-right tabular-nums text-text-secondary">
+                        {formatCurrency(m.unit_cost, org?.base_currency_code)}
+                      </td>
+                      <td className="p-2.5 text-right tabular-nums font-medium text-text-primary">
+                        {formatCurrency(m.quantity * m.unit_cost, org?.base_currency_code)}
+                      </td>
+                      <td className="p-2.5 text-text-muted max-w-xs truncate" title={m.description || m.source_type || ""}>
+                        {m.description || m.source_type || "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="flex justify-end pt-2">
+            <button
+              onClick={() => setMovementItem(null)}
+              className="px-4 py-2 rounded-xl text-sm font-medium bg-bg-muted hover:bg-bg-surface text-text-secondary hover:text-text-primary transition-colors"
+            >
+              Close
+            </button>
           </div>
         </div>
       </Modal>

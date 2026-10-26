@@ -199,6 +199,11 @@ export interface CatalogueItem {
    *  null = not stock-tracked (no units concept); a tracked item with no
    *  movements yet is 0. Derived at read time, never cached. */
   quantity_on_hand?: number | null;
+  opening_quantity?: number | null;
+  purchased_quantity?: number | null;
+  sold_quantity?: number | null;
+  average_cost?: number | null;
+  valuation?: number | null;
   /** Services */
   billing_unit?: string;
   standard_rate?: number | null;
@@ -270,6 +275,23 @@ export async function catalogueSetActive(
 }
 
 /** Hard delete — the API refuses (409) while any document references the item. */
+export interface StockMovement {
+  id: string;
+  direction: "RECEIPT" | "ISSUE";
+  quantity: number;
+  unit_cost: number;
+  source_type: string | null;
+  movement_date: string | null;
+  description: string | null;
+  created_at: string;
+}
+
+export async function catalogueProductMovements(
+  productId: string
+): Promise<StockMovement[]> {
+  return fetchApi<StockMovement[]>(`/api/catalogue/products/${productId}/movements`);
+}
+
 export async function catalogueDelete(
   kind: CatalogueKind,
   id: string

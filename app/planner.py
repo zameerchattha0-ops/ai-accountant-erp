@@ -205,6 +205,7 @@ _CONFIRMATION_INTENTS = frozenset({
     # user confirms before the accounting mutation (same as create_invoice).
 
     "convert_quotation",
+    "delete_product", "delete_service",
 
     # Loans move real money (opening journal / installment settlement) and
 
@@ -512,6 +513,10 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("register_fixed_asset", [r"fixed asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset", r"new.*(?:machinery|generator|delivery van|forklift)"]),
 
+    ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
+    ("update_product", [r"update.*product", r"edit.*product", r"change.*product", r"update.*item.*price"]),
+    ("delete_service", [r"delete.*service", r"remove.*service"]),
+    ("update_service", [r"update.*service", r"edit.*service", r"change.*service"]),
     ("create_product", [r"add.*product", r"create.*product", r"new product", r"register.*product"]),
 
     ("create_service", [r"add.*service", r"create.*service", r"new service", r"register.*service"]),
@@ -1736,7 +1741,10 @@ def plan(
 
     # price) so the header can never disagree with its own lines.
 
-    line_items = _extract_line_items(msg)
+    if prefill_entities and prefill_entities.get("line_items"):
+        line_items = prefill_entities["line_items"]
+    else:
+        line_items = _extract_line_items(msg)
 
     # ATTACHED DOCUMENTS: the vision-extracted block already carries the
 
@@ -1774,7 +1782,10 @@ def plan(
 
         entities["line_items"] = line_items
 
-        entities["amount"] = _line_items_total(line_items)
+        if any(l.get("unit_price") is not None or l.get("total_amount") is not None for l in line_items):
+            _calc_tot = _line_items_total(line_items)
+            if _calc_tot > 0:
+                entities["amount"] = _calc_tot
 
         if not entities.get("item_description"):
 
@@ -2176,7 +2187,7 @@ def plan(
 
         "supplier_name", "customer_name", "item_description",
 
-        "quantity", "reason",
+        "quantity", "reason", "line_items",
 
     }
 
@@ -3311,8 +3322,25 @@ def _questions_for_fields(
 
             questions.append(EXPENSE_EVENT_DATE_QUESTION)
 
+        elif f == "amount":
+            _l_items = ents.get("line_items")
+            if isinstance(_l_items, list) and len(_l_items) >= 2:
+                _desc_parts = []
+                for _it in _l_items:
+                    _q = _it.get("quantity")
+                    _q_str = str(int(_q)) if isinstance(_q, (int, float)) and float(_q).is_integer() else str(_q or '')
+                    _desc_parts.append(f"{_q_str} {_it.get('description', '')}".strip())
+                _items_desc = " and ".join(_desc_parts)
+                _supp = ents.get("supplier_name")
+                _supp_str = f" from {_supp}" if _supp else ""
+                _ex0 = _l_items[0].get('description', 'item 1')
+                _ex1 = _l_items[1].get('description', 'item 2')
+                questions.append(
+                    f"What is the price or total for the {_items_desc}{_supp_str}? (e.g. {_ex0}: Rs. 10,000 each or total; {_ex1}: Rs. 3,000 each or total)"
+                )
+            else:
+                questions.append(_FIELD_QUESTION[f])
         else:
-
             questions.append(_FIELD_QUESTION[f])
 
     return questions
@@ -5932,6 +5960,16 @@ def _merge_field_answer(
 
 
 
+    if field == "line_items":
+        if isinstance(answer, list):
+            merged["line_items"] = answer
+            merged["amount"] = _line_items_total(answer)
+            return True
+        elif isinstance(answer, dict) and "line_items" in answer:
+            merged["line_items"] = answer["line_items"]
+            merged["amount"] = answer.get("total_amount") or _line_items_total(answer["line_items"])
+            return True
+
     if field == "transaction_date":
 
         parsed = parse_transaction_date(value)
@@ -7513,13 +7551,21 @@ def _extract_document_lines(
 
 def _line_items_total(lines: List[Dict[str, Any]]) -> float:
 
-    """Σ (quantity × unit_price) over parsed line items."""
+    """Σ (quantity × unit_price or total_amount) over parsed line items."""
 
-    return round(
-
-        sum(float(l["quantity"]) * float(l["unit_price"]) for l in lines), 2
-
-    )
+    tot = 0.0
+    for l in lines or ():
+        if l.get("total_amount") is not None:
+            try:
+                tot += float(l["total_amount"])
+            except (ValueError, TypeError):
+                pass
+        elif l.get("quantity") is not None and l.get("unit_price") is not None:
+            try:
+                tot += float(l["quantity"]) * float(l["unit_price"])
+            except (ValueError, TypeError):
+                pass
+    return round(tot, 2)
 
 
 
@@ -7764,6 +7810,11 @@ def _tools_for_intent(intent: str) -> List[str]:
         "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
 
         "create_product": ["search_product", "create_product"],
+        "update_product": ["search_product", "update_product"],
+        "delete_product": ["search_product", "delete_product"],
+        "create_service": ["search_service", "create_service"],
+        "update_service": ["search_service", "update_service"],
+        "delete_service": ["search_service", "delete_service"],
 
         "create_service": ["search_service", "create_service"],
 
@@ -7950,6 +8001,11 @@ def _outcome(intent: str) -> str:
         "run_payroll": "Payroll run recorded with journal entry",
 
         "create_product": "Product added to the catalog",
+        "update_product": "Product updated in the catalog",
+        "delete_product": "Product removed or deactivated in the catalog",
+        "create_service": "Service added to the catalog",
+        "update_service": "Service updated in the catalog",
+        "delete_service": "Service removed or deactivated in the catalog",
 
         "create_service": "Service added to the catalog",
 

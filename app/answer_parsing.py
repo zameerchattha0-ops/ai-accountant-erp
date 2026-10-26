@@ -46,6 +46,7 @@ CANONICAL_FIELD_ENDPOINTS: Dict[str, str] = {
     "settlement_position": "Settlement treatment: PAID_NOW, OUTSTANDING (payable/pay later), PREPAID, or SETTLE_EXISTING_PAYABLE.",
     "payment_method": "Payment method: CASH, BANK_TRANSFER, CHEQUE, CARD, or CREDIT.",
     "account_name": "Specific ledger account name to post to.",
+    "line_items": "Prices, quantities, or details of multiple item lines (e.g. 'tables 10000 each and chairs 3000 each').",
 }
 
 _SYSTEM_INSTRUCTION = (
@@ -166,3 +167,89 @@ async def parse_packed_reply_to_endpoints(
     except Exception as exc:
         log.warning("answer_parsing.failed", error=str(exc)[:200])
         return None
+
+
+async def parse_line_items_reply_with_llm(
+    *,
+    user_reply: str,
+    existing_items: Optional[List[Dict[str, Any]]] = None,
+    client: Optional[Any] = None,
+    timeout: float = 8.0,
+) -> Optional[Dict[str, Any]]:
+    """Parse a user clarification reply specifying prices or details for multi-item lines using LLM."""
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not getattr(settings, "llm_answer_parsing_enabled", True):
+        return None
+
+    cleaned_reply = (user_reply or "").strip()
+    if not cleaned_reply:
+        return None
+
+    if client is None:
+        try:
+            from app.ai_orchestrator import get_client
+            client = get_client()
+        except Exception as exc:
+            log.warning("answer_parsing.get_client_failed", error=str(exc)[:160])
+            return None
+
+    items_repr = json.dumps(existing_items or [])
+    prompt = (
+        "You are an exact accounting line-item price parser.\n"
+        f"The transaction has these line items: {items_repr}\n"
+        f"USER REPLY: \"{cleaned_reply}\"\n"
+        "Extract unit_price and total_amount for each item. "
+        "Compute total_amount = quantity * unit_price or unit_price = total_amount / quantity if one is given. "
+        "Output STRICT JSON only: {\"line_items\": [{\"description\": \"<item name>\", \"quantity\": <number>, \"unit_price\": <number>, \"total_amount\": <number>}], \"total_amount\": <number>}\n"
+        "Do not output any text outside JSON."
+    )
+    try:
+        raw_text = await asyncio.wait_for(
+            client.generate_text_light(prompt=prompt),
+            timeout=timeout,
+        )
+        parsed = _extract_json(str(raw_text or ""))
+        if isinstance(parsed, dict) and isinstance(parsed.get("line_items"), list):
+            valid_items = []
+            for itm in parsed["line_items"]:
+                if not isinstance(itm, dict):
+                    continue
+                d = str(itm.get("description") or "").strip()
+                if not d:
+                    continue
+                q = itm.get("quantity")
+                up = itm.get("unit_price")
+                tot = itm.get("total_amount")
+                clean_itm: Dict[str, Any] = {"description": d}
+                if q is not None:
+                    try:
+                        clean_itm["quantity"] = float(q)
+                    except (ValueError, TypeError):
+                        pass
+                if up is not None:
+                    try:
+                        clean_itm["unit_price"] = float(up)
+                    except (ValueError, TypeError):
+                        pass
+                if tot is not None:
+                    try:
+                        clean_itm["total_amount"] = float(tot)
+                    except (ValueError, TypeError):
+                        pass
+                if "total_amount" in clean_itm and "unit_price" not in clean_itm and clean_itm.get("quantity"):
+                    clean_itm["unit_price"] = clean_itm["total_amount"] / clean_itm["quantity"]
+                if "unit_price" in clean_itm and "total_amount" not in clean_itm and clean_itm.get("quantity"):
+                    clean_itm["total_amount"] = clean_itm["unit_price"] * clean_itm["quantity"]
+                valid_items.append(clean_itm)
+            if valid_items:
+                tot = parsed.get("total_amount")
+                derived_tot = sum(it.get("total_amount", (it.get("quantity", 1) * it.get("unit_price", 0))) for it in valid_items)
+                return {
+                    "line_items": valid_items,
+                    "total_amount": float(tot) if tot is not None else derived_tot,
+                }
+    except Exception as exc:
+        log.warning("answer_parsing.multi_item_failed", error=str(exc)[:160])
+    return None
