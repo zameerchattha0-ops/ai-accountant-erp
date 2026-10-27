@@ -277,9 +277,14 @@ export async function catalogueSetActive(
 /** Hard delete — the API refuses (409) while any document references the item. */
 export interface StockMovement {
   id: string;
+  product_id?: string;
+  product_name?: string | null;
+  sku?: string | null;
+  unit?: string | null;
   direction: "RECEIPT" | "ISSUE";
   quantity: number;
   unit_cost: number;
+  valuation?: number;
   source_type: string | null;
   movement_date: string | null;
   description: string | null;
@@ -290,6 +295,12 @@ export async function catalogueProductMovements(
   productId: string
 ): Promise<StockMovement[]> {
   return fetchApi<StockMovement[]>(`/api/catalogue/products/${productId}/movements`);
+}
+
+export async function catalogueAllMovements(
+  limit: number = 200
+): Promise<StockMovement[]> {
+  return fetchApi<StockMovement[]>(`/api/catalogue/movements?limit=${limit}`);
 }
 
 export async function catalogueDelete(

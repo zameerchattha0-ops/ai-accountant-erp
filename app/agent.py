@@ -184,7 +184,19 @@ _FAST_PATH_INTENTS = {
     "generate_supplier_ledger",
     "customer_balance",
     "generate_customer_ledger",
+    "get_inventory_status",
 }
+
+_READ_ONLY_LOOKUPS_GATE = frozenset({
+    "supplier_balance", "customer_balance",
+    "generate_supplier_ledger", "generate_customer_ledger",
+    "generate_general_ledger", "generate_trial_balance",
+    "generate_balance_sheet", "generate_profit_loss",
+    "generate_cash_flow", "project_profitability",
+    "list_expenses", "list_bank_accounts", "list_customers",
+    "list_suppliers", "list_employees", "get_chart_of_accounts",
+    "get_inventory_status",
+})
 
 
 
@@ -442,6 +454,7 @@ async def _party_resolution_question(
         "generate_cash_flow", "project_profitability",
         "list_expenses", "list_bank_accounts", "list_customers",
         "list_suppliers", "list_employees", "get_chart_of_accounts",
+        "get_inventory_status",
     }
     if (
         execution_plan.intent not in _PARTY_GATE_INTENTS
@@ -2681,6 +2694,14 @@ async def _deterministic_mutation_calls(
         if entities.get("account_type"):
             args["account_type"] = str(entities["account_type"]).strip().upper()
         return [ToolCall(tool_name="get_chart_of_accounts", arguments=args)]
+
+    if execution_plan.intent == "get_inventory_status":
+        args = {}
+        if entities.get("product_name"):
+            args["product_name"] = str(entities["product_name"]).strip()
+        if entities.get("only_low_stock"):
+            args["only_low_stock"] = bool(entities["only_low_stock"])
+        return [ToolCall(tool_name="get_inventory_status", arguments=args)]
 
     if execution_plan.intent == "create_customer":
         cust_name = entities.get("customer_name") or entities.get("name")
@@ -6747,7 +6768,7 @@ async def execute(
                     "create_account", "get_chart_of_accounts", "create_customer",
                     "create_supplier", "create_product", "create_service",
                     "create_bank_account", "create_employee", "create_project",
-                    "create_recurring_template"
+                    "create_recurring_template", "get_inventory_status"
                 )
                 or _has_erp_entities
             )
@@ -7048,7 +7069,7 @@ async def execute(
             "generate_cash_flow", "project_profitability",
             "list_expenses", "list_bank_accounts", "list_customers",
             "list_suppliers", "list_employees", "get_chart_of_accounts",
-            "get_recurring_templates",
+            "get_recurring_templates", "get_inventory_status",
         })
         _is_operational = (
             _prov_hint in (
@@ -8183,6 +8204,8 @@ async def execute(
 
             and approved_tool_calls is None
 
+            and execution_plan.intent not in _READ_ONLY_LOOKUPS_GATE
+
         ):
 
             from app.questionnaire import (
@@ -8935,6 +8958,8 @@ async def execute(
             # original turn.
 
             and approved_tool_calls is None
+
+            and execution_plan.intent not in _READ_ONLY_LOOKUPS_GATE
 
         ):
 
@@ -12383,6 +12408,16 @@ async def execute(
 
                 )
 
+            from app.erp_endpoints import is_operational_task, format_operational_summary
+            _is_op_query = is_operational_task(execution_plan.intent) or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
+            _succ = [tr for tr in tool_results if tr.success]
+            primary_data = getattr(_succ[-1], "data", {}) if _succ else {}
+            if not (llm_text or "").strip() and _is_op_query and _succ:
+                if isinstance(primary_data, dict):
+                    llm_text = format_operational_summary(execution_plan.intent, primary_data)
+                elif isinstance(primary_data, list):
+                    llm_text = f"Retrieved {len(primary_data)} records for {execution_plan.intent}."
+
             if not (llm_text or "").strip():
 
                 # The model stalled (empty response) after only read-only
@@ -12482,6 +12517,8 @@ async def execute(
                 summary=llm_text or execution_plan.expected_outcome or "Done.",
 
                 verification_status="UNVERIFIED",
+
+                data=primary_data if isinstance(primary_data, dict) else {"items": primary_data},
 
             )
 

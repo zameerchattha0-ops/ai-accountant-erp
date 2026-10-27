@@ -1,7 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Search, Pencil, Trash2, Power, RefreshCw, Package, Wrench, History } from "lucide-react";
+import {
+  Plus,
+  Search,
+  Pencil,
+  Trash2,
+  Power,
+  RefreshCw,
+  Package,
+  Wrench,
+  History,
+  ArrowUpDown,
+  ArrowDownRight,
+  ArrowUpRight,
+  AlertTriangle,
+} from "lucide-react";
 import PageHeader from "@/components/shared/PageHeader";
 import Modal from "@/components/shared/Modal";
 import StatusBadge from "@/components/shared/StatusBadge";
@@ -16,6 +30,7 @@ import {
   catalogueSetActive,
   catalogueUpdate,
   catalogueProductMovements,
+  catalogueAllMovements,
   type CatalogueItem,
   type CatalogueKind,
   type StockMovement,
@@ -27,11 +42,28 @@ const inputCls =
 /** The service_unit_code enum (authoritative DB enum). */
 const BILLING_UNITS = ["HOUR", "DAY", "MONTH", "FIXED", "ITEM"] as const;
 
-const STATUS_FILTERS = ["ALL", "ACTIVE", "INACTIVE"] as const;
+const PRODUCT_STOCK_FILTERS = [
+  { id: "ALL", label: "All Items" },
+  { id: "TRACKED", label: "Stock Tracked" },
+  { id: "IN_STOCK", label: "In Stock" },
+  { id: "OUT_OF_STOCK", label: "Out of Stock" },
+  { id: "ACTIVE", label: "Active" },
+  { id: "INACTIVE", label: "Inactive" },
+] as const;
 
-/** Refresh cadence: the page is a catalogue, not a live feed — 20s is enough
- *  to see another user's edit without hammering the API. A window focus and
- *  every mutation also refresh immediately. */
+const SERVICE_STATUS_FILTERS = [
+  { id: "ALL", label: "All" },
+  { id: "ACTIVE", label: "Active" },
+  { id: "INACTIVE", label: "Inactive" },
+] as const;
+
+const MOVEMENT_DIRECTION_FILTERS = [
+  { id: "ALL", label: "All Movements" },
+  { id: "RECEIPT", label: "Inward Receipts (+)" },
+  { id: "ISSUE", label: "Outward Issues (-)" },
+] as const;
+
+/** Refresh cadence: 20s is enough without hammering the API. */
 const REFRESH_MS = 20_000;
 
 interface ItemForm {
@@ -50,33 +82,44 @@ interface ItemForm {
 }
 
 const EMPTY_FORM: ItemForm = {
-  name: "", description: "",
-  unit: "", is_stock_tracked: false, opening_stock: "", unit_price: "", cost_price: "",
-  billing_unit: "HOUR", standard_rate: "", cost_rate: "",
+  name: "",
+  description: "",
+  unit: "",
+  is_stock_tracked: false,
+  opening_stock: "",
+  unit_price: "",
+  cost_price: "",
+  billing_unit: "HOUR",
+  standard_rate: "",
+  cost_rate: "",
 };
 
 function codeOf(item: CatalogueItem): string {
   return item.product_code || item.service_code || "—";
 }
 
-/** A short, human status for the row: active items are live in pickers, an
- *  inactive item is archived but every past document still resolves it. */
 function statusOf(item: CatalogueItem): string {
   return item.is_active ? "ACTIVE" : "INACTIVE";
 }
 
-
 export default function CataloguePage() {
-    const { org } = useOrg();
-  const [kind, setKind] = useState<CatalogueKind>("products");
+  const { org } = useOrg();
+  const [view, setView] = useState<"products" | "services" | "movements">("products");
+  const kind: CatalogueKind = view === "services" ? "services" : "products";
   const noun = kind === "products" ? "Product" : "Service";
+
   const [items, setItems] = useState<CatalogueItem[] | null>(null);
   const [counts, setCounts] = useState({ total: 0, active: 0, inactive: 0 });
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [movementFilter, setMovementFilter] = useState<string>("ALL");
   const [loading, setLoading] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
+
+  // Global Movements Ledger state
+  const [allMovements, setAllMovements] = useState<StockMovement[] | null>(null);
+  const [loadingMovements, setLoadingMovements] = useState(false);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<CatalogueItem | null>(null);
@@ -84,52 +127,86 @@ export default function CataloguePage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Single-product movement drawer/modal
   const [movementItem, setMovementItem] = useState<CatalogueItem | null>(null);
-  const [movements, setMovements] = useState<StockMovement[] | null>(null);
-  const [loadingMovements, setLoadingMovements] = useState(false);
+  const [itemMovements, setItemMovements] = useState<StockMovement[] | null>(null);
+  const [loadingItemMovements, setLoadingItemMovements] = useState(false);
 
+  const [confirmDelete, setConfirmDelete] = useState<CatalogueItem | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+
+  // Fetch individual item movement history
   useEffect(() => {
     if (!movementItem) {
-      setMovements(null);
+      setItemMovements(null);
       return;
     }
-    setLoadingMovements(true);
+    setLoadingItemMovements(true);
     catalogueProductMovements(movementItem.id)
-      .then((data) => setMovements(data))
-      .catch(() => setMovements([]))
-      .finally(() => setLoadingMovements(false));
+      .then((data) => setItemMovements(data))
+      .catch(() => setItemMovements([]))
+      .finally(() => setLoadingItemMovements(false));
   }, [movementItem]);
 
+  // Inventory KPI aggregations across products
   const totalValuation = useMemo(() => {
-    if (kind !== "products" || !items) return 0;
+    if (!items || kind !== "products") return 0;
     return items.reduce((sum, it) => sum + (it.valuation || 0), 0);
   }, [kind, items]);
 
   const totalStockUnits = useMemo(() => {
-    if (kind !== "products" || !items) return 0;
+    if (!items || kind !== "products") return 0;
     return items.reduce((sum, it) => sum + (it.quantity_on_hand || 0), 0);
   }, [kind, items]);
 
-    const [confirmDelete, setConfirmDelete] = useState<CatalogueItem | null>(null);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const totalReceived = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => sum + (it.purchased_quantity || 0), 0);
+  }, [kind, items]);
 
-  // The polling interval must not restart on every keystroke, so `load` reads
-  // the latest term from a ref.  The ref is synced in an EFFECT: writing it
-  // during render is forbidden (react-hooks/refs) and can drop updates.
+  const totalIssued = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => sum + (it.sold_quantity || 0), 0);
+  }, [kind, items]);
+
+  const outOfStockCount = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.filter(
+      (it) => it.is_stock_tracked && (it.quantity_on_hand ?? 0) <= 0
+    ).length;
+  }, [kind, items]);
+
   const searchRef = useRef(search);
   useEffect(() => {
     searchRef.current = search;
   }, [search]);
+
+  const loadMovementsData = useCallback(async () => {
+    if (!org) return;
+    setLoadingMovements(true);
+    try {
+      const data = await catalogueAllMovements(300);
+      setAllMovements(data);
+    } catch {
+      setAllMovements([]);
+    } finally {
+      setLoadingMovements(false);
+    }
+  }, [org]);
 
   const load = useCallback(
     async (opts: { silent?: boolean } = {}) => {
       if (!org) return;
       if (!opts.silent) setLoading(true);
       try {
+        const backendStatus =
+          statusFilter === "ACTIVE" || statusFilter === "INACTIVE"
+            ? statusFilter
+            : "ALL";
         const data = await catalogueList(kind, {
           query: searchRef.current.trim(),
-          status: statusFilter,
+          status: backendStatus,
         });
         setItems(data.items ?? []);
         setCounts(data.counts ?? { total: 0, active: 0, inactive: 0 });
@@ -145,21 +222,40 @@ export default function CataloguePage() {
   );
 
   useEffect(() => {
-    const timer = setTimeout(() => load(), search ? 250 : 0);
+    const timer = setTimeout(() => {
+      load();
+      if (view === "movements") {
+        loadMovementsData();
+      }
+    }, search ? 250 : 0);
     return () => clearTimeout(timer);
-  }, [load, search]);
+  }, [load, loadMovementsData, search, view]);
 
-  // Real-time-ish tracking: refresh on an interval and whenever the window
-  // regains focus, so an item added elsewhere appears without a manual reload.
   useEffect(() => {
-    const timer = setInterval(() => load({ silent: true }), REFRESH_MS);
-    const onFocus = () => load({ silent: true });
+    if (view === "movements" && !allMovements) {
+      loadMovementsData();
+    }
+  }, [view, allMovements, loadMovementsData]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      load({ silent: true });
+      if (view === "movements") {
+        loadMovementsData();
+      }
+    }, REFRESH_MS);
+    const onFocus = () => {
+      load({ silent: true });
+      if (view === "movements") {
+        loadMovementsData();
+      }
+    };
     window.addEventListener("focus", onFocus);
     return () => {
       clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [load]);
+  }, [load, loadMovementsData, view]);
 
   const openCreate = () => {
     setEditing(null);
@@ -171,55 +267,77 @@ export default function CataloguePage() {
   const openEdit = (item: CatalogueItem) => {
     setEditing(item);
     setForm({
-      name: item.name ?? "",
-      description: item.description ?? "",
-      unit: item.unit ?? "",
-      is_stock_tracked: Boolean(item.is_stock_tracked),
-      opening_stock: item.opening_quantity != null ? String(item.opening_quantity) : "",
-      unit_price: item.unit_price != null ? String(item.unit_price) : "",
-      cost_price: item.cost_price != null ? String(item.cost_price) : "",
-      billing_unit: item.billing_unit ?? "HOUR",
-      standard_rate: item.standard_rate != null ? String(item.standard_rate) : "",
-      cost_rate: item.cost_rate != null ? String(item.cost_rate) : "",
+      name: item.name,
+      description: item.description || "",
+      unit: item.unit || "",
+      is_stock_tracked: item.is_stock_tracked || false,
+      opening_stock:
+        item.opening_quantity !== null && item.opening_quantity !== undefined
+          ? String(item.opening_quantity)
+          : "",
+      unit_price:
+        item.unit_price !== null && item.unit_price !== undefined
+          ? String(item.unit_price)
+          : "",
+      cost_price:
+        item.cost_price !== null && item.cost_price !== undefined
+          ? String(item.cost_price)
+          : "",
+      billing_unit: item.billing_unit || "HOUR",
+      standard_rate:
+        item.standard_rate !== null && item.standard_rate !== undefined
+          ? String(item.standard_rate)
+          : "",
+      cost_rate:
+        item.cost_rate !== null && item.cost_rate !== undefined
+          ? String(item.cost_rate)
+          : "",
     });
     setFormError(null);
     setModalOpen(true);
   };
 
-  const handleSave = async () => {
-    if (!org || form.name.trim().length < 2) return;
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.name.trim()) {
+      setFormError(`${noun} name is required.`);
+      return;
+    }
     setSaving(true);
     setFormError(null);
-    const payload: Record<string, unknown> =
-      kind === "products"
-        ? {
-            name: form.name.trim(),
-            description: form.description.trim() || null,
-            unit: form.unit.trim() || null,
-            is_stock_tracked: form.is_stock_tracked,
-            unit_price: form.unit_price === "" ? 0 : Number(form.unit_price),
-            ...(!editing && form.is_stock_tracked && form.opening_stock ? { opening_stock: Number(form.opening_stock) } : {}),
-            cost_price: form.cost_price === "" ? null : Number(form.cost_price),
-          }
-        : {
-            name: form.name.trim(),
-            description: form.description.trim() || null,
-            billing_unit: form.billing_unit,
-            standard_rate:
-              form.standard_rate === "" ? 0 : Number(form.standard_rate),
-            cost_rate: form.cost_rate === "" ? null : Number(form.cost_rate),
-          };
-
     try {
+      const payload: Record<string, unknown> = {
+        name: form.name.trim(),
+        description: form.description.trim() || null,
+      };
+
+      if (kind === "products") {
+        payload.unit = form.unit.trim() || null;
+        payload.is_stock_tracked = form.is_stock_tracked;
+        payload.opening_quantity =
+          form.opening_stock.trim() === "" ? null : Number(form.opening_stock);
+        payload.unit_price =
+          form.unit_price.trim() === "" ? null : Number(form.unit_price);
+        payload.cost_price =
+          form.cost_price.trim() === "" ? null : Number(form.cost_price);
+      } else {
+        payload.billing_unit = form.billing_unit;
+        payload.standard_rate =
+          form.standard_rate.trim() === "" ? null : Number(form.standard_rate);
+        payload.cost_rate =
+          form.cost_rate.trim() === "" ? null : Number(form.cost_rate);
+      }
+
       if (editing) {
         await catalogueUpdate(kind, editing.id, payload);
       } else {
         await catalogueCreate(kind, payload);
       }
       setModalOpen(false);
-      setEditing(null);
-      setForm(EMPTY_FORM);
       await load();
+      if (view === "movements") {
+        await loadMovementsData();
+      }
     } catch (err) {
       setFormError(apiErrorMessage(err));
     } finally {
@@ -247,73 +365,146 @@ export default function CataloguePage() {
       await catalogueDelete(kind, confirmDelete.id);
       setConfirmDelete(null);
       await load();
+      if (view === "movements") {
+        await loadMovementsData();
+      }
     } catch (err) {
-      // 409: the API refuses a used item and says to deactivate instead.
       setDeleteError(apiErrorMessage(err));
     } finally {
       setRowBusy(null);
     }
   };
 
+  // Client-side filtering including stock conditions
   const filtered = useMemo(() => {
-    const rows = items ?? [];
+    let rows = items ?? [];
+    if (kind === "products") {
+      if (statusFilter === "TRACKED") {
+        rows = rows.filter((r) => r.is_stock_tracked);
+      } else if (statusFilter === "IN_STOCK") {
+        rows = rows.filter(
+          (r) => r.is_stock_tracked && (r.quantity_on_hand ?? 0) > 0
+        );
+      } else if (statusFilter === "OUT_OF_STOCK") {
+        rows = rows.filter(
+          (r) => r.is_stock_tracked && (r.quantity_on_hand ?? 0) <= 0
+        );
+      } else if (statusFilter === "ACTIVE") {
+        rows = rows.filter((r) => r.is_active);
+      } else if (statusFilter === "INACTIVE") {
+        rows = rows.filter((r) => !r.is_active);
+      }
+    } else {
+      if (statusFilter === "ACTIVE") {
+        rows = rows.filter((r) => r.is_active);
+      } else if (statusFilter === "INACTIVE") {
+        rows = rows.filter((r) => !r.is_active);
+      }
+    }
+
     const term = search.trim().toLowerCase();
     if (!term) return rows;
-    // The server already searched; this keeps typing instant between fetches.
     return rows.filter(
       (row) =>
         row.name.toLowerCase().includes(term) ||
         codeOf(row).toLowerCase().includes(term)
     );
-  }, [items, search]);
+  }, [items, search, kind, statusFilter]);
 
+  // Client-side filtering for global movements
+  const filteredMovements = useMemo(() => {
+    let rows = allMovements ?? [];
+    if (movementFilter !== "ALL") {
+      rows = rows.filter((m) => m.direction === movementFilter);
+    }
+    const term = search.trim().toLowerCase();
+    if (!term) return rows;
+    return rows.filter(
+      (m) =>
+        (m.product_name && m.product_name.toLowerCase().includes(term)) ||
+        (m.sku && m.sku.toLowerCase().includes(term)) ||
+        (m.description && m.description.toLowerCase().includes(term)) ||
+        (m.source_type && m.source_type.toLowerCase().includes(term))
+    );
+  }, [allMovements, movementFilter, search]);
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Products & Services Catalogue"
-        subtitle="Every item you sell or bill, with live status. Edit anytime; an item that documents already use is archived (deactivated) instead of deleted, so history keeps resolving it."
+        subtitle="Manage inventory products, billable services, perpetual stock levels, and historical movement ledger with live valuation tracking."
         actions={
           <>
             <button
-              onClick={() => load()}
+              onClick={() => {
+                load();
+                if (view === "movements") loadMovementsData();
+              }}
               className="inline-flex items-center gap-1.5 rounded-xl border border-border-default bg-bg-surface px-3 py-2 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-ai-300 transition-colors"
               title="Refresh now"
             >
               <RefreshCw className="w-3.5 h-3.5" />
               Refresh
             </button>
-            <button
-              onClick={openCreate}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-ai-500 hover:bg-ai-600 px-4 py-2 text-sm font-medium text-white btn-3d btn-shine transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              Add {noun}
-            </button>
+            {view !== "movements" && (
+              <button
+                onClick={openCreate}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-ai-500 hover:bg-ai-600 px-4 py-2 text-sm font-medium text-white btn-3d btn-shine transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                Add {noun}
+              </button>
+            )}
           </>
         }
       />
 
-      {/* ---- tabs: two catalogues, one screen ---------------------------- */}
+      {/* ---- Navigation Tabs ---- */}
       <div className="flex flex-wrap items-center gap-2">
-        {(["products", "services"] as CatalogueKind[]).map((k) => {
-          const active = k === kind;
-          const Icon = k === "products" ? Package : Wrench;
-          return (
-            <button
-              key={k}
-              onClick={() => setKind(k)}
-              className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors ${
-                active
-                  ? "bg-ai-500 text-white shadow-sm"
-                  : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              {k === "products" ? "Products" : "Services"}
-            </button>
-          );
-        })}
+        <button
+          onClick={() => {
+            setView("products");
+            setStatusFilter("ALL");
+          }}
+          className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors ${
+            view === "products"
+              ? "bg-ai-500 text-white shadow-sm"
+              : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+          }`}
+        >
+          <Package className="w-4 h-4" />
+          Products & Stock
+        </button>
+
+        <button
+          onClick={() => {
+            setView("services");
+            setStatusFilter("ALL");
+          }}
+          className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors ${
+            view === "services"
+              ? "bg-ai-500 text-white shadow-sm"
+              : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+          }`}
+        >
+          <Wrench className="w-4 h-4" />
+          Services
+        </button>
+
+        <button
+          onClick={() => {
+            setView("movements");
+            loadMovementsData();
+          }}
+          className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors ${
+            view === "movements"
+              ? "bg-ai-500 text-white shadow-sm"
+              : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+          }`}
+        >
+          <ArrowUpDown className="w-4 h-4" />
+          Stock Movements Ledger
+        </button>
 
         <span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-text-muted">
           <span
@@ -324,323 +515,597 @@ export default function CataloguePage() {
           {error
             ? "not syncing"
             : lastSync
-              ? `live · updated ${lastSync.toLocaleTimeString()}`
-              : "connecting…"}
+            ? `live · updated ${lastSync.toLocaleTimeString()}`
+            : "connecting…"}
         </span>
       </div>
 
-      {/* ---- status strip ------------------------------------------------ */}
-      <div className={`grid gap-3 ${kind === "products" ? "grid-cols-2 sm:grid-cols-5" : "grid-cols-3"}`}>
-        {[
-          { label: `Total ${noun}s`, value: String(counts.total) },
-          { label: "Active", value: String(counts.active) },
-          { label: "Inactive", value: String(counts.inactive) },
-          ...(kind === "products"
-            ? [
-                { label: "Units on Hand (t₀)", value: String(totalStockUnits) },
-                { label: "Stock Valuation", value: formatCurrency(totalValuation, org?.base_currency_code) },
-              ]
-            : []),
-        ].map((card) => (
-          <div
-            key={card.label}
-            className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3"
-          >
+      {/* ---- Comprehensive KPI Strip ---- */}
+      {view !== "services" ? (
+        <div className="grid gap-3 grid-cols-2 sm:grid-cols-5">
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
             <p className="text-[11px] uppercase tracking-wide text-text-muted">
-              {card.label}
+              Total Stock Valuation
             </p>
             <p className="text-lg font-semibold text-text-primary">
-              {card.value}
+              {formatCurrency(totalValuation, org?.base_currency_code)}
             </p>
           </div>
-        ))}
-      </div>
 
-      {/* ---- toolbar ----------------------------------------------------- */}
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-text-muted">
+              Units on Hand (t₀)
+            </p>
+            <p className="text-lg font-semibold text-text-primary">
+              {totalStockUnits.toLocaleString()}
+            </p>
+          </div>
+
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-success-600 font-medium">
+              Inward Received (+)
+            </p>
+            <p className="text-lg font-semibold text-success-600">
+              +{totalReceived.toLocaleString()}
+            </p>
+          </div>
+
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-amber-600 font-medium">
+              Outward Issued (-)
+            </p>
+            <p className="text-lg font-semibold text-amber-600">
+              -{totalIssued.toLocaleString()}
+            </p>
+          </div>
+
+          <div className={`bg-bg-surface rounded-2xl border px-4 py-3 ${
+            outOfStockCount > 0 ? "border-error-300 bg-error-50/20" : "border-border-subtle"
+          }`}>
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] uppercase tracking-wide text-text-muted">
+                Out of Stock
+              </p>
+              {outOfStockCount > 0 && (
+                <AlertTriangle className="w-3.5 h-3.5 text-error-500" />
+              )}
+            </div>
+            <p className={`text-lg font-semibold ${outOfStockCount > 0 ? "text-error-600" : "text-text-primary"}`}>
+              {outOfStockCount} {outOfStockCount === 1 ? "item" : "items"}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="grid gap-3 grid-cols-3">
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-text-muted">
+              Total Services
+            </p>
+            <p className="text-lg font-semibold text-text-primary">
+              {counts.total}
+            </p>
+          </div>
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-text-muted">
+              Active
+            </p>
+            <p className="text-lg font-semibold text-success-600">
+              {counts.active}
+            </p>
+          </div>
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wide text-text-muted">
+              Inactive
+            </p>
+            <p className="text-lg font-semibold text-text-muted">
+              {counts.inactive}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ---- Toolbar (Search & Filter Pills) ---- */}
       <div className="flex flex-col sm:flex-row gap-3">
         <div className="relative flex-1">
           <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             className={`${inputCls} pl-9`}
-            placeholder={`Search ${kind} by name or code…`}
+            placeholder={
+              view === "movements"
+                ? "Search movements by product name, SKU, or reference..."
+                : `Search ${kind} by name or code…`
+            }
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
-        <div className="flex gap-1.5">
-          {STATUS_FILTERS.map((value) => (
-            <button
-              key={value}
-              onClick={() => setStatusFilter(value)}
-              className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
-                statusFilter === value
-                  ? "bg-brand-navy text-white"
-                  : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
-              }`}
-            >
-              {value === "ALL" ? "All" : value === "ACTIVE" ? "Active" : "Inactive"}
-            </button>
-          ))}
+
+        {/* Filter Pills */}
+        <div className="flex flex-wrap gap-1.5">
+          {view === "products" &&
+            PRODUCT_STOCK_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setStatusFilter(f.id)}
+                className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+                  statusFilter === f.id
+                    ? "bg-brand-navy text-white shadow-sm"
+                    : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+
+          {view === "services" &&
+            SERVICE_STATUS_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setStatusFilter(f.id)}
+                className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+                  statusFilter === f.id
+                    ? "bg-brand-navy text-white shadow-sm"
+                    : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+
+          {view === "movements" &&
+            MOVEMENT_DIRECTION_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setMovementFilter(f.id)}
+                className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+                  movementFilter === f.id
+                    ? "bg-brand-navy text-white shadow-sm"
+                    : "bg-bg-surface border border-border-default text-text-secondary hover:text-text-primary"
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
         </div>
       </div>
 
-      {/* ---- table ------------------------------------------------------- */}
-      {error && <ErrorState message={error} />}
+      {/* ---- View Content: Products/Services Table vs Movements Ledger ---- */}
+      {view !== "movements" ? (
+        <>
+          {error && <ErrorState message={error} />}
 
-      {!error && loading && !items && <TableSkeleton rows={6} cols={5} />}
+          {!error && loading && !items && <TableSkeleton rows={6} cols={5} />}
 
-      {!error && items && filtered.length === 0 && (
-        <EmptyState
-          title={search ? `No ${kind} match “${search}”` : `No ${kind} yet`}
-          hint={
-            search
-              ? "Try a different name or code."
-              : `Add your first ${noun} — the AI agent then uses it on invoices and bills instead of inventing a line item.`
-          }
-        />
-      )}
+          {!error && items && filtered.length === 0 && (
+            <EmptyState
+              title={search ? `No ${kind} match “${search}”` : `No ${kind} yet`}
+              hint={
+                search
+                  ? "Try a different search query or reset your stock filter."
+                  : `Add your first ${noun} — the AI agent then uses it on invoices and bills instead of inventing a line item.`
+              }
+            />
+          )}
 
-      {!error && items && filtered.length > 0 && (
-        <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
-                  <th className="px-4 py-3 font-medium">Code</th>
-                  <th className="px-4 py-3 font-medium">Name</th>
-                  <th className="px-4 py-3 font-medium">
-                    {kind === "products" ? "Unit price" : "Standard rate"}
-                  </th>
-                  <th className="px-4 py-3 font-medium">
-                    {kind === "products" ? "Unit" : "Billed per"}
-                  </th>
-                  {kind === "products" && (
-                    <>
-                      <th className="px-3 py-3 font-medium text-right" title="Opening balance">
-                        Opening
+          {!error && items && filtered.length > 0 && (
+            <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
+                      <th className="px-4 py-3 font-medium">Code</th>
+                      <th className="px-4 py-3 font-medium">Name</th>
+                      <th className="px-4 py-3 font-medium">
+                        {kind === "products" ? "Unit price" : "Standard rate"}
                       </th>
-                      <th className="px-3 py-3 font-medium text-right" title="Purchases during period">
-                        Inward (+)
+                      <th className="px-4 py-3 font-medium">
+                        {kind === "products" ? "Unit" : "Billed per"}
                       </th>
-                      <th className="px-3 py-3 font-medium text-right" title="Sales during period">
-                        Outward (-)
-                      </th>
-                      <th className="px-3 py-3 font-medium text-right" title="Closing stock position at t₀">
-                        Closing (t₀)
-                      </th>
-                      <th className="px-3 py-3 font-medium text-right" title="Closing valuation">
-                        Valuation
-                      </th>
-                    </>
-                  )}
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((item) => (
-                  <tr
-                    key={item.id}
-                    className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/40 transition-colors"
-                  >
-                    <td className="px-4 py-3 font-mono text-xs text-text-secondary">
-                      {codeOf(item)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <p className="font-medium text-text-primary">{item.name}</p>
-                      {item.description && (
-                        <p className="text-xs text-text-muted line-clamp-1">
-                          {item.description}
-                        </p>
+                      {kind === "products" && (
+                        <>
+                          <th className="px-3 py-3 font-medium text-right" title="Opening balance">
+                            Opening
+                          </th>
+                          <th className="px-3 py-3 font-medium text-right" title="Purchases during period">
+                            Inward (+)
+                          </th>
+                          <th className="px-3 py-3 font-medium text-right" title="Sales during period">
+                            Outward (-)
+                          </th>
+                          <th className="px-3 py-3 font-medium text-right" title="Closing stock position at t₀">
+                            Closing (t₀)
+                          </th>
+                          <th className="px-3 py-3 font-medium text-right" title="Closing valuation">
+                            Valuation
+                          </th>
+                        </>
                       )}
-                    </td>
-                    <td className="px-4 py-3 text-text-primary">
-                      {formatCurrency(
-                        Number(
-                          kind === "products"
-                            ? item.unit_price ?? 0
-                            : item.standard_rate ?? 0
-                        ),
-                        org?.base_currency_code
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-text-secondary">
-                      {kind === "products"
-                        ? item.unit || "—"
-                        : item.billing_unit || "—"}
-                    </td>
-                    {kind === "products" && (
-                      <>
-                        <td className="px-3 py-3 text-right text-xs tabular-nums text-text-secondary">
-                          {item.is_stock_tracked ? (item.opening_quantity ?? 0) : "—"}
+                      <th className="px-4 py-3 font-medium">Status</th>
+                      <th className="px-4 py-3 font-medium text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((item) => (
+                      <tr
+                        key={item.id}
+                        className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/40 transition-colors"
+                      >
+                        <td className="px-4 py-3 font-mono text-xs text-text-secondary">
+                          {codeOf(item)}
                         </td>
-                        <td className="px-3 py-3 text-right text-xs tabular-nums text-success-600 font-medium">
-                          {item.is_stock_tracked ? `+${item.purchased_quantity ?? 0}` : "—"}
-                        </td>
-                        <td className="px-3 py-3 text-right text-xs tabular-nums text-error-600 font-medium">
-                          {item.is_stock_tracked ? `-${item.sold_quantity ?? 0}` : "—"}
-                        </td>
-                        <td className="px-3 py-3 text-right">
-                          {item.is_stock_tracked ? (
-                            <span
-                              className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-semibold tabular-nums ${
-                                (item.quantity_on_hand ?? 0) > 0
-                                  ? "bg-success-100 text-success-800"
-                                  : "bg-bg-muted text-text-muted"
-                              }`}
-                              title="Closing units on hand at t₀ = Opening + Inward - Outward"
-                            >
-                              {item.quantity_on_hand ?? 0}
-                            </span>
-                          ) : (
-                            <span className="text-text-muted" title="Not stock-tracked">—</span>
+                        <td className="px-4 py-3">
+                          <p className="font-medium text-text-primary">{item.name}</p>
+                          {item.description && (
+                            <p className="text-xs text-text-muted line-clamp-1">
+                              {item.description}
+                            </p>
                           )}
                         </td>
-                        <td className="px-3 py-3 text-right text-xs tabular-nums font-medium text-text-primary">
-                          {item.is_stock_tracked
-                            ? formatCurrency(Number(item.valuation ?? 0), org?.base_currency_code)
-                            : "—"}
+                        <td className="px-4 py-3 text-text-primary">
+                          {formatCurrency(
+                            Number(
+                              kind === "products"
+                                ? item.unit_price ?? 0
+                                : item.standard_rate ?? 0
+                            ),
+                            org?.base_currency_code
+                          )}
                         </td>
-                      </>
-                    )}
-                    <td className="px-4 py-3">
-                      <StatusBadge status={statusOf(item)} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-1.5">
-                        {kind === "products" && item.is_stock_tracked && (
-                          <button
-                            onClick={() => setMovementItem(item)}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-ai-600 hover:border-ai-300 transition-colors"
-                            title="Stock Movement Ledger (Tracing)"
-                          >
-                            <History className="w-3.5 h-3.5" />
-                            History
-                          </button>
+                        <td className="px-4 py-3 text-text-secondary">
+                          {kind === "products"
+                            ? item.unit || "—"
+                            : item.billing_unit || "—"}
+                        </td>
+                        {kind === "products" && (
+                          <>
+                            <td className="px-3 py-3 text-right text-xs tabular-nums text-text-secondary">
+                              {item.is_stock_tracked ? (item.opening_quantity ?? 0) : "—"}
+                            </td>
+                            <td className="px-3 py-3 text-right text-xs tabular-nums text-success-600 font-medium">
+                              {item.is_stock_tracked ? `+${item.purchased_quantity ?? 0}` : "—"}
+                            </td>
+                            <td className="px-3 py-3 text-right text-xs tabular-nums text-error-600 font-medium">
+                              {item.is_stock_tracked ? `-${item.sold_quantity ?? 0}` : "—"}
+                            </td>
+                            <td className="px-3 py-3 text-right">
+                              {item.is_stock_tracked ? (
+                                <span
+                                  className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-semibold tabular-nums ${
+                                    (item.quantity_on_hand ?? 0) > 0
+                                      ? "bg-success-100 text-success-800"
+                                      : "bg-error-100 text-error-800"
+                                  }`}
+                                  title="Closing units on hand at t₀ = Opening + Inward - Outward"
+                                >
+                                  {item.quantity_on_hand ?? 0}
+                                </span>
+                              ) : (
+                                <span className="text-text-muted" title="Not stock-tracked">—</span>
+                              )}
+                            </td>
+                            <td className="px-3 py-3 text-right text-xs tabular-nums font-medium text-text-primary">
+                              {item.is_stock_tracked
+                                ? formatCurrency(Number(item.valuation ?? 0), org?.base_currency_code)
+                                : "—"}
+                            </td>
+                          </>
                         )}
-                        <button
-                          onClick={() => openEdit(item)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-ai-300 transition-colors"
+                        <td className="px-4 py-3">
+                          <StatusBadge status={statusOf(item)} />
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center justify-end gap-1.5">
+                            {kind === "products" && item.is_stock_tracked && (
+                              <button
+                                onClick={() => setMovementItem(item)}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-ai-600 hover:border-ai-300 transition-colors"
+                                title="Stock Movement Ledger (Tracing)"
+                              >
+                                <History className="w-3.5 h-3.5" />
+                                Tracing
+                              </button>
+                            )}
+                            <button
+                              onClick={() => openEdit(item)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-ai-300 transition-colors"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => handleToggleActive(item)}
+                              disabled={rowBusy === item.id}
+                              title={
+                                item.is_active
+                                  ? "Deactivate — keeps history, hides it from pickers"
+                                  : "Reactivate"
+                              }
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-warning-300 transition-colors disabled:opacity-40"
+                            >
+                              <Power className="w-3.5 h-3.5" />
+                              {item.is_active ? "Deactivate" : "Activate"}
+                            </button>
+                            <button
+                              onClick={() => {
+                                setConfirmDelete(item);
+                                setDeleteError(null);
+                              }}
+                              title="Delete — only possible while no document uses it"
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-error-600 hover:border-error-300 transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        /* ---- Global Stock Movements Ledger Table ---- */
+        <div className="space-y-3">
+          {loadingMovements && !allMovements && <TableSkeleton rows={8} cols={7} />}
+
+          {!loadingMovements && filteredMovements.length === 0 && (
+            <EmptyState
+              title={
+                search
+                  ? `No movements match “${search}”`
+                  : "No stock movements recorded yet"
+              }
+              hint={
+                search
+                  ? "Try searching by another product name, SKU, or clear your direction filter."
+                  : "Stock movements automatically register whenever purchase bills, invoices, or manual inventory adjustments are recorded."
+              }
+            />
+          )}
+
+          {filteredMovements.length > 0 && (
+            <div className="bg-bg-surface rounded-2xl border border-border-subtle overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
+                      <th className="px-4 py-3 font-medium">Date & Time</th>
+                      <th className="px-4 py-3 font-medium">Product / Item</th>
+                      <th className="px-4 py-3 font-medium">Direction</th>
+                      <th className="px-4 py-3 font-medium text-right">Quantity</th>
+                      <th className="px-4 py-3 font-medium text-right">Unit Cost</th>
+                      <th className="px-4 py-3 font-medium text-right">Movement Valuation</th>
+                      <th className="px-4 py-3 font-medium">Reference / Source</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredMovements.map((m) => {
+                      const isReceipt = m.direction === "RECEIPT";
+                      const dateStr = m.movement_date || m.created_at;
+                      const formattedDate = dateStr
+                        ? new Date(dateStr).toLocaleString("en-GB", {
+                            dateStyle: "medium",
+                            timeStyle: "short",
+                          })
+                        : "—";
+
+                      return (
+                        <tr
+                          key={m.id}
+                          className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/40 transition-colors"
                         >
-                          <Pencil className="w-3.5 h-3.5" />
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => handleToggleActive(item)}
-                          disabled={rowBusy === item.id}
-                          title={
-                            item.is_active
-                              ? "Deactivate — keeps history, hides it from pickers"
-                              : "Reactivate"
-                          }
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-warning-300 transition-colors disabled:opacity-40"
-                        >
-                          <Power className="w-3.5 h-3.5" />
-                          {item.is_active ? "Deactivate" : "Activate"}
-                        </button>
-                        <button
-                          onClick={() => {
-                            setConfirmDelete(item);
-                            setDeleteError(null);
-                          }}
-                          title="Delete — only possible while no document uses it"
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-error-600 hover:border-error-300 transition-colors"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          Delete
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                          <td className="px-4 py-3 font-mono text-xs text-text-secondary whitespace-nowrap">
+                            {formattedDate}
+                          </td>
+                          <td className="px-4 py-3">
+                            <p className="font-medium text-text-primary">
+                              {m.product_name || "—"}
+                            </p>
+                            {m.sku && (
+                              <p className="font-mono text-[11px] text-text-muted">
+                                SKU: {m.sku}
+                              </p>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            {isReceipt ? (
+                              <span className="inline-flex items-center gap-1 rounded-md bg-success-50 px-2 py-0.5 text-xs font-semibold text-success-700 border border-success-200">
+                                <ArrowDownRight className="w-3.5 h-3.5 text-success-600" />
+                                INWARD (+)
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 rounded-md bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700 border border-amber-200">
+                                <ArrowUpRight className="w-3.5 h-3.5 text-amber-600" />
+                                OUTWARD (-)
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right font-mono text-xs font-semibold tabular-nums whitespace-nowrap">
+                            <span className={isReceipt ? "text-success-600" : "text-amber-600"}>
+                              {isReceipt ? `+${m.quantity}` : `-${m.quantity}`} {m.unit || ""}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-right text-xs tabular-nums text-text-secondary whitespace-nowrap">
+                            {formatCurrency(m.unit_cost, org?.base_currency_code)}
+                          </td>
+                          <td className="px-4 py-3 text-right text-xs tabular-nums font-semibold text-text-primary whitespace-nowrap">
+                            {formatCurrency(
+                              m.valuation ?? (m.quantity * m.unit_cost),
+                              org?.base_currency_code
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-text-secondary max-w-xs">
+                            <p className="font-medium text-text-primary truncate">
+                              {m.source_type || "DIRECT"}
+                            </p>
+                            {m.description && (
+                              <p className="text-[11px] text-text-muted truncate">
+                                {m.description}
+                              </p>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-
-      {/* ---- add / edit -------------------------------------------------- */}
+      {/* ---- Create / Edit Modal ---- */}
       <Modal
         open={modalOpen}
         onClose={() => setModalOpen(false)}
-        title={`${editing ? "Edit" : "Add"} ${noun}`}
+        title={editing ? `Edit ${noun}` : `Add New ${noun}`}
       >
-        <div className="space-y-4">
+        <form onSubmit={handleSave} className="space-y-4">
+          {formError && <ErrorState message={formError} />}
+
           <div>
-            <label className="text-xs font-medium text-text-secondary">
-              Name *
+            <label className="block text-xs font-medium text-text-secondary mb-1">
+              Name <span className="text-error-500">*</span>
             </label>
             <input
-              className={`${inputCls} mt-1.5`}
-              value={form.name}
-              autoFocus
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              className={inputCls}
               placeholder={
-                kind === "products" ? "e.g. Study Table" : "e.g. Monthly Retainer"
+                kind === "products" ? "e.g. Ergonomic Office Chair" : "e.g. Audit Consulting"
               }
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              required
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-text-secondary mb-1">
+              Description (optional)
+            </label>
+            <textarea
+              className={`${inputCls} min-h-[70px] resize-y`}
+              placeholder="Internal notes or customer-facing description..."
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
             />
           </div>
 
           {kind === "products" ? (
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Unit price *
-                </label>
-                <input
-                  className={`${inputCls} mt-1.5`}
-                  type="number"
-                  min={0}
-                  value={form.unit_price}
-                  onChange={(e) =>
-                    setForm({ ...form, unit_price: e.target.value })
-                  }
-                />
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">
+                    Selling / Unit Price
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    className={inputCls}
+                    placeholder="0.00"
+                    value={form.unit_price}
+                    onChange={(e) =>
+                      setForm({ ...form, unit_price: e.target.value })
+                    }
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">
+                    Cost Price
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    className={inputCls}
+                    placeholder="0.00"
+                    value={form.cost_price}
+                    onChange={(e) =>
+                      setForm({ ...form, cost_price: e.target.value })
+                    }
+                  />
+                </div>
               </div>
-              <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Cost price
-                </label>
-                <input
-                  className={`${inputCls} mt-1.5`}
-                  type="number"
-                  min={0}
-                  value={form.cost_price}
-                  onChange={(e) =>
-                    setForm({ ...form, cost_price: e.target.value })
-                  }
-                />
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">
+                    Unit of Measure
+                  </label>
+                  <input
+                    className={inputCls}
+                    placeholder="e.g. pcs, kg, box"
+                    value={form.unit}
+                    onChange={(e) => setForm({ ...form, unit: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">
+                    Opening Stock (Units)
+                  </label>
+                  <input
+                    type="number"
+                    step="1"
+                    min="0"
+                    disabled={!!editing}
+                    className={`${inputCls} disabled:opacity-50`}
+                    placeholder="0"
+                    value={form.opening_stock}
+                    onChange={(e) =>
+                      setForm({ ...form, opening_stock: e.target.value })
+                    }
+                  />
+                </div>
               </div>
-            </div>
+
+              <label className="flex items-center gap-2 cursor-pointer pt-1">
+                <input
+                  type="checkbox"
+                  checked={form.is_stock_tracked}
+                  onChange={(e) =>
+                    setForm({ ...form, is_stock_tracked: e.target.checked })
+                  }
+                  className="rounded border-border-default text-ai-500 focus:ring-ai-100 w-4 h-4"
+                />
+                <span className="text-xs font-medium text-text-primary">
+                  Track perpetual stock levels & valuation for this product
+                </span>
+              </label>
+            </>
           ) : (
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Billed per
+                <label className="block text-xs font-medium text-text-secondary mb-1">
+                  Billing Unit
                 </label>
                 <select
-                  className={`${inputCls} mt-1.5`}
+                  className={inputCls}
                   value={form.billing_unit}
                   onChange={(e) =>
                     setForm({ ...form, billing_unit: e.target.value })
                   }
                 >
-                  {BILLING_UNITS.map((unit) => (
-                    <option key={unit} value={unit}>
-                      {unit}
+                  {BILLING_UNITS.map((u) => (
+                    <option key={u} value={u}>
+                      {u}
                     </option>
                   ))}
                 </select>
               </div>
               <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Standard rate *
+                <label className="block text-xs font-medium text-text-secondary mb-1">
+                  Standard Rate
                 </label>
                 <input
-                  className={`${inputCls} mt-1.5`}
                   type="number"
-                  min={0}
+                  step="0.01"
+                  min="0"
+                  className={inputCls}
+                  placeholder="0.00"
                   value={form.standard_rate}
                   onChange={(e) =>
                     setForm({ ...form, standard_rate: e.target.value })
@@ -648,13 +1113,15 @@ export default function CataloguePage() {
                 />
               </div>
               <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Cost rate
+                <label className="block text-xs font-medium text-text-secondary mb-1">
+                  Cost Rate
                 </label>
                 <input
-                  className={`${inputCls} mt-1.5`}
                   type="number"
-                  min={0}
+                  step="0.01"
+                  min="0"
+                  className={inputCls}
+                  placeholder="0.00"
                   value={form.cost_rate}
                   onChange={(e) =>
                     setForm({ ...form, cost_rate: e.target.value })
@@ -664,221 +1131,103 @@ export default function CataloguePage() {
             </div>
           )}
 
-          {kind === "products" && (
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Unit
-                </label>
-                <input
-                  className={`${inputCls} mt-1.5`}
-                  value={form.unit}
-                  onChange={(e) => setForm({ ...form, unit: e.target.value })}
-                  placeholder="pcs, kg, box…"
-                />
-              </div>
-              <label className="flex items-end gap-2 pb-2 text-xs text-text-secondary">
-                <input
-                  type="checkbox"
-                  checked={form.is_stock_tracked}
-                  onChange={(e) =>
-                    setForm({ ...form, is_stock_tracked: e.target.checked })
-                  }
-                />
-                Stock-tracked item
-              </label>
-            </div>
-          )}
+          <div className="flex justify-end gap-2 pt-2 border-t border-border-subtle">
+            <button
+              type="button"
+              onClick={() => setModalOpen(false)}
+              className="rounded-xl border border-border-default bg-bg-surface px-4 py-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="rounded-xl bg-ai-500 hover:bg-ai-600 px-4 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
+            >
+              {saving ? "Saving..." : editing ? "Save Changes" : `Create ${noun}`}
+            </button>
+          </div>
+        </form>
+      </Modal>
 
-          {kind === "products" && form.is_stock_tracked && !editing && (
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-xs font-medium text-text-secondary">
-                  Initial opening stock (units)
-                </label>
-                <input
-                  className={`${inputCls} mt-1.5`}
-                  type="number"
-                  min={0}
-                  placeholder="0"
-                  value={form.opening_stock}
-                  onChange={(e) => setForm({ ...form, opening_stock: e.target.value })}
-                />
-              </div>
-              <div className="flex items-center text-xs text-text-muted pt-5">
-                Initial units on hand at t₀ before purchases or sales
-              </div>
+      {/* ---- Individual Product Tracing Modal ---- */}
+      <Modal
+        open={!!movementItem}
+        onClose={() => setMovementItem(null)}
+        title={`Stock Tracing: ${movementItem?.name || ""}`}
+      >
+        <div className="space-y-4">
+          <div className="grid grid-cols-3 gap-2 bg-bg-muted/40 rounded-xl p-3 text-xs">
+            <div>
+              <p className="text-text-muted">Units On Hand</p>
+              <p className="font-semibold text-text-primary">
+                {movementItem?.quantity_on_hand ?? 0} {movementItem?.unit || ""}
+              </p>
             </div>
-          )}
-
-          <div>
-            <label className="text-xs font-medium text-text-secondary">
-              Description
-            </label>
-            <textarea
-              className={`${inputCls} mt-1.5 min-h-16 resize-y`}
-              value={form.description}
-              onChange={(e) =>
-                setForm({ ...form, description: e.target.value })
-              }
-            />
+            <div>
+              <p className="text-text-muted">Unit Cost</p>
+              <p className="font-semibold text-text-primary">
+                {formatCurrency(movementItem?.cost_price ?? 0, org?.base_currency_code)}
+              </p>
+            </div>
+            <div>
+              <p className="text-text-muted">Total Valuation</p>
+              <p className="font-semibold text-text-primary">
+                {formatCurrency(movementItem?.valuation ?? 0, org?.base_currency_code)}
+              </p>
+            </div>
           </div>
 
-          {formError && (
-            <p className="text-xs text-error-600 bg-error-50 rounded-xl px-3 py-2">
-              {formError}
+          {loadingItemMovements && <TableSkeleton rows={4} cols={4} />}
+
+          {!loadingItemMovements && itemMovements && itemMovements.length === 0 && (
+            <p className="text-center text-xs text-text-muted py-6">
+              No stock movements recorded for this item yet.
             </p>
           )}
 
-                              <div className="flex justify-end gap-2 pt-1">
-            <button
-              onClick={() => setModalOpen(false)}
-              className="px-4 py-2 rounded-xl text-sm font-medium text-text-secondary hover:text-text-primary transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleSave}
-              disabled={saving || form.name.trim().length < 2}
-              className="px-5 py-2 btn-3d btn-shine rounded-xl bg-ai-500 hover:bg-ai-600 text-white text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {saving ? "Saving…" : editing ? "Save changes" : `Save ${noun}`}
-            </button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* ---- delete (refused while used) --------------------------------- */}
-      <Modal
-        open={confirmDelete !== null}
-        onClose={() => setConfirmDelete(null)}
-        title={`Delete ${noun}`}
-      >
-        <div className="space-y-4">
-          <p className="text-sm text-text-primary">
-            Delete <span className="font-medium">{confirmDelete?.name}</span>?
-          </p>
-          <p className="text-xs text-text-secondary">
-            This is only possible while no document uses the {noun}. If it is in
-            use, the app refuses and offers to deactivate it instead — which
-            keeps every past invoice, quote and bill resolving correctly.
-          </p>
-
-          {deleteError && (
-            <div className="text-xs text-warning-700 bg-warning-50 rounded-xl px-3 py-2.5 space-y-2">
-              <p>{deleteError}</p>
-              {confirmDelete && (
-                <button
-                  onClick={async () => {
-                    await handleToggleActive(confirmDelete);
-                    setConfirmDelete(null);
-                    setDeleteError(null);
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-warning-300 bg-bg-surface px-2.5 py-1.5 text-xs font-medium text-warning-700 transition-colors"
-                >
-                  <Power className="w-3.5 h-3.5" />
-                  Deactivate it instead
-                </button>
-              )}
-            </div>
-          )}
-
-          <div className="flex justify-end gap-2 pt-1">
-            <button
-              onClick={() => setConfirmDelete(null)}
-              className="px-4 py-2 rounded-xl text-sm font-medium text-text-secondary hover:text-text-primary transition-colors"
-            >
-              Cancel
-            </button>
-            {!deleteError && (
-              <button
-                onClick={handleDelete}
-                disabled={rowBusy !== null}
-                className="px-5 py-2 rounded-xl bg-error-600 hover:bg-error-700 text-white text-sm font-medium disabled:opacity-40 transition-colors"
-              >
-                {rowBusy ? "Deleting…" : "Delete"}
-              </button>
-            )}
-          </div>
-        </div>
-      </Modal>
-
-      {/* ---- stock movement history modal ------------------------------- */}
-      <Modal
-        open={movementItem !== null}
-        onClose={() => setMovementItem(null)}
-        title={`Stock Movements: ${movementItem?.name || ""}`}
-      >
-        <div className="space-y-4">
-          <p className="text-xs text-text-muted -mt-2">
-            Chronological perpetual inventory ledger for code {movementItem ? codeOf(movementItem) : ""}
-          </p>
-          <div className="grid grid-cols-4 gap-2 bg-bg-muted/50 p-3 rounded-xl text-center text-xs">
-            <div>
-              <p className="text-text-muted">Opening</p>
-              <p className="font-semibold text-text-primary">{movementItem?.opening_quantity ?? 0}</p>
-            </div>
-            <div>
-              <p className="text-text-muted">Purchased (+)</p>
-              <p className="font-semibold text-success-600">+{movementItem?.purchased_quantity ?? 0}</p>
-            </div>
-            <div>
-              <p className="text-text-muted">Sold (-)</p>
-              <p className="font-semibold text-error-600">-{movementItem?.sold_quantity ?? 0}</p>
-            </div>
-            <div>
-              <p className="text-text-muted">Closing (t₀)</p>
-              <p className="font-bold text-brand-navy">{movementItem?.quantity_on_hand ?? 0}</p>
-            </div>
-          </div>
-
-          {loadingMovements ? (
-            <div className="py-8 text-center text-sm text-text-muted">
-              Loading movements from stock ledger…
-            </div>
-          ) : !movements || movements.length === 0 ? (
-            <div className="py-8 text-center text-sm text-text-muted">
-              No stock movements recorded yet for this product.
-            </div>
-          ) : (
+          {!loadingItemMovements && itemMovements && itemMovements.length > 0 && (
             <div className="max-h-80 overflow-y-auto rounded-xl border border-border-subtle">
               <table className="w-full text-xs">
-                <thead className="bg-bg-muted text-text-muted sticky top-0">
-                  <tr className="border-b border-border-subtle text-left">
-                    <th className="p-2.5">Date</th>
-                    <th className="p-2.5">Direction</th>
-                    <th className="p-2.5 text-right">Qty</th>
-                    <th className="p-2.5 text-right">Unit Cost</th>
-                    <th className="p-2.5 text-right">Value</th>
-                    <th className="p-2.5">Source / Note</th>
+                <thead>
+                  <tr className="border-b border-border-subtle bg-bg-muted/30 text-left text-[10px] uppercase tracking-wide text-text-muted">
+                    <th className="px-3 py-2">Date</th>
+                    <th className="px-3 py-2">Type</th>
+                    <th className="px-3 py-2 text-right">Qty</th>
+                    <th className="px-3 py-2 text-right">Cost</th>
+                    <th className="px-3 py-2">Reference</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {movements.map((m) => (
-                    <tr key={m.id} className="border-b border-border-subtle last:border-0 hover:bg-bg-muted/30">
-                      <td className="p-2.5 text-text-secondary whitespace-nowrap">
-                        {m.movement_date || new Date(m.created_at).toLocaleDateString()}
+                  {itemMovements.map((m) => (
+                    <tr
+                      key={m.id}
+                      className="border-b border-border-subtle last:border-0"
+                    >
+                      <td className="px-3 py-2 font-mono text-[11px] text-text-secondary">
+                        {m.movement_date || m.created_at
+                          ? new Date(m.movement_date || m.created_at).toLocaleDateString()
+                          : "—"}
                       </td>
-                      <td className="p-2.5">
-                        <span className={`inline-block px-1.5 py-0.5 rounded font-semibold text-[10px] ${
-                          m.direction === "RECEIPT"
-                            ? "bg-success-100 text-success-700"
-                            : "bg-amber-100 text-amber-700"
-                        }`}>
-                          {m.direction}
+                      <td className="px-3 py-2">
+                        <span
+                          className={`font-semibold ${
+                            m.direction === "RECEIPT"
+                              ? "text-success-600"
+                              : "text-amber-600"
+                          }`}
+                        >
+                          {m.direction === "RECEIPT" ? "Inward (+)" : "Outward (-)"}
                         </span>
                       </td>
-                      <td className="p-2.5 text-right font-medium tabular-nums">
+                      <td className="px-3 py-2 text-right font-mono tabular-nums font-medium">
                         {m.direction === "RECEIPT" ? `+${m.quantity}` : `-${m.quantity}`}
                       </td>
-                      <td className="p-2.5 text-right tabular-nums text-text-secondary">
+                      <td className="px-3 py-2 text-right tabular-nums text-text-secondary">
                         {formatCurrency(m.unit_cost, org?.base_currency_code)}
                       </td>
-                      <td className="p-2.5 text-right tabular-nums font-medium text-text-primary">
-                        {formatCurrency(m.quantity * m.unit_cost, org?.base_currency_code)}
-                      </td>
-                      <td className="p-2.5 text-text-muted max-w-xs truncate" title={m.description || m.source_type || ""}>
-                        {m.description || m.source_type || "—"}
+                      <td className="px-3 py-2 text-text-muted truncate max-w-[140px]">
+                        {m.source_type || m.description || "—"}
                       </td>
                     </tr>
                   ))}
@@ -890,9 +1239,45 @@ export default function CataloguePage() {
           <div className="flex justify-end pt-2">
             <button
               onClick={() => setMovementItem(null)}
-              className="px-4 py-2 rounded-xl text-sm font-medium bg-bg-muted hover:bg-bg-surface text-text-secondary hover:text-text-primary transition-colors"
+              className="rounded-xl border border-border-default bg-bg-surface px-4 py-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
             >
               Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* ---- Delete Confirmation Modal ---- */}
+      <Modal
+        open={!!confirmDelete}
+        onClose={() => setConfirmDelete(null)}
+        title={`Delete ${noun}?`}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-text-secondary">
+            Are you sure you want to delete{" "}
+            <span className="font-semibold text-text-primary">
+              {confirmDelete?.name}
+            </span>
+            ? If any transaction or invoice references this {noun.toLowerCase()},
+            the system will refuse deletion to safeguard accounting integrity.
+          </p>
+
+          {deleteError && <ErrorState message={deleteError} />}
+
+          <div className="flex justify-end gap-2 pt-2 border-t border-border-subtle">
+            <button
+              onClick={() => setConfirmDelete(null)}
+              className="rounded-xl border border-border-default bg-bg-surface px-4 py-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={!!rowBusy}
+              className="rounded-xl bg-error-600 hover:bg-error-700 px-4 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
+            >
+              {rowBusy ? "Deleting..." : "Delete Permanently"}
             </button>
           </div>
         </div>

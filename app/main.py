@@ -1685,6 +1685,18 @@ async def list_product_movements(
         auth.organization_id, product_id=product_id, limit=limit
     )
 
+
+@app.get("/api/catalogue/movements")
+async def list_all_catalogue_movements(
+    limit: int = 200,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Chronological stock movements across all products for global inventory tracing."""
+    from app.services import inventory_service
+    return await inventory_service.get_all_inventory_movements(
+        auth.organization_id, limit=limit
+    )
+
 @app.get("/api/catalogue/services")
 async def list_catalogue_services(
     query: str = "",

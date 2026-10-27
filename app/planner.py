@@ -539,6 +539,13 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"(?:create|add|new|setup)\s+(?:a\s+)?recurring\b",
     ]),
 
+    ("get_inventory_status", [
+        r"(?:show|view|list|get|display|fetch|check|what\s+is|what's|how\s+much|how\s+many)\b[^.\n]*\b(?:inventory|stock|units\s+on\s+hand|in\s+stock|out\s+of\s+stock|low\s+stock|stock\s+movements?)\b",
+        r"\b(?:inventory|stock)\b[^.\n]*\b(?:status|valuation|value|on\s+hand|summary|balance|level|position|movements?)\b",
+        r"\b(?:out\s+of\s+stock|low\s+stock|depleted\s+stock)\b",
+        r"\bhow\s+many\b[^.\n]*\b(?:in\s+stock|on\s+hand|left|remaining)\b",
+    ]),
+
     ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
     ("update_product", [r"update.*product", r"edit.*product", r"change.*product", r"update.*item.*price"]),
     ("delete_service", [r"delete.*service", r"remove.*service"]),
@@ -664,7 +671,7 @@ _SEMANTIC_INTENTS = frozenset({
     "create_product", "create_service", "create_employee", "create_project",
     "create_recurring_template", "get_recurring_templates", "create_bank_account",
     "list_bank_accounts", "list_expenses", "list_customers", "list_suppliers",
-    "list_employees", "supplier_balance", "customer_balance",
+    "list_employees", "get_inventory_status", "supplier_balance", "customer_balance",
     "generate_supplier_ledger", "generate_customer_ledger", "generate_general_ledger",
     "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
     "generate_cash_flow", "project_profitability", "record_bank_transfer",
@@ -2150,6 +2157,15 @@ def plan(
             if not entities["counterparty"]:
 
                 entities.pop("counterparty", None)
+
+    if intent == "get_inventory_status":
+        if re.search(r"\b(?:out\s+of\s+stock|low\s+stock|depleted)\b", msg, re.IGNORECASE):
+            entities["only_low_stock"] = True
+        _pm = re.search(r"(?:how\s+many|check\s+stock\s+(?:for|of)|stock\s+(?:of|for|level\s+of|status\s+of)|status\s+of|any)\s+([a-zA-Z0-9_\s\-]+?)(?:\s+do\s+we\s+have|\s+in\s+stock|\s+on\s+hand|\?|$)", msg, re.IGNORECASE)
+        if _pm:
+            _cand = _pm.group(1).strip()
+            if _cand.lower() not in ("items", "products", "goods", "inventory", "stock", "all", "everything"):
+                entities["product_name"] = _cand
 
 
 
@@ -7982,6 +7998,7 @@ def _tools_for_intent(intent: str) -> List[str]:
 
         "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
 
+        "get_inventory_status": ["get_inventory_status", "search_product"],
         "create_product": ["search_product", "create_product"],
         "update_product": ["search_product", "update_product"],
         "delete_product": ["search_product", "delete_product"],
@@ -8191,6 +8208,7 @@ def _outcome(intent: str) -> str:
         "create_project": "Project created",
         "create_account": "Account created in the Chart of Accounts",
         "get_chart_of_accounts": "Chart of Accounts retrieved",
+        "get_inventory_status": "Inventory status and stock levels retrieved",
         "create_customer": "Customer registered in CRM directory",
         "create_supplier": "Supplier registered in vendor directory",
         "create_employee": "Employee registered in personnel roster",

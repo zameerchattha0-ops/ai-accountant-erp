@@ -363,7 +363,7 @@ async def get_product_unit_tracing(
     movements = await fetch_many(
         "inventory_movements",
         filters=filters,
-        order_by="movement_date asc, created_at asc",
+        order="created_at.asc",
         limit=5000,
     )
 
@@ -426,6 +426,118 @@ async def get_product_movements(
             "organization_id": str(organization_id),
             "product_id": str(product_id),
         },
-        order_by="movement_date desc, created_at desc",
+        order="created_at.desc",
         limit=limit,
     )
+
+
+async def get_all_inventory_movements(
+    organization_id: uuid.UUID,
+    *,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return all chronological stock movements across products for global tracing."""
+    movements = await fetch_many(
+        "inventory_movements",
+        filters={"organization_id": str(organization_id)},
+        order="created_at.desc",
+        limit=limit,
+    )
+    if not movements:
+        return []
+    pids = list({str(m.get("product_id")) for m in movements if m.get("product_id")})
+    products_map = {}
+    if pids:
+        from app.database import fetch_many as _fetch_many
+        p_rows = await _fetch_many(
+            "products",
+            filters={"organization_id": str(organization_id)},
+            select="id,name,product_code,unit",
+            limit=500,
+        )
+        products_map = {str(p["id"]): p for p in p_rows}
+
+    for m in movements:
+        p_info = products_map.get(str(m.get("product_id")), {})
+        m["product_name"] = p_info.get("name") or "—"
+        m["sku"] = p_info.get("product_code") or "—"
+        m["product_code"] = p_info.get("product_code") or "—"
+        m["unit"] = p_info.get("unit") or "—"
+        m["valuation"] = float(m.get("value") or (float(m.get("quantity") or 0.0) * float(m.get("unit_cost") or 0.0)))
+    return movements
+
+
+async def get_inventory_status_summary(
+    organization_id: uuid.UUID,
+    *,
+    product_name: Optional[str] = None,
+    only_low_stock: bool = False,
+) -> Dict[str, Any]:
+    """Summary of stock positions, units received/issued, and valuation."""
+    from app.services import product_service
+    rows = await product_service.list_catalog(organization_id, status="ALL")
+    tracing_map = await get_product_unit_tracing(organization_id)
+
+    total_val = 0.0
+    total_on_hand = 0.0
+    total_received = 0.0
+    total_issued = 0.0
+    tracked_items = []
+
+    for r in rows:
+        if not r.get("is_stock_tracked"):
+            continue
+        pid = str(r.get("id"))
+        tr = tracing_map.get(pid, {
+            "opening_quantity": 0.0,
+            "purchased_quantity": 0.0,
+            "sold_quantity": 0.0,
+            "closing_quantity": 0.0,
+            "average_cost": float(r.get("cost_price") or 0.0),
+            "valuation": 0.0,
+        })
+        on_hand = float(tr.get("closing_quantity") or 0.0)
+        val = float(tr.get("valuation") or 0.0)
+        inward = float(tr.get("purchased_quantity") or 0.0)
+        outward = float(tr.get("sold_quantity") or 0.0)
+
+        total_val += val
+        total_on_hand += on_hand
+        total_received += inward
+        total_issued += outward
+
+        item_status = "IN_STOCK" if on_hand > 0 else "OUT_OF_STOCK"
+        item_dict = {
+            "id": pid,
+            "name": r.get("name"),
+            "product_code": r.get("product_code"),
+            "unit": r.get("unit") or "unit",
+            "quantity_on_hand": on_hand,
+            "purchased_quantity": inward,
+            "sold_quantity": outward,
+            "average_cost": tr.get("average_cost", 0.0),
+            "valuation": val,
+            "status": item_status,
+        }
+
+        if product_name:
+            p_low = product_name.lower()
+            if p_low in str(r.get("name", "")).lower() or p_low in str(r.get("product_code", "")).lower():
+                tracked_items.append(item_dict)
+        elif only_low_stock:
+            if on_hand <= 0:
+                tracked_items.append(item_dict)
+        else:
+            tracked_items.append(item_dict)
+
+    out_of_stock_count = sum(1 for item in tracked_items if item["quantity_on_hand"] <= 0)
+
+    return {
+        "total_valuation": round(total_val, 2),
+        "total_units_on_hand": round(total_on_hand, 2),
+        "total_received_units": round(total_received, 2),
+        "total_issued_units": round(total_issued, 2),
+        "out_of_stock_count": out_of_stock_count,
+        "tracked_products_count": len(tracked_items),
+        "products": tracked_items,
+    }

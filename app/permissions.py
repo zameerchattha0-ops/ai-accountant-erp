@@ -151,7 +151,7 @@ _ALWAYS_ALLOWED = {
     "get_invoice", "get_purchase_bill",
     "classify_expense", "list_expenses",
     "search_product", "search_fixed_asset", "get_fixed_asset",
-    "search_service",
+    "search_service", "get_inventory_status",
     # Employees module: reads only — mutations stay capability-gated
     # (ai.permissions.master_data).
     "search_employee", "get_employee",

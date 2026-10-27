@@ -83,6 +83,7 @@ ERP_MODULES: Dict[str, Dict[str, Any]] = {
             "update_service",
             "delete_service",
             "search_service",
+            "get_inventory_status",
         ],
     },
     "banking": {
@@ -338,6 +339,16 @@ ERP_TASKS: Dict[str, Dict[str, Any]] = {
             "sales_price": "What is the standard billing rate or price for this service?",
         },
     },
+    "get_inventory_status": {
+        "task_id": "get_inventory_status",
+        "module": "catalogue",
+        "name": "Inventory & Stock Status",
+        "tool": "get_inventory_status",
+        "execution_type": TYPE_OPERATIONAL_TASK,
+        "description": "View inventory valuation, total units on hand, inward received, outward issued, and stock levels across catalogue products.",
+        "required_fields": [],
+        "optional_fields": ["product_name", "only_low_stock"],
+    },
     # ---- BANKING MODULE ------------------------------------------------
     "create_bank_account": {
         "task_id": "create_bank_account",
@@ -468,6 +479,13 @@ def format_operational_summary(task_id: str, data: Dict[str, Any]) -> str:
         rate = data.get("standard_rate")
         rate_str = f" with rate Rs. {rate:,.2f}" if rate is not None else ""
         return f"Successfully added service '{name}'{rate_str} to the catalogue under {mod_name} (`{mod_path}`)."
+
+    if task_id == "get_inventory_status":
+        val = data.get("total_valuation", 0.0)
+        on_hand = data.get("total_units_on_hand", 0.0)
+        out_cnt = data.get("out_of_stock_count", 0)
+        items_cnt = data.get("product_count", len(data.get("products", [])))
+        return f"Inventory status retrieved from {mod_name} (`{mod_path}`): Total Valuation: Rs. {val:,.2f} across {on_hand:,.1f} units on hand ({items_cnt} products, {out_cnt} out of stock)."
 
     if task_id == "create_bank_account":
         acct_name = data.get("account_name") or "Bank Account"

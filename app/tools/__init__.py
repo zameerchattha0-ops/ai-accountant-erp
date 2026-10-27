@@ -4711,6 +4711,30 @@ async def _search_product(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 
+async def _get_inventory_status(organization_id: uuid.UUID, **kw) -> ToolResult:
+
+    """Get current inventory valuation, stock on hand, inward received, and outward issued."""
+
+    from app.services import inventory_service
+
+    product_name = kw.get("product_name") or kw.get("name") or kw.get("query")
+
+    only_low_stock = bool(kw.get("only_low_stock") or kw.get("out_of_stock") or False)
+
+    data = await inventory_service.get_inventory_status_summary(
+
+        organization_id,
+
+        product_name=str(product_name).strip() if product_name else None,
+
+        only_low_stock=only_low_stock,
+
+    )
+
+    return ToolResult(tool_name="get_inventory_status", success=True, data=data)
+
+
+
 async def _create_product(organization_id: uuid.UUID, **kw) -> ToolResult:
 
     if "sales_price" in kw and "unit_price" not in kw:
@@ -4867,6 +4891,8 @@ async def _record_asset_depreciation(organization_id: uuid.UUID, **kw) -> ToolRe
 # Product catalog
 
 register("search_product", handler=_search_product, read_only=True, description="Search the product catalog by name (empty result = no product exists yet)")
+
+register("get_inventory_status", handler=_get_inventory_status, read_only=True, description="Get current inventory valuation, quantities on hand, inward received, and outward issued stock across catalogue products")
 
 register("create_product", handler=_create_product, read_only=False, contract=contract_from_callable(product_service.create), description="Create a catalog product (catalog only — the ERP has no stock-quantity ledger). Set is_stock_tracked=true ONLY when the user explicitly answered the inventory question confirming resale stock — never infer it")
 register("update_product", handler=_update_product, read_only=False, description="Update an existing product in the catalog (unit_price, cost_price, description, name, is_stock_tracked)")
