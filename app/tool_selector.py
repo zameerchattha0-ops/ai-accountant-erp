@@ -25,7 +25,7 @@ from typing import Iterable, Set
 _CUSTOMER_LOOKUPS = {"search_customer", "get_customer", "get_customer_ledger"}
 _SUPPLIER_LOOKUPS = {"search_supplier", "get_supplier", "get_supplier_ledger"}
 _ACCOUNT_LOOKUPS = {"search_account", "get_chart_of_accounts"}
-_PRODUCT_LOOKUPS = {"search_product", "search_service"}
+_PRODUCT_LOOKUPS = {"search_product", "search_service", "get_inventory_status"}
 _ASSET_LOOKUPS = {"search_fixed_asset", "get_fixed_asset"}
 _BANK_LOOKUPS = {"list_bank_accounts"}
 _EMPLOYEE_LOOKUPS = {"search_employee", "get_employee"}

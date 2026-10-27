@@ -164,11 +164,65 @@ def register(
 
 
 
+_TOOL_ALIASES: Dict[str, str] = {
+    # Inventory / Stock status lookups
+    "get_inventory": "get_inventory_status",
+    "check_stock": "get_inventory_status",
+    "view_inventory": "get_inventory_status",
+    "fetch_inventory": "get_inventory_status",
+    "list_inventory": "get_inventory_status",
+    "inventory_status": "get_inventory_status",
+    "check_inventory": "get_inventory_status",
+    "stock_status": "get_inventory_status",
+    "get_stock": "get_inventory_status",
+    "get_stock_status": "get_inventory_status",
+    "view_stock": "get_inventory_status",
+    # Products & Services
+    "search_products": "search_product",
+    "list_products": "search_product",
+    "get_products": "search_product",
+    "find_product": "search_product",
+    "search_services": "search_service",
+    "list_services": "search_service",
+    "get_services": "search_service",
+    "find_service": "search_service",
+    # Chart of Accounts
+    "get_accounts": "get_chart_of_accounts",
+    "list_accounts": "get_chart_of_accounts",
+    "chart_of_accounts": "get_chart_of_accounts",
+    "fetch_chart_of_accounts": "get_chart_of_accounts",
+    "search_accounts": "search_account",
+    "find_account": "search_account",
+    # Customers & Suppliers
+    "search_customers": "search_customer",
+    "find_customer": "search_customer",
+    "search_suppliers": "search_supplier",
+    "find_supplier": "search_supplier",
+    # Assets
+    "search_assets": "search_fixed_asset",
+    "search_fixed_assets": "search_fixed_asset",
+    "get_fixed_assets": "search_fixed_asset",
+    "list_fixed_assets": "search_fixed_asset",
+    # Employees
+    "search_employees": "search_employee",
+    "find_employee": "search_employee",
+    # Banks
+    "get_bank_accounts": "list_bank_accounts",
+    "search_bank_accounts": "list_bank_accounts",
+}
+
+
+def resolve_tool_alias(slug: str) -> str:
+    """Map a tool alias or synonym to its canonical registered slug."""
+    return _TOOL_ALIASES.get(slug, slug)
+
+
 def get_handler(slug: str) -> Dict[str, Any] | None:
 
-    """Return the registered entry for *slug*, or None."""
+    """Return the registered entry for *slug*, resolving aliases if needed."""
 
-    return _TOOL_REGISTRY.get(slug)
+    canonical = _TOOL_ALIASES.get(slug, slug)
+    return _TOOL_REGISTRY.get(canonical)
 
 
 

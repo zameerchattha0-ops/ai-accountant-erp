@@ -15832,7 +15832,7 @@ async def _continue_lookup_only_plan(
 
     async def _read_only_executor(tool_name: str, args: dict) -> dict:
 
-        if tool_name in (excluded_tools or set()):
+        if tool_name in (excluded_tools or set()) and not is_read_only_tool(tool_name):
 
             return excluded_tool_refusal(tool_name, execution_plan.intent)
 

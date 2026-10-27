@@ -28,7 +28,7 @@ from app import idempotency as idem
 from app.error_normalizer import normalize_error
 from app.models.schemas import ToolCall, ToolResult
 from app.permissions import authorize_tool
-from app.tools import get_handler, list_tools
+from app.tools import get_handler, list_tools, resolve_tool_alias
 from app.validator import validate_operation
 
 log = structlog.get_logger(__name__)
@@ -134,6 +134,12 @@ async def route_tool_call(
     5. Execute the tool handler
     """
     slug = tool_call.tool_name
+    canonical_slug = resolve_tool_alias(slug)
+    if canonical_slug != slug:
+        log.info("tool_router.alias_resolved", requested=slug, canonical=canonical_slug)
+        slug = canonical_slug
+        tool_call.tool_name = canonical_slug
+
     arguments = tool_call.arguments or {}
 
     # 1. Check registry
@@ -322,6 +328,16 @@ async def route_tool_call(
             else:
                 arguments[date_param] = date.today().isoformat()
                 date_defaulted = True
+        # Argument Sanitization: strip unaccepted extra keyword arguments if contract is declared
+        contract = entry.get("contract") or {}
+        accepted = set(contract.get("accepted") or ())
+        if accepted and not contract.get("accepts_extra"):
+            sanitized_args = {k: v for k, v in arguments.items() if k in accepted or k in ("organization_id", "created_by")}
+            dropped = set(arguments.keys()) - set(sanitized_args.keys())
+            if dropped:
+                log.info("tool_router.sanitized_extra_kwargs", tool=slug, dropped=sorted(dropped))
+            arguments = sanitized_args
+
         result = await handler(organization_id, **arguments)
         if date_defaulted and result.success:
             if isinstance(result.data, dict):
@@ -476,6 +492,21 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             }
             if p.get("required"):
                 required_fields.append(pname)
+
+        # Fallback to Python signature contract if DB parameters are empty
+        if not properties and entry.get("contract"):
+            contract = entry["contract"]
+            for pname in contract.get("accepted") or ():
+                if pname in ("organization_id", "created_by"):
+                    continue
+                is_uuid = pname in (contract.get("uuid_params") or ())
+                properties[pname] = {
+                    "type": "string",
+                    "description": f"UUID for {pname}" if is_uuid else f"Parameter {pname}",
+                }
+            for req in contract.get("required") or ():
+                if req not in ("organization_id", "created_by"):
+                    required_fields.append(req)
 
         if slug == "record_cash_sale":
             if "items" not in properties:
