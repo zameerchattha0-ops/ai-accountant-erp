@@ -12,6 +12,7 @@ Never executes an arbitrary tool name received from Gemini.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import date
