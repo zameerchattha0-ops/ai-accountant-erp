@@ -122,14 +122,26 @@ def _check_dates(data: Dict[str, Any]) -> List[str]:
     return errors
 
 
+_RULES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_RULES_CACHE_TTL = 300.0  # 5 minutes in-memory cache
+
+
 async def _load_rules(operation: str) -> List[Dict[str, Any]]:
-    """Load active validation rules that apply to *operation*."""
+    """Load active validation rules that apply to *operation* with in-memory TTL."""
+    import time
+    now = time.monotonic()
+    cached = _RULES_CACHE.get(operation)
+    if cached and now < cached[0]:
+        return cached[1]
+
     rules = await fetch_many(
         "ai_validation_rules",
         filters={"applies_to": operation, "status": "ACTIVE"},
         order="priority.desc",
     )
-    return rules or []
+    res = rules or []
+    _RULES_CACHE[operation] = (now + _RULES_CACHE_TTL, res)
+    return res
 
 
 async def _apply_rule(

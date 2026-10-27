@@ -14091,18 +14091,20 @@ async def resume_with_clarification(
             followup_opts = ["Today", "Yesterday"]
 
             from app.database import create_clarification
-            await create_clarification(
-                session_id=session_id,
-                question=followup_q,
-                required_fields=["transaction_date"],
-                options=followup_opts,
-                reason=json.dumps({
-                    "intent": intent,
-                    "extracted_entities": merged_entities,
-                    "missing_fields": ["transaction_date"],
-                }),
+            await asyncio.gather(
+                create_clarification(
+                    session_id=session_id,
+                    question=followup_q,
+                    required_fields=["transaction_date"],
+                    options=followup_opts,
+                    reason=json.dumps({
+                        "intent": intent,
+                        "extracted_entities": merged_entities,
+                        "missing_fields": ["transaction_date"],
+                    }),
+                ),
+                _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION),
             )
-            await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -14327,13 +14329,15 @@ async def resume_with_clarification(
                     result_summary = f"Operation failed: {tool_result.error or 'Unknown error'}"
 
                 final_status = ExecutionStatus.COMPLETED if tool_result.success else ExecutionStatus.FAILED
-                await _update_status(session_id, final_status)
-                await _log_step(session_id, "SINGLE_HOP_EXECUTION", {
-                    "intent": intent,
-                    "tool": single_hop_call.tool_name,
-                    "success": tool_result.success,
-                    "summary": result_summary,
-                })
+                await asyncio.gather(
+                    _update_status(session_id, final_status),
+                    _log_step(session_id, "SINGLE_HOP_EXECUTION", {
+                        "intent": intent,
+                        "tool": single_hop_call.tool_name,
+                        "success": tool_result.success,
+                        "summary": result_summary,
+                    }),
+                )
 
                 return AgentResponse(
                     status=final_status,

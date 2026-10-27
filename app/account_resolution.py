@@ -48,6 +48,19 @@ log = structlog.get_logger(__name__)
 # E:\Qoder\AUDIT_REPORT.md §3.1.  The old `_DEFAULT_SHAPE`
 # ("EXPENSE", "DEBIT", "6100") is GONE: an unknown treatment now raises
 # InvalidAccountingNature instead of silently becoming an operating expense.
+
+_EXPENSE_CATEGORY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "supplies": ("supplies", "office supplies", "stationery", "printing", "consumables"),
+    "utilities expense": ("utilities", "electricity", "water", "gas", "power", "utility"),
+    "rent expense": ("rent", "office rent", "building rent", "premises rent", "lease"),
+    "communication expense": ("communication", "internet", "telephone", "phone", "mobile", "broadband"),
+    "travel & transport": ("travel", "transport", "conveyance", "fuel", "petrol", "vehicle expense"),
+    "repairs & maintenance": ("repair", "repairs", "maintenance", "service"),
+    "marketing & advertising expense": ("marketing", "advertising", "promotion", "ads"),
+    "bank charges": ("bank charges", "bank fee", "service charge"),
+    "salaries & wages": ("salary", "salaries", "wages", "payroll"),
+}
+
 from app.accounting_vocabulary import (
     ACCOUNT_SHAPES as _VOCAB_SHAPES,
     NATURE_LEDGER_NAMES as _NATURE_LEDGER_NAMES,
@@ -953,6 +966,26 @@ async def expense_category_gap(
     name, code = proposal
     if await account_exists(organization_id, name) is not None:
         return None
+
+    # Semantic/synonym resolution for common expense categories:
+    try:
+        from app.repositories import account_repository as a_repo
+        keywords = _EXPENSE_CATEGORY_SYNONYMS.get(label.lower(), (label.lower(),))
+        existing_accounts = await a_repo.get_chart_of_accounts(
+            organization_id, account_type="EXPENSE"
+        )
+        for acc in existing_accounts or []:
+            acc_name = str(acc.get("name") or "").lower()
+            if any(kw in acc_name for kw in keywords):
+                log.info(
+                    "account_resolution.expense_synonym_matched",
+                    requested=name,
+                    matched=acc.get("name"),
+                )
+                return None  # Ledger exists! No gap needed.
+    except Exception as exc:
+        log.warning("account_resolution.synonym_check_failed", error=str(exc)[:160])
+
     gap = gap_for_nature(name, "OPERATING_EXPENSE", "expense_category")
     if code:
         gap.base_code = str(code)

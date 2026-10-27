@@ -186,38 +186,53 @@ async def route_tool_call(
             )
         log.warning("tool_router.read_without_auth", tool=slug)
     else:
-        permitted = await authorize_tool(slug, auth=auth)
-        if not permitted:
-            log.warning(
-                "tool_router.permission_denied",
-                tool=slug,
-                user=str(user_id),
-                role=auth.role_code,
+        # Run authorization and business validation in parallel for mutations (saves 1 round-trip)
+        if not read_only:
+            permitted, validation = await asyncio.gather(
+                authorize_tool(slug, auth=auth),
+                validate_operation(
+                    organization_id=organization_id,
+                    operation=slug,
+                    data=arguments,
+                ),
             )
-            return ToolResult(
-                tool_name=slug,
-                success=False,
-                error=f"Permission denied: your role ({auth.role_code}) cannot use {slug}.",
-            )
-
-    # 3. Parameter validation for mutations
-    if not read_only:
-        validation = await validate_operation(
-            organization_id=organization_id,
-            operation=slug,
-            data=arguments,
-        )
-        if not validation.valid:
-            log.warning(
-                "tool_router.validation_failed",
-                tool=slug,
-                errors=validation.errors,
-            )
-            return ToolResult(
-                tool_name=slug,
-                success=False,
-                error=f"Validation failed: {'; '.join(validation.errors)}",
-            )
+            if not permitted:
+                log.warning(
+                    "tool_router.permission_denied",
+                    tool=slug,
+                    user=str(user_id),
+                    role=auth.role_code,
+                )
+                return ToolResult(
+                    tool_name=slug,
+                    success=False,
+                    error=f"Permission denied: your role ({auth.role_code}) cannot use {slug}.",
+                )
+            if not validation.valid:
+                log.warning(
+                    "tool_router.validation_failed",
+                    tool=slug,
+                    errors=validation.errors,
+                )
+                return ToolResult(
+                    tool_name=slug,
+                    success=False,
+                    error=f"Validation failed: {'; '.join(validation.errors)}",
+                )
+        else:
+            permitted = await authorize_tool(slug, auth=auth)
+            if not permitted:
+                log.warning(
+                    "tool_router.permission_denied",
+                    tool=slug,
+                    user=str(user_id),
+                    role=auth.role_code,
+                )
+                return ToolResult(
+                    tool_name=slug,
+                    success=False,
+                    error=f"Permission denied: your role ({auth.role_code}) cannot use {slug}.",
+                )
 
     # 3b. EXACTLY-ONCE PROTECTION for financial mutations (migration 075).
     #

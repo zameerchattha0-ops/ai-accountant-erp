@@ -650,7 +650,13 @@ class QwenClient:
             params = td.get("parameters")
             # Only include a parameters schema when the tool actually has
             # parameters — mirrors the Gemini convention.
-            if params and params.get("properties"):
-                fn["parameters"] = params
+            if params and isinstance(params, dict) and params.get("properties"):
+                clean_params = dict(params)
+                clean_params["type"] = "object"
+                if not isinstance(clean_params.get("properties"), dict):
+                    clean_params["properties"] = {}
+                fn["parameters"] = clean_params
+            else:
+                fn["parameters"] = {"type": "object", "properties": {}}
             tools.append({"type": "function", "function": fn})
         return tools
