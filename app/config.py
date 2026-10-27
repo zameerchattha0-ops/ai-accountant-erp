@@ -498,7 +498,7 @@ class Settings(BaseSettings):
     # provider is unreachable/disabled the deterministic rule chain runs as
     # FALLBACK — behaviour degrades to the old classifier, never to a guess.
     llm_classification_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Enable the LLM decision layer for transaction classification "
             "(nature + account routing). Disabling restores the purely "
@@ -517,7 +517,7 @@ class Settings(BaseSettings):
         ),
     )
     llm_preliminary_extraction_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Enable the SHORT LLM extraction of the PRELIMINARY facts "
             "(stage 2, app/llm_extraction.py). AUTHORITY SPLIT (2026-10-20): "
