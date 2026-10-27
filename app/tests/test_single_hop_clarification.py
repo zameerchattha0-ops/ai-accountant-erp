@@ -240,3 +240,177 @@ async def test_single_hop_supplier_balance_lookup(monkeypatch):
     assert executed_calls[0].tool_name == "get_supplier_ledger"
     assert executed_calls[0].arguments["supplier_name"] == "Prime Steel"
     assert "Rs. 45,000.00" in resp.summary
+
+
+@pytest.mark.asyncio
+async def test_single_hop_financial_expense_date_followup_without_assume_today(monkeypatch):
+    """Requirement 2: When payment_type is answered and transaction_date is omitted:
+
+    Do NOT assume today, ask the user directly (<200ms) without restarting pipeline.
+    """
+    session_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    session_row = {
+        "id": str(session_id),
+        "organization_id": str(org_id),
+        "user_id": str(user_id),
+        "status": "WAITING_FOR_USER",
+        "user_request": "Paid 3500 for ac repair",
+    }
+
+    clarification_row = {
+        "id": str(uuid.uuid4()),
+        "execution_session_id": str(session_id),
+        "question": "How was the AC repair paid and on what date?",
+        "required_information": ["payment_type", "transaction_date"],
+        "reason": '{"intent": "record_expense", "extracted_entities": {"amount": 3500.0, "description": "AC repair"}, "missing_fields": ["payment_type", "transaction_date"]}',
+        "status": "WAITING_FOR_USER",
+    }
+
+    created_clarifications = []
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return session_row
+        if table == "ai_clarifications":
+            return clarification_row
+        return None
+
+    async def fake_resolve_clarification(*, session_id, user_response):
+        clarification_row["user_response"] = user_response
+        clarification_row["status"] = "COMPLETED"
+        return clarification_row
+
+    async def fake_get_clarification_history(sid):
+        return [{"field": "payment_type", "question": "payment_type", "answer": "Cash"}]
+
+    async def fake_create_clarification(*, session_id, question, required_fields=None, options=None, reason=None):
+        rec = {
+            "session_id": session_id,
+            "question": question,
+            "required_fields": required_fields,
+            "options": options,
+            "reason": reason,
+        }
+        created_clarifications.append(rec)
+        return rec
+
+    async def fake_update_status(sid, status):
+        session_row["status"] = status.value
+
+    async def fake_log_step(sid, step_type, data):
+        pass
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "resolve_clarification", fake_resolve_clarification)
+    monkeypatch.setattr(agent_mod, "get_clarification_history", fake_get_clarification_history)
+    monkeypatch.setattr("app.database.create_clarification", fake_create_clarification)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=session_id,
+        user_answer="Cash",
+        user_id=user_id,
+        organization_id=org_id,
+        auth=AuthContext(user_id=user_id, organization_id=org_id, role_code="admin", role_permissions=[]),
+    )
+
+    # Must NOT assume today! Must ask user for date directly without restarting pipeline
+    assert resp.status == ExecutionStatus.AWAITING_CLARIFICATION
+    assert resp.required_information == ["transaction_date"]
+    assert "Today" in resp.options
+    assert len(created_clarifications) == 1
+    assert created_clarifications[0]["required_fields"] == ["transaction_date"]
+
+
+@pytest.mark.asyncio
+async def test_single_hop_financial_expense_with_date_and_payment_in_one_turn(monkeypatch):
+    """Requirement 3: When all financial fields (amount, payment_mode, date) are resolved,
+
+    execute create_expense in single-hop directly.
+    """
+    session_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    session_row = {
+        "id": str(session_id),
+        "organization_id": str(org_id),
+        "user_id": str(user_id),
+        "status": "WAITING_FOR_USER",
+        "user_request": "Paid 3500 for ac repair",
+    }
+
+    clarification_row = {
+        "id": str(uuid.uuid4()),
+        "execution_session_id": str(session_id),
+        "question": "How was the AC repair paid and on what date?",
+        "required_information": ["payment_type", "transaction_date"],
+        "reason": '{"intent": "record_expense", "extracted_entities": {"amount": 3500.0, "description": "AC repair"}, "missing_fields": ["payment_type", "transaction_date"]}',
+        "status": "WAITING_FOR_USER",
+    }
+
+    executed_calls = []
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return session_row
+        if table == "ai_clarifications":
+            return clarification_row
+        return None
+
+    async def fake_resolve_clarification(*, session_id, user_response):
+        clarification_row["user_response"] = user_response
+        clarification_row["status"] = "COMPLETED"
+        return clarification_row
+
+    async def fake_get_clarification_history(sid):
+        return []
+
+    async def fake_route_tool_call(tc, organization_id, session_id, user_id, auth=None):
+        executed_calls.append(tc)
+        return ToolResult(
+            tool_name=tc.tool_name,
+            success=True,
+            data={
+                "id": str(uuid.uuid4()),
+                "total": tc.arguments.get("subtotal"),
+                "description": tc.arguments.get("description"),
+                "payment_mode": tc.arguments.get("payment_mode"),
+                "expense_date": tc.arguments.get("expense_date"),
+                "journal_posted": True,
+            },
+        )
+
+    async def fake_update_status(sid, status):
+        session_row["status"] = status.value
+
+    async def fake_log_step(sid, step_type, data):
+        pass
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "resolve_clarification", fake_resolve_clarification)
+    monkeypatch.setattr(agent_mod, "get_clarification_history", fake_get_clarification_history)
+    monkeypatch.setattr("app.tool_router.route_tool_call", fake_route_tool_call)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_log_step)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=session_id,
+        user_answer="Cash, today",
+        user_id=user_id,
+        organization_id=org_id,
+        auth=AuthContext(user_id=user_id, organization_id=org_id, role_code="admin", role_permissions=[]),
+    )
+
+    assert resp.status == ExecutionStatus.COMPLETED
+    assert len(executed_calls) == 1
+    assert executed_calls[0].tool_name == "create_expense"
+    assert executed_calls[0].arguments["subtotal"] == 3500.0
+    assert executed_calls[0].arguments["payment_mode"] == "CASH"
+    assert "Expense Recorded" in resp.summary
+
+

@@ -13864,19 +13864,19 @@ async def resume_with_clarification(
 
     # the answer must survive even if the resumed run later fails.
 
-    await resolve_clarification(session_id=session_id, user_response=answer)
-
+    # Record the user's answer and retrieve history + snapshot in ONE collapsed pass
+    snapshot: Optional[Dict[str, Any]] = None
+    try:
+        from app.database import resolve_and_fetch_clarifications
+        _resolved_clar, history, snapshot = await resolve_and_fetch_clarifications(
+            session_id=session_id,
+            user_response=answer,
+        )
+    except Exception as _r_err:
+        log.warning("agent.resolve_and_fetch_fallback", error=str(_r_err))
+        await resolve_clarification(session_id=session_id, user_response=answer)
+        history = await get_clarification_history(session_id)
     log.info("clarification_resumed", session_id=str(session_id))
-
-
-
-    # Rebuild the COMPLETE Q&A history for this conversation — the planner
-
-    # merges each answer into the entity set, and Gemini receives both the
-
-    # original request and the structured history as context.
-
-    history = await get_clarification_history(session_id)
 
 
 
@@ -13900,17 +13900,17 @@ async def resume_with_clarification(
 
                 break
 
-        if latest_question and ("," in answer or "\n" in answer or " " in answer):
+        req_info = None
+        for h in reversed(history or []):
+            if h.get("required_information"):
+                req_info = h.get("required_information")
+                break
 
-            req_info = None
-
-            for h in reversed(history or []):
-
-                if h.get("required_information"):
-
-                    req_info = h.get("required_information")
-
-                    break
+        is_multi_endpoint = (
+            ("," in answer or "\n" in answer or ";" in answer)
+            or (req_info and len(req_info) > 1 and " " in answer)
+        )
+        if latest_question and is_multi_endpoint:
 
             parsed_endpoints = await parse_packed_reply_to_endpoints(
 
@@ -13925,7 +13925,7 @@ async def resume_with_clarification(
             )
 
             # Multi-item line pricing resolution via LLM
-            _existing_li = (_preliminary or {}).get('literals', {}).get('line_items')
+            _existing_li = (snapshot.get('extracted_entities') or {}).get('line_items') if snapshot else None
             if not _existing_li and history:
                 for _h in reversed(history):
                     if _h.get('field') == 'line_items' and isinstance(_h.get('answer'), list):
@@ -14019,8 +14019,12 @@ async def resume_with_clarification(
     # ------------------------------------------------------------------
     # SINGLE-HOP RESOLUTION (Turn 2 Fast-Path: <500ms)
     # ------------------------------------------------------------------
-    snapshot = await _get_clarification_snapshot(session_id)
+    if not snapshot:
+        snapshot = await _get_clarification_snapshot(session_id)
     if snapshot and snapshot.get("intent"):
+        from app.date_parser import parse_transaction_date
+        import re
+
         intent = snapshot["intent"]
         merged_entities = dict(snapshot.get("extracted_entities") or {})
         missing_fields = list(snapshot.get("missing_fields") or [])
@@ -14032,33 +14036,82 @@ async def resume_with_clarification(
             if f_name and f_ans not in (None, ""):
                 merged_entities[str(f_name).strip()] = f_ans
 
-        # If a single missing field remains, map user answer directly
-        unfulfilled = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
-        if len(unfulfilled) == 1 and answer:
-            field = unfulfilled[0]
-            if field == "account_type":
-                ans_up = answer.strip().upper()
-                for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
-                    if c_type in ans_up:
-                        merged_entities["account_type"] = c_type
-                        break
+        # Multi-field answer extraction for Turn 2 user response
+        if answer:
+            parts = [p.strip() for p in re.split(r"[,;\n]+", answer) if p.strip()]
+            for part in parts:
+                date_res = parse_transaction_date(part)
+                if date_res.ok:
+                    merged_entities["transaction_date"] = date_res.iso_date
+                    merged_entities["expense_date"] = date_res.iso_date
+                elif any(k in part.upper() for k in ("CASH", "BANK", "TRANSFER", "CREDIT", "CARD", "CHEQUE")):
+                    ans_up = part.upper()
+                    pm = "CASH" if "CASH" in ans_up else ("BANK" if ("BANK" in ans_up or "TRANSFER" in ans_up) else ("CREDIT" if any(k in ans_up for k in ("CREDIT", "LATER", "PAYABLE")) else "CASH"))
+                    merged_entities["payment_method"] = pm
+                    merged_entities["payment_type"] = pm
+                elif any(k in part.upper() for k in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY")):
+                    ans_up = part.upper()
+                    for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+                        if c_type in ans_up:
+                            merged_entities["account_type"] = c_type
+                            break
+                    else:
+                        merged_entities["account_type"] = ans_up
                 else:
-                    merged_entities["account_type"] = ans_up
-            elif field == "payment_method":
-                ans_up = answer.strip().upper()
-                if "CASH" in ans_up:
-                    merged_entities["payment_method"] = "CASH"
-                elif "BANK" in ans_up or "TRANSFER" in ans_up:
-                    merged_entities["payment_method"] = "BANK"
-                elif any(k in ans_up for k in ("CREDIT", "LATER", "PAYABLE", "RECEIVABLE")):
-                    merged_entities["payment_method"] = "CREDIT"
-                else:
-                    merged_entities["payment_method"] = answer.strip()
-            else:
-                merged_entities[field] = answer.strip()
+                    unfulfilled = [f for f in missing_fields if merged_entities.get(f) in (None, "", []) and f not in ("transaction_date", "expense_date", "payment_type", "payment_method", "account_type")]
+                    if unfulfilled:
+                        merged_entities[unfulfilled[0]] = part.strip()
+                    elif len(missing_fields) == 1:
+                        merged_entities[missing_fields[0]] = part.strip()
+
+        if intent in ("record_expense", "expense", "create_expense"):
+            desc_known = merged_entities.get("description") or merged_entities.get("item_description") or merged_entities.get("transaction_purpose")
+            if not desc_known and session.get("user_request"):
+                req = session["user_request"]
+                m = re.search(r"\b(?:for|on)\s+([a-zA-Z0-9\s&/-]+)", req, re.IGNORECASE)
+                if m:
+                    desc_known = m.group(1).strip()
+            if desc_known:
+                merged_entities.setdefault("transaction_purpose", desc_known)
+                merged_entities.setdefault("item_description", desc_known)
+                merged_entities.setdefault("description", desc_known)
 
         # Re-check missing fields
         still_missing = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
+
+        # REQUIREMENT 2: When payment_type is answered and transaction_date is omitted:
+        # DO NOT ASSUME TODAY! ASK THE USER DIRECTLY (<200ms) without restarting 5-stage pipeline!
+        if len(still_missing) == 1 and still_missing[0] in ("transaction_date", "expense_date", "date"):
+            amt_val = merged_entities.get("amount") or merged_entities.get("subtotal")
+            amt_str = f"Rs. {float(amt_val):,.2f} " if amt_val else ""
+            desc_val = merged_entities.get("description") or merged_entities.get("item_description") or "transaction"
+            pm_val = merged_entities.get("payment_method") or merged_entities.get("payment_type")
+            pm_str = f"paid via {pm_val} " if pm_val else ""
+            followup_q = f"What date was the {amt_str}{desc_val} {pm_str}paid on? (Reply TODAY, or YYYY-MM-DD)"
+            followup_opts = ["Today", "Yesterday"]
+
+            from app.database import create_clarification
+            await create_clarification(
+                session_id=session_id,
+                question=followup_q,
+                required_fields=["transaction_date"],
+                options=followup_opts,
+                reason=json.dumps({
+                    "intent": intent,
+                    "extracted_entities": merged_entities,
+                    "missing_fields": ["transaction_date"],
+                }),
+            )
+            await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                summary=followup_q,
+                question=followup_q,
+                options=followup_opts,
+                required_information=["transaction_date"],
+                requires_user_input=True,
+            )
 
         if not still_missing:
             from app.erp_endpoints import is_operational_task, format_operational_summary
@@ -14148,6 +14201,74 @@ async def resume_with_clarification(
                 if party:
                     single_hop_call = ToolCall(tool_name="get_customer_ledger", arguments={"customer_name": str(party)})
 
+            # ------------------------------------------------------------------
+            # REQUIREMENT 3: Financial Journals (create_expense / cash_sale / receipt / payment)
+            # ------------------------------------------------------------------
+            elif intent in ("record_expense", "expense", "create_expense"):
+                amt = float(merged_entities.get("amount") or merged_entities.get("subtotal") or 0.0)
+                desc = (
+                    merged_entities.get("description")
+                    or merged_entities.get("item_description")
+                    or merged_entities.get("transaction_purpose")
+                    or session.get("user_request")
+                    or "Expense"
+                )
+                pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
+                dt = (
+                    merged_entities.get("transaction_date")
+                    or merged_entities.get("expense_date")
+                    or date.today().isoformat()
+                )
+                args = {
+                    "description": str(desc).strip(),
+                    "subtotal": amt,
+                    "total": amt,
+                    "payment_mode": pm,
+                    "expense_date": dt,
+                }
+                if merged_entities.get("supplier_name") or merged_entities.get("payee_name"):
+                    args["payee_name"] = str(merged_entities.get("supplier_name") or merged_entities.get("payee_name")).strip()
+                if merged_entities.get("account_id"):
+                    args["account_id"] = merged_entities["account_id"]
+                elif snapshot.get("account_hint"):
+                    args["account_id"] = snapshot["account_hint"]
+                single_hop_call = ToolCall(tool_name="create_expense", arguments=args)
+
+            elif intent in ("record_cash_sale", "cash_sale"):
+                amt = float(merged_entities.get("amount") or merged_entities.get("total") or 0.0)
+                dt = merged_entities.get("transaction_date") or date.today().isoformat()
+                single_hop_call = ToolCall(tool_name="record_cash_sale", arguments={
+                    "amount": amt,
+                    "transaction_date": dt,
+                    "description": str(merged_entities.get("description") or "Cash sale").strip(),
+                })
+
+            elif intent in ("record_customer_receipt", "record_receipt", "receipt"):
+                amt = float(merged_entities.get("amount") or 0.0)
+                party = merged_entities.get("customer_name") or merged_entities.get("name")
+                dt = merged_entities.get("transaction_date") or date.today().isoformat()
+                pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
+                if party and amt > 0:
+                    single_hop_call = ToolCall(tool_name="record_customer_receipt", arguments={
+                        "customer_name": str(party).strip(),
+                        "amount": amt,
+                        "receipt_date": dt,
+                        "payment_mode": pm,
+                    })
+
+            elif intent in ("record_supplier_payment", "payment"):
+                amt = float(merged_entities.get("amount") or 0.0)
+                party = merged_entities.get("supplier_name") or merged_entities.get("name")
+                dt = merged_entities.get("transaction_date") or date.today().isoformat()
+                pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
+                if party and amt > 0:
+                    single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments={
+                        "supplier_name": str(party).strip(),
+                        "amount": amt,
+                        "payment_date": dt,
+                        "payment_mode": pm,
+                    })
+
             if single_hop_call is not None:
                 log.info(
                     "single_hop_clarification_resolution",
@@ -14167,6 +14288,19 @@ async def resume_with_clarification(
 
                 if is_operational_task(intent) and tool_result.success and isinstance(tool_result.data, dict):
                     result_summary = format_operational_summary(intent, tool_result.data)
+                elif intent in ("record_expense", "expense", "create_expense") and tool_result.success:
+                    amt = float(merged_entities.get("amount") or merged_entities.get("subtotal") or 0.0)
+                    desc = merged_entities.get("description") or merged_entities.get("item_description") or "Expense"
+                    pm = merged_entities.get("payment_method") or merged_entities.get("payment_type") or "Cash"
+                    dt = merged_entities.get("transaction_date") or merged_entities.get("expense_date") or "today"
+                    result_summary = (
+                        f"### ✅ Expense Recorded & Journal Posted\n\n"
+                        f"* **Description:** {desc}\n"
+                        f"* **Amount:** **Rs. {amt:,.2f}**\n"
+                        f"* **Payment Mode:** {pm}\n"
+                        f"* **Date:** {dt}\n\n"
+                        f"Journal entry auto-prepared and posted to general ledger. [View in Expenses →](/purchases/expenses)"
+                    )
                 elif intent in ("supplier_balance", "generate_supplier_ledger") and tool_result.success:
                     supp_name = merged_entities.get("supplier_name", "Supplier")
                     bal = 0.0
@@ -14205,10 +14339,11 @@ async def resume_with_clarification(
                     status=final_status,
                     execution_id=session_id,
                     summary=result_summary,
-                    tool_calls=[single_hop_call],
-                    tool_results=[tool_result],
-                    requires_confirmation=False,
-                    verified=tool_result.success,
+                    action=intent,
+                    data={"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data},
+                    requires_user_input=False,
+                    confirmation_required=False,
+                    verification_status="VERIFIED" if tool_result.success else "FAILED",
                 )
 
     original_request = session.get("user_request", "") or ""

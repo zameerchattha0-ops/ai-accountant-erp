@@ -730,6 +730,80 @@ async def resolve_clarification(
     )
 
 
+async def resolve_and_fetch_clarifications(
+    *,
+    session_id: uuid.UUID,
+    user_response: str,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Atomically resolve pending clarification and return (resolved_row, history, snapshot).
+
+    Collapses 4 sequential DB round-trips into 1 fetch + 1 update:
+    - 1. Fetch all clarification rows for this session.
+    - 2. Locate the pending (WAITING_FOR_USER) row and extract snapshot from `reason`.
+    - 3. Update that row to COMPLETED with user_response.
+    - 4. Construct chronological deduplicated Q&A history in-memory.
+    """
+    rows = await fetch_many(
+        "ai_clarifications",
+        filters={"execution_session_id": str(session_id)},
+        order="created_at.desc",
+        limit=100,
+    )
+    pending = None
+    for r in rows or []:
+        if str(r.get("status")) == "WAITING_FOR_USER":
+            pending = r
+            break
+
+    snapshot: Optional[Dict[str, Any]] = None
+    resolved: Optional[Dict[str, Any]] = None
+
+    if pending:
+        raw_reason = pending.get("reason")
+        if raw_reason:
+            try:
+                data = json.loads(raw_reason) if isinstance(raw_reason, str) else raw_reason
+                if isinstance(data, dict) and data.get("intent"):
+                    snapshot = data
+            except Exception:
+                pass
+
+        resolved = await update_one(
+            "ai_clarifications",
+            row_id=uuid.UUID(str(pending["id"])),
+            data={
+                "user_response": user_response,
+                "answered_at": datetime.now(timezone.utc).isoformat(),
+                "status": "COMPLETED",
+            },
+        )
+        if resolved:
+            pending.update(resolved)
+        else:
+            pending["user_response"] = user_response
+            pending["status"] = "COMPLETED"
+
+    seen: set = set()
+    history: List[Dict[str, Any]] = []
+    for r in reversed(rows or []):
+        ans = str(r.get("user_response") or "")
+        if not ans:
+            continue
+        q = str(r.get("question") or "")
+        fields = list(r.get("required_information") or [])
+        key = (q, ans, tuple(fields))
+        if key in seen:
+            continue
+        seen.add(key)
+        history.append({
+            "question": q,
+            "answer": ans,
+            "required_information": fields,
+        })
+
+    return resolved or pending, history, snapshot
+
+
 async def get_clarification_history(
     session_id: uuid.UUID,
 ) -> List[Dict[str, Any]]:
