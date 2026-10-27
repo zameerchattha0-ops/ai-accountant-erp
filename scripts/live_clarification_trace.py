@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+sys.stdout.reconfigure(encoding="utf-8")
 import time
 import uuid
 from pathlib import Path
@@ -21,7 +22,79 @@ from app.agent import execute, resume_with_clarification
 from app.ai_orchestrator import get_client
 from app.auth import AuthContext
 from app.database import fetch_many
-from scripts._e2e_live import resolve_identity, dump_trail
+import httpx
+
+EMAIL = "zameerchattha3@gmail.com"
+_env: Dict[str, str] = {}
+env_file = ERP_ROOT / ".env"
+if env_file.exists():
+    for _line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        if "=" in _line and not _line.strip().startswith("#"):
+            _k, _v = _line.split("=", 1)
+            _env[_k.strip()] = _v.strip().strip('"').strip("'")
+
+_URL = _env.get("SUPABASE_URL", "")
+_KEY = _env.get("SUPABASE_SERVICE_ROLE_KEY", "")
+_H = {"apikey": _KEY, "Authorization": f"Bearer {_KEY}"}
+_HA = {**_H, "Accept-Profile": "ai"}
+
+
+async def resolve_identity() -> Dict[str, Any]:
+    uid = None
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(f"{_URL}/auth/v1/admin/users", headers=_H)
+            r.raise_for_status()
+            for u in (r.json().get("users") or []):
+                if (u.get("email") or "").lower() == EMAIL.lower():
+                    uid = u["id"]
+                    break
+    except Exception as exc:
+        p(f"(admin users API unavailable: {str(exc)[:80]} - using membership-verified ids)")
+    if not uid:
+        uid = "b2ad946f-9d5e-4c71-832b-3b873e13d1aa"
+    members = await fetch_many(
+        "organization_members",
+        filters={"user_id": f"{uid}", "status": "ACTIVE"},
+        limit=5,
+    )
+    if not members:
+        raise SystemExit("no ACTIVE membership for the user")
+    m = members[0]
+    roles = await fetch_many(
+        "organization_roles", filters={"id": f"{m['role_id']}"}, limit=1,
+    )
+    role = roles[0] if roles else {}
+    role_code = str(role.get("role_code") or role.get("code") or "owner")
+    perms: List[str] = []
+    for key in ("permissions", "role_permissions"):
+        raw = role.get(key)
+        if isinstance(raw, list):
+            perms = [str(x) for x in raw]
+    return {
+        "user_id": uuid.UUID(str(m["user_id"])),
+        "organization_id": uuid.UUID(str(m["organization_id"])),
+        "role_code": role_code,
+        "role_permissions": perms,
+    }
+
+
+async def dump_trail(session_id: uuid.UUID, label: str) -> None:
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(
+            f"{_URL}/rest/v1/execution_steps", headers=_HA,
+            params={"select": "created_at,step_type,status,input_summary",
+                    "execution_session_id": f"eq.{session_id}",
+                    "order": "created_at.asc"},
+        )
+        steps = r.json() if r.status_code == 200 else []
+    p(f"\n----- TRAIL [{label}] ({len(steps)} steps) -----")
+    for st in steps:
+        kind = st.get("step_type") or "?"
+        blob = st.get("input_summary") or ""
+        if not isinstance(blob, str):
+            blob = json.dumps(blob, default=str)
+        p(f"  {str(st.get('created_at'))[11:19]} {kind:<24} [{st.get('status')}] {blob[:220]}")
 
 
 def p(*args: Any) -> None:

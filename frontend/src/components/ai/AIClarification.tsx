@@ -87,6 +87,17 @@ function optionsForSubQuestion(
   if (payload && payload.length > 0) {
     return payload;
   }
+  if (
+    /how was .*paid|how was .*settled|payment (?:mode|method|type)|how did you pay|cash or (?:credit|bank)|settlement/i.test(
+      q
+    )
+  ) {
+    return [
+      { value: "CASH", label: "Cash" },
+      { value: "BANK", label: "Bank transfer" },
+      { value: "CREDIT", label: "On credit" },
+    ];
+  }
   if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(q)) {
     return [
       { value: "CASH", label: "Cash" },
@@ -107,20 +118,33 @@ function optionsForSubQuestion(
       { value: "CREDIT", label: "On credit" },
     ];
   }
-  const hardcoded = quickOptions(q);
-  if (hardcoded) {
-    return hardcoded.map((opt) => ({ value: opt, label: opt }));
-  }
-  if (/transaction date|expense date|receive the goods/i.test(q)) {
+  if (
+    /(?:what|which) date|date was .*paid|date of|transaction date|expense date|invoice date|payment date|when was .*paid|receive the goods/i.test(
+      q
+    )
+  ) {
     return [
       { value: "TODAY", label: "Today" },
       { value: "YESTERDAY", label: "Yesterday" },
     ];
   }
+  if (/what type of account|account type|type of .*in the chart of accounts/i.test(q)) {
+    return [
+      { value: "Expense", label: "Expense" },
+      { value: "Asset", label: "Asset" },
+      { value: "Liability", label: "Liability" },
+      { value: "Income", label: "Income" },
+      { value: "Equity", label: "Equity" },
+    ];
+  }
+  const hardcoded = quickOptions(q);
+  if (hardcoded) {
+    return hardcoded.map((opt) => ({ value: opt, label: opt }));
+  }
   return null;
 }
 
-const isPaymentQ = (q: string) => /cash or on credit/i.test(q);
+const isPaymentQ = (q: string) => /cash or on credit|how was .*paid|how was .*settled|payment (?:mode|method|type)/i.test(q);
 /** R3.3 — the settlement question's Outstanding answer ("c") also
  *  requires the party box (a payable needs a party). */
 const isSettlementQ = (q: string) => /paid, or is it outstanding/i.test(q);

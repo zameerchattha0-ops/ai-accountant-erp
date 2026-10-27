@@ -62,13 +62,18 @@ async def _resolve_cash_gl_account(
     """
     if not cash_account_id:
         default = await bank_repo.get_default_cash_account(organization_id)
-        if not default:
-            raise ValueError(
-                "No cash account specified and no cash account configured "
-                "(a cash transaction must hit the cash ledger, never the "
-                "bank ledger)"
-            )
-        return uuid.UUID(default["gl_account_id"])
+        if default and default.get("gl_account_id"):
+            return uuid.UUID(default["gl_account_id"])
+        # Fallback: auto-bind to the org's Chart of Accounts Cash asset ledger
+        from app.accounting_engine import ensure_cash_account
+        cash_coa = await ensure_cash_account(organization_id)
+        if cash_coa and cash_coa.get("id"):
+            return uuid.UUID(str(cash_coa["id"]))
+        raise ValueError(
+            "No cash account specified and no cash account configured "
+            "(a cash transaction must hit the cash ledger, never the "
+            "bank ledger)"
+        )
     ca = await bank_repo.get_cash_account(organization_id, cash_account_id=cash_account_id)
     if not ca:
         raise ValueError(f"Cash account {cash_account_id} not found")

@@ -14245,6 +14245,26 @@ async def resume_with_clarification(
                     "description": str(merged_entities.get("description") or "Cash sale").strip(),
                 })
 
+            elif intent in ("create_invoice", "record_sale", "invoice", "sale"):
+                amt = float(merged_entities.get("amount") or merged_entities.get("total") or 0.0)
+                party = merged_entities.get("customer_name") or merged_entities.get("name")
+                dt = merged_entities.get("transaction_date") or merged_entities.get("invoice_date") or date.today().isoformat()
+                desc = merged_entities.get("description") or merged_entities.get("item_description") or "Sales"
+                if party and amt > 0:
+                    single_hop_call = ToolCall(tool_name="create_invoice", arguments={
+                        "customer_name": str(party).strip(),
+                        "total": amt,
+                        "subtotal": amt,
+                        "invoice_date": dt,
+                        "description": str(desc).strip(),
+                        "items": [{
+                            "description": str(desc).strip(),
+                            "quantity": 1.0,
+                            "unit_price": amt,
+                            "total": amt,
+                        }],
+                    })
+
             elif intent in ("record_customer_receipt", "record_receipt", "receipt"):
                 amt = float(merged_entities.get("amount") or 0.0)
                 party = merged_entities.get("customer_name") or merged_entities.get("name")
@@ -14290,6 +14310,45 @@ async def resume_with_clarification(
 
                 if is_operational_task(intent) and tool_result.success and isinstance(tool_result.data, dict):
                     result_summary = format_operational_summary(intent, tool_result.data)
+                elif intent in ("create_invoice", "record_sale", "invoice", "sale") and tool_result.success:
+                    inv_data = tool_result.data if isinstance(tool_result.data, dict) else {}
+                    inv_num = inv_data.get("invoice_number", "INV")
+                    amt = float(inv_data.get("total") or merged_entities.get("amount") or 0.0)
+                    cname = merged_entities.get("customer_name") or "Customer"
+                    result_summary = (
+                        f"### ✅ Invoice Issued & Receivable Recorded\n\n"
+                        f"* **Invoice Number:** `{inv_num}`\n"
+                        f"* **Customer:** {cname}\n"
+                        f"* **Amount:** **Rs. {amt:,.2f}**\n"
+                        f"* **Status:** ISSUED (Journal auto-posted)\n\n"
+                        f"[View Invoices in Sales →](/sales/invoices)"
+                    )
+                elif intent in ("record_customer_receipt", "record_receipt", "receipt") and tool_result.success:
+                    rec_data = tool_result.data if isinstance(tool_result.data, dict) else {}
+                    amt = float(rec_data.get("amount") or merged_entities.get("amount") or 0.0)
+                    cname = merged_entities.get("customer_name") or "Customer"
+                    pm = merged_entities.get("payment_method") or merged_entities.get("payment_mode") or "CASH"
+                    result_summary = (
+                        f"### ✅ Payment Received & Receipt Recorded\n\n"
+                        f"* **Customer:** {cname}\n"
+                        f"* **Amount Received:** **Rs. {amt:,.2f}**\n"
+                        f"* **Payment Mode:** {pm}\n"
+                        f"* **Status:** Posted to General Ledger\n\n"
+                        f"[View Receipts in Sales →](/sales/receipts)"
+                    )
+                elif intent in ("record_supplier_payment", "payment") and tool_result.success:
+                    pay_data = tool_result.data if isinstance(tool_result.data, dict) else {}
+                    amt = float(pay_data.get("amount") or merged_entities.get("amount") or 0.0)
+                    sname = merged_entities.get("supplier_name") or "Supplier"
+                    pm = merged_entities.get("payment_method") or merged_entities.get("payment_mode") or "CASH"
+                    result_summary = (
+                        f"### ✅ Supplier Payment Recorded\n\n"
+                        f"* **Supplier:** {sname}\n"
+                        f"* **Amount Paid:** **Rs. {amt:,.2f}**\n"
+                        f"* **Payment Mode:** {pm}\n"
+                        f"* **Status:** Posted to General Ledger\n\n"
+                        f"[View Payments in Purchases →](/purchases/payments)"
+                    )
                 elif intent in ("record_expense", "expense", "create_expense") and tool_result.success:
                     amt = float(merged_entities.get("amount") or merged_entities.get("subtotal") or 0.0)
                     desc = merged_entities.get("description") or merged_entities.get("item_description") or "Expense"

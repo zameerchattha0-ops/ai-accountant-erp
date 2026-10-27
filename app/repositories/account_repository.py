@@ -5,6 +5,7 @@ Account Repository — Supabase data access for the chart of accounts.
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +69,21 @@ async def get_account_by_code(
     )
 
 
+_COA_CACHE: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+_COA_CACHE_TTL_SECONDS = 60.0
+
+
+def invalidate_coa_cache(organization_id: Optional[uuid.UUID] = None) -> None:
+    """Invalidate cached Chart of Accounts entries for an org (or all orgs)."""
+    if organization_id is None:
+        _COA_CACHE.clear()
+    else:
+        prefix = f"{organization_id}:"
+        keys_to_del = [k for k in _COA_CACHE if k.startswith(prefix)]
+        for k in keys_to_del:
+            _COA_CACHE.pop(k, None)
+
+
 async def get_chart_of_accounts(
     organization_id: uuid.UUID,
     *,
@@ -75,20 +91,28 @@ async def get_chart_of_accounts(
     is_active: bool = True,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
-    """Fetch the full (or filtered) chart of accounts."""
+    """Fetch the full (or filtered) chart of accounts with short-lived TTL cache."""
+    cache_key = f"{organization_id}:{account_type}:{is_active}:{limit}"
+    now = time.monotonic()
+    cached = _COA_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < _COA_CACHE_TTL_SECONDS:
+        return cached[1]
+
     filters: Dict[str, Any] = {
         "organization_id": str(organization_id),
         "is_active": is_active,
     }
     if account_type:
         filters["account_type"] = account_type
-    return await fetch_many(
+    rows = await fetch_many(
         "accounts",
         filters=filters,
         select="id,code,name,account_type,normal_balance,parent_account_id,is_control_account,is_active",
         order="code.asc",
         limit=limit,
     )
+    _COA_CACHE[cache_key] = (now, rows)
+    return rows
 
 
 async def create_account(
@@ -102,6 +126,7 @@ async def create_account(
     is_control_account: bool = False,
     description: Optional[str] = None,
 ) -> Dict[str, Any]:
+    invalidate_coa_cache(organization_id)
     return await insert_one(
         "accounts",
         data={

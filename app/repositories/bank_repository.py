@@ -95,7 +95,13 @@ async def set_default_bank_account(
 async def get_default_bank_account(
     organization_id: uuid.UUID,
 ) -> Optional[Dict[str, Any]]:
-    return await fetch_one(
+    """Return the org's default bank account.
+
+    If no bank account is explicitly marked is_default=True, but the org has
+    exactly ONE active bank account, auto-bind that single account so
+    settlements resolve with zero false configuration friction.
+    """
+    row = await fetch_one(
         "bank_accounts",
         filters={
             "organization_id": str(organization_id),
@@ -103,6 +109,13 @@ async def get_default_bank_account(
             "is_active": True,
         },
     )
+    if row is not None:
+        return row
+
+    active_banks = await list_bank_accounts(organization_id, is_active=True, limit=2)
+    if len(active_banks) == 1:
+        return active_banks[0]
+    return None
 
 
 # ---- Cash Accounts (cash ledger is SEPARATE from the

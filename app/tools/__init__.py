@@ -1808,6 +1808,24 @@ async def _record_cash_purchase(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
 
+    if "customer_id" in kw and isinstance(kw["customer_id"], str):
+        kw["customer_id"] = uuid.UUID(kw["customer_id"])
+    elif "customer_id" not in kw and kw.get("customer_name"):
+        cname = str(kw.pop("customer_name")).strip()
+        found = await customer_service.search(organization_id, query=cname, limit=1)
+        if found:
+            kw["customer_id"] = uuid.UUID(str(found[0]["id"]))
+        else:
+            created = await customer_service.create(organization_id, name=cname)
+            kw["customer_id"] = uuid.UUID(str(created["id"]))
+
+    if not kw.get("items") and (kw.get("total") or kw.get("amount")):
+        tot = float(kw.get("total") or kw.get("amount") or 0.0)
+        desc = kw.get("description") or "Sales"
+        kw["items"] = [{"description": desc, "quantity": 1.0, "unit_price": tot, "total": tot}]
+        kw["total"] = tot
+        kw["subtotal"] = tot
+
     # PERPETUAL INVENTORY (audit fix): link every sale line to its catalogue
 
     # product (EXACT name match) BEFORE persistence — the COGS trigger only
@@ -3086,7 +3104,20 @@ async def _record_customer_receipt(organization_id: uuid.UUID, **kw) -> ToolResu
 
     if invoice_id:
 
-        kw["invoice_id"] = uuid.UUID(invoice_id)
+        kw["invoice_id"] = uuid.UUID(str(invoice_id))
+
+    if "customer_id" in kw and isinstance(kw["customer_id"], str):
+        kw["customer_id"] = uuid.UUID(kw["customer_id"])
+    elif "customer_id" not in kw and kw.get("customer_name"):
+        cname = str(kw.pop("customer_name")).strip()
+        found = await customer_service.search(organization_id, query=cname, limit=1)
+        if found:
+            kw["customer_id"] = uuid.UUID(str(found[0]["id"]))
+        else:
+            created = await customer_service.create(organization_id, name=cname)
+            kw["customer_id"] = uuid.UUID(str(created["id"]))
+    if "payment_mode" in kw and "payment_method" not in kw:
+        kw["payment_method"] = kw.pop("payment_mode")
 
     data = await payment_service.record_customer_receipt(organization_id=organization_id, **kw)
 
@@ -3100,7 +3131,20 @@ async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResu
 
     if bill_id:
 
-        kw["bill_id"] = uuid.UUID(bill_id)
+        kw["bill_id"] = uuid.UUID(str(bill_id))
+
+    if "supplier_id" in kw and isinstance(kw["supplier_id"], str):
+        kw["supplier_id"] = uuid.UUID(kw["supplier_id"])
+    elif "supplier_id" not in kw and kw.get("supplier_name"):
+        sname = str(kw.pop("supplier_name")).strip()
+        found = await supplier_service.search(organization_id, query=sname, limit=1)
+        if found:
+            kw["supplier_id"] = uuid.UUID(str(found[0]["id"]))
+        else:
+            created = await supplier_service.create(organization_id, name=sname)
+            kw["supplier_id"] = uuid.UUID(str(created["id"]))
+    if "payment_mode" in kw and "payment_method" not in kw:
+        kw["payment_method"] = kw.pop("payment_mode")
 
     data = await payment_service.record_supplier_payment(organization_id=organization_id, **kw)
 
