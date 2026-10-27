@@ -69,25 +69,20 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     log.info("app.startup", env=settings.app_env, port=settings.app_port)
 
-    # Pre-warm the AI orchestrator (Qwen primary / Gemini fallback).
+    # Pre-warm the AI orchestrator (Token Harbor exclusive primary).
     # Provider initialisation is lazy and MUST NEVER block or crash
     # startup — a broken/missing provider only degrades availability.
     try:
         from app.ai_orchestrator import get_client
         client = get_client()
         try:
-            client._get_qwen()
-            log.info("app.qwen_client", status="ready",
-                     model=get_settings().qwen_model)
+            th_model = settings.th_text_model
+            client._get_harbor(th_model)
+            log.info('app.token_harbor_client', status='ready', model=th_model)
         except Exception as exc:
-            log.warning("app.qwen_client_warm_failed", error=str(exc))
-        try:
-            client._get_gemini()
-            log.info("app.gemini_client", status="ready")
-        except Exception as exc:
-            log.warning("app.gemini_client_warm_failed", error=str(exc))
+            log.warning('app.token_harbor_client_warm_failed', error=str(exc))
     except Exception as exc:
-        log.warning("app.ai_orchestrator_warm_failed", error=str(exc))
+        log.warning('app.ai_orchestrator_warm_failed', error=str(exc))
 
     # Pre-import the heavy agent stack in the BACKGROUND (never blocks
     # startup, so cold-start budgets are respected). The first user request
