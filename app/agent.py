@@ -199,6 +199,26 @@ _READ_ONLY_LOOKUPS_GATE = frozenset({
 })
 
 
+def _is_read_only_inquiry(message: str, intent: Optional[str] = None) -> bool:
+    """True if message or intent represents an informational query / lookup rather than a transaction to book."""
+    if intent and intent in _READ_ONLY_LOOKUPS_GATE:
+        return True
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    inquiry_starters = (
+        "how many", "what is", "what are", "check ", "show ", "list ", "view ", "tell me",
+        "do we have", "is there", "are there", "units of", "quantity of", "stock of",
+        "balance of", "status of", "how much stock", "how much balance", "can i see",
+    )
+    if any(msg.startswith(s) or f" {s}" in msg for s in inquiry_starters):
+        return True
+    if msg.endswith("?") and not any(k in msg for k in ("bought", "purchased", "sold", "paid", "received rs", "recorded")):
+        return True
+    return False
+
+
+
 
 
 
@@ -7720,6 +7740,13 @@ async def execute(
 
         _decision = getattr(_reasoning, "decision", None) or {}
         _model_intent = str(_decision.get("intent") or "").strip().lower()
+
+        # If planner ended up unknown, LLM preliminary extraction intent hint is promoted
+        if not _model_intent and execution_plan.intent == "unknown" and (_preliminary or {}).get("provisional_intent_hint"):
+            _candidate_hint = str((_preliminary or {}).get("provisional_intent_hint") or "").strip().lower()
+            if is_canonical_intent(_candidate_hint):
+                _model_intent = _candidate_hint
+
         if not confirmed_intent and _model_intent and is_canonical_intent(_model_intent):
             execution_plan.intent = _model_intent
             if not execution_plan.potential_tools:
@@ -7739,18 +7766,31 @@ async def execute(
                     **execution_plan.extracted_entities,
                     **_reasoning.entities,
                 }
+
             # Re-evaluate missing fields based on model intent and authoritative entities
             from app.planner import _missing_fields, _questions_for_fields
             _rem_missing = _missing_fields(_model_intent, execution_plan.extracted_entities)
-            execution_plan.missing_fields = _rem_missing
-            if not _rem_missing:
-                execution_plan.requires_clarification = False
-                execution_plan.clarification_questions = []
-            elif not execution_plan.clarification_questions:
-                execution_plan.requires_clarification = True
-                execution_plan.clarification_questions = _questions_for_fields(
-                    _model_intent, _rem_missing, execution_plan.extracted_entities
-                )
+            if _model_intent in _READ_ONLY_LOOKUPS_GATE or not _decision:
+                if _model_intent in _READ_ONLY_LOOKUPS_GATE:
+                    execution_plan.requires_clarification = False
+                    execution_plan.clarification_questions = []
+            else:
+                execution_plan.missing_fields = _rem_missing
+                if not _rem_missing:
+                    execution_plan.requires_clarification = False
+                    execution_plan.clarification_questions = []
+                elif not execution_plan.clarification_questions:
+                    execution_plan.requires_clarification = True
+                    execution_plan.clarification_questions = _questions_for_fields(
+                        _model_intent, _rem_missing, execution_plan.extracted_entities
+                    )
+
+        for _k in (
+            "product_name", "account_name", "bank_name", "employee_name",
+            "supplier_name", "customer_name", "project_name"
+        ):
+            if (_preliminary or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
+                execution_plan.extracted_entities[_k] = _preliminary[_k]
 
 
 
@@ -8205,6 +8245,8 @@ async def execute(
             and approved_tool_calls is None
 
             and execution_plan.intent not in _READ_ONLY_LOOKUPS_GATE
+
+            and not _is_read_only_inquiry(user_message, execution_plan.intent)
 
         ):
 
@@ -8960,6 +9002,8 @@ async def execute(
             and approved_tool_calls is None
 
             and execution_plan.intent not in _READ_ONLY_LOOKUPS_GATE
+
+            and not _is_read_only_inquiry(user_message, execution_plan.intent)
 
         ):
 

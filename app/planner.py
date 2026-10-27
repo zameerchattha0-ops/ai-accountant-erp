@@ -543,7 +543,9 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"(?:show|view|list|get|display|fetch|check|what\s+is|what's|how\s+much|how\s+many)\b[^.\n]*\b(?:inventory|stock|units\s+on\s+hand|in\s+stock|out\s+of\s+stock|low\s+stock|stock\s+movements?)\b",
         r"\b(?:inventory|stock)\b[^.\n]*\b(?:status|valuation|value|on\s+hand|summary|balance|level|position|movements?)\b",
         r"\b(?:out\s+of\s+stock|low\s+stock|depleted\s+stock)\b",
-        r"\bhow\s+many\b[^.\n]*\b(?:in\s+stock|on\s+hand|left|remaining)\b",
+        r"\bhow\s+many\b[^.\n]*\b(?:units?|items?|pieces?|pcs|in\s+stock|on\s+hand|left|remaining|available|we\s+have|there\s+are)\b",
+        r"\bhow\s+many\b\s+([a-zA-Z0-9_\s\-]+?)\??$",
+        r"\b(?:units?|quantity|count|balance|level)\s+of\b[^.\n]*\b(?:stock|inventory|[a-zA-Z0-9_\-]+)\b",
     ]),
 
     ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
@@ -2161,9 +2163,18 @@ def plan(
     if intent == "get_inventory_status":
         if re.search(r"\b(?:out\s+of\s+stock|low\s+stock|depleted)\b", msg, re.IGNORECASE):
             entities["only_low_stock"] = True
-        _pm = re.search(r"(?:how\s+many|check\s+stock\s+(?:for|of)|stock\s+(?:of|for|level\s+of|status\s+of)|status\s+of|any)\s+([a-zA-Z0-9_\s\-]+?)(?:\s+do\s+we\s+have|\s+in\s+stock|\s+on\s+hand|\?|$)", msg, re.IGNORECASE)
+        _cleaned_msg = re.sub(r"[?!.,;]+$", "", msg.strip())
+        _pm = re.search(
+            r"(?:how\s+many(?:\s+units?\s+of|\s+pieces?\s+of|\s+pcs\s+of)?|"
+            r"check\s+stock\s+(?:for|of)|"
+            r"(?:stock|quantity|units?|count|balance|level)\s+(?:of|for)|"
+            r"status\s+of|any)\s+([a-zA-Z0-9_\s\-]+?)(?:\s+do\s+we\s+have|\s+in\s+stock|\s+on\s+hand|\s+available|\s+left|\?|$)",
+            _cleaned_msg,
+            re.IGNORECASE,
+        )
         if _pm:
             _cand = _pm.group(1).strip()
+            _cand = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", _cand, flags=re.IGNORECASE).strip()
             if _cand.lower() not in ("items", "products", "goods", "inventory", "stock", "all", "everything"):
                 entities["product_name"] = _cand
 

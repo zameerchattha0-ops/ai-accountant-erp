@@ -78,7 +78,13 @@ _INSTRUCTION = (
     "ERP OPERATIONS & SETUP: For tasks across ERP modules, intelligently extract the exact names stated by the user: "
     "account_name (Chart of Accounts ledger title), account_type (ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE if stated or clear), "
     "account_code (numeric code), parent_account_name (heading/grouping), product_name / service_name, sales_price, "
-    "bank_name (e.g. Meezan Bank, HBL), employee_name (personnel full name), project_name (project title). null when absent."
+    "bank_name (e.g. Meezan Bank, HBL), employee_name (personnel full name), project_name (project title). null when absent. "
+    "INTENT RECOGNITION (provisional_intent_hint): Provide the canonical ERP intent whenever clear: "
+    "Inquiries/Lookups: 'get_inventory_status' (for inquiries about stock, units on hand, inventory levels, or 'how many units of <product>?'), "
+    "'customer_balance', 'supplier_balance', 'get_chart_of_accounts', 'list_expenses', 'list_bank_accounts', 'list_customers', 'list_suppliers', 'list_employees', "
+    "'generate_trial_balance', 'generate_balance_sheet', 'generate_profit_loss', 'generate_general_ledger'. "
+    "Mutations: 'record_sale', 'record_purchase', 'record_expense', 'create_invoice', 'create_purchase_bill', 'create_product', 'create_service', 'create_account', 'create_customer', 'create_supplier', 'create_bank_account'. "
+    "If the intent is unclear, use null."
 )
 
 # Pronouns / fillers that are never a business counterparty (mirrors the
@@ -255,6 +261,15 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
             clean["account_type"] = "EQUITY"
 
     _num("sales_price")
+
+    if clean.get("provisional_intent_hint") == "get_inventory_status":
+        if not clean.get("product_name") and clean.get("item_description"):
+            desc = clean["item_description"]
+            desc = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", desc, flags=re.I).strip()
+            clean["product_name"] = desc
+
+    if clean.get("product_name"):
+        clean["product_name"] = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", clean["product_name"], flags=re.I).strip()
 
     return clean, failures
 
