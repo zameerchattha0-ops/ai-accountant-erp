@@ -45,110 +45,58 @@ _AREAS = frozenset({
 })
 _DOC_REF_RE = re.compile(r"\b(?:INV|BILL|RCPT|PAY|PO|JV)[-/ \t]?\d{2,}\b", re.I)
 
-_INSTRUCTION = (
-    'You are the PRIMARY intelligence and fact-extraction engine for an enterprise ERP AI agent. '
-    'Analyze the user request, determine the exact canonical business intent, and extract all stated entities and parameters. '
-    'Output STRICT JSON only matching this schema:
-'
-    '{
-'
-    '  "provisional_intent_hint": "<canonical intent string or null>",
-'
-    '  "amount": <number|null>,
-'
-    '  "transaction_date": "<YYYY-MM-DD>"|null,
-'
-    '  "item_description": "<string>"|null,
-'
-    '  "quantity": <number|null>,
-'
-    '  "payment_channel": "<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null,
-'
-    '  "customer_name": "<string>"|null,
-'
-    '  "supplier_name": "<string>"|null,
-'
-    '  "invoice_number": "<string>"|null,
-'
-    '  "bill_number": "<string>"|null,
-'
-    '  "document_reference": "<string>"|null,
-'
-    '  "reason": "<string>"|null,
-'
-    '  "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null,
-'
-    '  "account_name": "<string>"|null,
-'
-    '  "account_type": "<ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE>"|null,
-'
-    '  "account_code": "<string>"|null,
-'
-    '  "parent_account_name": "<string>"|null,
-'
-    '  "product_name": "<string>"|null,
-'
-    '  "service_name": "<string>"|null,
-'
-    '  "sales_price": <number|null>,
-'
-    '  "bank_name": "<string>"|null,
-'
-    '  "employee_name": "<string>"|null,
-'
-    '  "date_of_joining": "<YYYY-MM-DD or TODAY>"|null,
-'
-    '  "basic_salary": <number|null>,
-'
-    '  "project_name": "<string>"|null,
-'
-    '  "candidate_subject_areas": ["<area>", ...]
-'
-    '}
+_INSTRUCTION = """You are the PRIMARY intelligence and fact-extraction engine for an enterprise ERP AI agent. Analyze the user request, determine the exact canonical business intent, and extract all stated entities and parameters. Output STRICT JSON only matching this schema:
+{
+  "provisional_intent_hint": "<canonical intent string or null>",
+  "amount": <number|null>,
+  "transaction_date": "<YYYY-MM-DD>"|null,
+  "item_description": "<string>"|null,
+  "quantity": <number|null>,
+  "payment_channel": "<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null,
+  "customer_name": "<string>"|null,
+  "supplier_name": "<string>"|null,
+  "invoice_number": "<string>"|null,
+  "bill_number": "<string>"|null,
+  "document_reference": "<string>"|null,
+  "reason": "<string>"|null,
+  "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null,
+  "account_name": "<string>"|null,
+  "account_type": "<ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE>"|null,
+  "account_code": "<string>"|null,
+  "parent_account_name": "<string>"|null,
+  "product_name": "<string>"|null,
+  "service_name": "<string>"|null,
+  "sales_price": <number|null>,
+  "bank_name": "<string>"|null,
+  "employee_name": "<string>"|null,
+  "date_of_joining": "<YYYY-MM-DD or TODAY>"|null,
+  "basic_salary": <number|null>,
+  "project_name": "<string>"|null,
+  "candidate_subject_areas": ["<area>", ...]
+}
 
-'
-    'RULES:
-'
-    '1. INTENT RECOGNITION (provisional_intent_hint): Select the exact canonical ERP intent from:
-'
-    '   - Personnel & Staff: create_employee (e.g. "record an employee", "add staff", "hire worker", "new employee"), list_employees, run_payroll
-'
-    '   - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation
-'
-    '   - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill
-'
-    '   - Settlements & Cashflow: record_receipt (customer payments, receipts against invoice, e.g. "record payment receipt against invoice 12"), record_payment (supplier payments, payments against bill, e.g. "record payment against bill 5"), record_expense_payment, record_bank_transfer
-'
-    '   - Expenses: record_expense, list_expenses
-'
-    '   - Returns: create_credit_note (sales return), create_purchase_return (purchase return/debit note)
-'
-    '   - Inventory & Catalogue: get_inventory_status (stock levels, counts, "how many units of X?"), create_product, create_service, update_product, delete_product, update_service, delete_service
-'
-    '   - Fixed Assets: register_fixed_asset, dispose_fixed_asset, record_asset_depreciation
-'
-    '   - General Ledger & Reports: create_account, get_chart_of_accounts, generate_general_ledger, generate_trial_balance, generate_balance_sheet, generate_profit_loss, generate_cash_flow
-'
-    '   - CRM & Master Data: create_customer, create_supplier, list_customers, list_suppliers, customer_balance, supplier_balance, generate_customer_ledger, generate_supplier_ledger
-'
-    '   - Projects: create_project, project_profitability
-'
-    '   - Banking: create_bank_account, list_bank_accounts
-'
-    '   - Adjustments: record_adjustment, record_correction, reverse_journal
-'
-    '2. ENTITY & PARAMETER EXTRACTION:
-'
-    '   - Personnel: extract employee_name, date_of_joining (if stated, e.g. today or ISO date), basic_salary (if compensation amount stated).
-'
-    '   - Invoices & Bills: extract invoice_number (e.g. "12", "INV-000012"), bill_number (e.g. "5", "PUR-000005").
-'
-    '   - Parties vs Items: customer_name is who we sell to / receive from; supplier_name is who we buy from / pay to. Items/goods go in item_description.
-'
-    '   - Multi-item: extract each distinct product/service into line_items with description, quantity, unit_price, total_amount.
-'
-    '   - Never guess values not stated; leave null when absent.'
-)
+RULES:
+1. INTENT RECOGNITION (provisional_intent_hint): Select the exact canonical ERP intent from:
+   - Personnel & Staff: create_employee (e.g. "record an employee", "add staff", "hire worker", "new employee"), list_employees, run_payroll
+   - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation
+   - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill
+   - Settlements & Cashflow: record_receipt (customer payments, receipts against invoice, e.g. "record payment receipt against invoice 12"), record_payment (supplier payments, payments against bill, e.g. "record payment against bill 5"), record_expense_payment, record_bank_transfer
+   - Expenses: record_expense, list_expenses
+   - Returns: create_credit_note (sales return), create_purchase_return (purchase return/debit note)
+   - Inventory & Catalogue: get_inventory_status (stock levels, counts, "how many units of X?"), create_product, create_service, update_product, delete_product, update_service, delete_service
+   - Fixed Assets: register_fixed_asset, dispose_fixed_asset, record_asset_depreciation
+   - General Ledger & Reports: create_account, get_chart_of_accounts, generate_general_ledger, generate_trial_balance, generate_balance_sheet, generate_profit_loss, generate_cash_flow
+   - CRM & Master Data: create_customer, create_supplier, list_customers, list_suppliers, customer_balance, supplier_balance, generate_customer_ledger, generate_supplier_ledger
+   - Projects: create_project, project_profitability
+   - Banking: create_bank_account, list_bank_accounts
+   - Adjustments: record_adjustment, record_correction, reverse_journal
+
+2. ENTITY & PARAMETER EXTRACTION:
+   - Personnel: extract employee_name, date_of_joining (if stated, e.g. today or ISO date), basic_salary (if compensation amount stated).
+   - Invoices & Bills: extract invoice_number (e.g. "12", "INV-000012"), bill_number (e.g. "5", "PUR-000005").
+   - Parties vs Items: customer_name is who we sell to / receive from; supplier_name is who we buy from / pay to. Items/goods go in item_description.
+   - Multi-item: extract each distinct product/service into line_items with description, quantity, unit_price, total_amount.
+   - Never guess values not stated; leave null when absent."""
 
 # Pronouns / fillers that are never a business counterparty (mirrors the
 # planner's party guard so a model echo of "we"/"them"/"the supplier" can
