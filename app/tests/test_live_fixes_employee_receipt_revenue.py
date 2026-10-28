@@ -95,3 +95,23 @@ async def test_revenue_ledger_fallback_to_general_revenue():
         assert account is not None
         assert account["name"] == "Sales Revenue"
         assert reason == "general"
+
+
+def test_llm_primary_intent_authority():
+    # Even with unusual wording that regex would classify as unknown,
+    # the LLM's semantic intent and extracted facts are authoritative
+    unusual_msg = "Please welcome our newest colleague Zameer into the personnel system"
+    llm_prefill = {
+        "semantic_intent": "create_employee",
+        "employee_name": "Zameer",
+        "date_of_joining": "2026-11-01",
+        "basic_salary": 150000.0,
+    }
+    plan = run_planner(unusual_msg, prefill_entities=llm_prefill)
+    assert plan.intent == "create_employee"
+    assert plan.extracted_entities["employee_name"] == "Zameer"
+    assert plan.extracted_entities["date_of_joining"] == "2026-11-01"
+    assert plan.extracted_entities["basic_salary"] == 150000.0
+    assert plan.missing_fields == []
+    assert plan.requires_clarification is False
+

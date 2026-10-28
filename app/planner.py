@@ -1895,10 +1895,11 @@ def plan(
         for _k in (
             "account_name", "account_type", "code", "account_code",
             "parent_account_name", "product_name", "service_name", "sales_price",
-            "bank_name", "employee_name", "project_name", "customer_name", "supplier_name"
+            "bank_name", "employee_name", "project_name", "customer_name", "supplier_name",
+            "date_of_joining", "basic_salary", "invoice_number", "bill_number", "invoice_id", "bill_id"
         ):
             if prefill_entities.get(_k) is not None:
-                entities.setdefault(_k, prefill_entities[_k])
+                entities[_k] = prefill_entities[_k]
 
     if intent in ("create_account", "create_customer", "create_supplier", "create_product", "create_service", "create_employee", "create_project"):
         target_name_key = {

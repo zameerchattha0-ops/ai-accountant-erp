@@ -200,6 +200,13 @@ async def resolve_revenue_account(
 
 # The heading stream ledgers group under when the chart has no general revenue
 # account of its own (see ensure_revenue_parent).
+    general = await find_general_revenue(organization_id)
+    if general is not None:
+        return general, label, "general"
+
+    return None, label, "ambiguous"
+
+
 REVENUE_PARENT_NAME = "Revenue"
 
 

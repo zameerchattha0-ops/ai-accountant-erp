@@ -7709,9 +7709,9 @@ async def execute(
 
 
 
-                _gaps = text_understanding_gaps(user_message)
+                _has_settled_llm = bool((_preliminary or {}).get("provisional_intent_hint"))
 
-                if _gaps:
+                if not _has_settled_llm:
 
                     from app.entity_segregation import extract_request_facts
 
@@ -7741,13 +7741,7 @@ async def execute(
 
                         ),
 
-                        nature_values=accepted_nature_values(
-
-                            intent_for_message(user_message)
-
-                        )
-
-                        or None,
+                        nature_values=None,
 
                         intent_values=sorted(_SEMANTIC_INTENTS),
 
@@ -7757,6 +7751,10 @@ async def execute(
 
                         _ai_prefill = {**_ai_prefill, **_facts}
 
+                        if _facts.get("semantic_intent") and not (_preliminary or {}).get("provisional_intent_hint"):
+
+                            _preliminary["provisional_intent_hint"] = _facts["semantic_intent"]
+
                         await _log_step(session_id, "AI_PERCEPTION", {
 
                             "facts": sorted(_facts.keys()),
@@ -7764,8 +7762,6 @@ async def execute(
                             "intent": _facts.get("semantic_intent"),
 
                             "ambiguous": False,
-
-                            "gaps": _gaps,
 
                             "source": "bounded_understanding",
 
@@ -7850,8 +7846,8 @@ async def execute(
         _decision = getattr(_reasoning, "decision", None) or {}
         _model_intent = str(_decision.get("intent") or "").strip().lower()
 
-        # If planner ended up unknown, LLM preliminary extraction intent hint is promoted
-        if not _model_intent and execution_plan.intent == "unknown" and (_preliminary or {}).get("provisional_intent_hint"):
+        # LLM intent is ALWAYS authoritative over legacy planner guessing
+        if not _model_intent and (_preliminary or {}).get("provisional_intent_hint"):
             _candidate_hint = str((_preliminary or {}).get("provisional_intent_hint") or "").strip().lower()
             if is_canonical_intent(_candidate_hint):
                 _model_intent = _candidate_hint

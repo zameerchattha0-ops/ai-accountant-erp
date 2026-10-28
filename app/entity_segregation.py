@@ -168,10 +168,11 @@ _SYSTEM_PROMPT = (
     "customer_name/supplier_name) and NEVER a pronoun (it/them/this/that/"
     "these/those). When the request names no product or service, OMIT the "
     "key - never invent one.\n"
-    "10. Operational & Setup Tasks (CRITICAL - LLM is authoritative for all ERP modules):\n"
+    "10. Operational, Setup & Document References (CRITICAL - LLM is authoritative for all ERP modules):\n"
+    "    - Personnel: extract employee_name, date_of_joining, basic_salary.\n"
+    "    - Invoices & Bills: extract invoice_number (e.g. 12, INV-000012), bill_number (e.g. 5, PUR-000013).\n"
     "    - Chart of Accounts: extract account_name, account_type (ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE), code, parent_account_name.\n"
     "    - Banking: extract bank_name, account_name.\n"
-    "    - Personnel: extract employee_name, amount.\n"
     "    - Catalogue: extract product_name, service_name, amount, sales_price.\n"
     "    - CRM: extract customer_name, supplier_name.\n"
     "    - Projects: extract project_name.\n"
@@ -413,6 +414,22 @@ def _ground_fields(
                 num = float(str(raw_value).replace(",", "").strip())
                 if num >= 0 and _number_grounded(num, normalized):
                     grounded["sales_price"] = num
+            except (TypeError, ValueError):
+                pass
+
+        elif key in ("invoice_number", "bill_number", "document_reference"):
+            cand = str(raw_value).strip()
+            if cand:
+                grounded[key] = cand
+
+        elif key in ("date_of_joining", "joining_date"):
+            cand = str(raw_value).strip()
+            if cand:
+                grounded["date_of_joining"] = cand
+
+        elif key in ("basic_salary", "salary"):
+            try:
+                grounded["basic_salary"] = float(str(raw_value).replace(",", "").strip())
             except (TypeError, ValueError):
                 pass
 

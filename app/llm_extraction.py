@@ -46,45 +46,108 @@ _AREAS = frozenset({
 _DOC_REF_RE = re.compile(r"\b(?:INV|BILL|RCPT|PAY|PO|JV)[-/ \t]?\d{2,}\b", re.I)
 
 _INSTRUCTION = (
-    'You are a LITERAL extractor for an accounting intake. Output STRICT JSON '
-    'only, matching EXACTLY this schema: {"amount": <number|null>, '
-    '"transaction_date": "<YYYY-MM-DD>"|null, "item_description": "<string>"'
-    '|null, "quantity": <number|null>, "payment_channel": '
-    '"<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null, "supplier_name": '
-    '"<string>"|null, "customer_name": "<string>"|null, "reason": "<string>"'
-    '|null, "bill_number": "<PUR-000013 style token>"|null, "named_parties": '
-    '["<string>", ...] (max 5), "document_reference": "<INV-000012 style '
-    'token>"|null, "invoice_number": "<digits>"|null, '
-    '"provisional_intent_hint": "<canonical intent or null>", '
-    '"candidate_subject_areas": ["<one of: fixed_assets,revenue,'
-    'receivables,payables,expenses,purchases,loans,equity,tax,bank,cash>", '
-    '..., "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null, "account_name": "<string>"|null, "account_type": "<ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE>"|null, "account_code": "<string>"|null, "parent_account_name": "<string>"|null, "product_name": "<string>"|null, "service_name": "<string>"|null, "sales_price": <number|null>, "bank_name": "<string>"|null, "employee_name": "<string>"|null, "project_name": "<string>"|null} RULES: extract ONLY values the user LITERALLY stated; null when '
-    'absent; NEVER infer, compute, or guess (e.g. no quantity unless '
-    'stated); NEVER decide accounting treatment or accounts; keep the '
-    "request's own wording for items and parties. PARTY vs ITEM (critical): "
-    "the COUNTERPARTY (the business you bought FROM / sold TO / returned "
-    "goods TO) is a PARTY and goes in supplier_name (you bought or returned "
-    "to them) or customer_name (you sold or received from them) — it is "
-    "NEVER part of item_description. item_description is only the GOODS "
-    "(e.g. 'return to umer autos against damaged motorbikes' -> "
-    "supplier_name='umer autos', item_description='damaged motorbikes'). "
-    "MULTI-ITEM EXTRACTION (CRITICAL): When a request mentions multiple items or goods "
-    "(e.g. '2 tables and 3 chairs from Shabbir Furnitures', '5 laptops at 100000 and 10 keyboards at 2000', "
-    "'bought cement bags and steel rods'), extract each distinct item as an object in 'line_items' with "
-    "description, quantity (as a number, e.g. 2, 3), unit_price (if stated, else null), and total_amount (if stated, else null). "
-    "Also set item_description to a summary such as 'tables / chairs'. "
-    "reason is the user's own stated cause for a return ('damaged', "
-    "'wrong item delivered'), null when not stated. "
-    "ERP OPERATIONS & SETUP: For tasks across ERP modules, intelligently extract the exact names stated by the user: "
-    "account_name (Chart of Accounts ledger title), account_type (ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE if stated or clear), "
-    "account_code (numeric code), parent_account_name (heading/grouping), product_name / service_name, sales_price, "
-    "bank_name (e.g. Meezan Bank, HBL), employee_name (personnel full name), project_name (project title). null when absent. "
-    "INTENT RECOGNITION (provisional_intent_hint): Provide the canonical ERP intent whenever clear: "
-    "Inquiries/Lookups: 'get_inventory_status' (for inquiries about stock, units on hand, inventory levels, or 'how many units of <product>?'), "
-    "'customer_balance', 'supplier_balance', 'get_chart_of_accounts', 'list_expenses', 'list_bank_accounts', 'list_customers', 'list_suppliers', 'list_employees', "
-    "'generate_trial_balance', 'generate_balance_sheet', 'generate_profit_loss', 'generate_general_ledger'. "
-    "Mutations: 'record_sale', 'record_purchase', 'record_expense', 'create_invoice', 'create_purchase_bill', 'create_product', 'create_service', 'create_account', 'create_customer', 'create_supplier', 'create_bank_account'. "
-    "If the intent is unclear, use null."
+    'You are the PRIMARY intelligence and fact-extraction engine for an enterprise ERP AI agent. '
+    'Analyze the user request, determine the exact canonical business intent, and extract all stated entities and parameters. '
+    'Output STRICT JSON only matching this schema:
+'
+    '{
+'
+    '  "provisional_intent_hint": "<canonical intent string or null>",
+'
+    '  "amount": <number|null>,
+'
+    '  "transaction_date": "<YYYY-MM-DD>"|null,
+'
+    '  "item_description": "<string>"|null,
+'
+    '  "quantity": <number|null>,
+'
+    '  "payment_channel": "<CASH|CREDIT|BANK|CARD|TRANSFER|CHEQUE>"|null,
+'
+    '  "customer_name": "<string>"|null,
+'
+    '  "supplier_name": "<string>"|null,
+'
+    '  "invoice_number": "<string>"|null,
+'
+    '  "bill_number": "<string>"|null,
+'
+    '  "document_reference": "<string>"|null,
+'
+    '  "reason": "<string>"|null,
+'
+    '  "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null,
+'
+    '  "account_name": "<string>"|null,
+'
+    '  "account_type": "<ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE>"|null,
+'
+    '  "account_code": "<string>"|null,
+'
+    '  "parent_account_name": "<string>"|null,
+'
+    '  "product_name": "<string>"|null,
+'
+    '  "service_name": "<string>"|null,
+'
+    '  "sales_price": <number|null>,
+'
+    '  "bank_name": "<string>"|null,
+'
+    '  "employee_name": "<string>"|null,
+'
+    '  "date_of_joining": "<YYYY-MM-DD or TODAY>"|null,
+'
+    '  "basic_salary": <number|null>,
+'
+    '  "project_name": "<string>"|null,
+'
+    '  "candidate_subject_areas": ["<area>", ...]
+'
+    '}
+
+'
+    'RULES:
+'
+    '1. INTENT RECOGNITION (provisional_intent_hint): Select the exact canonical ERP intent from:
+'
+    '   - Personnel & Staff: create_employee (e.g. "record an employee", "add staff", "hire worker", "new employee"), list_employees, run_payroll
+'
+    '   - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation
+'
+    '   - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill
+'
+    '   - Settlements & Cashflow: record_receipt (customer payments, receipts against invoice, e.g. "record payment receipt against invoice 12"), record_payment (supplier payments, payments against bill, e.g. "record payment against bill 5"), record_expense_payment, record_bank_transfer
+'
+    '   - Expenses: record_expense, list_expenses
+'
+    '   - Returns: create_credit_note (sales return), create_purchase_return (purchase return/debit note)
+'
+    '   - Inventory & Catalogue: get_inventory_status (stock levels, counts, "how many units of X?"), create_product, create_service, update_product, delete_product, update_service, delete_service
+'
+    '   - Fixed Assets: register_fixed_asset, dispose_fixed_asset, record_asset_depreciation
+'
+    '   - General Ledger & Reports: create_account, get_chart_of_accounts, generate_general_ledger, generate_trial_balance, generate_balance_sheet, generate_profit_loss, generate_cash_flow
+'
+    '   - CRM & Master Data: create_customer, create_supplier, list_customers, list_suppliers, customer_balance, supplier_balance, generate_customer_ledger, generate_supplier_ledger
+'
+    '   - Projects: create_project, project_profitability
+'
+    '   - Banking: create_bank_account, list_bank_accounts
+'
+    '   - Adjustments: record_adjustment, record_correction, reverse_journal
+'
+    '2. ENTITY & PARAMETER EXTRACTION:
+'
+    '   - Personnel: extract employee_name, date_of_joining (if stated, e.g. today or ISO date), basic_salary (if compensation amount stated).
+'
+    '   - Invoices & Bills: extract invoice_number (e.g. "12", "INV-000012"), bill_number (e.g. "5", "PUR-000005").
+'
+    '   - Parties vs Items: customer_name is who we sell to / receive from; supplier_name is who we buy from / pay to. Items/goods go in item_description.
+'
+    '   - Multi-item: extract each distinct product/service into line_items with description, quantity, unit_price, total_amount.
+'
+    '   - Never guess values not stated; leave null when absent.'
 )
 
 # Pronouns / fillers that are never a business counterparty (mirrors the
@@ -169,7 +232,7 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
     if reason is not None and str(reason).strip():
         clean["reason"] = str(reason).strip()[:160]
     bill = payload.get("bill_number")
-    if bill is not None and _DOC_REF_RE.fullmatch(str(bill).strip()):
+    if bill is not None and str(bill).strip():
         clean["bill_number"] = str(bill).strip()
     channel = payload.get("payment_channel")
     if channel is not None:
@@ -184,10 +247,10 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
         if kept:
             clean["named_parties"] = kept
     ref = payload.get("document_reference")
-    if ref is not None and _DOC_REF_RE.fullmatch(str(ref).strip()):
+    if ref is not None and str(ref).strip():
         clean["document_reference"] = str(ref).strip()
     inv = payload.get("invoice_number")
-    if inv is not None and re.fullmatch(r"\d{1,6}", str(inv).strip()):
+    if inv is not None and str(inv).strip():
         clean["invoice_number"] = str(inv).strip()
     hint = payload.get("provisional_intent_hint")
     if hint:
@@ -235,6 +298,14 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
             valid_lines.append(clean_item)
         if valid_lines:
             clean["line_items"] = valid_lines
+    if payload.get("date_of_joining") and str(payload["date_of_joining"]).strip():
+        clean["date_of_joining"] = str(payload["date_of_joining"]).strip()
+    if payload.get("basic_salary") is not None:
+        try:
+            clean["basic_salary"] = float(payload["basic_salary"])
+        except (ValueError, TypeError):
+            pass
+
     for str_key in (
         "account_name", "account_code", "parent_account_name",
         "product_name", "service_name", "bank_name", "employee_name",
