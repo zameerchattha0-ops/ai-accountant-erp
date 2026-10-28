@@ -113,6 +113,9 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
         "supplier_id": ReferenceSpec(
             "supplier_id", "supplier", ("supplier_name", "party_name")
         ),
+        "bill_id": ReferenceSpec(
+            "bill_id", "bill", ("bill_number",)
+        ),
     },
     "create_credit_note": {
         "customer_id": ReferenceSpec(
@@ -259,18 +262,51 @@ async def _search(role: str, organization_id: uuid.UUID, query: str, limit: int)
 
         return await service_service.search(organization_id, query=query, limit=limit)
     if role == "invoice":
-        # Document references resolve against the tenant's own numbering,
-        # not a name search: exact invoice_number, org-scoped. The match
-        # layer compares ``name``, so the invoice's human key (its number)
-        # is exposed under that field; anything else is a different row.
         from app.repositories import invoice_repository
-
+        q = str(query).strip()
         row = await invoice_repository.get_invoice_by_number(
-            organization_id, invoice_number=str(query).strip()
+            organization_id, invoice_number=q
         )
+        digits = "".join(ch for ch in q if ch.isdigit())
+        if not row and digits:
+            for cand in [f"INV-{int(digits):06d}", f"INV-{digits}", f"INV-00{digits}"]:
+                row = await invoice_repository.get_invoice_by_number(
+                    organization_id, invoice_number=cand
+                )
+                if row:
+                    break
+        if not row:
+            invoices = await invoice_repository.list_invoices(organization_id, limit=50)
+            for inv in (invoices or []):
+                inv_num = str(inv.get("invoice_number") or "")
+                if q.lower() in inv_num.lower() or (digits and digits == "".join(ch for ch in inv_num if ch.isdigit())):
+                    row = inv
+                    break
         if not row:
             return []
-        return [{"id": row.get("id"), "name": row.get("invoice_number")}]
+        return [{"id": row.get("id"), "name": row.get("invoice_number"), "_raw_row": row}]
+
+    if role == "bill":
+        from app.repositories import purchase_repository
+        from app.database import fetch_one
+        q = str(query).strip()
+        row = await fetch_one("purchase_bills", filters={"bill_number": q, "organization_id": str(organization_id)})
+        digits = "".join(ch for ch in q if ch.isdigit())
+        if not row and digits:
+            for cand in [f"PUR-{int(digits):06d}", f"BILL-{int(digits):06d}", f"PUR-{digits}", f"BILL-{digits}"]:
+                row = await fetch_one("purchase_bills", filters={"bill_number": cand, "organization_id": str(organization_id)})
+                if row:
+                    break
+        if not row:
+            bills = await purchase_repository.list_purchase_bills(organization_id, limit=50)
+            for b in (bills or []):
+                b_num = str(b.get("bill_number") or "")
+                if q.lower() in b_num.lower() or (digits and digits == "".join(ch for ch in b_num if ch.isdigit())):
+                    row = b
+                    break
+        if not row:
+            return []
+        return [{"id": row.get("id"), "name": row.get("bill_number"), "_raw_row": row}]
     return []
 
 
@@ -279,11 +315,14 @@ def _exact_matches(rows: Sequence[Dict[str, Any]], name: Any) -> List[Dict[str, 
     wanted = str(name or "").strip().lower()
     if not wanted:
         return []
-    return [
+    matches = [
         row
         for row in rows or ()
         if str(row.get("name") or "").strip().lower() == wanted
     ]
+    if not matches and rows and len(rows) == 1 and rows[0].get("_raw_row"):
+        return [rows[0]]
+    return matches
 
 
 async def resolve_reference(

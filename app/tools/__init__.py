@@ -1065,10 +1065,17 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     # nothing was reviewed does the service resolve one deliberately.
 
     revenue = None
-
     revenue_source = "reviewed"
 
-    stream = revenue_ledger_service.stream_label(description)
+    item_desc = None
+    if kw.get("items") and isinstance(kw["items"], list) and len(kw["items"]) > 0:
+        item_desc = kw["items"][0].get("description")
+    if not item_desc:
+        item_desc = kw.get("item_description") or kw.get("item")
+    if not item_desc or str(item_desc).strip().lower() in ("goods", "service", "item", "items"):
+        item_desc = description
+
+    stream = revenue_ledger_service.stream_label(item_desc) or revenue_ledger_service.stream_label(description)
 
     override_id = kw.get("revenue_account_id")
 
@@ -1111,13 +1118,9 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
     else:
 
         revenue, stream, revenue_source = (
-
             await revenue_ledger_service.resolve_revenue_account(
-
-                organization_id, description
-
+                organization_id, item_desc or description
             )
-
         )
 
     if revenue is None:
@@ -4093,11 +4096,18 @@ async def _create_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
             kw["full_name"] = kw.pop("employee_name")
         if "salary" in kw and "basic_salary" not in kw:
             kw["basic_salary"] = kw.pop("salary")
-        if "date_of_joining" not in kw:
+        if "joining_date" in kw and "date_of_joining" not in kw:
+            kw["date_of_joining"] = kw.pop("joining_date")
+        if "date_of_joining" in kw and str(kw["date_of_joining"]).strip().upper() == "TODAY":
             from datetime import date
             kw["date_of_joining"] = date.today().isoformat()
-        if "basic_salary" not in kw:
-            kw["basic_salary"] = 0.0
+
+        if not kw.get("full_name"):
+            return ToolResult(tool_name="create_employee", success=False, error="Employee full name is required.")
+        if not kw.get("date_of_joining"):
+            return ToolResult(tool_name="create_employee", success=False, error="Date of joining is required (e.g. YYYY-MM-DD, DD/MM/YYYY, or TODAY).")
+        if kw.get("basic_salary") is None:
+            return ToolResult(tool_name="create_employee", success=False, error="Basic salary amount is required.")
 
         data = await employee_service.create(organization_id, **kw)
 

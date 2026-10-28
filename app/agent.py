@@ -1166,6 +1166,9 @@ async def _receipt_fast_path_call(
 
     }
 
+    if entities.get("invoice_id"):
+        params["invoice_id"] = str(entities["invoice_id"])
+
     reference = entities.get("item_description") or entities.get("description")
 
     if reference:
@@ -1231,6 +1234,9 @@ async def _payment_fast_path_call(
         "transaction_nature": nature,
 
     }
+
+    if entities.get("bill_id"):
+        params["bill_id"] = str(entities["bill_id"])
 
     reference = entities.get("item_description") or entities.get("description")
 
@@ -5470,6 +5476,108 @@ def _seed_invoice_reference(preliminary: Any, prefill: Dict[str, Any]) -> None:
         prefill["reason"] = str(reason_ref).strip()
 
 
+async def _resolve_open_document_reference(
+    organization_id: uuid.UUID,
+    entities: Dict[str, Any],
+) -> None:
+    """Pre-resolve invoice or bill references against the tenant's books.
+
+    When a user specifies 'against invoice 12' or 'against bill 5':
+    1. Looks up the exact or normalized invoice/bill (e.g. 12 -> INV-000012).
+    2. Binds invoice_id / bill_id to guarantee transactional settlement allocation.
+    3. Prefills party (customer_name / supplier_name) and outstanding balance (amount)
+       so redundant clarification questions are never asked.
+    """
+    if not isinstance(entities, dict):
+        return
+
+    # --- Invoice Resolution ---
+    inv_ref = entities.get("invoice_number") or entities.get("invoice_id")
+    if inv_ref and not (entities.get("invoice_id") and entities.get("customer_name") and entities.get("amount")):
+        try:
+            from app.repositories import invoice_repository
+            from app.services import customer_service
+            q = str(inv_ref).strip()
+            row = None
+            try:
+                row = await invoice_repository.get_invoice(organization_id, invoice_id=uuid.UUID(q))
+            except (ValueError, TypeError):
+                row = await invoice_repository.get_invoice_by_number(organization_id, invoice_number=q)
+                digits = "".join(ch for ch in q if ch.isdigit())
+                if not row and digits:
+                    for cand in (f"INV-{int(digits):06d}", f"INV-{digits}", f"INV-00{digits}"):
+                        row = await invoice_repository.get_invoice_by_number(organization_id, invoice_number=cand)
+                        if row:
+                            break
+                if not row:
+                    invoices = await invoice_repository.list_invoices(organization_id, limit=50)
+                    for inv in (invoices or []):
+                        inv_num = str(inv.get("invoice_number") or "")
+                        if q.lower() in inv_num.lower() or (digits and digits == "".join(ch for ch in inv_num if ch.isdigit())):
+                            row = inv
+                            break
+            if row:
+                entities["invoice_id"] = str(row["id"])
+                entities["invoice_number"] = str(row.get("invoice_number") or q)
+                if row.get("customer_id"):
+                    entities.setdefault("customer_id", str(row["customer_id"]))
+                    if not entities.get("customer_name"):
+                        cust = await customer_service.get(organization_id, uuid.UUID(str(row["customer_id"])))
+                        if cust and cust.get("name"):
+                            entities["customer_name"] = str(cust["name"]).strip()
+                tot = float(row.get("total") or 0.0)
+                paid = float(row.get("paid_amount") or 0.0)
+                bal = max(0.0, tot - paid)
+                if not entities.get("amount") or float(entities.get("amount") or 0.0) <= 0:
+                    entities["amount"] = bal if bal > 0 else tot
+        except Exception as exc:
+            log.warning("agent.resolve_invoice_reference_failed", error=str(exc)[:200])
+
+    # --- Bill Resolution ---
+    bill_ref = entities.get("bill_number") or entities.get("bill_id")
+    if bill_ref and not (entities.get("bill_id") and entities.get("supplier_name") and entities.get("amount")):
+        try:
+            from app.repositories import purchase_repository
+            from app.services import supplier_service
+            from app.database import fetch_one
+            q = str(bill_ref).strip()
+            row = None
+            try:
+                row = await purchase_repository.get_purchase_bill(organization_id, bill_id=uuid.UUID(q))
+            except (ValueError, TypeError):
+                row = await fetch_one("purchase_bills", filters={"bill_number": q, "organization_id": str(organization_id)})
+                digits = "".join(ch for ch in q if ch.isdigit())
+                if not row and digits:
+                    for cand in (f"PUR-{int(digits):06d}", f"BILL-{int(digits):06d}", f"PUR-{digits}", f"BILL-{digits}"):
+                        row = await fetch_one("purchase_bills", filters={"bill_number": cand, "organization_id": str(organization_id)})
+                        if row:
+                            break
+                if not row:
+                    bills = await purchase_repository.list_purchase_bills(organization_id, limit=50)
+                    for b in (bills or []):
+                        b_num = str(b.get("bill_number") or "")
+                        if q.lower() in b_num.lower() or (digits and digits == "".join(ch for ch in b_num if ch.isdigit())):
+                            row = b
+                            break
+            if row:
+                entities["bill_id"] = str(row["id"])
+                entities["bill_number"] = str(row.get("bill_number") or q)
+                if row.get("supplier_id"):
+                    entities.setdefault("supplier_id", str(row["supplier_id"]))
+                    if not entities.get("supplier_name"):
+                        supp = await supplier_service.get(organization_id, uuid.UUID(str(row["supplier_id"])))
+                        if supp and supp.get("name"):
+                            entities["supplier_name"] = str(supp["name"]).strip()
+                tot = float(row.get("total") or 0.0)
+                paid = float(row.get("paid_amount") or 0.0)
+                bal = max(0.0, tot - paid)
+                if not entities.get("amount") or float(entities.get("amount") or 0.0) <= 0:
+                    entities["amount"] = bal if bal > 0 else tot
+        except Exception as exc:
+            log.warning("agent.resolve_bill_reference_failed", error=str(exc)[:200])
+
+
+
 
 
 
@@ -7680,6 +7788,7 @@ async def execute(
         # "credit note against invoice …" turns died without it).
 
         _seed_invoice_reference(_preliminary, _ai_prefill)
+        await _resolve_open_document_reference(organization_id, _ai_prefill)
         if (_preliminary or {}).get("provisional_intent_hint") and not _ai_prefill.get("semantic_intent"):
             _ai_prefill["semantic_intent"] = _preliminary["provisional_intent_hint"]
 
@@ -7787,10 +7896,13 @@ async def execute(
 
         for _k in (
             "product_name", "account_name", "bank_name", "employee_name",
-            "supplier_name", "customer_name", "project_name"
+            "supplier_name", "customer_name", "project_name", "invoice_id", "invoice_number", "bill_id", "bill_number"
         ):
             if (_preliminary or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _preliminary[_k]
+            if _ai_prefill.get(_k) and not execution_plan.extracted_entities.get(_k):
+                execution_plan.extracted_entities[_k] = _ai_prefill[_k]
+        await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
 
 
 
@@ -8108,15 +8220,25 @@ async def execute(
 
         )
 
-        classification = await classify_transaction(
+        from app.erp_endpoints import is_operational_task
+        if is_operational_task(execution_plan.intent):
+            from app.classifier import TransactionClassification
+            classification = TransactionClassification(
+                transaction_nature="OPERATIONAL",
+                confidence=1.0,
+                source="OPERATIONAL_TASK",
+                requires_clarification=False,
+            )
+        else:
+            classification = await classify_transaction(
 
-            organization_id=organization_id,
+                organization_id=organization_id,
 
-            intent=execution_plan.intent,
+                intent=execution_plan.intent,
 
-            entities=entity_hints,
+                entities=entity_hints,
 
-            message=user_message,
+                message=user_message,
 
             # P1-⑧ (forensic latency report ⑧): skip ONLY the account-hint /
 
@@ -14352,12 +14474,15 @@ async def resume_with_clarification(
                 dt = merged_entities.get("transaction_date") or date.today().isoformat()
                 pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
                 if party and amt > 0:
-                    single_hop_call = ToolCall(tool_name="record_customer_receipt", arguments={
+                    _rcpt_args = {
                         "customer_name": str(party).strip(),
                         "amount": amt,
                         "receipt_date": dt,
                         "payment_mode": pm,
-                    })
+                    }
+                    if merged_entities.get("invoice_id"):
+                        _rcpt_args["invoice_id"] = str(merged_entities["invoice_id"])
+                    single_hop_call = ToolCall(tool_name="record_customer_receipt", arguments=_rcpt_args)
 
             elif intent in ("record_supplier_payment", "payment"):
                 amt = float(merged_entities.get("amount") or 0.0)
@@ -14365,12 +14490,15 @@ async def resume_with_clarification(
                 dt = merged_entities.get("transaction_date") or date.today().isoformat()
                 pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
                 if party and amt > 0:
-                    single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments={
+                    _pmt_args = {
                         "supplier_name": str(party).strip(),
                         "amount": amt,
                         "payment_date": dt,
                         "payment_mode": pm,
-                    })
+                    }
+                    if merged_entities.get("bill_id"):
+                        _pmt_args["bill_id"] = str(merged_entities["bill_id"])
+                    single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             if single_hop_call is not None:
                 log.info(

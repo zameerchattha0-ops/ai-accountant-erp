@@ -183,10 +183,17 @@ async def resolve_revenue_account(
         # several candidates.  Whether the stream DESERVES its own ledger is the
         # user's call (reporting granularity), so this is deliberately
         # ambiguous — the caller asks.
+        general = await find_general_revenue(organization_id)
+        if general is not None:
+            return general, label, "general"
         return None, label, "ambiguous"
 
     if len(rows) == 1:
         return rows[0], label, "only-one"
+
+    general = await find_general_revenue(organization_id)
+    if general is not None:
+        return general, label, "general"
 
     return None, label, "ambiguous"
 

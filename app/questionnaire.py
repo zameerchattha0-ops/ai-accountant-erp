@@ -223,6 +223,25 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         answer_hint="Project name, e.g. 'Mobile App'",
         why="The project record is identified by its name.",
     ),
+    "employee_name": QuestionSpec(
+        field="employee_name", kind=KIND_TEXT,
+        question="What is the employee's full name?",
+        answer_hint="Full name, e.g. 'Ahmad Ali'",
+        why="The employee record is identified by their name.",
+    ),
+    "date_of_joining": QuestionSpec(
+        field="date_of_joining", kind=KIND_DATE,
+        question="What is the employee's date of joining? Reply TODAY, or the date as YYYY-MM-DD or DD/MM/YYYY.",
+        options=_DATE_OPTIONS,
+        answer_hint="TODAY, YYYY-MM-DD or DD/MM/YYYY",
+        why="Employment start date is required for the employee record and payroll.",
+    ),
+    "basic_salary": QuestionSpec(
+        field="basic_salary", kind=KIND_MONEY,
+        question="What is the employee's basic monthly salary (amount)?",
+        answer_hint="A number, e.g. 50000",
+        why="Monthly basic salary is required for compensation and payroll.",
+    ),
     "project_code": QuestionSpec(
         field="project_code", kind=KIND_TEXT,
         question=(

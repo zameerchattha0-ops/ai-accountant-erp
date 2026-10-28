@@ -468,34 +468,29 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     ]),
 
     (
-
         "record_receipt",
-
         [
-
             r"receipt",
-
+            r"(?:receive|received|collect|collected)\b[^.\n]*\b(?:payment|amount|money|cash)\b",
             r"received.*from.*customer",
-
             r"customer.*paid",
-
             r"payment.*received",
-
-            # "I received 60000 from FDS Labs Pvt" — money-in stated as a
-
-            # bare figure directly after "received" + "from <party>".  The
-
-            # digits must sit IMMEDIATELY after "received ... from" so
-
-            # goods receipts ("received 3 boxes from supplier") never match.
-
+            r"(?:payment\s+)?receipt\s+against\s+(?:invoice|sale)",
+            r"(?:receive|received|record)\s+(?:payment|receipt)\s+against\s+invoice",
             r"\breceived\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?\s+from\b",
-
         ],
-
     ),
-
-    ("record_payment", [r"paid.*supplier", r"supplier.*payment", r"payment.*to.*supplier"]),
+    (
+        "record_payment",
+        [
+            r"paid.*supplier",
+            r"supplier.*payment",
+            r"payment.*to.*supplier",
+            r"(?:record|make|send)?\s*payment\s+against\s+(?:bill|purchase)",
+            r"(?:pay|settle)\s+(?:bill|purchase\s+bill)",
+            r"\bpay\s+supplier\b",
+        ],
+    ),
 
     ("record_bank_transfer", [r"transfer.*bank", r"bank.*transfer", r"transfer.*from.*to.*account", r"move.*money.*from", r"transfer.*hbl\b", r"transfer.*meezan\b"]),
 
@@ -532,8 +527,10 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
         r"\bnew\s+(?:supplier|vendor|seller)\b",
     ]),
     ("create_employee", [
-        r"(?:create|add|new|register|hire|onboard)\b[^.\n]*\b(?:employee|staff|worker)\b",
-        r"\bnew\s+(?:employee|staff|worker)\b",
+        r"(?:create|add|new|register|hire|onboard|record)\b[^.\n]*\b(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\bnew\s+(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\brecord\s+(?:an?\s+)?(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\b(?:employee|staff|worker|personnel|emplyee|employe)\s+(?:setup|registration|onboarding)\b",
     ]),
     ("create_recurring_template", [
         r"(?:create|add|new|setup)\s+(?:a\s+)?recurring\b",
@@ -3323,6 +3320,8 @@ _FIELD_QUESTION = {
     "sales_price": "What is the selling / sales price for this item?",
     "bank_name": "What is the name of the bank (e.g. Meezan Bank, HBL, Standard Chartered)?",
     "employee_name": "What is the full name of the employee to register?",
+    "date_of_joining": "What is the employee's date of joining? Reply with the date (e.g. YYYY-MM-DD or DD/MM/YYYY) or TODAY.",
+    "basic_salary": "What is the employee's basic monthly salary (amount)?",
     "project_name": "What is the name of the project to set up?",
 }
 
@@ -4002,8 +4001,13 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
         if not (entities.get("account_name") or entities.get("name")):
             missing.append("account_name")
 
-    if intent == "create_employee" and not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
-        missing.append("employee_name")
+    if intent == "create_employee":
+        if not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
+            missing.append("employee_name")
+        if not (entities.get("date_of_joining") or entities.get("joining_date")):
+            missing.append("date_of_joining")
+        if entities.get("basic_salary") is None and entities.get("salary") is None:
+            missing.append("basic_salary")
 
     if intent in ("supplier_balance", "generate_supplier_ledger") and not (entities.get("supplier_name") or entities.get("name")):
         missing.append("supplier_name")
