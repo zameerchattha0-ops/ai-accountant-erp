@@ -1525,12 +1525,17 @@ async def _catalogue_list(table: str, auth: AuthContext, query: str, status: str
             tracing_map = await inventory_service.get_product_unit_tracing(
                 auth.organization_id
             )
+            pipeline_map = await inventory_service.get_stock_pipeline(
+                auth.organization_id
+            )
         except Exception as exc:  # noqa: BLE001 — tracing is additive, never fatal
             log.warning("api.catalogue.tracing_lookup_failed", error=str(exc)[:200])
             tracing_map = {}
+            pipeline_map = {}
         for r in rows:
             pid_str = str(r.get("id"))
             tr = tracing_map.get(pid_str)
+            pipe = pipeline_map.get(pid_str, {})
             if r.get("is_stock_tracked"):
                 if tr:
                     r["opening_quantity"] = tr["opening_quantity"]
@@ -1546,6 +1551,12 @@ async def _catalogue_list(table: str, auth: AuthContext, query: str, status: str
                     r["quantity_on_hand"] = 0.0
                     r["average_cost"] = float(r.get("cost_price") or 0.0)
                     r["valuation"] = 0.0
+                r["qty_on_hand"] = pipe.get("qty_on_hand", r["quantity_on_hand"])
+                r["qty_inbound_transit"] = pipe.get("qty_inbound_transit", 0.0)
+                r["qty_requisitioned"] = pipe.get("qty_requisitioned", 0.0)
+                r["qty_reserved"] = pipe.get("qty_reserved", 0.0)
+                r["qty_customer_premises"] = pipe.get("qty_customer_premises", 0.0)
+                r["qty_available"] = pipe.get("qty_available", max(0.0, r["quantity_on_hand"] - r["qty_reserved"]))
             else:
                 r["opening_quantity"] = None
                 r["purchased_quantity"] = None
@@ -1553,6 +1564,12 @@ async def _catalogue_list(table: str, auth: AuthContext, query: str, status: str
                 r["quantity_on_hand"] = None
                 r["average_cost"] = None
                 r["valuation"] = None
+                r["qty_on_hand"] = None
+                r["qty_inbound_transit"] = None
+                r["qty_requisitioned"] = None
+                r["qty_reserved"] = None
+                r["qty_customer_premises"] = None
+                r["qty_available"] = None
     return {
         "items": rows,
         "counts": catalogue_rules.status_counts(rows),
@@ -2510,6 +2527,96 @@ async def update_debit_note_status_endpoint(
         raise HTTPException(status_code=404, detail="Debit note not found.")
     updated = await pr_repo.set_status(return_id=return_id, status=status)
     return {"item": updated}
+
+
+# ---------------------------------------------------------------------------
+# PURCHASE ORDERS & MULTI-STATE STOCK PIPELINE
+# ---------------------------------------------------------------------------
+@app.get("/api/purchases/orders")
+async def list_purchase_orders_endpoint(
+    status: str = "ALL",
+    query: str = "",
+    auth: AuthContext = Depends(get_current_user),
+):
+    from app.services import purchase_order_service
+    orders = await purchase_order_service.list_orders(
+        auth.organization_id, status=status, query=query
+    )
+    return {"orders": orders, "status": status}
+
+
+@app.post("/api/purchases/orders", status_code=201)
+async def create_purchase_order_endpoint(
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    from app.services import purchase_order_service
+    try:
+        items = payload.get("items") or []
+        supplier_id = uuid.UUID(str(payload["supplier_id"])) if payload.get("supplier_id") else None
+        order = await purchase_order_service.create_order(
+            auth.organization_id,
+            supplier_id=supplier_id,
+            items=items,
+            status=payload.get("status") or "RFQ",
+            order_date=payload.get("order_date"),
+            expected_delivery_date=payload.get("expected_delivery_date"),
+            notes=payload.get("notes"),
+            terms=payload.get("terms"),
+            created_by=auth.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"order": order}
+
+
+@app.get("/api/purchases/orders/{order_id}")
+async def get_purchase_order_endpoint(
+    order_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_user),
+):
+    from app.services import purchase_order_service
+    order = await purchase_order_service.get_order_with_items(
+        auth.organization_id, order_id=order_id
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    return {"order": order}
+
+
+@app.post("/api/purchases/orders/{order_id}/status")
+async def update_purchase_order_status_endpoint(
+    order_id: uuid.UUID,
+    payload: Dict[str, Any] = Body(default={}),
+    auth: AuthContext = Depends(get_current_user),
+):
+    from app.services import purchase_order_service
+    new_status = str(payload.get("status") or "").upper()
+    if not new_status:
+        raise HTTPException(status_code=400, detail="status is required")
+    try:
+        order = await purchase_order_service.transition_order_status(
+            auth.organization_id,
+            order_id=order_id,
+            new_status=new_status,
+            auto_receive_stock=bool(payload.get("auto_receive_stock", True)),
+            auto_create_bill=bool(payload.get("auto_create_bill", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"order": order}
+
+
+@app.get("/api/catalogue/pipeline")
+async def get_catalogue_pipeline_endpoint(
+    auth: AuthContext = Depends(get_current_user),
+):
+    from app.services import inventory_service
+    try:
+        pipeline = await inventory_service.get_stock_pipeline(auth.organization_id)
+        return {"pipeline": pipeline}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

@@ -199,7 +199,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "list_expenses", "list_bank_accounts", "get_inventory_status",
         # §12.8 expressibility repair — model-only, no planner routing yet
         # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment).
-        "reverse_journal", "record_correction", "record_adjustment",
+        "reverse_journal", "record_correction", "record_adjustment", "update_document_status",
     }
 )
 
@@ -216,7 +216,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
 #: change (Wave A freeze, ``fc01502``).  Wiring them into
 #: ``planner._INTENT_PATTERNS`` / ``_tools_for_intent`` is Wave B/D work.
 MODEL_ONLY_INTENTS: FrozenSet[str] = frozenset(
-    {"reverse_journal", "record_correction", "record_adjustment"}
+    {"reverse_journal", "record_correction", "record_adjustment", "update_document_status"}
 )
 
 

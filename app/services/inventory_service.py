@@ -413,6 +413,121 @@ async def get_product_unit_tracing(
     return results
 
 
+async def get_stock_pipeline(
+    organization_id: uuid.UUID,
+    *,
+    product_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Derive real-time multi-state segregated inventory metrics per product:
+    - qty_on_hand: physical stock in warehouse
+    - qty_inbound_transit: ordered on PO, in-transit
+    - qty_requisitioned: RFQ / vendor quotation
+    - qty_reserved: committed to accepted customer orders / quotations
+    - qty_customer_premises: consignment / trial / in-flight issued to client
+    - qty_available: max(0, on_hand - reserved)
+    """
+    tracing_map = await get_product_unit_tracing(organization_id, product_id=product_id)
+
+    # 1. Inbound PO & Requisitioned RFQ items
+    po_items_map: Dict[str, Dict[str, float]] = {"ORDERED": {}, "RFQ": {}}
+    try:
+        po_rows = await fetch_many(
+            "purchase_orders",
+            filters={"organization_id": str(organization_id)},
+            select="id,status",
+            limit=1000,
+        )
+        po_status_by_id = {str(r["id"]): str(r.get("status") or "").upper() for r in po_rows}
+        if po_status_by_id:
+            items_rows = await fetch_many(
+                "purchase_order_items",
+                filters={"organization_id": str(organization_id)},
+                select="purchase_order_id,product_id,quantity",
+                limit=2000,
+            )
+            for it in items_rows:
+                pid = str(it.get("product_id") or "")
+                if not pid:
+                    continue
+                p_status = po_status_by_id.get(str(it.get("purchase_order_id")))
+                qty = float(it.get("quantity") or 0.0)
+                if p_status in po_items_map:
+                    po_items_map[p_status][pid] = po_items_map[p_status].get(pid, 0.0) + qty
+    except Exception as exc:
+        log.warning("inventory.pipeline_po_lookup_failed", error=str(exc)[:200])
+
+    # 2. Reserved items from accepted quotations
+    reserved_map: Dict[str, float] = {}
+    try:
+        q_rows = await fetch_many(
+            "quotations",
+            filters={"organization_id": str(organization_id), "status": "ACCEPTED"},
+            select="id",
+            limit=500,
+        )
+        q_ids = {str(r["id"]) for r in q_rows}
+        if q_ids:
+            q_items = await fetch_many(
+                "quotation_items",
+                filters={"organization_id": str(organization_id)},
+                select="quotation_id,product_id,quantity",
+                limit=2000,
+            )
+            for it in q_items:
+                if str(it.get("quotation_id")) in q_ids:
+                    pid = str(it.get("product_id") or "")
+                    if pid:
+                        reserved_map[pid] = reserved_map.get(pid, 0.0) + float(it.get("quantity") or 0.0)
+    except Exception as exc:
+        log.warning("inventory.pipeline_reserved_lookup_failed", error=str(exc)[:200])
+
+    # 3. Customer premises movements
+    cp_map: Dict[str, float] = {}
+    try:
+        cp_moves = await fetch_many(
+            "inventory_movements",
+            filters={"organization_id": str(organization_id)},
+            limit=2000,
+        )
+        for m in cp_moves:
+            s_type = str(m.get("source_type") or "").lower()
+            if s_type in ("customer_premises", "consignment", "in_flight"):
+                pid = str(m.get("product_id") or "")
+                qty = float(m.get("quantity") or 0.0)
+                direction = str(m.get("direction") or "").upper()
+                signed_qty = qty if direction == "ISSUE" else -qty
+                cp_map[pid] = cp_map.get(pid, 0.0) + signed_qty
+    except Exception as exc:
+        log.warning("inventory.pipeline_cp_lookup_failed", error=str(exc)[:200])
+
+    all_pids = set(tracing_map.keys()) | set(po_items_map["ORDERED"].keys()) | set(po_items_map["RFQ"].keys()) | set(reserved_map.keys()) | set(cp_map.keys())
+
+    pipeline_result: Dict[str, Dict[str, Any]] = {}
+    for pid in all_pids:
+        tr = tracing_map.get(pid, {})
+        on_hand = float(tr.get("closing_quantity") or 0.0)
+        avg_cost = float(tr.get("average_cost") or 0.0)
+        valuation = float(tr.get("valuation") or 0.0)
+        inbound = float(po_items_map["ORDERED"].get(pid, 0.0))
+        rfq_qty = float(po_items_map["RFQ"].get(pid, 0.0))
+        reserved = float(reserved_map.get(pid, 0.0))
+        cp_qty = float(cp_map.get(pid, 0.0))
+        available = max(0.0, on_hand - reserved)
+
+        pipeline_result[pid] = {
+            "qty_on_hand": on_hand,
+            "qty_inbound_transit": inbound,
+            "qty_requisitioned": rfq_qty,
+            "qty_reserved": reserved,
+            "qty_customer_premises": cp_qty,
+            "qty_available": available,
+            "average_cost": avg_cost,
+            "valuation": valuation,
+        }
+
+    return pipeline_result
+
+
 async def get_product_movements(
     organization_id: uuid.UUID,
     *,

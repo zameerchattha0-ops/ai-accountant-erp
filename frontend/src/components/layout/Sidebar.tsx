@@ -41,6 +41,7 @@ export const navItems: NavItem[] = [
     label: "Purchases", icon: ShoppingCart,
     tone: { icon: "text-warning-600", chip: "bg-warning-50" },
     children: [
+      { label: "Purchase Orders", href: "/purchases/orders" },
       { label: "Purchase Bills", href: "/purchases/bills" },
       { label: "Purchase Returns", href: "/purchases/returns" },
     ],

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle } from "lucide-react";
+import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle, RotateCcw, ArrowRight } from "lucide-react";
 import type { AgentResponse } from "@/lib/types/api";
 import { formatCurrency } from "@/lib/utils/currency";
 import { cn } from "@/lib/utils/cn";
@@ -173,6 +173,84 @@ export default function AIActionCard({ response }: Props) {
       </div>
 
       <div className="p-5 space-y-4">
+        {/* Audit Verification Table for Document Status Updates */}
+        {(() => {
+          const rawData = response.data as Record<string, any> | undefined;
+          const auditDocs = Array.isArray(rawData?.documents) ? (rawData?.documents as any[]) : null;
+          if (!auditDocs || auditDocs.length === 0) return null;
+          return (
+            <div className="space-y-2.5">
+              <h4 className="text-xs font-semibold text-text-primary uppercase tracking-wide flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 text-success-600" /> Document Verification Table
+              </h4>
+              <div className="overflow-x-auto rounded-xl border border-border-subtle bg-bg-muted/40">
+                <table className="w-full text-xs text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-border-subtle bg-bg-muted text-text-muted font-medium">
+                      <th className="px-3 py-2">Document Ref</th>
+                      <th className="px-3 py-2">Party / Name</th>
+                      <th className="px-3 py-2">Previous Status</th>
+                      <th className="px-3 py-2">New Status</th>
+                      <th className="px-3 py-2 text-right">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border-subtle">
+                    {auditDocs.map((doc: any, i: number) => (
+                      <tr key={i} className="hover:bg-bg-muted/60 transition-colors">
+                        <td className="px-3 py-2 font-mono font-medium">
+                          {doc.url ? (
+                            <Link href={doc.url} className="text-ai-600 hover:underline">
+                              {String(doc.reference || "")}
+                            </Link>
+                          ) : (
+                            <span>{String(doc.reference || "")}</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-text-secondary">{String(doc.party_name || "—")}</td>
+                        <td className="px-3 py-2">
+                          <span className="px-1.5 py-0.5 rounded bg-bg-muted text-text-muted border border-border-subtle font-mono text-[10px]">
+                            {String(doc.previous_status || "")}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className="px-1.5 py-0.5 rounded bg-success-50 text-success-700 border border-success-200 font-mono text-[10px] font-semibold">
+                            {String(doc.new_status || "")}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-right font-medium tabular-nums text-text-primary">
+                          {doc.total != null && Number(doc.total) > 0 ? formatCurrency(Number(doc.total)) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex items-center gap-2 pt-1">
+                {auditDocs[0]?.url && (
+                  <Link
+                    href={auditDocs[0].url}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-ai-50 text-ai-700 hover:bg-ai-100 text-xs font-medium transition-colors border border-ai-200"
+                  >
+                    <ExternalLink className="w-3 h-3" /> View Updated Documents
+                  </Link>
+                )}
+                {rawData?.undo_available && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      alert(`To revert these changes, you can ask in chat: "Revert ${auditDocs.map((d: any) => d.reference).join(', ')} back to ${auditDocs[0]?.previous_status}".`);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-bg-muted text-text-secondary hover:text-text-primary text-xs font-medium transition-colors border border-border-default"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Undo / Revert
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Affected Entities */}
         {response.affected_entities && response.affected_entities.length > 0 && (
           <div className="space-y-2">
@@ -275,6 +353,7 @@ function actionLabel(action?: string): string {
   const labels: Record<string, string> = {
     record_credit_purchase: "Purchase Recorded",
     record_cash_purchase: "Purchase Recorded",
+    update_document_status: "Document Status Updated",
     record_credit_sale: "Sale Recorded",
     record_cash_sale: "Sale Recorded",
     create_invoice: "Invoice Created",

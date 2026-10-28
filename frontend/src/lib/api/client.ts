@@ -204,6 +204,12 @@ export interface CatalogueItem {
   sold_quantity?: number | null;
   average_cost?: number | null;
   valuation?: number | null;
+  qty_on_hand?: number | null;
+  qty_inbound_transit?: number | null;
+  qty_requisitioned?: number | null;
+  qty_reserved?: number | null;
+  qty_customer_premises?: number | null;
+  qty_available?: number | null;
   /** Services */
   billing_unit?: string;
   standard_rate?: number | null;
@@ -860,4 +866,79 @@ export async function updateProject(
 
 export async function healthCheck(): Promise<{ status: string; version: string }> {
   return fetchApi("/api/health");
+}
+
+/* ---- Purchase Orders & Multi-State Pipeline ---- */
+
+export interface PurchaseOrderItem {
+  id?: string;
+  line_number?: number;
+  product_id?: string | null;
+  description: string;
+  quantity: number;
+  unit_price: number;
+  tax_rate_id?: string | null;
+  tax_amount?: number;
+  line_total?: number;
+}
+
+export interface PurchaseOrder {
+  id: string;
+  organization_id: string;
+  po_number: string;
+  supplier_id?: string | null;
+  supplier_name?: string;
+  supplier_email?: string;
+  supplier_phone?: string;
+  status: "RFQ" | "ORDERED" | "RECEIVED" | "BILLED" | "CANCELLED";
+  order_date: string;
+  expected_delivery_date?: string | null;
+  currency_code: string;
+  subtotal: number;
+  tax_total: number;
+  total: number;
+  notes?: string | null;
+  terms?: string | null;
+  items?: PurchaseOrderItem[];
+  created_at: string;
+  updated_at: string;
+}
+
+export async function purchaseOrderList(
+  status = "ALL",
+  query = ""
+): Promise<{ orders: PurchaseOrder[]; status: string }> {
+  const params = new URLSearchParams({ status, query });
+  return fetchApi<{ orders: PurchaseOrder[]; status: string }>(`/api/purchases/orders?${params.toString()}`);
+}
+
+export async function purchaseOrderCreate(
+  payload: Partial<PurchaseOrder>
+): Promise<{ order: PurchaseOrder }> {
+  return fetchApi<{ order: PurchaseOrder }>("/api/purchases/orders", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function purchaseOrderGet(
+  orderId: string
+): Promise<{ order: PurchaseOrder }> {
+  return fetchApi<{ order: PurchaseOrder }>(`/api/purchases/orders/${orderId}`);
+}
+
+export async function purchaseOrderStatusUpdate(
+  orderId: string,
+  status: string,
+  autoReceiveStock = true,
+  autoCreateBill = false
+): Promise<{ order: PurchaseOrder }> {
+  return fetchApi<{ order: PurchaseOrder }>(`/api/purchases/orders/${orderId}/status`, {
+    method: "POST",
+    body: JSON.stringify({ status, auto_receive_stock: autoReceiveStock, auto_create_bill: autoCreateBill }),
+  });
+}
+
+export async function cataloguePipeline(): Promise<{ pipeline: Record<string, any> }> {
+  return fetchApi<{ pipeline: Record<string, any> }>("/api/catalogue/pipeline");
 }

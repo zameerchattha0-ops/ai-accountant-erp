@@ -72,7 +72,10 @@ _INSTRUCTION = """You are the PRIMARY intelligence and fact-extraction engine fo
   "date_of_joining": "<YYYY-MM-DD or TODAY>"|null,
   "basic_salary": <number|null>,
   "project_name": "<string>"|null,
-  "candidate_subject_areas": ["<area>", ...]
+  "candidate_subject_areas": ["<area>", ...],
+  "target_status": "<PAID|OPEN|ORDERED|RECEIVED|BILLED|CANCELLED|ISSUED|VOIDED|ACCEPTED|ACTIVE|INACTIVE>"|null,
+  "document_type": "<purchase_bill|purchase_order|invoice|quotation|product>"|null,
+  "reference_numbers": ["<ref1>", "<ref2>", ...]
 }
 
 RULES:
@@ -254,10 +257,14 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
         except (ValueError, TypeError):
             pass
 
+    ref_nums = payload.get("reference_numbers")
+    if isinstance(ref_nums, list):
+        clean["reference_numbers"] = [str(r).strip() for r in ref_nums if str(r).strip()]
+
     for str_key in (
         "account_name", "account_code", "parent_account_name",
         "product_name", "service_name", "bank_name", "employee_name",
-        "project_name", "template_name",
+        "project_name", "template_name", "target_status", "document_type",
     ):
         v = payload.get(str_key)
         if v is not None and str(v).strip():

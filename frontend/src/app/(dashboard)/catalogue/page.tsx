@@ -177,6 +177,29 @@ export default function CataloguePage() {
     ).length;
   }, [kind, items]);
 
+  const totalInbound = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => sum + (Number(it.qty_inbound_transit) || 0), 0);
+  }, [kind, items]);
+
+  const totalReserved = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => sum + (Number(it.qty_reserved) || 0), 0);
+  }, [kind, items]);
+
+  const totalCustomerPremises = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => sum + (Number(it.qty_customer_premises) || 0), 0);
+  }, [kind, items]);
+
+  const totalAvailable = useMemo(() => {
+    if (!items || kind !== "products") return 0;
+    return items.reduce((sum, it) => {
+      const avail = it.qty_available != null ? Number(it.qty_available) : Math.max(0, (it.quantity_on_hand || 0) - (Number(it.qty_reserved) || 0));
+      return sum + avail;
+    }, 0);
+  }, [kind, items]);
+
   const searchRef = useRef(search);
   useEffect(() => {
     searchRef.current = search;
@@ -520,58 +543,60 @@ export default function CataloguePage() {
         </span>
       </div>
 
-      {/* ---- Comprehensive KPI Strip ---- */}
+      {/* ---- Multi-State Stock Pipeline KPI Strip ---- */}
       {view !== "services" ? (
-        <div className="grid gap-3 grid-cols-2 sm:grid-cols-5">
-          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
-            <p className="text-[11px] uppercase tracking-wide text-text-muted">
-              Total Stock Valuation
+        <div className="grid gap-2.5 grid-cols-2 sm:grid-cols-6">
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-text-muted font-medium">
+              Total Valuation
             </p>
-            <p className="text-lg font-semibold text-text-primary">
+            <p className="text-base font-bold text-text-primary mt-0.5">
               {formatCurrency(totalValuation, org?.base_currency_code)}
             </p>
           </div>
 
-          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
-            <p className="text-[11px] uppercase tracking-wide text-text-muted">
-              Units on Hand (t₀)
+          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-text-muted font-medium" title="Physical stock inside warehouse">
+              Warehouse On-Hand (Q_on_hand)
             </p>
-            <p className="text-lg font-semibold text-text-primary">
+            <p className="text-base font-bold text-text-primary mt-0.5">
               {totalStockUnits.toLocaleString()}
             </p>
           </div>
 
-          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
-            <p className="text-[11px] uppercase tracking-wide text-success-600 font-medium">
-              Inward Received (+)
+          <div className="bg-bg-surface rounded-2xl border border-purple-200/50 bg-purple-50/20 px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-purple-700 font-medium" title="Purchased goods on confirmed PO in transit">
+              Inbound In-Flight (Q_inbound)
             </p>
-            <p className="text-lg font-semibold text-success-600">
-              +{totalReceived.toLocaleString()}
-            </p>
-          </div>
-
-          <div className="bg-bg-surface rounded-2xl border border-border-subtle px-4 py-3">
-            <p className="text-[11px] uppercase tracking-wide text-amber-600 font-medium">
-              Outward Issued (-)
-            </p>
-            <p className="text-lg font-semibold text-amber-600">
-              -{totalIssued.toLocaleString()}
+            <p className="text-base font-bold text-purple-800 mt-0.5">
+              +{totalInbound.toLocaleString()}
             </p>
           </div>
 
-          <div className={`bg-bg-surface rounded-2xl border px-4 py-3 ${
-            outOfStockCount > 0 ? "border-error-300 bg-error-50/20" : "border-border-subtle"
-          }`}>
-            <div className="flex items-center justify-between">
-              <p className="text-[11px] uppercase tracking-wide text-text-muted">
-                Out of Stock
-              </p>
-              {outOfStockCount > 0 && (
-                <AlertTriangle className="w-3.5 h-3.5 text-error-500" />
-              )}
-            </div>
-            <p className={`text-lg font-semibold ${outOfStockCount > 0 ? "text-error-600" : "text-text-primary"}`}>
-              {outOfStockCount} {outOfStockCount === 1 ? "item" : "items"}
+          <div className="bg-bg-surface rounded-2xl border border-amber-200/50 bg-amber-50/20 px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-amber-700 font-medium" title="Allocated to accepted sales orders">
+              Reserved (Q_reserved)
+            </p>
+            <p className="text-base font-bold text-amber-800 mt-0.5">
+              -{totalReserved.toLocaleString()}
+            </p>
+          </div>
+
+          <div className="bg-bg-surface rounded-2xl border border-sky-200/50 bg-sky-50/20 px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-sky-700 font-medium" title="Consignment / in-flight on customer premises">
+              Customer Site (Q_premises)
+            </p>
+            <p className="text-base font-bold text-sky-800 mt-0.5">
+              {totalCustomerPremises.toLocaleString()}
+            </p>
+          </div>
+
+          <div className="bg-bg-surface rounded-2xl border border-emerald-200/50 bg-emerald-50/20 px-3.5 py-3">
+            <p className="text-[10px] uppercase tracking-wide text-emerald-700 font-medium" title="Usable stock: On-Hand - Reserved">
+              Available to Promise
+            </p>
+            <p className="text-base font-bold text-emerald-800 mt-0.5">
+              {totalAvailable.toLocaleString()}
             </p>
           </div>
         </div>

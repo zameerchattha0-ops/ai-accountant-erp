@@ -185,6 +185,7 @@ _FAST_PATH_INTENTS = {
     "customer_balance",
     "generate_customer_ledger",
     "get_inventory_status",
+    "update_document_status",
 }
 
 _READ_ONLY_LOOKUPS_GATE = frozenset({
@@ -2596,6 +2597,23 @@ async def _deterministic_mutation_calls(
         party = entities.get("supplier_name") or entities.get("name")
         if party and not execution_plan.requires_clarification:
             return [ToolCall(tool_name="get_supplier_ledger", arguments={"supplier_name": str(party)})]
+
+    if execution_plan.intent == "update_document_status":
+        doc_type = entities.get("document_type") or "purchase_bill"
+        target_status = entities.get("target_status") or "PAID"
+        ref_nums = entities.get("reference_numbers") or []
+        doc_ref = entities.get("document_reference") or entities.get("bill_number") or entities.get("invoice_number")
+        return [
+            ToolCall(
+                tool_name="update_document_status",
+                arguments={
+                    "document_type": str(doc_type),
+                    "target_status": str(target_status),
+                    "reference_numbers": ref_nums,
+                    "document_reference": str(doc_ref) if doc_ref else None,
+                },
+            )
+        ]
 
     if execution_plan.intent in ("customer_balance", "generate_customer_ledger"):
         party = entities.get("customer_name") or entities.get("name")

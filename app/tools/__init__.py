@@ -5133,3 +5133,18 @@ register("update_recurring_template", handler=_update_recurring_template, read_o
 register("generate_recurring", handler=_generate_recurring, read_only=False, description="Generate journal entries for every due recurring template (draft unless auto_post); advances next due dates")
 
 register("get_recurring_executions", handler=_get_recurring_executions, read_only=True, description="List recurring executions (generated/failed journal runs)")
+
+
+# ===================================================================
+# UNIVERSAL DOCUMENT STATUS UPDATE (Single & Bulk)
+# ===================================================================
+async def _update_document_status(organization_id: uuid.UUID, **kw) -> ToolResult:
+    from app.tools.document_status_tools import update_document_status
+    return await update_document_status(organization_id=organization_id, **kw)
+
+register(
+    "update_document_status",
+    handler=_update_document_status,
+    read_only=False,
+    description="Update status of single or bulk documents across all modules (purchase_bill, purchase_order, invoice, quotation, product) with verification audit table.",
+)
