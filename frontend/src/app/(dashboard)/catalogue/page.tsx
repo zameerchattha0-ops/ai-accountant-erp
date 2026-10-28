@@ -695,8 +695,8 @@ export default function CataloguePage() {
                     <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
                       <th className="px-4 py-3 font-medium">Code</th>
                       <th className="px-4 py-3 font-medium">Name</th>
-                      <th className="px-4 py-3 font-medium">
-                        {kind === "products" ? "Unit price" : "Standard rate"}
+                      <th className="px-4 py-3 font-medium" title={kind === "products" ? "Moving average cost for stock-tracked products, or base unit price" : undefined}>
+                        {kind === "products" ? "Unit price (Avg Cost)" : "Standard rate"}
                       </th>
                       <th className="px-4 py-3 font-medium">
                         {kind === "products" ? "Unit" : "Billed per"}
@@ -742,14 +742,25 @@ export default function CataloguePage() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-text-primary">
-                          {formatCurrency(
-                            Number(
-                              kind === "products"
-                                ? item.unit_price ?? 0
-                                : item.standard_rate ?? 0
-                            ),
-                            org?.base_currency_code
-                          )}
+                          <div>
+                            <span className="font-medium">
+                              {formatCurrency(
+                                Number(
+                                  kind === "products"
+                                    ? (item.is_stock_tracked && item.average_cost != null && item.average_cost > 0
+                                        ? item.average_cost
+                                        : item.unit_price ?? 0)
+                                    : item.standard_rate ?? 0
+                                ),
+                                org?.base_currency_code
+                              )}
+                            </span>
+                            {kind === "products" && item.is_stock_tracked && (
+                              <span className="block text-[10px] text-text-muted font-normal">
+                                {item.average_cost != null && item.average_cost > 0 ? "Avg cost" : "Unit price"}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-4 py-3 text-text-secondary">
                           {kind === "products"
@@ -1165,9 +1176,9 @@ export default function CataloguePage() {
               </p>
             </div>
             <div>
-              <p className="text-text-muted">Unit Cost</p>
+              <p className="text-text-muted">Moving Avg Cost</p>
               <p className="font-semibold text-text-primary">
-                {formatCurrency(movementItem?.cost_price ?? 0, org?.base_currency_code)}
+                {formatCurrency(movementItem?.average_cost ?? movementItem?.cost_price ?? 0, org?.base_currency_code)}
               </p>
             </div>
             <div>

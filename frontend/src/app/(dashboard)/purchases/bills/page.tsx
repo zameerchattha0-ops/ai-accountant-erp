@@ -281,7 +281,14 @@ export default function PurchaseBillsPage() {
                 const balance = bill.total - bill.amount_paid;
                 return (
                   <tr key={bill.id} className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
-                    <td className="px-4 py-3 font-medium text-text-primary tabular-nums">{bill.bill_number}</td>
+                    <td className="px-4 py-3">
+                      <Link
+                        href={`/purchases/bills/${bill.id}`}
+                        className="font-medium text-ai-600 hover:text-ai-700 tabular-nums transition-colors"
+                      >
+                        {bill.bill_number}
+                      </Link>
+                    </td>
                     <td className="px-4 py-3 text-text-primary">{supplierName ?? "-"}</td>
                     <td className="px-4 py-3 text-text-secondary">{bill.supplier_invoice_ref ?? "-"}</td>
                     <td className="px-4 py-3 text-text-secondary tabular-nums">{bill.bill_date}</td>

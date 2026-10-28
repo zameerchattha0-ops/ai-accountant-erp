@@ -73,6 +73,31 @@ async def test_resolve_open_invoice_and_bill():
         assert entities["customer_name"] == "Ahmad Enterprise"
         assert entities["amount"] == 20000.0  # Remaining balance (30000 - 10000)
 
+    # Test Bill Resolution with keyword-only supplier_service.get and amount_paid
+    mock_bill_id = uuid.uuid4()
+    mock_supp_id = uuid.uuid4()
+    mock_bill = {
+        "id": str(mock_bill_id),
+        "bill_number": "PUR-000015",
+        "supplier_id": str(mock_supp_id),
+        "total": 50000.0,
+        "amount_paid": 0.0,
+    }
+    mock_supplier = {
+        "id": str(mock_supp_id),
+        "name": "Global Tech Suppliers",
+    }
+    with patch("app.database.fetch_one", new=AsyncMock(side_effect=lambda t, filters: mock_bill if filters.get("bill_number") in ("15", "PUR-000015") else None)), \
+         patch("app.repositories.purchase_repository.list_purchase_bills", new=AsyncMock(return_value=[mock_bill])), \
+         patch("app.services.supplier_service.get", new=AsyncMock(return_value=mock_supplier)):
+        bill_entities = {"bill_number": "15"}
+        await _resolve_open_document_reference(org_id, bill_entities)
+        assert bill_entities["bill_id"] == str(mock_bill_id)
+        assert bill_entities["bill_number"] == "PUR-000015"
+        assert bill_entities["supplier_id"] == str(mock_supp_id)
+        assert bill_entities["supplier_name"] == "Global Tech Suppliers"
+        assert bill_entities["amount"] == 50000.0
+
 
 @pytest.mark.asyncio
 async def test_revenue_ledger_fallback_to_general_revenue():

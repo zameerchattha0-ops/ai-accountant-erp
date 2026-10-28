@@ -25,6 +25,7 @@ export default function DocShell({
 }) {
   const [doc, setDoc] = useState<PrintDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [template, setTemplate] = useState<"modern" | "professional" | "minimal">("modern");
 
   const run = useCallback(async () => {
     try {
@@ -67,6 +68,19 @@ export default function DocShell({
           <span className="text-xs text-text-muted">
             {doc.title} · {doc.docNumber}
           </span>
+          <div className="flex items-center gap-1 bg-bg-surface border border-border-subtle rounded-xl p-1">
+            {(["modern", "professional", "minimal"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTemplate(t)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium capitalize transition-colors ${
+                  template === t ? "bg-ai-500 text-white shadow-xs" : "text-text-secondary hover:text-text-primary"
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => window.print()}
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-bg-surface border border-border-subtle text-sm font-medium text-text-secondary hover:text-text-primary hover:border-ai-200 transition-colors"
@@ -76,7 +90,7 @@ export default function DocShell({
         </div>
       </div>
 
-      <DocTemplate doc={doc} />
+      <DocTemplate doc={doc} variant={template} />
     </div>
   );
 }

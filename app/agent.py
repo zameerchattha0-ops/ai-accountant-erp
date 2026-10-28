@@ -5522,11 +5522,11 @@ async def _resolve_open_document_reference(
                 if row.get("customer_id"):
                     entities.setdefault("customer_id", str(row["customer_id"]))
                     if not entities.get("customer_name"):
-                        cust = await customer_service.get(organization_id, uuid.UUID(str(row["customer_id"])))
+                        cust = await customer_service.get(organization_id, customer_id=uuid.UUID(str(row["customer_id"])))
                         if cust and cust.get("name"):
                             entities["customer_name"] = str(cust["name"]).strip()
                 tot = float(row.get("total") or 0.0)
-                paid = float(row.get("paid_amount") or 0.0)
+                paid = float(row.get("amount_paid") or row.get("paid_amount") or 0.0)
                 bal = max(0.0, tot - paid)
                 if not entities.get("amount") or float(entities.get("amount") or 0.0) <= 0:
                     entities["amount"] = bal if bal > 0 else tot
@@ -5565,7 +5565,7 @@ async def _resolve_open_document_reference(
                 if row.get("supplier_id"):
                     entities.setdefault("supplier_id", str(row["supplier_id"]))
                     if not entities.get("supplier_name"):
-                        supp = await supplier_service.get(organization_id, uuid.UUID(str(row["supplier_id"])))
+                        supp = await supplier_service.get(organization_id, supplier_id=uuid.UUID(str(row["supplier_id"])))
                         if supp and supp.get("name"):
                             entities["supplier_name"] = str(supp["name"]).strip()
                 tot = float(row.get("total") or 0.0)
@@ -7899,6 +7899,19 @@ async def execute(
             if _ai_prefill.get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _ai_prefill[_k]
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
+        if execution_plan.missing_fields:
+            _resolved_fields = set()
+            if execution_plan.extracted_entities.get("supplier_name"):
+                _resolved_fields.add("supplier_name")
+            if execution_plan.extracted_entities.get("customer_name"):
+                _resolved_fields.add("customer_name")
+            if execution_plan.extracted_entities.get("amount") and float(execution_plan.extracted_entities.get("amount") or 0) > 0:
+                _resolved_fields.add("amount")
+            if _resolved_fields:
+                execution_plan.missing_fields = [f for f in execution_plan.missing_fields if f not in _resolved_fields]
+                if not execution_plan.missing_fields:
+                    execution_plan.requires_clarification = False
+                    execution_plan.clarification_questions = []
 
 
 
