@@ -241,7 +241,6 @@ _CUSTOMER_PARTY_INTENTS = {
 
     "record_credit_sale",
 
-    "create_purchase_order",
     "create_quotation",
 
     "record_receipt",
@@ -2818,6 +2817,27 @@ async def _deterministic_mutation_calls(
             if entities.get("budget") or entities.get("amount"):
                 args["budget"] = float(entities.get("budget") or entities.get("amount"))
             return [ToolCall(tool_name="create_project", arguments=args)]
+
+    if execution_plan.intent == "create_purchase_order":
+        supp_name = entities.get("supplier_name") or entities.get("party_name") or entities.get("counterparty")
+        p_name = entities.get("product_name") or entities.get("item_name") or entities.get("item_description") or entities.get("description")
+        price = entities.get("unit_price") or entities.get("price") or entities.get("amount")
+        qty = entities.get("quantity") or 1
+        args = {
+            "supplier_name": str(supp_name).strip() if supp_name else None,
+            "status": str(entities.get("order_status") or entities.get("status") or "RFQ").upper(),
+        }
+        if p_name:
+            args["product_name"] = str(p_name).strip()
+            args["quantity"] = float(qty) if str(qty).replace(".", "").isdigit() else 1
+            if price is not None and float(price or 0) > 0:
+                args["unit_price"] = float(price)
+        if entities.get("transaction_date") or entities.get("order_date"):
+            args["order_date"] = str(entities.get("transaction_date") or entities.get("order_date"))
+        if entities.get("transaction_nature"):
+            args["transaction_nature"] = str(entities.get("transaction_nature")).upper()
+        if supp_name and (p_name or entities.get("items")):
+            return [ToolCall(tool_name="create_purchase_order", arguments=args)]
 
     if execution_plan.intent in ("create_invoice", "record_credit_sale"):
 
@@ -5532,6 +5552,12 @@ async def _resolve_open_document_reference(
 
     # --- Invoice Resolution ---
     inv_ref = entities.get("invoice_number") or entities.get("invoice_id")
+    if not inv_ref:
+        msg_str = str(entities.get("user_message") or entities.get("original_request") or "")
+        m_inv = re.search(r"\b(?:invoice|inv)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", msg_str, re.I)
+        if m_inv:
+            inv_ref = m_inv.group(1)
+            entities["invoice_number"] = inv_ref
     if inv_ref and not (entities.get("invoice_id") and entities.get("customer_name") and entities.get("amount")):
         try:
             from app.repositories import invoice_repository
@@ -5563,7 +5589,10 @@ async def _resolve_open_document_reference(
                     if not entities.get("customer_name"):
                         cust = await customer_service.get(organization_id, customer_id=uuid.UUID(str(row["customer_id"])))
                         if cust and cust.get("name"):
-                            entities["customer_name"] = str(cust["name"]).strip()
+                            c_name = str(cust["name"]).strip()
+                            entities["customer_name"] = c_name
+                            entities["party_name"] = c_name
+                            entities["name"] = c_name
                 tot = float(row.get("total") or 0.0)
                 paid = float(row.get("amount_paid") or row.get("paid_amount") or 0.0)
                 bal = max(0.0, tot - paid)
@@ -5574,6 +5603,13 @@ async def _resolve_open_document_reference(
 
     # --- Bill Resolution ---
     bill_ref = entities.get("bill_number") or entities.get("bill_id")
+    if not bill_ref:
+        msg_str = str(entities.get("user_message") or entities.get("original_request") or "")
+        m_bill = re.search(r"\b(?:bill|purchase\s*bill|po|pur)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", msg_str, re.I)
+        if m_bill:
+            bill_ref = m_bill.group(1)
+            entities["bill_number"] = bill_ref
+
     if bill_ref and not (entities.get("bill_id") and entities.get("supplier_name") and entities.get("amount")):
         try:
             from app.repositories import purchase_repository
@@ -5606,9 +5642,12 @@ async def _resolve_open_document_reference(
                     if not entities.get("supplier_name"):
                         supp = await supplier_service.get(organization_id, supplier_id=uuid.UUID(str(row["supplier_id"])))
                         if supp and supp.get("name"):
-                            entities["supplier_name"] = str(supp["name"]).strip()
+                            s_name = str(supp["name"]).strip()
+                            entities["supplier_name"] = s_name
+                            entities["party_name"] = s_name
+                            entities["name"] = s_name
                 tot = float(row.get("total") or 0.0)
-                paid = float(row.get("paid_amount") or 0.0)
+                paid = float(row.get("amount_paid") or row.get("paid_amount") or 0.0)
                 bal = max(0.0, tot - paid)
                 if not entities.get("amount") or float(entities.get("amount") or 0.0) <= 0:
                     entities["amount"] = bal if bal > 0 else tot

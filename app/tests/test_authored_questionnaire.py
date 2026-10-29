@@ -323,3 +323,12 @@ def test_purchase_order_ca_cognitive_planning():
     assert "search_supplier" in p.potential_tools
     assert p.extracted_entities.get("supplier_name") == "fahad associates"
     assert p.extracted_entities.get("quantity") == 2.0
+
+
+def test_loose_bill_number_extraction():
+    from app.accounting_reasoning import preliminary_extraction
+    res = preliminary_extraction("paid against bill no 15")
+    assert res.get("literals", {}).get("bill_number") == "15"
+
+    res_pur = preliminary_extraction("paid against PUR-000014")
+    assert res_pur.get("literals", {}).get("bill_number") == "PUR-000014"

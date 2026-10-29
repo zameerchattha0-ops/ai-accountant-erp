@@ -113,6 +113,41 @@ sales, depreciation, finance costs, tax expense, loss on disposal — and the
 statements they feed (balance sheet, income statement, cash flow, trial
 balance, general ledger, customer/supplier ledgers, subledgers).
 
+
+UNIVERSAL CHARTERED ACCOUNTANT (CA) COGNITIVE PIPELINE ACROSS ALL MODULES:
+1. SALES MODULE (Outbound Revenue):
+   - Quotation -> Sales Invoice -> Credit Note -> Customer Receipt.
+   - Pre-flight DB check: Look up customer in database; if missing, pre-create or request creation in tandem.
+   - Check product/service in Catalogue.
+   - Financial Impact: Dr Accounts Receivable (Customer Sub-ledger) / Cr Sales Revenue. If stock-tracked, Dr COGS / Cr Inventory.
+
+2. PURCHASES MODULE (Inbound Procurement):
+   - RFQ / Vendor Quotation -> Purchase Order -> Goods Received Note (GRN) -> Purchase Bill -> Debit Note.
+   - Pre-flight DB check: Look up supplier in database; if missing, pre-create supplier.
+   - Item nature check: Resale stock (INVENTORY) vs Capital Equipment (FIXED_ASSET) vs Consumable Expense.
+   - Financial Impact: Dr Inventory/Asset/Expense / Cr Accounts Payable (Supplier Sub-ledger). Recalculate moving average cost.
+
+3. SETTLEMENTS & PAYMENTS/RECEIPTS:
+   - When paying against a specific bill or invoice (e.g. "paid against bill no 15"):
+     ALWAYS look up the bill/invoice in the database FIRST!
+     Extract the supplier/customer and outstanding balance (Total - Amount Paid).
+     NEVER ask the user for the supplier or customer when the bill/invoice number is specified!
+   - Payment Channel: Cash (Cash Drawer) vs Bank Transfer. If cash drawer unconfigured, offer guided one-click setup.
+   - Financial Impact: Reduce open payable/receivable balance on the specific document and post Dr AP / Cr Cash or Bank.
+
+4. CATALOGUE & REAL-TIME INVENTORY PIPELINE:
+   - 5-stage segregated tracking: Requisitioned (RFQ) -> Inbound in-flight (PO) -> Physical On-Hand -> Outbound Issued -> Consumed/Billed.
+   - Average cost updates dynamically on new unit purchase.
+
+5. FIXED ASSETS:
+   - Capitalize if cost >= capitalization threshold (50,000 PKR / $500) and useful life > 1 year.
+   - Categorize under Furniture, Computer Equipment, Vehicles, Machinery (never individual item accounts).
+   - Track accumulated depreciation and book value.
+
+6. CHART OF ACCOUNTS & GENERAL LEDGER:
+   - Always balanced: Total Debits == Total Credits.
+   - Period lock check: Refuse posting to closed fiscal periods.
+
 WORK IN THIS ORDER:
 1. What real-world economic event is this?
 2. What is the user actually trying to accomplish?
@@ -1892,6 +1927,14 @@ def preliminary_extraction(
         if loose:
             reference = loose.group(1)
             invoice_number = reference
+        loose_bill = re.search(
+            r"\b(?:bill|purchase\s*bill|po|pur)\s+(?:no\.?|number|#)\s*[-#:]?\s*([A-Za-z0-9_-]+)\b",
+            message,
+            re.I,
+        )
+        if loose_bill:
+            reference = loose_bill.group(1)
+            literals["bill_number"] = reference
     if reference:
         literals["document_reference"] = reference
     if invoice_number:
@@ -1899,8 +1942,8 @@ def preliminary_extraction(
     # PUR-prefixed references ARE purchase-bill numbers (2026-10-19: the
     # debit-note lane must carry bill_number so the return links to its
     # source bill — "against purchase bill PUR-000013" extracted NOTHING).
-    if reference and reference.upper().startswith(("PUR", "BILL")):
-        literals["bill_number"] = reference
+    if reference and (reference.upper().startswith(("PUR", "BILL")) or "bill_number" in literals):
+        literals["bill_number"] = literals.get("bill_number") or reference
     # "with reason <text>" — the user's OWN words for the return documents
     # (2026-10-19: both return tools REQUIRE a reason; neither the planner
     # nor the semantic stage reliably carried it — the DN execution died

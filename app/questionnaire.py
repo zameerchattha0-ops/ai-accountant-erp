@@ -891,6 +891,9 @@ def questionnaire_from_authored(
     text = str(payload.get("text") or "").strip()
     if not text:
         return None
+    parsed = parse_model_question_text(text, intent=intent)
+    if parsed is not None and not parsed.is_empty():
+        return parsed
     numbered = re.findall(r"^\s*\d+[.)]\s*(.+)$", text, re.MULTILINE)
     intro = "" if numbered else text
     statements = numbered or [text]
