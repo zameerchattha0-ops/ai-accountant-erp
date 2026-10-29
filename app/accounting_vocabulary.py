@@ -216,7 +216,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
 #: change (Wave A freeze, ``fc01502``).  Wiring them into
 #: ``planner._INTENT_PATTERNS`` / ``_tools_for_intent`` is Wave B/D work.
 MODEL_ONLY_INTENTS: FrozenSet[str] = frozenset(
-    {"reverse_journal", "record_correction", "record_adjustment", "update_document_status"}
+    {"reverse_journal", "record_correction", "record_adjustment"}
 )
 
 

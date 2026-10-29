@@ -362,7 +362,7 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("create_credit_note", [
 
-        r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit",
+        r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit\s*note",
 
         # "<party> returned/returns/refunded …" and "return of <items>".
 
@@ -484,6 +484,7 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
             r"payment.*received",
             r"(?:payment\s+)?receipt\s+against\s+(?:invoice|sale)",
             r"(?:receive|received|record)\s+(?:payment|receipt)\s+against\s+invoice",
+            r"(?:receive|received|collect|collected)\s+(?:against\s+)?(?:invoice|inv\b)",
             r"\breceived\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?\s+from\b",
         ],
     ),
@@ -494,7 +495,7 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
             r"supplier.*payment",
             r"payment.*to.*supplier",
             r"(?:record|make|send)?\s*payment\s+against\s+(?:bill|purchase)",
-            r"(?:pay|settle)\s+(?:bill|purchase\s+bill)",
+            r"(?:pay|paid|settle|settled|cleared?)\s+(?:against\s+)?(?:bill|purchase\s+bill|pur\b)",
             r"\bpay\s+supplier\b",
         ],
     ),
@@ -513,7 +514,15 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("record_asset_depreciation", [r"depreciat"]),
 
-    ("register_fixed_asset", [r"fixed asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset", r"new.*(?:machinery|generator|delivery van|forklift)"]),
+    ("update_document_status", [
+        r"\b(?:mark|change|set|update|convert)\b[^.\n]*\b(?:status|paid|void|approved|cancelled|ordered|rfq)\b",
+        r"\b(?:mark|change|set)\s+(?:bills?|invoices?|orders?|pos?|rfqs?)\b[^.\n]*\bas\s+(?:paid|void|open|approved|cancelled)\b",
+    ]),
+
+    ("register_fixed_asset", [
+        r"fixed\s*asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset",
+        r"new.*(?:machinery|generator|delivery van|forklift)",
+    ]),
 
     # Master data / Setup & Configuration intents across all ERP modules
     ("create_account", [
@@ -8022,6 +8031,7 @@ def _tools_for_intent(intent: str) -> List[str]:
 
         "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
 
+        "update_document_status": ["update_document_status"],
         "get_inventory_status": ["get_inventory_status", "search_product"],
         "create_product": ["search_product", "create_product"],
         "update_product": ["search_product", "update_product"],
@@ -8233,6 +8243,7 @@ def _outcome(intent: str) -> str:
         "create_project": "Project created",
         "create_account": "Account created in the Chart of Accounts",
         "get_chart_of_accounts": "Chart of Accounts retrieved",
+        "update_document_status": "Document status updated and audit entry recorded",
         "get_inventory_status": "Inventory status and stock levels retrieved",
         "create_customer": "Customer registered in CRM directory",
         "create_supplier": "Supplier registered in vendor directory",
