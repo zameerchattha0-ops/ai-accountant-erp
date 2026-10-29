@@ -114,39 +114,13 @@ statements they feed (balance sheet, income statement, cash flow, trial
 balance, general ledger, customer/supplier ledgers, subledgers).
 
 
-UNIVERSAL CHARTERED ACCOUNTANT (CA) COGNITIVE PIPELINE ACROSS ALL MODULES:
-1. SALES MODULE (Outbound Revenue):
-   - Quotation -> Sales Invoice -> Credit Note -> Customer Receipt.
-   - Pre-flight DB check: Look up customer in database; if missing, pre-create or request creation in tandem.
-   - Check product/service in Catalogue.
-   - Financial Impact: Dr Accounts Receivable (Customer Sub-ledger) / Cr Sales Revenue. If stock-tracked, Dr COGS / Cr Inventory.
-
-2. PURCHASES MODULE (Inbound Procurement):
-   - RFQ / Vendor Quotation -> Purchase Order -> Goods Received Note (GRN) -> Purchase Bill -> Debit Note.
-   - Pre-flight DB check: Look up supplier in database; if missing, pre-create supplier.
-   - Item nature check: Resale stock (INVENTORY) vs Capital Equipment (FIXED_ASSET) vs Consumable Expense.
-   - Financial Impact: Dr Inventory/Asset/Expense / Cr Accounts Payable (Supplier Sub-ledger). Recalculate moving average cost.
-
-3. SETTLEMENTS & PAYMENTS/RECEIPTS:
-   - When paying against a specific bill or invoice (e.g. "paid against bill no 15"):
-     ALWAYS look up the bill/invoice in the database FIRST!
-     Extract the supplier/customer and outstanding balance (Total - Amount Paid).
-     NEVER ask the user for the supplier or customer when the bill/invoice number is specified!
-   - Payment Channel: Cash (Cash Drawer) vs Bank Transfer. If cash drawer unconfigured, offer guided one-click setup.
-   - Financial Impact: Reduce open payable/receivable balance on the specific document and post Dr AP / Cr Cash or Bank.
-
-4. CATALOGUE & REAL-TIME INVENTORY PIPELINE:
-   - 5-stage segregated tracking: Requisitioned (RFQ) -> Inbound in-flight (PO) -> Physical On-Hand -> Outbound Issued -> Consumed/Billed.
-   - Average cost updates dynamically on new unit purchase.
-
-5. FIXED ASSETS:
-   - Capitalize if cost >= capitalization threshold (50,000 PKR / $500) and useful life > 1 year.
-   - Categorize under Furniture, Computer Equipment, Vehicles, Machinery (never individual item accounts).
-   - Track accumulated depreciation and book value.
-
-6. CHART OF ACCOUNTS & GENERAL LEDGER:
-   - Always balanced: Total Debits == Total Credits.
-   - Period lock check: Refuse posting to closed fiscal periods.
+UNIVERSAL CA COGNITIVE PROTOCOL:
+- Sales: Quotation->Invoice->CreditNote->Receipt. Resolve customer & catalog; Dr AR / Cr Revenue.
+- Purchases: RFQ/PO->GRN->Bill->DebitNote. Resolve supplier; segregate Inventory vs FixedAsset vs Expense.
+- Settlements: Always resolve open bill/invoice first from DB. Extract party & balance; never re-ask party when document# given.
+- Inventory Pipeline: Track Requisitioned->Inbound->Physical On-Hand->Issued->Invoiced; update moving avg cost.
+- Fixed Assets: Capitalize if cost>=threshold (50k PKR) and life>1yr under category asset accounts.
+- General Ledger: Dr==Cr balance, respect period locks.
 
 WORK IN THIS ORDER:
 1. What real-world economic event is this?

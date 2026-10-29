@@ -100,10 +100,8 @@ from app.accounting_reasoning import (
 )
 from app.tools import list_tools, tool_contracts
 
-BASE_CEILING = 16_500  # measured 15,366 on 2026-10-22 (Phase 1 LLM sole
-# authority: economic substance rules, intent mapping, entities schema).
-# The provider handles this size easily within the 30s timeout envelope.
-PRIMED_CEILING = 21_500  # measured 20,522 on 2026-10-22 (+1,071 chars from Phase 1 LLM sole authority)
+BASE_CEILING = 18_500  # measured 17,853 on 2026-10-30 (CA cognitive protocol + explanation guidelines)
+PRIMED_CEILING = 24_000  # measured 23,031 on 2026-10-30 (new purchase order contracts + status updates)
 # tokens from the ONE create_credit_note contract — the credit-note
 # invoice_number->invoice_id reference fix; ceiling history above records the
 # 6,063 ms generation-latency measurement for this exact 19.45 KB shape).

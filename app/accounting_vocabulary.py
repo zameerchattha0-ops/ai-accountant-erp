@@ -174,7 +174,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "record_purchase", "record_credit_purchase", "record_cash_purchase",
         "record_expense", "record_receipt", "record_payment",
         "record_expense_payment", "record_bank_transfer",
-        "create_invoice", "create_quotation", "convert_quotation",
+        "create_invoice", "create_purchase_order", "create_quotation", "convert_quotation",
         "create_credit_note", "create_purchase_return", "create_purchase_bill",
         "create_bank_account", "create_product", "create_service",
         "update_product", "delete_product", "update_service", "delete_service",
