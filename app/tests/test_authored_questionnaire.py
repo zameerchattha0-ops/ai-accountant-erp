@@ -312,3 +312,14 @@ def test_count_clarification_turns():
     # Unique user responses: TODAY, INVENTORY, 25000, c -> 4 user turns, NOT 9!
     assert _count_clarification_turns(history) == 4
     assert _count_clarification_turns([]) == 0
+
+
+def test_purchase_order_ca_cognitive_planning():
+    from app.planner import plan
+    query = "prepare a quotation for purchasing 2 beds from fahad associates"
+    p = plan(query)
+    assert p.intent == "create_purchase_order"
+    assert "create_purchase_order" in p.potential_tools
+    assert "search_supplier" in p.potential_tools
+    assert p.extracted_entities.get("supplier_name") == "fahad associates"
+    assert p.extracted_entities.get("quantity") == 2.0

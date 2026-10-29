@@ -990,7 +990,7 @@ You are given:
 
 Reply with ONLY this JSON object (no prose, no markdown):
 
-{"intro": "<one short sentence>",
+{"intro": "<1-2 friendly sentences explaining in plain English what transaction/document is being prepared and why these details are needed for their business records, without accounting jargon>",
  "questions": [{"field": "<one FIELD_VOCABULARY name>",
                 "kind": "choice|date|money|number|text",
                 "question": "<ONE sentence, at most 300 characters>",

@@ -241,6 +241,7 @@ _CUSTOMER_PARTY_INTENTS = {
 
     "record_credit_sale",
 
+    "create_purchase_order",
     "create_quotation",
 
     "record_receipt",

@@ -309,6 +309,13 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     # invoice" also matches the generic quotation pattern below.
 
+    ("create_purchase_order", [
+        r"(?:purchase|vendor|supplier)\s*(?:quotation|quote|rfq|order|po)",
+        r"(?:quotation|quote|rfq|order|po)\s+(?:for\s+purchasing|for\s+buying|from\s+supplier|from\s+vendor)",
+        r"(?:prepare|create|make|issue|draft)\s*(?:a\s+)?(?:quotation|quote|rfq|order)\s+(?:for\s+purchasing|for\s+buying|from)",
+        r"\bpurchas(?:e|ing)\s+quotation\b",
+        r"\brfq\b",
+    ]),
     ("convert_quotation", [r"convert.*(?:quotation|quote)", r"(?:quotation|quote).*invoice", r"accept.*(?:quotation|quote).*invoice"]),
 
     ("create_quotation", [r"quotation", r"quote", r"price\s*quote", r"create.*quote", r"send.*quotation"]),
@@ -677,7 +684,7 @@ _SEMANTIC_INTENTS = frozenset({
     "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
     "record_adjustment", "record_correction", "reverse_journal",
     "update_product", "delete_product", "update_service", "delete_service",
-    "create_quotation", "convert_quotation",
+    "create_purchase_order", "create_quotation", "convert_quotation",
 })
 
 
@@ -7962,6 +7969,7 @@ def _tools_for_intent(intent: str) -> List[str]:
 
     mapping = {
 
+        "create_purchase_order": ["search_supplier", "get_supplier", "search_product", "get_product", "create_purchase_order"],
         "create_quotation": ["search_customer", "get_customer", "create_quotation"],
 
         "convert_quotation": ["search_customer", "get_customer", "get_invoice", "convert_quotation", "prepare_journal", "validate_journal"],
@@ -8172,6 +8180,7 @@ def _outcome(intent: str) -> str:
 
     outcomes = {
 
+        "create_purchase_order": "Purchase order / vendor quotation created with status RFQ",
         "create_quotation": "Sales quotation created and ready to send",
 
         "convert_quotation": "Quotation converted to a sales invoice with posted receivable journal",

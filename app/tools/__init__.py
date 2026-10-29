@@ -3463,6 +3463,91 @@ async def _get_project_profitability(organization_id: uuid.UUID, **kw) -> ToolRe
 
 
 
+async def _create_purchase_order(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """Create a Purchase Order or Request for Quotation (RFQ) in the ERP."""
+    from app.services import purchase_order_service, supplier_service, product_service
+
+    supplier_id = kw.get("supplier_id")
+    supplier_name = kw.get("supplier_name") or kw.get("party_name") or kw.get("counterparty")
+    if not supplier_id and supplier_name:
+        supp_matches = await supplier_service.search(organization_id, query=supplier_name)
+        if supp_matches:
+            supplier_id = supp_matches[0]["id"]
+        else:
+            new_supp = await supplier_service.create(organization_id, name=supplier_name)
+            supplier_id = new_supp["id"]
+
+    if supplier_id and not isinstance(supplier_id, uuid.UUID):
+        supplier_id = uuid.UUID(str(supplier_id))
+
+    raw_items = kw.get("items") or []
+    if not raw_items:
+        p_name = kw.get("product_name") or kw.get("item_name") or kw.get("description") or "Item"
+        qty = kw.get("quantity") or 1
+        price = kw.get("unit_price") or kw.get("price") or kw.get("amount") or 0
+        raw_items = [{
+            "description": p_name,
+            "quantity": float(qty) if str(qty).replace(".", "").isdigit() else 1,
+            "unit_price": float(price) if str(price).replace(".", "").isdigit() else 0,
+        }]
+
+    is_inventory = kw.get("transaction_nature") == "INVENTORY" or any(item.get("is_inventory") for item in raw_items)
+    for item in raw_items:
+        desc = item.get("description") or item.get("product_name")
+        if desc and not item.get("product_id"):
+            prod_matches = await product_service.search_products(organization_id, query=desc)
+            if prod_matches:
+                item["product_id"] = prod_matches[0]["id"]
+            elif is_inventory:
+                new_prod = await product_service.create_product(
+                    organization_id,
+                    name=desc,
+                    sales_price=float(item.get("unit_price") or 0) * 1.25,
+                    cost_price=float(item.get("unit_price") or 0),
+                    is_inventory=True,
+                )
+                item["product_id"] = new_prod["id"]
+
+    status = str(kw.get("status") or "RFQ").upper()
+    order_date = kw.get("order_date") or kw.get("date")
+    data = await purchase_order_service.create_order(
+        organization_id=organization_id,
+        supplier_id=supplier_id,
+        items=raw_items,
+        status=status,
+        order_date=str(order_date) if order_date else None,
+        expected_delivery_date=str(kw.get("expected_delivery_date") or "") or None,
+        notes=kw.get("notes"),
+        terms=kw.get("terms"),
+    )
+    po_num = data.get("po_number") or "PO"
+    return ToolResult(
+        tool_name="create_purchase_order",
+        success=True,
+        data=data,
+        message=f"Purchase order / quotation {po_num} created with status {status}.",
+    )
+
+
+async def _get_purchase_order(organization_id: uuid.UUID, **kw) -> ToolResult:
+    from app.services import purchase_order_service
+    order_id = kw.get("order_id")
+    if order_id:
+        if not isinstance(order_id, uuid.UUID):
+            order_id = uuid.UUID(str(order_id))
+        data = await purchase_order_service.get_order_with_items(organization_id, order_id=order_id)
+    else:
+        po_num = kw.get("po_number") or kw.get("query")
+        orders = await purchase_order_service.list_orders(organization_id, query=po_num)
+        data = orders[0] if orders else None
+    return ToolResult(
+        tool_name="get_purchase_order",
+        success=bool(data),
+        data=data,
+        message=f"Purchase order: {data.get('po_number') if data else 'Not found'}",
+    )
+
+
 async def _create_quotation(organization_id: uuid.UUID, **kw) -> ToolResult:
 
     data = await quotation_service.create_quotation(organization_id=organization_id, **kw)
@@ -4727,6 +4812,8 @@ register("get_project_profitability", handler=_get_project_profitability, read_o
 
 # Quotation
 
+register("create_purchase_order", handler=_create_purchase_order, read_only=False, description="Create a purchase order or vendor quotation / RFQ with status 'RFQ' or 'ORDERED'. Line items require description, quantity, and unit_price.")
+register("get_purchase_order", handler=_get_purchase_order, read_only=True, description="Get purchase order or vendor quotation details.")
 register("create_quotation", handler=_create_quotation, read_only=False, description="Create a sales quotation")
 
 register("convert_quotation", handler=_convert_quotation, read_only=False, contract=contract_from_callable(quotation_service.convert_quotation), description="Convert an accepted quotation into a sales invoice: creates the invoice linked to the source quotation, posts the receivable journal, and marks the quotation CONVERTED (double conversion is refused)")

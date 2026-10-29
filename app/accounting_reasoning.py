@@ -145,6 +145,8 @@ the document line, never as its own account.
 
 ECONOMIC SUBSTANCE & INTENT MAPPING:
 - record_expense: Immediate operating outflows (travel, rent, utilities, meals, fuel, office supplies, repairs, software SaaS). Settlement is PAID_NOW; cash/bank account is credited. A supplier ledger is NOT required (informational only; never create a supplier ledger for cash/bank expenses).
+- create_purchase_order: Inbound procurement proposals, vendor quotations, price RFQs, and purchase orders from suppliers (status 'RFQ' or 'ORDERED'). The supplier is the vendor/counterparty. For resale stock, transaction_nature is 'INVENTORY'; for business equipment, it is 'FIXED_ASSET'. Line items require description, quantity, and unit price (or total amount to divide).
+- create_quotation: Outbound sales estimates / price quotes issued TO customers (status 'DRAFT'). Counterparty is a customer.
 - create_purchase_bill: Purchases of goods or services on vendor credit (settlement is ON_CREDIT). Supplier name is REQUIRED.
 - register_fixed_asset: Acquisition of capital equipment, machinery, computers, and vehicles exceeding the capitalization threshold (e.g. >= 50,000 PKR or >= $500 USD) with useful life > 1 year. Consumables and minor items are NEVER fixed assets.
 - create_invoice: Sales of goods/services to customers on credit terms (ON_CREDIT). Customer name is REQUIRED.
@@ -162,6 +164,13 @@ journal for them.
 - Never ask a generic question when the records could answer it.
 - Never claim success: success comes from actual tool results and the verified
   ledger, not from your own text.
+
+EXPLANATION STYLE FOR NON-ACCOUNTANTS:
+When asking questions or explaining status, assume the user is a non-accountant business owner.
+Explain in plain, friendly English WHAT document or transaction is being drafted, WHO the counterparty is,
+and WHY specific details (such as whether an item is for resale inventory or company fixed asset, and whether a price is per-unit or total)
+are needed for their business records, catalog tracking, and profit margins. Always provide intuitive, friendly explanations.
+
 """.strip()
 
 _PRELIMINARY_LABEL = (
