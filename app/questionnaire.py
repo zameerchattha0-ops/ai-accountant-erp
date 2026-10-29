@@ -1203,12 +1203,14 @@ def _infer_field_name(q_text: str, index: int) -> str:
     text_lower = q_text.lower()
     if any(w in text_lower for w in ("unit price", "price per", "rate")):
         return "unit_price"
-    if any(w in text_lower for w in ("price", "amount", "cost", "pkr", "rate", "total", "rs")):
-        return "amount"
     if any(w in text_lower for w in ("supplier", "vendor", "customer", "party", "counterparty")):
+        if any(w in text_lower for w in ("added as", "add as", "create", "new record", "record for them")):
+            return "party_create_confirmed"
         if any(w in text_lower for w in ("quotation", "role", "recorded", "sales", "purchase", "purchasing", "how should")):
             return "counterparty_role"
         return "party_name"
+    if any(w in text_lower for w in ("price", "amount", "cost", "pkr", "rate", "total", "rs")):
+        return "amount"
     if any(w in text_lower for w in ("date", "when", "day")):
         return "transaction_date"
     if any(w in text_lower for w in ("how was", "payment method", "paid", "settled", "cash", "bank")):
@@ -1267,20 +1269,37 @@ def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionn
                     )
                 )
             else:
-                lines = [l.strip() for l in block.split("\n") if l.strip()]
-                q_lines = [l for l in lines if not re.match(r"^(?:please answer|let me know|reply with|kindly answer)\b", l, re.IGNORECASE)]
-                q_text = " ".join(q_lines) if q_lines else block
+                paragraphs = [p.strip() for p in block.split("\n\n") if p.strip()]
+                primary = paragraphs[0] if paragraphs else block
+                lines = [l.strip() for l in primary.split("\n") if l.strip()]
+                q_lines = [
+                    l for l in lines 
+                    if not re.match(r"^(?:please answer|let me know|reply with|kindly answer|also note|once you|informational response)\b", l, re.IGNORECASE)
+                ]
+                q_text = " ".join(q_lines) if q_lines else primary
                 field_name = _infer_field_name(q_text, i)
-                kind = KIND_MONEY if field_name in ("unit_price", "amount") else (
-                    KIND_DATE if field_name == "transaction_date" else KIND_TEXT
-                )
-                specs.append(
-                    QuestionSpec(
-                        field=field_name,
-                        kind=kind,
-                        question=q_text,
+                if field_name == "party_create_confirmed":
+                    kind = KIND_CHOICE
+                    options = (("yes", "Yes, create party record"), ("no", "No"))
+                    specs.append(
+                        QuestionSpec(
+                            field=field_name,
+                            kind=kind,
+                            question=q_text,
+                            options=options,
+                        )
                     )
-                )
+                else:
+                    kind = KIND_MONEY if field_name in ("unit_price", "amount") else (
+                        KIND_DATE if field_name == "transaction_date" else KIND_TEXT
+                    )
+                    specs.append(
+                        QuestionSpec(
+                            field=field_name,
+                            kind=kind,
+                            question=q_text,
+                        )
+                    )
 
         if specs:
             return Questionnaire(

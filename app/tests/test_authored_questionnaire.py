@@ -332,3 +332,30 @@ def test_loose_bill_number_extraction():
 
     res_pur = preliminary_extraction("paid against PUR-000014")
     assert res_pur.get("literals", {}).get("bill_number") == "PUR-000014"
+
+
+def test_gulfam_unverified_question_extraction():
+    from app.agent import _looks_like_question, _usable_question
+    from app.questionnaire import parse_model_question_text
+
+    text = """What's missing before I can create the RFQ:
+
+1. The price per door. A quotation line needs a unit price, and I won't invent one. If Gulfam Associates hasn't quoted yet, tell me the expected/estimated price per door to put on the RFQ.
+2. Whether Gulfam Associates should be added as a supplier record. They don't exist yet. A purchase order/RFQ normally references a supplier, so I'd need to create them — confirm you want that, and give me their phone/email if you have them (optional).
+
+Also note: the date will be today, 2026-07-29, per your answer — the 2026-10-29 in the extracted data is not what you confirmed, so I'll use today unless you say otherwise.
+
+Once you give me the unit price (and confirm creating the supplier), I'll create the RFQ for 2 doors.
+
+Informational response - no ERP data was changed."""
+
+    assert _looks_like_question(text) is True
+    assert _usable_question(text) is not None
+
+    parsed = parse_model_question_text(text, intent="create_purchase_order")
+    assert parsed is not None
+    assert len(parsed.questions) == 2
+    assert parsed.questions[0].field == "unit_price"
+    assert parsed.questions[0].kind == "money"
+    assert parsed.questions[1].field == "party_create_confirmed"
+    assert parsed.questions[1].kind == "choice"

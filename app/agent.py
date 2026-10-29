@@ -3187,21 +3187,41 @@ def _count_clarification_turns(prior_qa: List[Dict[str, Any]]) -> int:
 
 def _looks_like_question(text: str) -> bool:
 
-    """Heuristic: does this model response ask the user for information?
+    """Heuristic: does this model response ask the user for information or clarification?
 
 
 
-    The model is instructed to ask at most ONE question when material
+    The model response may contain questions with or without question marks (e.g.
 
-    information is missing; such responses contain a question mark.  Used
+    numbered requirements '1. The price per door... 2. Whether supplier should be added...').
 
-    to route text-only model responses into the clarification mechanism
+    Routes model responses asking for missing facts or confirmations into the clarification
 
-    instead of reporting a completed (never verified) ERP operation.
+    mechanism instead of prematurely terminating with an unverified informational completion.
 
     """
 
-    return "?" in (text or "")
+    t = str(text or "").strip()
+
+    if not t:
+
+        return False
+
+    if "?" in t:
+
+        return True
+
+    if re.search(r"\b(?:missing|tell me|confirm|provide|specify|what is|how should|please answer|let me know)\b", t, re.I):
+
+        if re.search(r"(?:^|\n)\s*(?:1[.)]|[-*•])\s+", t):
+
+            return True
+
+    from app.questionnaire import parse_model_question_text
+
+    parsed = parse_model_question_text(t)
+
+    return bool(parsed and not parsed.is_empty())
 
 
 
