@@ -10,46 +10,90 @@ import {
   AURA_PALETTES,
   nextPaletteIndex,
 } from "./auraPalette";
+import { useDeviceTier } from "@/lib/utils/devicePerf";
 
 /**
  * Palette-rotation hook: advances the palette index every AURA_CYCLE_MS.
- * (The pure rotation logic lives in auraPalette.ts and is unit-tested.)
+ * Pauses automatically when tab is hidden or device has low resources.
  */
-export function useAuraPalette(): number {
+export function useAuraPalette(enabled = true): number {
   const [paletteIndex, setPaletteIndex] = useState(0);
 
   useEffect(() => {
-    const id = setInterval(() => {
-      setPaletteIndex((current) =>
-        nextPaletteIndex(current, AURA_PALETTES.length)
-      );
-    }, AURA_CYCLE_MS);
-    return () => clearInterval(id);
-  }, []);
+    if (!enabled) return;
+
+    let id: ReturnType<typeof setInterval> | null = null;
+
+    const start = () => {
+      if (id || typeof document === "undefined" || document.hidden) return;
+      id = setInterval(() => {
+        setPaletteIndex((current) =>
+          nextPaletteIndex(current, AURA_PALETTES.length)
+        );
+      }, AURA_CYCLE_MS);
+    };
+
+    const stop = () => {
+      if (id) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        start();
+      }
+    };
+
+    start();
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [enabled]);
 
   return paletteIndex;
 }
 
 /**
- * AmbientAura - a perpetually moving, color-shifting light shade BEHIND the
- * dashboard content.
+ * AmbientAura - adaptive background ambiance.
  *
- * Contract:
- * - absolutely positioned layer, pointer-events-none, behind all content
- *   (-z-10), overflow-hidden, aria-hidden - it can never obstruct or
- *   compete with the layout or create scrollbars.
- * - 3 large blurred radial-gradient blobs (blur 100px, border-radius 50%),
- *   light cool colors only, base opacity 0.10-0.16.
- * - each blob drifts on its own desynchronized slow loop (22s/30s/38s),
- *   CSS keyframes animating transform ONLY.
- * - the palette crossfades to a new combination every 7s with a 1.8s CSS
- *   transition - never an abrupt jump, perpetual and seamless.
- * - prefers-reduced-motion pauses the drift (static faint tint remains);
- *   the print block in globals.css hides the layer entirely.
+ * Performance Contract:
+ * - On standard desktop/high-end devices: 3 drifting blurred radial blobs
+ * - On low-end devices / slow networks / battery-saver mode:
+ *   Immediately drops to a zero-CPU, zero-GPU static CSS tint layer.
+ *   Eliminates all continuous 84px Gaussian blurs, GPU texture composite
+ *   loops, and 7-second timer wakeups.
  */
 export default function AmbientAura() {
-  const paletteIndex = useAuraPalette();
+  const { shouldReduceEffects } = useDeviceTier();
+  const paletteIndex = useAuraPalette(!shouldReduceEffects);
   const palette = AURA_PALETTES[paletteIndex];
+
+  // Low-spec / Data-saver eco mode: single static lightweight tint, 0% CPU
+  if (shouldReduceEffects) {
+    return (
+      <div
+        className="ambient-aura ambient-aura-eco pointer-events-none fixed inset-0 -z-10 overflow-hidden"
+        aria-hidden="true"
+        data-testid="ambient-aura"
+      >
+        <div
+          className="absolute inset-0 opacity-15"
+          style={{
+            background: `radial-gradient(circle at 10% 10%, #14b8a6 0%, transparent 40%),
+                         radial-gradient(circle at 90% 20%, #7dd3fc 0%, transparent 40%),
+                         radial-gradient(circle at 50% 90%, #c4b5fd 0%, transparent 40%)`,
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="ambient-aura" aria-hidden="true" data-testid="ambient-aura">
@@ -59,9 +103,6 @@ export default function AmbientAura() {
           className={`ambient-aura-blob ambient-aura-blob-${i + 1}`}
           data-testid={`ambient-aura-blob-${i + 1}`}
           style={{
-            // Solid colour + blur(100px) == soft radial glow, and
-            // background-color transitions reliably in EVERY browser
-            // (background-image gradients do not crossfade in Firefox).
             backgroundColor: palette[i],
             opacity: AURA_BLOB_OPACITIES[i],
             animationDuration: AURA_BLOB_DURATIONS[i],

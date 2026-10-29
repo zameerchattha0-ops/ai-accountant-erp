@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.auth import (
@@ -136,6 +137,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+# Low-bandwidth optimization: compress HTTP responses > 1KB with gzip
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1000,
 )
 
 

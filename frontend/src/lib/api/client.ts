@@ -1,6 +1,8 @@
 import type { AgentResponse, UserRequest, ClarificationAnswer, ConfirmationDecision, ActivityFeed, SessionBundle, AgentProgress, OnboardingSchema, OnboardingAnalysis, OnboardingAnswer } from "@/lib/types/api";
 import type { AssetCategory, FixedAsset, Project } from "@/lib/types/entities";
 
+import { createClient } from "@/lib/supabase/client";
+
 // Same-origin by default: on Vercel the FastAPI backend is served under
 // /api/* of the same domain (see vercel.json "services"). For local dev set
 // NEXT_PUBLIC_API_URL=http://localhost:8000 in frontend/.env.local.
@@ -12,12 +14,30 @@ class ApiError extends Error {
   }
 }
 
-async function fetchApi<T>(path: string, options: RequestInit = {}): Promise<T> {
-  // Get JWT from Supabase session (stored in cookie)
-  const { createClient } = await import("@/lib/supabase/client");
-  const supabase = createClient();
+// Module-level Supabase client singleton to avoid redundant factory calls
+let _supabaseClientInstance: ReturnType<typeof createClient> | null = null;
+function getSupabaseClient() {
+  if (!_supabaseClientInstance) {
+    _supabaseClientInstance = createClient();
+  }
+  return _supabaseClientInstance;
+}
 
-  async function doFetch<T>(): Promise<T> {
+// In-flight GET request deduplication map to prevent flooding slow networks
+const _inFlightRequests = new Map<string, Promise<unknown>>();
+
+async function fetchApi<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method || "GET").toUpperCase();
+  const isGet = method === "GET";
+
+  // If an identical GET is already in-flight over poor networks, share the promise
+  if (isGet && _inFlightRequests.has(path)) {
+    return _inFlightRequests.get(path) as Promise<T>;
+  }
+
+  const supabase = getSupabaseClient();
+
+  async function doFetch(): Promise<T> {
     const { data: { session } } = await supabase.auth.getSession();
     const token = session?.access_token;
 
@@ -43,20 +63,27 @@ async function fetchApi<T>(path: string, options: RequestInit = {}): Promise<T> 
     return res.json();
   }
 
-  try {
-    return await doFetch<T>();
-  } catch (err) {
-    // A 401 from the API almost always means the browser held a stale
-    // access token (e.g. signed by a rotated JWT signing key). supabase-js
-    // does NOT proactively refresh a still-unexpired token, so force one
-    // refresh and retry exactly once. Security is unchanged: the retry still
-    // carries a freshly issued Supabase session token.
-    const is401 = err instanceof ApiError && err.status === 401;
-    if (!is401) throw err;
-    const { data } = await supabase.auth.refreshSession();
-    if (!data.session) throw err;
-    return doFetch<T>();
+  const exec = (async () => {
+    try {
+      return await doFetch();
+    } catch (err) {
+      const is401 = err instanceof ApiError && err.status === 401;
+      if (!is401) throw err;
+      const { data } = await supabase.auth.refreshSession();
+      if (!data.session) throw err;
+      return doFetch();
+    } finally {
+      if (isGet) {
+        _inFlightRequests.delete(path);
+      }
+    }
+  })();
+
+  if (isGet) {
+    _inFlightRequests.set(path, exec);
   }
+
+  return exec;
 }
 
 /* ---- AI Endpoints ---- */

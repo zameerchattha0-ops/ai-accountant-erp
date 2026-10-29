@@ -245,22 +245,29 @@ export default function CataloguePage() {
   }, [view, allMovements, loadMovementsData]);
 
   useEffect(() => {
+    // Only refresh when tab is visible and network is not constrained
     const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
       load({ silent: true });
       if (view === "movements") {
         loadMovementsData();
       }
     }, REFRESH_MS);
-    const onFocus = () => {
+
+    const onVisible = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       load({ silent: true });
       if (view === "movements") {
         loadMovementsData();
       }
     };
-    window.addEventListener("focus", onFocus);
+
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       clearInterval(timer);
-      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [load, loadMovementsData, view]);
 

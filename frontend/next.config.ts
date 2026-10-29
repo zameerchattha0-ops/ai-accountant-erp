@@ -1,6 +1,11 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Low-bandwidth & performance optimizations
+  compress: true,
+  poweredByHeader: false,
+  reactStrictMode: true,
+
   images: {
     remotePatterns: [
       { protocol: "https", hostname: "**.supabase.co" },

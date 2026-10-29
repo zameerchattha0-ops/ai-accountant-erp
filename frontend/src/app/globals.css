@@ -1587,3 +1587,71 @@ body {
     filter: none !important;
   }
 }
+
+
+/* ============================================================
+   LOW-END DEVICE & POOR NETWORK OPTIMIZATIONS (Eco / High-Perf Mode)
+   Removes heavy multi-pass blur filters, off-screen layout thrash,
+   and endless GPU composite loops on budget phones / older PCs.
+   ============================================================ */
+
+/* Disable expensive backdrop-filter on low-spec devices */
+[data-low-perf="true"] [class*="backdrop-blur"],
+[data-low-perf="true"] .ambient-aura-blob,
+[data-save-data="true"] [class*="backdrop-blur"] {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+[data-low-perf="true"] header[class*="backdrop-blur"],
+[data-low-perf="true"] aside[class*="backdrop-blur"] {
+  background-color: var(--color-bg-surface) !important;
+}
+
+/* Offscreen Table Layout Containment:
+   Skips rendering and style calculation for off-screen table rows
+   until scrolled near the viewport (huge CPU/memory saving on low RAM devices) */
+.table-containment,
+table tbody tr {
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 48px;
+}
+
+/* High-efficiency GPU Skeleton Shimmer Animation */
+@keyframes skeleton-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton-shimmer-wrapper {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--color-bg-muted);
+}
+
+.skeleton-shimmer-wrapper::after {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  transform: translateX(-100%);
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0,
+    rgba(255, 255, 255, 0.45) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  animation: skeleton-shimmer 1.5s infinite;
+  content: "";
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-shimmer-wrapper::after {
+    animation: none !important;
+  }
+}
