@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, Truck, FileText, CheckCircle2, AlertCircle, ArrowRight, RefreshCw, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Plus, Search, Truck, FileText, CheckCircle2, AlertCircle, X } from "lucide-react";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { formatCurrency } from "@/lib/utils/currency";
 import Modal from "@/components/shared/Modal";
@@ -60,24 +60,25 @@ export default function PurchaseOrdersPage() {
   // Detailed View Modal
   const [viewingOrder, setViewingOrder] = useState<PurchaseOrder | null>(null);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     if (!org) return;
     setLoading(true);
     setError(null);
     try {
       const res = await purchaseOrderList(statusFilter, search);
       setOrders(res.orders || []);
-    } catch (err: any) {
-      setError(err?.message || "Failed to load purchase orders.");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to load purchase orders.";
+      setError(msg);
       setOrders([]);
     } finally {
       setLoading(false);
     }
-  };
+  }, [org, statusFilter, search]);
 
   useEffect(() => {
     loadData();
-  }, [org, statusFilter]);
+  }, [loadData]);
 
   // Load products for dropdown
   useEffect(() => {
@@ -180,8 +181,9 @@ export default function PurchaseOrdersPage() {
       setLines([{ product_id: "", description: "", quantity: "1", unit_price: "", tax_amount: "0" }]);
       setNotes("");
       loadData();
-    } catch (err: any) {
-      setFormError(err?.message || "Failed to create order.");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to create order.";
+      setFormError(msg);
     } finally {
       setSaving(false);
     }
@@ -192,8 +194,9 @@ export default function PurchaseOrdersPage() {
     try {
       await purchaseOrderStatusUpdate(order.id, nextStatus, true, nextStatus === "BILLED");
       loadData();
-    } catch (err: any) {
-      alert(err?.message || "Status transition failed");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Status transition failed";
+      alert(msg);
     } finally {
       setRowBusy(null);
     }
@@ -213,6 +216,13 @@ export default function PurchaseOrdersPage() {
           </button>
         }
       />
+
+      {error && (
+        <div className="p-3.5 rounded-xl bg-danger-50 border border-danger-200 text-xs text-danger-700 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
 
       {/* Metrics Banner */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -417,7 +427,8 @@ export default function PurchaseOrdersPage() {
               </label>
               <PartyCombobox
                 kind="supplier"
-                organizationId={org?.id || ""}
+                organizationId={org?.organization_id ?? ""}
+                baseCurrency={org?.base_currency_code}
                 value={supplierId}
                 onChange={(id) => setSupplierId(id)}
                 inputId="po-supplier"

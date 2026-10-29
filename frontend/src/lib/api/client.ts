@@ -939,6 +939,6 @@ export async function purchaseOrderStatusUpdate(
   });
 }
 
-export async function cataloguePipeline(): Promise<{ pipeline: Record<string, any> }> {
-  return fetchApi<{ pipeline: Record<string, any> }>("/api/catalogue/pipeline");
+export async function cataloguePipeline(): Promise<{ pipeline: Record<string, unknown> }> {
+  return fetchApi<{ pipeline: Record<string, unknown> }>("/api/catalogue/pipeline");
 }

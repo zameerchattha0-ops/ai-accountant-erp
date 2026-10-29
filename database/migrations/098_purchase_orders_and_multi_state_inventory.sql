@@ -155,3 +155,4 @@ grant select on public.purchase_orders to authenticated, service_role;
 grant select on public.purchase_order_items to authenticated, service_role;
 grant select on public.v_product_stock_pipeline to authenticated, service_role;
 revoke all on public.v_product_stock_pipeline from anon;
+

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle, RotateCcw, ArrowRight } from "lucide-react";
+import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle, RotateCcw } from "lucide-react";
 import type { AgentResponse } from "@/lib/types/api";
 import { formatCurrency } from "@/lib/utils/currency";
 import { cn } from "@/lib/utils/cn";
@@ -175,8 +175,20 @@ export default function AIActionCard({ response }: Props) {
       <div className="p-5 space-y-4">
         {/* Audit Verification Table for Document Status Updates */}
         {(() => {
-          const rawData = response.data as Record<string, any> | undefined;
-          const auditDocs = Array.isArray(rawData?.documents) ? (rawData?.documents as any[]) : null;
+          interface AuditDocItem {
+            reference?: string;
+            party_name?: string;
+            previous_status?: string;
+            new_status?: string;
+            total?: number | null;
+            url?: string;
+          }
+          interface AuditDataPayload {
+            documents?: AuditDocItem[];
+            undo_available?: boolean;
+          }
+          const rawData = response.data as AuditDataPayload | undefined;
+          const auditDocs = Array.isArray(rawData?.documents) ? rawData.documents : null;
           if (!auditDocs || auditDocs.length === 0) return null;
           return (
             <div className="space-y-2.5">
@@ -195,7 +207,7 @@ export default function AIActionCard({ response }: Props) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border-subtle">
-                    {auditDocs.map((doc: any, i: number) => (
+                    {auditDocs.map((doc: AuditDocItem, i: number) => (
                       <tr key={i} className="hover:bg-bg-muted/60 transition-colors">
                         <td className="px-3 py-2 font-mono font-medium">
                           {doc.url ? (
@@ -239,7 +251,7 @@ export default function AIActionCard({ response }: Props) {
                   <button
                     type="button"
                     onClick={() => {
-                      alert(`To revert these changes, you can ask in chat: "Revert ${auditDocs.map((d: any) => d.reference).join(', ')} back to ${auditDocs[0]?.previous_status}".`);
+                      alert(`To revert these changes, you can ask in chat: "Revert ${auditDocs.map((d: AuditDocItem) => d.reference).join(', ')} back to ${auditDocs[0]?.previous_status}".`);
                     }}
                     className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-bg-muted text-text-secondary hover:text-text-primary text-xs font-medium transition-colors border border-border-default"
                   >

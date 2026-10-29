@@ -14,7 +14,6 @@ import {
   ArrowUpDown,
   ArrowDownRight,
   ArrowUpRight,
-  AlertTriangle,
 } from "lucide-react";
 import PageHeader from "@/components/shared/PageHeader";
 import Modal from "@/components/shared/Modal";
@@ -160,22 +159,7 @@ export default function CataloguePage() {
     return items.reduce((sum, it) => sum + (it.quantity_on_hand || 0), 0);
   }, [kind, items]);
 
-  const totalReceived = useMemo(() => {
-    if (!items || kind !== "products") return 0;
-    return items.reduce((sum, it) => sum + (it.purchased_quantity || 0), 0);
-  }, [kind, items]);
 
-  const totalIssued = useMemo(() => {
-    if (!items || kind !== "products") return 0;
-    return items.reduce((sum, it) => sum + (it.sold_quantity || 0), 0);
-  }, [kind, items]);
-
-  const outOfStockCount = useMemo(() => {
-    if (!items || kind !== "products") return 0;
-    return items.filter(
-      (it) => it.is_stock_tracked && (it.quantity_on_hand ?? 0) <= 0
-    ).length;
-  }, [kind, items]);
 
   const totalInbound = useMemo(() => {
     if (!items || kind !== "products") return 0;
