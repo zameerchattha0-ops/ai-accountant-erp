@@ -117,3 +117,4 @@ export function useDeviceTier() {
 
   return tier;
 }
+

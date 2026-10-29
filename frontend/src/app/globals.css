@@ -365,6 +365,45 @@ body {
   animation: pulse-slow 1.4s ease-in-out infinite;
 }
 
+@keyframes quantum-pulse {
+  0%, 100% { transform: scale(0.92); opacity: 0.85; filter: drop-shadow(0 0 6px rgba(14, 165, 233, 0.45)); }
+  50% { transform: scale(1.15); opacity: 1; filter: drop-shadow(0 0 16px rgba(99, 102, 241, 0.7)); }
+}
+
+@utility animate-quantum-pulse {
+  animation: quantum-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes quantum-spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@utility animate-quantum-spin {
+  animation: quantum-spin-slow 7s linear infinite;
+}
+
+@keyframes border-sheen-sweep {
+  0% { transform: translateX(-100%); }
+  50%, 100% { transform: translateX(200%); }
+}
+
+@utility animate-sheen-sweep {
+  animation: border-sheen-sweep 2.8s ease-in-out infinite;
+}
+
+@keyframes neural-bar-1 { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1.0); } }
+@keyframes neural-bar-2 { 0%, 100% { transform: scaleY(0.85); } 50% { transform: scaleY(0.2); } }
+@keyframes neural-bar-3 { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(0.95); } }
+@keyframes neural-bar-4 { 0%, 100% { transform: scaleY(0.9); } 50% { transform: scaleY(0.35); } }
+@keyframes neural-bar-5 { 0%, 100% { transform: scaleY(0.25); } 50% { transform: scaleY(0.9); } }
+
+@utility animate-bar-1 { animation: neural-bar-1 0.85s ease-in-out infinite; transform-origin: bottom; }
+@utility animate-bar-2 { animation: neural-bar-2 0.7s ease-in-out infinite 0.1s; transform-origin: bottom; }
+@utility animate-bar-3 { animation: neural-bar-3 0.95s ease-in-out infinite 0.25s; transform-origin: bottom; }
+@utility animate-bar-4 { animation: neural-bar-4 0.75s ease-in-out infinite 0.15s; transform-origin: bottom; }
+@utility animate-bar-5 { animation: neural-bar-5 0.9s ease-in-out infinite 0.2s; transform-origin: bottom; }
+
 /* ============================================================
    CURSOR-APPROACH PREMIUM EFFECTS
    ============================================================ */

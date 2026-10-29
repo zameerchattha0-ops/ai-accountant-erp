@@ -2,7 +2,7 @@
 
 import { useSyncExternalStore } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { CheckCircle2, ChevronRight, Loader2, X } from "lucide-react";
+import { CheckCircle2, ChevronRight, X } from "lucide-react";
 import { agentRunStore, type AgentRunState } from "@/lib/agent/agentRunStore";
 import { ExecutionStatus } from "@/lib/types/enums";
 
@@ -49,16 +49,20 @@ export default function AgentRunDock() {
   return (
     <div className="fixed bottom-4 right-4 z-40 print:hidden">
       {loading ? (
-        <div className="w-[calc(100vw-2rem)] max-w-xs rounded-2xl bg-bg-surface/95 backdrop-blur-xl border border-ai-200 shadow-[0_22px_48px_-20px_rgba(27,42,74,0.5)] p-3.5 flex items-center gap-2 transition-transform hover:-translate-y-0.5">
+        <div className="relative overflow-hidden w-[calc(100vw-2rem)] max-w-xs rounded-2xl bg-bg-surface/90 backdrop-blur-xl border border-ai-300/70 shadow-[0_20px_48px_-15px_rgba(27,42,74,0.35)] p-3.5 flex items-center gap-2 transition-transform hover:-translate-y-0.5">
+          <div className="absolute top-0 left-0 right-0 h-[2px] overflow-hidden pointer-events-none rounded-t-2xl">
+            <div className="w-1/2 h-full bg-gradient-to-r from-transparent via-ai-400 to-transparent animate-sheen-sweep" />
+          </div>
           <button
             type="button"
             onClick={() => router.push("/")}
             aria-label="Agent working — open the live progress"
             className="flex items-center gap-3 flex-1 min-w-0 text-left"
           >
-            <span className="w-9 h-9 rounded-full bg-ai-50 flex items-center justify-center shrink-0">
-              <Loader2 className="w-4.5 h-4.5 w-[18px] h-[18px] animate-spin text-ai-600" />
-            </span>
+            <div className="relative w-9 h-9 rounded-full bg-ai-50 flex items-center justify-center shrink-0 border border-ai-200/50">
+              <span className="absolute inset-0 rounded-full border border-dashed border-ai-400/60 animate-quantum-spin" />
+              <span className="relative w-3.5 h-3.5 rounded-full bg-ai-600 shadow-md animate-quantum-pulse" />
+            </div>
             <span className="min-w-0">
               <span className="block text-sm font-semibold text-text-primary">
                 Agent working…

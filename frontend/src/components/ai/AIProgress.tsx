@@ -43,15 +43,15 @@ const PHASE_ORDER = [
 
 // Multi-colour pipeline - each phase has its own identity colour so the
 // user can SEE the agent move through the machine.
-const PHASE_COLORS: Record<string, { dot: string; text: string }> = {
-  RECEIVED: { dot: "bg-info-500", text: "text-info-600" },
-  INTERPRETING: { dot: "bg-ai-500", text: "text-ai-600" },
-  PLANNING: { dot: "bg-purple-500", text: "text-purple-600" },
-  CONTEXT_LOADING: { dot: "bg-warning-500", text: "text-warning-600" },
-  EXECUTING: { dot: "bg-success-500", text: "text-success-600" },
-  VALIDATING: { dot: "bg-info-500", text: "text-info-600" },
-  VERIFYING: { dot: "bg-ai-600", text: "text-ai-700" },
-  COMPLETED: { dot: "bg-success-500", text: "text-success-600" },
+const PHASE_COLORS: Record<string, { dot: string; text: string; coreBg: string; glowBg: string }> = {
+  RECEIVED: { dot: "bg-info-500", text: "text-info-600", coreBg: "bg-info-500", glowBg: "bg-info-400" },
+  INTERPRETING: { dot: "bg-ai-500", text: "text-ai-600", coreBg: "bg-ai-500", glowBg: "bg-ai-400" },
+  PLANNING: { dot: "bg-purple-500", text: "text-purple-600", coreBg: "bg-purple-500", glowBg: "bg-purple-400" },
+  CONTEXT_LOADING: { dot: "bg-warning-500", text: "text-warning-600", coreBg: "bg-warning-500", glowBg: "bg-warning-400" },
+  EXECUTING: { dot: "bg-success-500", text: "text-success-600", coreBg: "bg-success-500", glowBg: "bg-success-400" },
+  VALIDATING: { dot: "bg-info-500", text: "text-info-600", coreBg: "bg-info-500", glowBg: "bg-info-400" },
+  VERIFYING: { dot: "bg-ai-600", text: "text-ai-700", coreBg: "bg-ai-600", glowBg: "bg-ai-500" },
+  COMPLETED: { dot: "bg-success-500", text: "text-success-600", coreBg: "bg-success-500", glowBg: "bg-success-400" },
 };
 
 // Rotating, human thoughts per phase - swaps every ~1.2s so the waiting
@@ -251,127 +251,174 @@ export default function AIProgress({
   const stepIndex = currentPhase ? PHASE_ORDER.indexOf(currentPhase) : -1;
 
   return (
-    <div className="glass rounded-2xl p-4">
-      {/* Header row - collapsible toggle + the CANCEL button (production
-          2026-10-08: a run the user is watching must be abortable in ONE
-          click, right where the progress lives). */}
-      <div className="flex items-center gap-2">
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        className="flex-1 flex items-center gap-3 text-sm font-medium text-text-primary text-left"
-        aria-expanded={expanded}
-      >
-        {terminal && progress?.status === "COMPLETED" ? (
-          <CheckCircle2 className="w-5 h-5 text-success-500 shrink-0" />
-        ) : terminal ? (
-          <XCircle
-            className={cn(
-              "w-5 h-5 shrink-0",
-              progress?.status === "FAILED"
-                ? "text-error-500"
-                : "text-text-muted"
-            )}
-          />
-        ) : (
-          /* Pulsing gradient orb - the agent's "brain" while it thinks */
-          <span className="relative w-5 h-5 shrink-0 flex items-center justify-center">
-            <span
-              className={cn(
-                "absolute inset-0 rounded-full opacity-40 animate-ping",
-                activeColor.dot
-              )}
-            />
-            <span
-              className={cn(
-                "relative w-3 h-3 rounded-full animate-think",
-                activeColor.dot
-              )}
-            />
-          </span>
-        )}
-        <span className="flex-1 min-w-0">
-          {terminal ? (
-            <span className="font-medium">
-              Agent progress
-              {currentPhase && (
-                <span className="text-text-secondary font-normal">
-                  {" "}- {PHASE_LABELS[currentPhase] || currentPhase.toLowerCase()}
-                </span>
-              )}
-            </span>
-          ) : (
-            <>
-              {/* Rotating thought - key forces the fade-swap animation */}
-              <span
-                key={thought}
+    <div className="relative overflow-hidden rounded-2xl border border-white/60 dark:border-white/10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl shadow-[0_12px_36px_-10px_rgba(27,42,74,0.12)] p-4.5 transition-all duration-300">
+      {/* Top border quantum luminous sheen sweep */}
+      {!terminal && (
+        <div className="absolute top-0 left-0 right-0 h-[2px] overflow-hidden pointer-events-none">
+          <div className="w-1/2 h-full bg-gradient-to-r from-transparent via-ai-400 to-transparent animate-sheen-sweep" />
+        </div>
+      )}
+
+      {/* Header row - Quantum Neural Core + Real-time Flux + Inspector toggle */}
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="flex-1 flex items-center gap-3.5 text-sm font-medium text-text-primary text-left group"
+          aria-expanded={expanded}
+        >
+          {terminal && progress?.status === "COMPLETED" ? (
+            <div className="w-9 h-9 rounded-full bg-success-50 border border-success-200/60 flex items-center justify-center shrink-0 shadow-sm">
+              <CheckCircle2 className="w-5 h-5 text-success-600" />
+            </div>
+          ) : terminal ? (
+            <div className="w-9 h-9 rounded-full bg-error-50 border border-error-200/60 flex items-center justify-center shrink-0 shadow-sm">
+              <XCircle
                 className={cn(
-                  "block font-semibold animate-fade-swap",
-                  activeColor.text
+                  "w-5 h-5",
+                  progress?.status === "FAILED" ? "text-error-600" : "text-text-muted"
+                )}
+              />
+            </div>
+          ) : (
+            /* Quantum Neural Orb with concentric orbital flux and core pulsing */
+            <div className="relative w-9 h-9 shrink-0 flex items-center justify-center">
+              {/* Outer soft atmospheric aura */}
+              <span
+                className={cn(
+                  "absolute inset-0 rounded-full opacity-35 blur-[3px] animate-pulse-slow",
+                  activeColor.glowBg
+                )}
+              />
+              {/* Concentric rotating orbital ring */}
+              <span className="absolute inset-0 rounded-full border border-dashed border-ai-400/50 dark:border-ai-300/40 animate-quantum-spin" />
+              {/* Orbiting particle */}
+              <span className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-ai-500 shadow-[0_0_8px_rgba(99,102,241,0.9)] animate-quantum-spin" />
+              {/* Inner quantum core */}
+              <span
+                className={cn(
+                  "relative w-4 h-4 rounded-full shadow-md flex items-center justify-center animate-quantum-pulse",
+                  activeColor.coreBg
                 )}
               >
-                {thought}
+                <span className="w-1.5 h-1.5 rounded-full bg-white shadow-inner" />
               </span>
-              <span className="block text-[11px] text-text-muted font-normal mt-0.5">
-                {PHASE_LABELS[currentPhase ?? ""] || "Agent working"}
-                {" · "}
-                {elapsed}s
-              </span>
-            </>
+            </div>
           )}
-        </span>
-        {expanded ? (
-          <ChevronDown className="w-4 h-4 text-text-muted" />
-        ) : (
-          <ChevronRight className="w-4 h-4 text-text-muted" />
-        )}
-      </button>
-      {!terminal && (
-        <button
-          type="button"
-          onClick={() => void agentRunStore.cancel()}
-          disabled={cancelling}
-          aria-label="Cancel this request"
-          className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wide text-error-600 border border-error-100 hover:bg-error-50 transition-colors disabled:opacity-60"
-        >
-          {cancelling ? "Cancelling…" : "Cancel"}
+
+          <div className="flex-1 min-w-0">
+            {terminal ? (
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-semibold text-text-primary text-sm">
+                  Agent progress
+                </span>
+                {currentPhase && (
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-bg-muted text-text-secondary border border-border-subtle">
+                    {PHASE_LABELS[currentPhase] || currentPhase.toLowerCase()}
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div>
+                {/* Rotating thought stream */}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span
+                    key={thought}
+                    className={cn(
+                      "block font-semibold text-sm tracking-tight animate-fade-swap",
+                      activeColor.text
+                    )}
+                  >
+                    {thought}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                  <span className="text-[11px] font-medium text-text-secondary">
+                    {PHASE_LABELS[currentPhase ?? ""] || "Live Reasoning"}
+                  </span>
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-ai-50 text-ai-700 dark:bg-ai-950/60 dark:text-ai-300 border border-ai-200/50">
+                    {elapsed}s elapsed
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Real-time Quantum Waveform / Frequency Bars (working stage visualizer) */}
+          {!terminal && (
+            <div
+              className="hidden sm:flex items-end gap-1 h-5 px-2 py-1 rounded-lg bg-bg-muted/80 backdrop-blur-sm border border-border-subtle/60 shrink-0"
+              title="Real-time neural flux waveform"
+            >
+              <span className="w-1 h-full bg-ai-500 rounded-full animate-bar-1" />
+              <span className="w-1 h-full bg-ai-600 rounded-full animate-bar-2" />
+              <span className="w-1 h-full bg-indigo-500 rounded-full animate-bar-3" />
+              <span className="w-1 h-full bg-purple-500 rounded-full animate-bar-4" />
+              <span className="w-1 h-full bg-cyan-500 rounded-full animate-bar-5" />
+            </div>
+          )}
+
+          <div className="p-1 rounded-lg text-text-muted group-hover:text-text-primary transition-colors">
+            {expanded ? (
+              <ChevronDown className="w-4 h-4" />
+            ) : (
+              <ChevronRight className="w-4 h-4" />
+            )}
+          </div>
         </button>
-      )}
+
+        {!terminal && (
+          <button
+            type="button"
+            onClick={() => void agentRunStore.cancel()}
+            disabled={cancelling}
+            aria-label="Cancel this request"
+            className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold uppercase tracking-wide text-error-600 border border-error-100 hover:bg-error-50 transition-colors disabled:opacity-60"
+          >
+            {cancelling ? "Cancelling…" : "Cancel"}
+          </button>
+        )}
       </div>
 
-      {/* Multi-colour pipeline stepper - visible while the agent works */}
+      {/* Elite Glassmorphic Stage Stepper Pills */}
       {!terminal && stepIndex >= 0 && (
-        <div className="mt-3 flex items-center gap-0">
+        <div className="mt-3.5 pt-3 border-t border-border-subtle/50 flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
           {PHASE_ORDER.slice(0, -1).map((phase, i) => {
             const done = i < stepIndex;
             const active = phase === currentPhase;
-            const color = PHASE_COLORS[phase] ?? PHASE_COLORS.RECEIVED;
+            const label = PHASE_LABELS[phase] || phase;
             return (
-              <div key={phase} className="flex items-center flex-1 last:flex-none">
-                <div
-                  className={cn(
-                    "w-2.5 h-2.5 rounded-full shrink-0 transition-all duration-300",
-                    done && color.dot,
-                    active && cn(color.dot, "ring-4 ring-ai-100 animate-pulse-slow"),
-                    !done && !active && "bg-border-default"
-                  )}
-                  title={PHASE_LABELS[phase]}
-                />
-                {i < PHASE_ORDER.length - 2 && (
-                  <div
-                    className={cn(
-                      "h-0.5 flex-1 transition-colors duration-300",
-                      done ? "bg-success-300" : "bg-border-subtle"
-                    )}
-                  />
+              <div
+                key={phase}
+                className={cn(
+                  "shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-200 border",
+                  done
+                    ? "bg-success-50/80 text-success-700 border-success-200/70"
+                    : active
+                    ? "bg-ai-50/90 text-ai-700 border-ai-300 ring-2 ring-ai-100 dark:ring-ai-900 shadow-sm"
+                    : "bg-bg-muted/40 text-text-muted border-border-subtle/40"
                 )}
+                title={label}
+              >
+                <span
+                  className={cn(
+                    "w-1.5 h-1.5 rounded-full shrink-0",
+                    done
+                      ? "bg-success-500"
+                      : active
+                      ? "bg-ai-500 animate-pulse"
+                      : "bg-border-default"
+                  )}
+                />
+                <span className="truncate max-w-[90px]">{label}</span>
               </div>
             );
           })}
         </div>
       )}
 
+      {/* Collapsible Execution Inspector */}
       {expanded && (
-        <div className="mt-3 max-h-64 overflow-y-auto pr-1 space-y-2">
+        <div className="mt-3.5 pt-3 border-t border-border-subtle/60 max-h-64 overflow-y-auto pr-1 space-y-2">
           {steps.length === 0 && tools.length === 0 && !currentPhase && (
             <p className="text-xs text-text-muted">
               Waiting for the agent to accept the request…
@@ -388,11 +435,11 @@ export default function AIProgress({
               .map(stepSummaryLabel)
               .filter(Boolean);
             return (
-              <div key={phase} className="flex items-start gap-2.5 text-sm">
+              <div key={phase} className="flex items-start gap-2.5 text-sm p-1.5 rounded-xl hover:bg-bg-muted/40 transition-colors">
                 {isActive ? (
                   <span className="relative w-4 h-4 mt-0.5 shrink-0 flex items-center justify-center">
                     <span className="absolute inset-0 rounded-full bg-ai-500 opacity-40 animate-ping" />
-                    <span className="relative w-2 h-2 rounded-full bg-ai-500 animate-think" />
+                    <span className="relative w-2 h-2 rounded-full bg-ai-500 animate-quantum-pulse" />
                   </span>
                 ) : (
                   <CheckCircle2 className="w-4 h-4 mt-0.5 text-success-500 shrink-0" />
@@ -401,8 +448,8 @@ export default function AIProgress({
                   <span
                     className={cn(
                       isActive
-                        ? "text-text-primary font-medium"
-                        : "text-text-secondary"
+                        ? "text-text-primary font-semibold"
+                        : "text-text-secondary font-medium"
                     )}
                   >
                     {label}
@@ -418,11 +465,20 @@ export default function AIProgress({
           })}
 
           {tools.length > 0 && (
-            <div className="text-xs text-text-muted pt-1 border-t border-border-subtle">
-              <span className="font-medium text-text-secondary">
-                Trusted tools used:{" "}
+            <div className="text-xs text-text-muted pt-2 border-t border-border-subtle/50">
+              <span className="font-semibold text-text-secondary">
+                Trusted tools utilized:{" "}
               </span>
-              {tools.map((t) => t.tool.replace(/_/g, " ")).join(", ")}
+              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                {tools.map((t) => (
+                  <span
+                    key={t.tool}
+                    className="px-2 py-0.5 rounded-md bg-bg-muted text-[11px] font-mono text-text-secondary border border-border-subtle"
+                  >
+                    {t.tool.replace(/_/g, " ")}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
         </div>

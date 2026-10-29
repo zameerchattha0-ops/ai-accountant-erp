@@ -1192,3 +1192,136 @@ async def author_questionnaire(
         source="llm_authored",
     )
 
+
+
+def _infer_field_name(q_text: str, index: int) -> str:
+    """Infer a semantic field name from question wording for structured questionnaires."""
+    text_lower = q_text.lower()
+    if any(w in text_lower for w in ("unit price", "price per", "rate")):
+        return "unit_price"
+    if any(w in text_lower for w in ("price", "amount", "cost", "pkr", "rate", "total", "rs")):
+        return "amount"
+    if any(w in text_lower for w in ("supplier", "vendor", "customer", "party", "counterparty")):
+        if any(w in text_lower for w in ("quotation", "role", "recorded", "sales", "purchase", "purchasing", "how should")):
+            return "counterparty_role"
+        return "party_name"
+    if any(w in text_lower for w in ("date", "when", "day")):
+        return "transaction_date"
+    if any(w in text_lower for w in ("how was", "payment method", "paid", "settled", "cash", "bank")):
+        return "payment_method"
+    if any(w in text_lower for w in ("nature", "inventory", "asset", "expense", "service")):
+        return "transaction_nature"
+    if any(w in text_lower for w in ("account", "chart of accounts", "head", "ledger")):
+        return "account_head"
+    return f"clarification_{index + 1}"
+
+
+def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionnaire]:
+    """Parse an LLM's natural-language clarification response into a structured Questionnaire.
+
+    Guarantees that when an LLM asks one or more clarification questions with or without
+    sub-options (e.g. (a), (b), (c)), they are transformed into first-class QuestionSpec
+    instances so the user interface can render dedicated input boxes, option chips,
+    and structured questionnaires instead of dead-end plain text.
+    """
+    clean = str(text or "").strip()
+    if not clean:
+        return None
+
+    # Check for numbered questions: "1. ...\n2. ..."
+    matches = list(re.finditer(r"(?:^|\n)\s*(\d+)[.)]\s*", clean))
+    if matches and len(matches) >= 1:
+        intro_candidate = clean[:matches[0].start()].strip()
+        intro = intro_candidate if intro_candidate else QUESTIONNAIRE_INTRO
+        specs: List[QuestionSpec] = []
+
+        for i, m in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(clean)
+            block = clean[start:end].strip()
+            if not block:
+                continue
+
+            # Look for sub-options inside the question block, e.g. "- (a) ...", "(a) ...", "a) ..."
+            opt_matches = list(re.finditer(r"(?:^|\n)\s*[-*•]?\s*\(?([a-zA-Z0-9])\)?[.)]\s*(.+)", block))
+            if opt_matches:
+                q_text = block[:opt_matches[0].start()].strip()
+                options_list: List[Tuple[str, str]] = []
+                for om in opt_matches:
+                    val = om.group(1).strip()
+                    desc = om.group(2).strip()
+                    label = f"({val}) {desc}" if not desc.startswith("(") else desc
+                    options_list.append((val, label))
+                field_name = _infer_field_name(q_text, i)
+                specs.append(
+                    QuestionSpec(
+                        field=field_name,
+                        kind=KIND_CHOICE,
+                        question=q_text,
+                        options=tuple(options_list),
+                        answer_hint=", ".join(o[0] for o in options_list),
+                    )
+                )
+            else:
+                lines = [l.strip() for l in block.split("\n") if l.strip()]
+                q_lines = [l for l in lines if not re.match(r"^(?:please answer|let me know|reply with|kindly answer)\b", l, re.IGNORECASE)]
+                q_text = " ".join(q_lines) if q_lines else block
+                field_name = _infer_field_name(q_text, i)
+                kind = KIND_MONEY if field_name in ("unit_price", "amount") else (
+                    KIND_DATE if field_name == "transaction_date" else KIND_TEXT
+                )
+                specs.append(
+                    QuestionSpec(
+                        field=field_name,
+                        kind=kind,
+                        question=q_text,
+                    )
+                )
+
+        if specs:
+            return Questionnaire(
+                intent=intent,
+                intro=intro,
+                questions=specs,
+                source="llm_parsed_text",
+            )
+
+    if "?" in clean:
+        opt_matches = list(re.finditer(r"(?:^|\n)\s*[-*•]?\s*\(?([a-zA-Z0-9])\)?[.)]\s*(.+)", clean))
+        if opt_matches:
+            q_text = clean[:opt_matches[0].start()].strip()
+            options_list = [(om.group(1).strip(), f"({om.group(1).strip()}) {om.group(2).strip()}") for om in opt_matches]
+            field_name = _infer_field_name(q_text, 0)
+            return Questionnaire(
+                intent=intent,
+                intro=QUESTIONNAIRE_INTRO,
+                questions=[
+                    QuestionSpec(
+                        field=field_name,
+                        kind=KIND_CHOICE,
+                        question=q_text,
+                        options=tuple(options_list),
+                        answer_hint=", ".join(o[0] for o in options_list),
+                    )
+                ],
+                source="llm_parsed_single",
+            )
+        else:
+            field_name = _infer_field_name(clean, 0)
+            kind = KIND_MONEY if field_name in ("unit_price", "amount") else (
+                KIND_DATE if field_name == "transaction_date" else KIND_TEXT
+            )
+            return Questionnaire(
+                intent=intent,
+                intro=QUESTIONNAIRE_INTRO,
+                questions=[
+                    QuestionSpec(
+                        field=field_name,
+                        kind=kind,
+                        question=clean,
+                    )
+                ],
+                source="llm_parsed_single",
+            )
+
+    return None

@@ -57,3 +57,32 @@ describe("legacyChipOptions (no more duplicated buttons)", () => {
     expect(legacyChipOptions(undefined, structured)).toEqual([]);
   });
 });
+
+
+import { parseEmbeddedSubQuestions } from "@/lib/ai/clarification";
+
+describe("parseEmbeddedSubQuestions", () => {
+  it("parses multi-line text into intro, questions and options", () => {
+    const raw = `Two things are genuinely missing before I can prepare this quotation:
+
+1. What is the price per bed (or the total quotation amount) in PKR? I have the quantity (2 beds) but no price, and I cannot invent one.
+
+2. FAHAD ASSOCIATES is described as the party you are purchasing FROM (a supplier), but the quotation document in this system is a sales quotation issued to a customer. How should this be recorded?
+- (a) It is actually a sales quotation to one of your customers — tell me which customer.
+- (b) You want it issued in the name of FAHAD ASSOCIATES as the counterparty anyway (I would need to create a party record for them first).
+- (c) You meant a purchase-side document rather than a quotation.
+
+Please answer 1 and 2 and I will proceed.`;
+
+    const result = parseEmbeddedSubQuestions(raw);
+    expect(result.questions).toHaveLength(2);
+    expect(result.intro).toContain("Two things are genuinely missing");
+    expect(result.questions[0].question).toContain("What is the price per bed");
+    expect(result.questions[0].options).toBeUndefined();
+    expect(result.questions[1].question).toContain("FAHAD ASSOCIATES is described as the party");
+    expect(result.questions[1].options).toHaveLength(3);
+    expect(result.questions[1].options?.[0].value).toBe("a");
+    expect(result.questions[1].options?.[1].value).toBe("b");
+    expect(result.questions[1].options?.[2].value).toBe("c");
+  });
+});

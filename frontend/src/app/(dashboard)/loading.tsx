@@ -8,3 +8,4 @@ import { PageSkeleton } from "@/components/shared/States";
 export default function DashboardLoading() {
   return <PageSkeleton />;
 }
+

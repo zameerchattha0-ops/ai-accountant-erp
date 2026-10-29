@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { MessageCircleQuestion, Send } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
-import { legacyChipOptions } from "@/lib/ai/clarification";
+import { legacyChipOptions, parseEmbeddedSubQuestions, type ParsedQuestionBlock } from "@/lib/ai/clarification";
 import type { QuestionOption } from "@/lib/types/api";
 
 interface Props {
@@ -81,11 +81,16 @@ function quickOptions(q: string): string[] | null {
 function optionsForSubQuestion(
   q: string,
   index: number,
-  questionOptions?: QuestionOption[][]
+  questionOptions?: QuestionOption[][],
+  parsedQuestions?: ParsedQuestionBlock[]
 ): QuestionOption[] | null {
   const payload = questionOptions?.[index];
   if (payload && payload.length > 0) {
     return payload;
+  }
+  const embedded = parsedQuestions?.[index]?.options;
+  if (embedded && embedded.length > 0) {
+    return embedded;
   }
   if (
     /how was .*paid|how was .*settled|payment (?:mode|method|type)|how did you pay|cash or (?:credit|bank)|settlement/i.test(
@@ -156,7 +161,11 @@ export default function AIClarification({
   onAnswer,
   disabled = false,
 }: Props) {
-  const subQuestions = splitQuestions(question);
+  const parsed = parseEmbeddedSubQuestions(question);
+  const hasStructured = parsed.questions.length >= 2;
+  const subQuestions = hasStructured
+    ? parsed.questions.map((q) => q.question)
+    : splitQuestions(question);
   const multi = subQuestions.length >= 2;
   const [custom, setCustom] = useState("");
   // One answer slot per question - answered separately, sent together.
@@ -196,7 +205,7 @@ export default function AIClarification({
   // fallback).  Typing remains available below the chips.
   const singleOpts = multi
     ? null
-    : optionsForSubQuestion(question, 0, questionOptions);
+    : optionsForSubQuestion(question, 0, questionOptions, parsed.questions);
 
   // The backend sends the SAME choices in `options` AND `question_options[0]`
   // (agent.py account-treatment round).  The structured chips win and the
@@ -225,7 +234,11 @@ export default function AIClarification({
   // Deduplicated header: only the intro prose, never the numbered
   // questions (they render below as their own interactive fields).
   // R3.4a: markdown is stripped before rendering.
-  const headerText = sanitizeMarkdown(multi ? introText(question) : question);
+  const headerText = sanitizeMarkdown(
+    hasStructured
+      ? (parsed.intro || "Please provide the following details to proceed:")
+      : (multi ? introText(question) : question)
+  );
 
   return (
     <div className="bg-bg-surface rounded-2xl border border-warning-100 shadow-sm p-5 space-y-4">
@@ -291,9 +304,9 @@ export default function AIClarification({
               </label>
               {/* R3.4: data-driven chips — backend payload first, the
                   hardcoded quickOptions switch as fallback. */}
-              {optionsForSubQuestion(q, i, questionOptions) && (
+              {optionsForSubQuestion(q, i, questionOptions, parsed.questions) && (
                 <div className="flex flex-wrap gap-1.5">
-                  {optionsForSubQuestion(q, i, questionOptions)!.map((opt) => (
+                  {optionsForSubQuestion(q, i, questionOptions, parsed.questions)!.map((opt) => (
                     <button
                       key={opt.value}
                       type="button"
@@ -317,7 +330,7 @@ export default function AIClarification({
               <input
                 type="text"
                 value={answers[i] ?? ""}
-                autoFocus={i === 0 && !optionsForSubQuestion(q, i, questionOptions)}
+                autoFocus={i === 0 && !optionsForSubQuestion(q, i, questionOptions, parsed.questions)}
                 disabled={disabled}
                 onChange={(e) =>
                   setAnswers((prev) =>

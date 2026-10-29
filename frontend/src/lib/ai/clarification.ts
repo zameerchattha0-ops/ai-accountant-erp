@@ -44,3 +44,81 @@ export function legacyChipOptions(
     .filter(isAnswerOption)
     .filter((option) => !covered.has(chipKey(option)));
 }
+
+
+export interface ParsedQuestionBlock {
+  id: number;
+  question: string;
+  options?: QuestionOption[];
+}
+
+export interface ParsedQuestionnaire {
+  intro: string;
+  questions: ParsedQuestionBlock[];
+}
+
+/**
+ * Robustly parses multi-line question text emitted by LLMs into structured questions
+ * with isolated intros, clean questions, and extracted sub-options ((a), (b), (c))
+ * so each question renders its own interactive answer box and clickable chips.
+ */
+export function parseEmbeddedSubQuestions(rawText: string): ParsedQuestionnaire {
+  const text = (rawText || "").trim();
+  if (!text) {
+    return { intro: "", questions: [] };
+  }
+
+  const numberRegex = /(?:^|\n)\s*(\d+)[.)]\s*/g;
+  const matches: Array<{ num: number; index: number; end: number }> = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = numberRegex.exec(text)) !== null) {
+    matches.push({
+      num: parseInt(m[1], 10),
+      index: m.index,
+      end: m.index + m[0].length,
+    });
+  }
+
+  if (matches.length >= 2) {
+    const firstMatch = matches[0];
+    const rawIntro = text.slice(0, firstMatch.index).trim();
+    const questions: ParsedQuestionBlock[] = [];
+
+    for (let i = 0; i < matches.length; i++) {
+      const current = matches[i];
+      const next = matches[i + 1];
+      const block = text.slice(current.end, next ? next.index : undefined).trim();
+
+      const optRegex = /(?:^|\n)\s*[-*•]?\s*\(?([a-zA-Z0-9])\)?[.)]\s*(.+)/g;
+      const opts: QuestionOption[] = [];
+      let firstOptIdx = -1;
+      let om: RegExpExecArray | null;
+
+      while ((om = optRegex.exec(block)) !== null) {
+        if (firstOptIdx === -1) {
+          firstOptIdx = om.index;
+        }
+        const val = om[1].trim();
+        const desc = om[2].trim();
+        opts.push({
+          value: val,
+          label: desc.startsWith("(") ? desc : `(${val}) ${desc}`,
+        });
+      }
+
+      let qText = firstOptIdx >= 0 ? block.slice(0, firstOptIdx).trim() : block;
+      qText = qText.replace(/(?:^|\n)\s*(?:please answer|let me know|reply with).+$/i, "").trim();
+
+      questions.push({
+        id: current.num,
+        question: qText,
+        options: opts.length > 0 ? opts : undefined,
+      });
+    }
+
+    return { intro: rawIntro, questions };
+  }
+
+  return { intro: text, questions: [] };
+}

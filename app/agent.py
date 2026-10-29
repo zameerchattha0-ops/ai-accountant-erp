@@ -3114,7 +3114,7 @@ def _make_account_label_resolver(organization_id: uuid.UUID):
 
 # gate can no longer loop.
 
-MAX_CLARIFICATION_ROUNDS = 3
+MAX_CLARIFICATION_ROUNDS = 10
 
 # Ceiling for MODEL-driven clarification rounds.  Missing information is
 
@@ -3130,7 +3130,27 @@ MAX_CLARIFICATION_ROUNDS = 3
 
 # a runaway guard, not a question quota.
 
-MODEL_MAX_CLARIFICATION_ROUNDS = 8
+MODEL_MAX_CLARIFICATION_ROUNDS = 25
+
+
+def _count_clarification_turns(prior_qa: List[Dict[str, Any]]) -> int:
+    """Return the number of actual conversational clarification rounds.
+
+    A single questionnaire round persists multiple field rows into
+    ai_clarifications (or duplicate seeded rows from prior sessions).
+    Measuring len(prior_qa) directly counts raw rows instead of user interaction
+    turns, prematurely hitting the runaway guard after just 1-2 user replies.
+    """
+    if not prior_qa:
+        return 0
+    unique_answers = set()
+    for qa in prior_qa:
+        ans = str(qa.get("answer") or qa.get("user_response") or "").strip()
+        if ans:
+            unique_answers.add(ans)
+    if unique_answers:
+        return len(unique_answers)
+    return len(prior_qa)
 
 
 
@@ -4618,7 +4638,7 @@ async def _account_rescue_question(
 
         return None
 
-    if gap_already_asked(prior_qa) or len(prior_qa) >= MODEL_MAX_CLARIFICATION_ROUNDS:
+    if gap_already_asked(prior_qa) or _count_clarification_turns(prior_qa) >= MODEL_MAX_CLARIFICATION_ROUNDS:
 
         return None
 
@@ -8383,7 +8403,7 @@ async def execute(
 
             and execution_plan.missing_fields
 
-            and len(prior_qa) < MAX_CLARIFICATION_ROUNDS
+            and _count_clarification_turns(prior_qa) < MAX_CLARIFICATION_ROUNDS
 
             and _reasoning_calls is None
 
@@ -9134,7 +9154,7 @@ async def execute(
 
             classification.requires_clarification
 
-            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+            and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
 
             and _reasoning_calls is None
 
@@ -10065,23 +10085,36 @@ async def execute(
         # so the user can answer and the SAME conversation resumes.
 
         if (
-
             not planned_tool_calls
-
             and _usable_question(llm_text)
-
-            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
-
+            and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
         ):
+            from app.questionnaire import parse_model_question_text
+            _raw_q = _usable_question(llm_text) or llm_text
+            _parsed_q = parse_model_question_text(_raw_q, intent=execution_plan.intent)
+            _q_text = _parsed_q.render_text() if _parsed_q else _raw_q
+            _q_opts = _parsed_q.render_options() if _parsed_q else None
+            _q_payload = _parsed_q.to_payload() if _parsed_q else None
+            _req_fields = _parsed_q.fields() if _parsed_q else execution_plan.missing_fields
 
             await create_clarification(
-
                 session_id=session_id,
-
-                question=_usable_question(llm_text),
-
-                required_fields=execution_plan.missing_fields,
-
+                question=_q_text,
+                required_fields=_req_fields,
+            )
+            await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                "source": "model",
+                "stage": "planning",
+                "question": _q_text[:500],
+            })
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=_q_text,
+                question_options=_q_opts,
+                questionnaire=_q_payload,
+                required_information=_req_fields,
+                requires_user_input=True,
             )
 
             await _log_step(session_id, "AWAITING_CLARIFICATION", {
@@ -10554,7 +10587,7 @@ async def execute(
 
                     and not gap_already_asked(prior_qa)
 
-                    and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS):
+                    and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS):
 
                 _gap = _gaps[0]
 
@@ -12562,45 +12595,34 @@ async def execute(
         # NOT VERIFIED.
 
         if not _mutation_executed(tool_calls):
-
             model_question = _usable_question(llm_text)
-
-            if model_question and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+            if model_question and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                from app.questionnaire import parse_model_question_text
+                _parsed_q = parse_model_question_text(model_question, intent=execution_plan.intent)
+                _q_text = _parsed_q.render_text() if _parsed_q else model_question
+                _q_opts = _parsed_q.render_options() if _parsed_q else None
+                _q_payload = _parsed_q.to_payload() if _parsed_q else None
+                _req_fields = _parsed_q.fields() if _parsed_q else execution_plan.missing_fields
 
                 await create_clarification(
-
                     session_id=session_id,
-
-                    question=model_question,
-
-                    required_fields=execution_plan.missing_fields,
-
+                    question=_q_text,
+                    required_fields=_req_fields,
                 )
-
                 await _log_step(session_id, "AWAITING_CLARIFICATION", {
-
                     "source": "model",
-
                     "stage": "execution",
-
-                    "question": model_question[:500],
-
+                    "question": _q_text[:500],
                 })
-
                 return AgentResponse(
-
                     status=ExecutionStatus.AWAITING_CLARIFICATION,
-
                     execution_id=session_id,
-
-                    question=model_question,
-
-                    required_information=execution_plan.missing_fields,
-
+                    question=_q_text,
+                    question_options=_q_opts,
+                    questionnaire=_q_payload,
+                    required_information=_req_fields,
                     requires_user_input=True,
-
                 )
-
             from app.erp_endpoints import is_operational_task, format_operational_summary
             _is_op_query = is_operational_task(execution_plan.intent) or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
             _succ = [tr for tr in tool_results if tr.success]
@@ -12631,7 +12653,7 @@ async def execute(
 
                 )
 
-                if len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                if _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
 
                     await create_clarification(
 
@@ -12759,7 +12781,7 @@ async def execute(
 
             user_input_failures
 
-            and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+            and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
 
         ):
 
@@ -13269,7 +13291,7 @@ async def execute(
 
                     _input_question
 
-                    and len(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
+                    and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS
 
                 ):
 

@@ -259,3 +259,56 @@ class TestFrontendContractAndRouting:
                 "answer": "FIXED_ASSET",
             }
         ]
+
+
+def test_parse_model_question_text_with_suboptions():
+    from app.questionnaire import parse_model_question_text
+    sample = (
+        "I checked the live records before preparing anything:\n"
+        "FAHAD ASSOCIATES does not exist as a customer record.\n"
+        "BEDS does not exist in the product catalogue or service catalogue.\n\n"
+        "Two things are genuinely missing before I can prepare this quotation:\n\n"
+        "1. What is the price per bed (or the total quotation amount) in PKR? I have the quantity (2 beds) but no price, and I cannot invent one.\n\n"
+        "2. FAHAD ASSOCIATES is described as the party you are purchasing FROM (a supplier), but the quotation document in this system is a sales quotation issued to a customer. How should this be recorded?\n"
+        "- (a) It is actually a sales quotation to one of your customers — tell me which customer.\n"
+        "- (b) You want it issued in the name of FAHAD ASSOCIATES as the counterparty anyway (I would need to create a party record for them first).\n"
+        "- (c) You meant a purchase-side document rather than a quotation.\n\n"
+        "Please answer 1 and 2 and I will proceed."
+    )
+    q = parse_model_question_text(sample, intent="create_quotation")
+    assert q is not None
+    assert len(q.questions) == 2
+    assert q.questions[0].field == "unit_price"
+    assert q.questions[0].kind == "money"
+    assert q.questions[1].field == "counterparty_role"
+    assert q.questions[1].kind == "choice"
+    assert len(q.questions[1].options) == 3
+    assert q.questions[1].options[0][0] == "a"
+    assert q.questions[1].options[1][0] == "b"
+    assert q.questions[1].options[2][0] == "c"
+
+    # Verify options rendering for frontend
+    rendered_options = q.render_options()
+    assert rendered_options is not None
+    assert rendered_options[0] is None
+    assert len(rendered_options[1]) == 3
+    assert rendered_options[1][0]["value"] == "a"
+
+
+def test_count_clarification_turns():
+    from app.agent import _count_clarification_turns
+    # 9 rows from database containing repeated fields/seed history across 2 actual user turns
+    history = [
+        {"question": "Date?", "answer": "TODAY", "required_information": ["transaction_date"]},
+        {"question": "Nature?", "answer": "INVENTORY", "required_information": ["transaction_nature"]},
+        {"question": "Date?", "answer": "TODAY", "required_information": ["transaction_date"]},
+        {"question": "Nature?", "answer": "INVENTORY", "required_information": ["transaction_nature"]},
+        {"question": "Nature?", "answer": "INVENTORY", "required_information": ["transaction_nature"]},
+        {"question": "Date?", "answer": "TODAY", "required_information": ["transaction_date"]},
+        {"question": "Price?", "answer": "25000", "required_information": ["unit_price"]},
+        {"question": "Price?", "answer": "25000", "required_information": ["unit_price"]},
+        {"question": "Role?", "answer": "c", "required_information": ["counterparty_role"]},
+    ]
+    # Unique user responses: TODAY, INVENTORY, 25000, c -> 4 user turns, NOT 9!
+    assert _count_clarification_turns(history) == 4
+    assert _count_clarification_turns([]) == 0
