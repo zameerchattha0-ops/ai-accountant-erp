@@ -1,8272 +1,8291 @@
-"""
-
-ERP AI Agent — Planner
-
-========================
-
-Translates natural language into an execution plan.
-
-
-
-The Planner determines:
-
-* Intent
-
-* Extracted entities (amount, supplier, customer, item, date, payment method)
-
-* Required context sources
-
-* Potentially required tools
-
-* Whether validation / accounting engine / confirmation is needed
-
-* Clarification questions (ONLY for genuinely missing material information)
-
-
-
-Clarification philosophy (anti-loop guarantees):
-
-* Extract FIRST — every entity format variant is attempted before
-
-  deciding anything is missing.
-
-* Reuse — values answered in prior clarification rounds are merged into
-
-  the entity set and NEVER re-asked.
-
-* Minimal & consolidated — ALL independently-missing material fields are
-
-  gathered into ONE questionnaire per round (dependency-first ordering,
-
-  no fixed question sequence, no drip-feeding one question per turn).
-
-* Trust the LLM — when extraction is inconclusive the request is passed
-
-  to Gemini with all extracted hints rather than blocked here.
-
-
-
-The Planner does NOT directly execute database mutations.
-
-"""
-
-
-
-from __future__ import annotations
-
-
-
-import re
-
-from datetime import date, timedelta
-
-from typing import Any, Dict, List, Optional, Tuple
-
-
-
-import structlog
-
-
-
-from app.accounting_vocabulary import NATURE_LEDGER_NAMES
-
-from app.date_parser import (
-
-    parse_transaction_date,
-
-    resolve_date_range,
-
-    resolve_relative_date_text,
-
-)
-
-from app.questionnaire import QUESTION_BANK
-
-from app.reasoning import (
-
-    DATE_REQUIRED_INTENTS,
-
-    NATURE_DECISION_QUESTION,
-
-    EXPENSE_EVENT_DATE_QUESTION,
-
-    SETTLEMENT_POSITION_QUESTION,
-
-    capitalization_question_for,
-
-    capitalization_threshold_from_prefs,
-
-    accepted_nature_values,
-
-    derive_nature_from_text,
-
-    nature_family_for_intent,
-
-    nature_for_purpose,
-
-    nature_question_for_intent,
-
-    purpose_label,
-
-    purpose_option,
-
-    purpose_question,
-
-    purpose_requires_capitalization_question,
-
-    resolve_capitalization_answer,
-
-    resolve_nature_answer,
-
-    resolve_purpose_answer,
-
-    resolve_settlement_answer,
-
-)
-
-from app.models.schemas import ExecutionPlan
-
-
-
-log = structlog.get_logger(__name__)
-
-
-
-
-
-# Intents whose nature comes from the EXPENSE decision tree
-
-# (FIXED_ASSET / INVENTORY / CONSUMABLE / OPERATING_EXPENSE / SERVICE).
-
-#
-
-# A LEARNED nature preference is only meaningful inside this family.  It must
-
-# never answer a SALE: a sale's nature vocabulary is
-
-# GOODS / SERVICE / ASSET_DISPOSAL / OTHER_INCOME, and applying an expense
-
-# nature to one both mislabels the transaction ("Nature: Operating Expense" on
-
-# a sale) and suppresses the sale-type question, which then lets the revenue
-
-# account be resolved silently by fuzzy name match.
-
-_EXPENSE_NATURE_INTENTS = frozenset({
-
-    "record_expense",
-
-    "record_purchase",
-
-    "record_cash_purchase",
-
-    "record_credit_purchase",
-
-    "register_fixed_asset",
-
-})
-
-
-
-# Intents that require explicit user authorization BEFORE any mutation
-
-# (the PHASE 5 confirmation gate).  Exported through
-
-# intent_requires_confirmation() so the agent can RE-EVALUATE the
-
-# requirement after FIX-5 reconciliation (when the planned tools reveal a
-
-# confirmation-class event under a non-confirmation intent, e.g. a
-
-# register_fixed_asset plan living under record_expense).
-
-_CONFIRMATION_INTENTS = frozenset({
-
-    "record_credit_purchase", "record_credit_sale", "create_invoice",
-
-    "record_receipt", "record_payment",
-
-    "create_credit_note", "create_purchase_return", "record_expense_payment",
-
-    "record_bank_transfer", "create_bank_account",
-
-    "register_fixed_asset", "dispose_fixed_asset",
-
-    "record_asset_depreciation",
-
-    # Payroll moves real money (or books the salary liability) and is
-
-    # computed from the roster — the user always authorizes the run first.
-
-    "run_payroll",
-
-    # Quotation → invoice conversion posts a receivable journal, so the
-
-    # user confirms before the accounting mutation (same as create_invoice).
-
-    "convert_quotation",
-    "delete_product", "delete_service",
-
-    # Loans move real money (opening journal / installment settlement) and
-
-    # create or settle a liability or loan receivable — the user always
-
-    # authorizes first (same class as record_receipt / record_payment).
-
-    "record_loan", "record_loan_repayment",
-
-})
-
-
-
-
-
-def intent_requires_confirmation(intent: str) -> bool:
-
-    """Does *intent* require user authorization before mutating?"""
-
-    return intent in _CONFIRMATION_INTENTS
-
-
-
-
-
-# hard ceiling on batch size - beyond this the request is
-
-# treated as a single (possibly itemised) transaction instead of N
-
-# documents, preventing pathological N-document explosions.
-
-_BATCH_MAX_ITEMS = 10
-
-
-
-# ---------------------------------------------------------------------------
-
-# Intent patterns — order matters (more specific first)
-
-# ---------------------------------------------------------------------------
-
-_INTENT_PATTERNS: List[tuple[str, list[str]]] = [
-
-    # Reports (read-only, no mutation)
-
-    ("generate_trial_balance", [r"trial\s*balance"]),
-
-    ("generate_balance_sheet", [r"balance\s*sheet"]),
-
-    ("generate_profit_loss", [r"profit.*loss", r"\bp\s*&?\s*l\b", r"income\s*statement"]),
-
-    ("generate_cash_flow", [r"cash\s*flow"]),
-
-    ("generate_general_ledger", [r"general\s*ledger"]),
-
-    # "owe" with WORD BOUNDARIES (Fix 5): the bare substring `owe` matched
-
-    # inside "borrow**owe**d", so every borrowing phrasing was routed to the
-
-    # customer-ledger report.  owe/owes/owed/owing still match.
-
-    ("customer_balance", [r"\bowe(?:s|d|ing)?\b", r"receivable", r"customer.*ledger", r"how much.*\bowe"]),
-
-    ("supplier_balance", [r"supplier.*ledger", r"\bpayables?\b", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
-
-    ("project_profitability", [r"project.*profit", r"profitability"]),
-
-    ("generate_customer_ledger", [r"customer.*ledger"]),
-
-    ("generate_supplier_ledger", [r"supplier.*ledger"]),
-
-    # Expense LOOKUPS must win over record_expense: the bare "expense"
-
-    # keyword in record_expense used to swallow query phrasings like
-
-    # "provide details of current month expenses" and drag them into the
-
-    # recording clarification ladder.  Query-shaped
-
-    # phrasings are matched FIRST and routed to the read-only listing.
-
-    ("list_expenses", [
-
-        r"(?:show|list|give|provide|tell|view|display|details?|summary|"
-
-        r"summar\w*|breakdown|what|which|how much|any|all)[^.\n]*expenses?",
-
-        r"expenses?[^.\n]*\b(?:details?|report|summary|list|history|"
-
-        r"breakdown|this month|last month|this week|last month)",
-
-        r"expense\s+report",
-
-        r"(?:how much|what|total)[^.\n]*\bspen[td]\b",
-
-    ]),
-
-    # New document types
-
-    # convert_quotation MUST precede create_quotation: "convert quotation to
-
-    # invoice" also matches the generic quotation pattern below.
-
-    ("create_purchase_order", [
-        r"(?:purchase|vendor|supplier)\s*(?:quotation|quote|rfq|order|po)",
-        r"(?:quotation|quote|rfq|order|po)\s+(?:for\s+purchasing|for\s+buying|from\s+supplier|from\s+vendor)",
-        r"(?:prepare|create|make|issue|draft)\s*(?:a\s+)?(?:quotation|quote|rfq|order)\s+(?:for\s+purchasing|for\s+buying|from)",
-        r"\bpurchas(?:e|ing)\s+quotation\b",
-        r"\brfq\b",
-    ]),
-    ("convert_quotation", [r"convert.*(?:quotation|quote)", r"(?:quotation|quote).*invoice", r"accept.*(?:quotation|quote).*invoice"]),
-
-    ("create_quotation", [r"quotation", r"quote", r"price\s*quote", r"create.*quote", r"send.*quotation"]),
-
-    # RETURNS — the SIDE is decided by who sent the goods back:
-
-    #   "<party> returned X"          → they returned goods to us → SALE return
-
-    #                                   (credit note against their invoice)
-
-    #   "we returned X" / "…to <supplier>" → we sent goods back → PURCHASE return
-
-    # create_purchase_return MUST precede create_credit_note: both now
-
-    # recognise the bare verb, so the "we"/supplier phrasings have to be
-
-    # claimed first.  Production 2026-09-30 (session 387b7cb8): "Alpha
-
-    # Associates Returned Chairs amounting to 34000" matched NOTHING — the
-
-    # old patterns demanded the literal words "goods"+"customer" — so intent
-
-    # stayed unknown, every deterministic gate (party check, questionnaire,
-
-    # confirmation) was skipped and the run fell into the generic LLM tool
-
-    # loop and died at the 120s execution budget.
-
-    ("create_purchase_return", [
-
-        r"purchase\s*return",
-
-        r"return.*goods.*supplier",
-
-        r"return.*to.*supplier",
-
-        r"send.*back.*supplier",
-
-        r"\bsent\b[^.]*\bback\b",
-
-        r"\bwe\s+return(?:ed|s|ing)?\b",
-
-    ]),
-
-    ("create_credit_note", [
-
-        r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit\s*note",
-
-        # "<party> returned/returns/refunded …" and "return of <items>".
-
-        r"\breturned\b",
-
-        r"\breturn\s+of\b",
-
-        r"\breturns?\s+(?:the\s+)?(?:goods|items?|stock|merchandise|units?)\b",
-
-    ]),
-
-    # Payroll (Employees Phase 2).  An ACTION verb is required — a bare
-
-    # "payroll" keyword would swallow query phrasings ("show payroll") and
-
-    # drag them into a mutation's confirmation ladder.  A plan that names the
-
-    # payroll TOOL under any other intent is reconciled to this intent by
-
-    # tool_selector.reconcile_intent_with_tools (FIX-5), which then applies
-
-    # the confirmation gate.
-
-    ("run_payroll", [
-
-        r"(?:run|process|do|make|execute|prepare|record)[^.\n]*\bpayroll\b",
-
-        r"\bpayroll\b[^.\n]*\b(?:run|processing)\b",
-
-        r"\bpa(?:y|id|ying)\b[^.\n]{0,40}\bsalar(?:y|ies)\b",
-
-        r"\bsalar(?:y|ies)\b[^.\n]{0,20}\b(?:payment|disburs\w*|payout|run)\b",
-
-        r"pay\s+(?:the\s+)?(?:staff|employees|workers|team)\b",
-
-        r"\bwages\b[^.\n]{0,20}\b(?:pay|paying|disburs\w*)\b",
-
-    ]),
-
-    # Settlement of an ALREADY-RECORDED expense liability (mandate Case C):
-
-    # only UNMISTAKABLE settlement wording claims this family deterministically
-
-    # — "settled the bill", "expense payment".  A bare "paid ... bill/expense"
-
-    # phrasing is a NEW event whose nature (expense vs purchase vs settlement)
-
-    # is the LLM understanding stage's decision via the semantic-intent
-
-    # whitelist (planner._SEMANTIC_INTENTS) — never a Python keyword guess
-
-    # (production 2026-10-14: `paid.*bill` hijacked "Paid 3000 against monthly
-
-    # internet bill of flash fibre" into the supplier-settlement family and
-
-    # dead-ended the whole app).
-
-    ("record_expense_payment", [r"expense\s+payment", r"settled?\s+[^.\n]*\bbill\b"]),
-
-    # Mutations
-
-    ("create_invoice", [r"create.*invoice", r"invoice.*for", r"bill.*customer"]),
-
-    ("record_credit_sale", [r"sold.*credit", r"credit\s*sale", r"on\s*credit.*sold"]),
-
-    # "received payment for X" claims the sale family ONLY when X is
-
-    # actually sale vocabulary (Fix 5/6, RC-4: "Received payment for loan
-
-    # repayment" matched the loose `.*for` pattern, took the sale nature
-
-    # ladder and asked "nature of this sale?" on a borrowing).  Without a
-
-    # sale marker the phrase falls through to the receipt family (the
-
-    # operation question — which offers LOAN as a settlement — decides).
-
-    ("record_cash_sale", [
-
-        r"sold.*cash", r"cash\s*sale",
-
-        r"received\s*payment[^.\n]*\b(?:sale|invoice|goods|services?|stock|products?|items?)\b",
-
-    ]),
-
-    ("record_credit_purchase", [r"bought.*credit", r"credit\s*purchase", r"on\s*credit.*bought", r"purchased.*credit"]),
-
-    ("record_cash_purchase", [r"bought.*cash", r"cash\s*purchase", r"purchased.*cash", r"bought.*paid"]),
-
-    # record_expense requires a RECORDING verb (or an amount-bearing
-
-    # "expense of/for <figure>" phrasing) — a bare "expense" keyword
-
-    # swallowed query phrasings and sent them into the recording ladder.
-
-    ("record_expense", [
-
-        r"record[^.\n]*expense",
-
-        r"(?:log|book|add|track|enter|submit|file)[^.\n]*expense",
-
-        r"expense\s+(?:of|for)\s+(?:rs\.?|pkr)?\s*[\d,]",
-
-        r"spent",
-
-        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b[^.\n]*\b[\d,]+(?:\.\d+)?\b",
-
-        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b[\d,]+(?:\.\d+)?\b[^.\n]*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b",
-
-    ]),
-
-    (
-        "record_receipt",
-        [
-            r"receipt",
-            r"(?:receive|received|collect|collected)\b[^.\n]*\b(?:payment|amount|money|cash)\b",
-            r"received.*from.*customer",
-            r"customer.*paid",
-            r"payment.*received",
-            r"(?:payment\s+)?receipt\s+against\s+(?:invoice|sale)",
-            r"(?:receive|received|record)\s+(?:payment|receipt)\s+against\s+invoice",
-            r"(?:receive|received|collect|collected)\s+(?:against\s+)?(?:invoice|inv\b)",
-            r"\breceived\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?\s+from\b",
-        ],
-    ),
-    (
-        "record_payment",
-        [
-            r"paid.*supplier",
-            r"supplier.*payment",
-            r"payment.*to.*supplier",
-            r"(?:record|make|send)?\s*payment\s+against\s+(?:bill|purchase)",
-            r"(?:pay|paid|settle|settled|cleared?)\s+(?:against\s+)?(?:bill|purchase\s+bill|pur\b)",
-            r"\bpay\s+supplier\b",
-        ],
-    ),
-
-    ("record_bank_transfer", [r"transfer.*bank", r"bank.*transfer", r"transfer.*from.*to.*account", r"move.*money.*from", r"transfer.*hbl\b", r"transfer.*meezan\b"]),
-
-    ("create_bank_account", [r"add.*bank.*account", r"create.*bank.*account", r"new.*bank.*account", r"open.*bank.*account"]),
-
-    ("list_bank_accounts", [r"bank.*account", r"list.*bank", r"show.*bank"]),
-
-    # Fixed-asset lifecycle + product catalog (BEFORE generic buy/sell so
-
-    # the specific economic event wins)
-
-    ("dispose_fixed_asset", [r"dispos.*asset", r"sell.*(?:asset|machinery|vehicle|equipment|furniture)", r"sold.*(?:asset|machinery|vehicle|equipment|furniture)", r"write.?off.*asset", r"scrap.*asset"]),
-
-    ("record_asset_depreciation", [r"depreciat"]),
-
-    ("update_document_status", [
-        r"\b(?:mark|change|set|update|convert)\b[^.\n]*\b(?:status|paid|void|approved|cancelled|ordered|rfq)\b",
-        r"\b(?:mark|change|set)\s+(?:bills?|invoices?|orders?|pos?|rfqs?)\b[^.\n]*\bas\s+(?:paid|void|open|approved|cancelled)\b",
-    ]),
-
-    ("register_fixed_asset", [
-        r"fixed\s*asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset",
-        r"new.*(?:machinery|generator|delivery van|forklift)",
-    ]),
-
-    # Master data / Setup & Configuration intents across all ERP modules
-    ("create_account", [
-        r"(?:create|add|new|setup|open)\b[^.\n]*\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b",
-        r"\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b[^.\n]*\b(?:create|add|new|setup|open)\b",
-        r"\bnew\s+(?:account|ledger)\b",
-    ]),
-    ("get_chart_of_accounts", [
-        r"(?:show|view|list|get|display|fetch|see)\b[^.\n]*\bchart\s+of\s+accounts?\b",
-        r"\bchart\s+of\s+accounts?\b[^.\n]*\b(?:list|summary|view|overview)\b",
-    ]),
-    ("create_customer", [
-        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:customer|client|buyer)\b",
-        r"\bnew\s+(?:customer|client|buyer)\b",
-    ]),
-    ("create_supplier", [
-        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:supplier|vendor|seller)\b",
-        r"\bnew\s+(?:supplier|vendor|seller)\b",
-    ]),
-    ("create_employee", [
-        r"(?:create|add|new|register|hire|onboard|record)\b[^.\n]*\b(?:employee|staff|worker|personnel|emplyee|employe)\b",
-        r"\bnew\s+(?:employee|staff|worker|personnel|emplyee|employe)\b",
-        r"\brecord\s+(?:an?\s+)?(?:employee|staff|worker|personnel|emplyee|employe)\b",
-        r"\b(?:employee|staff|worker|personnel|emplyee|employe)\s+(?:setup|registration|onboarding)\b",
-    ]),
-    ("create_recurring_template", [
-        r"(?:create|add|new|setup)\s+(?:a\s+)?recurring\b",
-    ]),
-
-    ("get_inventory_status", [
-        r"(?:show|view|list|get|display|fetch|check|what\s+is|what's|how\s+much|how\s+many)\b[^.\n]*\b(?:inventory|stock|units\s+on\s+hand|in\s+stock|out\s+of\s+stock|low\s+stock|stock\s+movements?)\b",
-        r"\b(?:inventory|stock)\b[^.\n]*\b(?:status|valuation|value|on\s+hand|summary|balance|level|position|movements?)\b",
-        r"\b(?:out\s+of\s+stock|low\s+stock|depleted\s+stock)\b",
-        r"\bhow\s+many\b[^.\n]*\b(?:units?|items?|pieces?|pcs|in\s+stock|on\s+hand|left|remaining|available|we\s+have|there\s+are)\b",
-        r"\bhow\s+many\b\s+([a-zA-Z0-9_\s\-]+?)\??$",
-        r"\b(?:units?|quantity|count|balance|level)\s+of\b[^.\n]*\b(?:stock|inventory|[a-zA-Z0-9_\-]+)\b",
-    ]),
-
-    ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
-    ("update_product", [r"update.*product", r"edit.*product", r"change.*product", r"update.*item.*price"]),
-    ("delete_service", [r"delete.*service", r"remove.*service"]),
-    ("update_service", [r"update.*service", r"edit.*service", r"change.*service"]),
-    ("create_product", [r"add.*product", r"create.*product", r"new product", r"register.*product"]),
-
-    ("create_service", [r"add.*service", r"create.*service", r"new service", r"register.*service"]),
-
-    # PROJECT SETUP — non-financial, but it needs its own intent: without one
-
-    # the request fell to intent=unknown (no keyword route, no field ladder,
-
-    # no context) and the model invented the call until the DB refused
-
-    # project_code (production 2026-10-01, "Set up a project called Mobile App
-
-    # for XYZ Client with a budget of Rs. 2,000,000", sessions 500d0aa4 /
-
-    # 03221efb).  An ACTION verb (or "new project") is required so query
-
-    # phrasings ("show the project budget") are never dragged into a mutation.
-
-    ("create_project", [
-
-        r"(?:set\s*up|create|start|open|register|add|make|launch)\b[^.\n]*\bprojects?\b",
-
-        r"\bnew\s+project\b",
-
-    ]),
-
-    # "we BUY a car …" (production 2026-09-30, session f2166d3f): the ladder
-
-    # had purchase/bought/purchased but NOT "buy", so even after four
-
-    # clarified answers (amount, CASH, FIXED_ASSET, account "Vehicle - Car")
-
-    # the final turn still ran intent=unknown → no deterministic gate → the
-
-    # LLM tool loop → 120s timeout.  The generic purchase intent is the
-
-    # right home: the nature ladder decides fixed-asset vs inventory vs
-
-    # expense, and the payment method refines it to cash/credit.
-
-    ("record_purchase", [r"purchase", r"bought", r"purchased", r"\bbuy(?:s|ing)?\b"]),
-
-    ("record_sale", [r"sold", r"sale"]),
-
-]
-
-
-
-# Intents for which a missing amount is material enough to clarify.
-
-_TRANSACTION_INTENTS = {
-
-    "record_credit_purchase", "record_cash_purchase", "record_purchase",
-
-    "record_credit_sale", "record_cash_sale", "record_sale",
-
-    "record_expense", "record_receipt", "record_payment",
-
-    "create_invoice", "create_credit_note", "create_purchase_return",
-
-    "record_expense_payment", "record_bank_transfer",
-
-    "register_fixed_asset",
-
-    # Loans are material money movements — a missing amount is worth
-
-    # clarifying exactly like any other transaction intent.
-
-    "record_loan", "record_loan_repayment",
-
-}
-
-
-
-# planner intents the SEMANTIC layer may set. This is the
-
-# deterministic whitelist: a semantic intent outside it is ignored and the
-
-# keyword extractor decides (the LLM cannot invent an intent).
-
-# record_loan / record_loan_repayment are intentionally reachable ONLY via
-
-# this whitelist (LLM-identified route): the keyword ladder carries no
-
-# borrowing vocabulary by design — nature/route identification for loans
-
-# belongs to the understanding stage, never to substring routing.
-
-_SEMANTIC_INTENTS = frozenset({
-
-    "record_credit_sale", "record_cash_sale", "record_sale",
-
-    "record_credit_purchase", "record_cash_purchase", "record_purchase",
-
-    "record_expense", "record_receipt", "record_payment",
-
-    "create_invoice", "create_purchase_bill", "create_credit_note",
-
-    "create_purchase_return", "run_payroll",
-
-    "record_loan", "record_loan_repayment",
-
-    # record_expense_payment is reachable ONLY via this whitelist (LLM-
-
-    # identified route): a bare "paid ... bill" must never be claimed by the
-
-    # keyword ladder, but when the understanding stage DOES identify it as the
-
-    # settlement of an already-recorded expense liability (mandate Case C) the
-
-    # whitelist must carry it to the settlement workflow — dropping it to
-
-    # `unknown` would dead-end the exact decision the LLM just made.
-
-    "record_expense_payment",
-
-    # Master data / Setup and Operational intents across all ERP modules
-    "create_account", "get_chart_of_accounts", "create_customer", "create_supplier",
-    "create_product", "create_service", "create_employee", "create_project",
-    "create_recurring_template", "get_recurring_templates", "create_bank_account",
-    "list_bank_accounts", "list_expenses", "list_customers", "list_suppliers",
-    "list_employees", "get_inventory_status", "supplier_balance", "customer_balance",
-    "generate_supplier_ledger", "generate_customer_ledger", "generate_general_ledger",
-    "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
-    "generate_cash_flow", "project_profitability", "record_bank_transfer",
-    "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
-    "record_adjustment", "record_correction", "reverse_journal",
-    "update_product", "delete_product", "update_service", "delete_service",
-    "create_purchase_order", "create_quotation", "convert_quotation",
-})
-
-
-
-# every mutation
-
-# intent must resolve an explicit accounting date before any tool call.
-
-# Canonical set lives in app.reasoning (DATE_REQUIRED_INTENTS) so the
-
-# dependency graph and the planner can never drift apart.
-
-
-
-# ---------------------------------------------------------------------------
-
-# Amount extraction — ordered by confidence (highest first)
-
-# ---------------------------------------------------------------------------
-
-_NUM = r"([\d,]+(?:\.\d+)?)"
-
-
-
-_AMOUNT_PATTERNS = [
-
-    # Explicit clarification answer (highest confidence — it IS the answer)
-
-    re.compile(
-
-        r"(?:clarification|answer)\s*:?[^.\n]*?" + _NUM, re.IGNORECASE
-
-    ),
-
-    # Currency BEFORE number: "Rs 20000", "Rs. 20,000", "PKR 20000", "₨ 20000"
-
-    re.compile(r"(?:Rs\.?|PKR|₨)\s*" + _NUM + r"\s*(k|thousand|lac|lakh|million)?\b", re.IGNORECASE),
-
-    # Number BEFORE currency: "20000 rs", "20,000 Rs.", "20000 PKR"
-
-    re.compile(r"\b" + _NUM + r"\s*(?:rs\.?|pkr|₨)\b", re.IGNORECASE),
-
-    # South-Asian suffix: "20000/-"
-
-    re.compile(r"\b" + _NUM + r"\s*/-"),
-
-    # Multiplier suffix: "20k", "1.5 lac"
-
-    re.compile(r"\b" + _NUM + r"\s*(k|lac|lakh|million)\b", re.IGNORECASE),
-
-    # Strong money context words: "total 15000", "worth 20000", "paid 5000",
-
-    # "received payment of 8000", ...  (allows filler like "a payment of")
-
-    re.compile(
-
-        r"\b(?:total(?:ing|led)?|worth|amount(?:ing)?\s+to|paid|paying|"
-
-        r"price(?:\s+of|\s+is)?|cost(?:ing)?|spent|received|receiving|"
-
-        r"deposit(?:ed)?|withdr(?:ew|awn|aw)|transfer(?:red)?)\s+"
-
-        r"(?:an?\s+)?(?:payment\s+)?(?:of\s+)?(?:rs\.?\s*|pkr\s*)?" + _NUM,
-
-        re.IGNORECASE,
-
-    ),
-
-    # R4.9 — labelled amount cue: "AMOUNT 20,000", "amount: 15000",
-
-    # "amount - 8000".  3+ digits so counts ("amount 2 items") never match.
-
-    re.compile(
-
-        r"\bamount\s*[:\-]?\s*(?:rs\.?\s*|pkr\s*)?([\d,]{3,}(?:\.\d+)?)\b",
-
-        re.IGNORECASE,
-
-    ),
-
-    # "for <number>" — classic price position ("bought X for 20000").
-
-    # Requires 3+ digits to avoid matching counts ("for 3 items").
-
-    re.compile(r"\bfor\s+(?:rs\.?\s*|pkr\s*)?([\d,]{3,}(?:\.\d+)?)\b", re.IGNORECASE),
-
-    # R3.1 — loose expense phrasings put the figure after "of"
-
-    # ("record an expense of 25000", "an explanation of 25000").
-
-    # Requires 4+ digits so counts ("a batch of 100 items") never match.
-
-    re.compile(r"\bof\s+(?:rs\.?\s*|pkr\s*)?([\d,]{4,}(?:\.\d+)?)\b", re.IGNORECASE),
-
-    # "record expense: 5000" — a bare figure directly after the colon.
-
-    re.compile(r":\s*(?:rs\.?\s*|pkr\s*)?([\d,]{4,}(?:\.\d+)?)\s*$", re.IGNORECASE),
-
-]
-
-
-
-_AMOUNT_MULTIPLIERS = {
-
-    "k": 1_000,
-
-    "thousand": 1_000,
-
-    "lac": 100_000,
-
-    "lakh": 100_000,
-
-    "million": 1_000_000,
-
-}
-
-
-
-# ---------------------------------------------------------------------------
-
-# Entity (name) extraction — case-insensitive, position-aware
-
-# ---------------------------------------------------------------------------
-
-_NAME = r"([a-zA-Z][\w&.]*(?:\s+[a-zA-Z][\w&.]*)*?)"
-
-_NAME_STOP = (
-
-    r"(?=\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|and|at)\b"
-
-    r"|[,.!?;]|\s*$|\s+\d)"
-
-)
-
-
-
-_SUPPLIER_PATTERNS = [
-
-    re.compile(r"\bfrom\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
-    re.compile(r"\bsupplier\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
-    # "we returned/sent back/gave back … to <Party>" — the goods went TO
-
-    # the supplier (purchase-return phrasing).  Live 2026-10-19: the debit
-
-    # note message extracted NO supplier_name at all (the "we" subject
-
-    # blocked the customer rule and nothing owned the "to <Party>" side),
-
-    # so the DN lane fell to the lossy model path every turn.  Own stop
-
-    # set: the sentence's dash ("SHABBIR FURNITURES - create a debit
-
-    # note…") is not one of _NAME_STOP's boundaries.
-
-    re.compile(
-
-        r"\b(?:returned|sent\s+back|gave\s+back)\b[^.]*?\bto\s+"
-
-        + _NAME
-
-        + r"(?=\s*[-\u2013\u2014]"
-
-        + r"|\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|"
-
-        r"and|at|with|create|against)\b"
-
-        + r"|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-]
-
-
-
-# Action verbs, gerunds and document nouns can never START a party name.
-
-# Without this guard, "create an invoice for selling 2 ovens to lkj pvt
-
-# limited" captured "selling" as the customer: _NAME_STOP's `\s+\d`
-
-# lookahead ends the name at the quantity that follows the verb, so the
-
-# regex never reached the real party after "to".
-
-_NON_PARTY_WORDS = {
-
-    "selling", "sold", "sale", "sells", "sell", "buying", "bought", "buy",
-
-    "purchasing", "purchased", "purchase", "procuring", "acquired",
-
-    "invoice", "invoicing", "bill", "billing", "quotation", "quote",
-
-    "creating", "create", "record", "recording", "issue", "issuing",
-
-    "raise", "raising", "make", "making", "add", "adding", "enter",
-
-    "entering", "post", "posting", "be", "is", "are", "was", "were",
-
-    "to", "the", "a", "an", "and", "or",
-
-}
-
-
-
-
-
-def _is_plausible_party(value: str) -> bool:
-
-    """True when a captured string can plausibly be a party name.
-
-
-
-    Rejects pronouns / short filler and any capture whose FIRST word is an
-
-    action verb or document noun (``selling``, ``invoice``, ``bought`` ...).
-
-    That is exactly how "create an invoice for selling 2 ovens to lkj pvt
-
-    limited" used to produce the customer name "selling".
-
-    """
-
-    text = (value or "").strip()
-
-    if len(text) < 2:
-
-        return False
-
-    words = text.split()
-
-    if not words:
-
-        return False
-
-    if text.lower() in (
-
-        "the", "a", "an", "it", "us", "we", "you", "they", "i",
-
-        "me", "him", "her", "them", "our", "your", "their",
-
-    ):
-
-        return False
-
-    return words[0].strip(",.").lower() not in _NON_PARTY_WORDS
-
-
-
-_CUSTOMER_PATTERNS = [
-
-    # "invoice/quote/bill ... to <party>" — the party is often stated at the
-
-    # END, after the goods being invoiced ("create an invoice for selling
-
-    # 2 ovens to lkj pvt limited").  MUST precede the
-
-    # "invoice ... for <party>" rule below, which would otherwise capture the
-
-    # verb ("selling") that follows "for".
-
-    re.compile(
-
-        r"\b(?:invoice|bill|quotation|quote)\b[^.]*?\bto\s+" + _NAME + _NAME_STOP,
-
-        re.IGNORECASE,
-
-    ),
-
-    re.compile(
-
-        r"\bsold\b[^.]*?\bto\s+" + _NAME + _NAME_STOP, re.IGNORECASE
-
-    ),
-
-    re.compile(r"\bcustomer\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
-    re.compile(
-
-        r"\b(?:invoice|bill|quotation|quote)\s+(?:for|to)\s+" + _NAME + _NAME_STOP,
-
-        re.IGNORECASE,
-
-    ),
-
-    # "<Proper Name> owes/ledger/receivable/balance" — every word of the
-
-    # name must be capitalised (Title or ACRONYM) so ordinary sentences
-
-    # like "Show me the trial balance" are not captured as customer names.
-
-    re.compile(
-
-        r"\b([A-Z][a-z&.]*|[A-Z]{2,})(?:\s+(?:[A-Z][a-z&.]*|[A-Z]{2,}))+"
-
-        r"\s+(?:owes?|ledger|receivable|balance)\b"
-
-    ),
-
-    # "<Party> returned/returns/refunded <items>" — the customer sent the
-
-    # goods back to us, so the name ending at the return verb IS the
-
-    # customer ("Alpha Associates Returned Chairs amounting to 34000").
-
-    # The returned item itself is captured by _ITEM_PATTERNS; the side of
-
-    # the return is decided by _INTENT_PATTERNS ("we returned" = purchase
-
-    # return, so the "we" capture is rejected as a party below).
-
-    re.compile(r"\b" + _NAME + r"\s+(?:returned|returns|refunded)\b", re.IGNORECASE),
-
-]
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Generic party capture â€” any named counterparty that does not already
-
-# match the supplier / customer patterns above (e.g. "paid Zameer Labs",
-
-# "paid to Acme Traders", "received from Delta Corp").  Surfaced as a
-
-# standalone ``party`` entity so the initial LLM call can see the named
-
-# counterparty even when it does not cleanly fit the supplier/customer
-
-# regex shapes.
-
-# ---------------------------------------------------------------------------
-
-_PARTY_PATTERNS = [
-
-    re.compile(
-
-        r"\b(?:paid|payment)\s+to\s+" + _NAME + _NAME_STOP, re.IGNORECASE
-
-    ),
-
-    re.compile(
-
-        r"\breceived\s+from\s+" + _NAME + _NAME_STOP, re.IGNORECASE
-
-    ),
-
-    # "paid <Party> <amount>" â€” the name is directly after "paid" and
-
-    # before a figure (stop on \s+\d so the amount is not swallowed).
-
-    re.compile(r"\bpaid\s+" + _NAME + r"(?=\s+\d)", re.IGNORECASE),
-
-]
-
-
-
-_ITEM_PATTERNS = [
-
-    re.compile(
-
-        r"\b(?:purchas(?:e|es|ed|ing)|bought|buy(?:ing)?|procured?|acquired?)\s+"
-
-        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
-
-        # (2026-10-07, AES) — never capture the SOURCE side as the item:
-
-        # "bought from Dell" used to capture "from Dell", the leading-
-
-        # preposition strip removed "from " and the SUPPLIER became
-
-        # item_description.  A standalone to/from right after the verb means
-
-        # the sentence states no object — ask, never guess.
-
-        r"(?!from\b|to\b)"
-
-        r"([\w][\w\s-]*?)(?=\s+(?:from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-    re.compile(
-
-        r"\b(?:sold|sells?|selling)\s+(?:an?\s+|the\s+|some\s+|\d+\s+)?"
-
-        # (2026-10-07, AES production) — same guard on the sale verb:
-
-        # "Sold to Murkez Technologies pvt Limited" captured "to Murkez …",
-
-        # the strip removed "to " and the CUSTOMER became item_description
-
-        # (product, catalog gate and revenue gate all then named the party).
-
-        r"(?!to\b|from\b)"
-
-        r"([\w][\w\s-]*?)(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-    # NOUN phrasing — "create an invoice for 45000 against SALE OF tax
-
-    # services", "supply of cement to X", "purchase of laptops".  Only the
-
-    # verb forms above were recognised, so a request that plainly names its
-
-    # item still got asked "What item or service is being invoiced?".  The
-
-    # captured item must start with a LETTER, so the amount in
-
-    # "invoice for 45000 …" can never be mistaken for the item.
-
-    re.compile(
-
-        r"\b(?:sale|sales|supply|supplies|purchase|purchases|rendering|"
-
-        r"provision|delivery|invoice|bill|return(?:s)?)\s+of\s+"
-
-        r"([a-zA-Z][\w\s-]*?)"
-
-        r"(?=\s+(?:to|from|for|on|in|at|via|against|amounting|worth|total)\b"
-
-        r"|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-    # "invoice/bill for <item>" — same noun phrasing with "for".  The lookahead
-
-    # also stops at a NESTED transaction preposition followed by a number or a
-
-    # clause: "create invoice for zeta pvt ltd for selling them 2 laptops" —
-
-    # "…ltd for selling them" is not an item (it swallowed the party + a
-
-    # pronoun and dead-ended the flow), and "invoice for inventory stock of
-
-    # 50000 to X" — "inventory stock of 50000" stops at "of 5000".  A real
-
-    # "invoice for <item>" keeps its own tail or is read by the verb/noun
-
-    # patterns above.
-
-    re.compile(
-
-        r"\b(?:invoice|bill)\s+for\s+"
-
-        r"([a-zA-Z][\w\s-]*?)"
-
-        r"(?=\s+(?:to|from|for|on|in|at|via|against)\b"
-
-        r"|\s+(?:of|for|worth|total|amounting)\s+(?:\d|[Rr]s\b|PKR\b|₨)"
-
-        r"|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-    # "<party> returned <items>" — the goods that came back, so a return can
-
-    # be anchored to an item instead of being swallowed by the party capture
-
-    # ("Alpha Associates Returned Chairs amounting to 34000" → "chairs").
-
-    # `amounting|worth|total` end the capture, so the item is never
-
-    # "chairs amounting".
-
-    re.compile(
-
-        r"\b(?:returned|returns|refunded)\s+"
-
-        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
-
-        r"([a-zA-Z][\w\s-]*?)"
-
-        r"(?=\s+(?:amounting|worth|total|for|on|in|at|via|to|from|against)\b"
-
-        r"|[,.!?;]|\s*$|\s+\d)",
-
-        re.IGNORECASE,
-
-    ),
-
-]
-
-
-
-_MONTHS = {
-
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-
-}
-
-
-
-# ---------------------------------------------------------------------------
-
-# Payment method detection
-
-# ---------------------------------------------------------------------------
-
-_PAYMENT_METHOD_PATTERNS = [
-
-    (re.compile(r"\bon\s+credit\b|\bcredit\s+(?:purchase|sale|basis|terms)\b|\bkhata\b|\budhaar\b", re.IGNORECASE), "CREDIT"),
-
-    (re.compile(r"\bin\s+cash\b|\bcash\s+(?:purchase|sale|payment)\b|\bpaid\s+(?:in\s+)?cash\b|\bcash\b", re.IGNORECASE), "CASH"),
-
-    (re.compile(r"\bbank\s+transfer\b|\bwire\s+transfer\b|\bonline\s+banking\b|\btransfer(?:red)?\s+(?:to|from)\b", re.IGNORECASE), "BANK_TRANSFER"),
-
-    (re.compile(r"\bcheque\b|\bcheck\b", re.IGNORECASE), "CHEQUE"),
-
-    (re.compile(r"\b(?:credit|debit)\s+card\b|\bcard\s+payment\b|\bby\s+card\b", re.IGNORECASE), "CARD"),
-
-]
-
-
-
-# ---------------------------------------------------------------------------
-
-# Expense payment-status markers (mandate Cases A/B): the user's OWN words
-
-# decide paid-now vs outstanding when they say it — "Paid 3000 ..." states
-
-# the payment happened; "will pay … next month" / "due" states it has not.
-
-# Explicit answer text always wins (the derivation only fills an open
-
-# treatment), and when neither is stated the settlement question is still
-
-# asked — never guessed.
-
-# ---------------------------------------------------------------------------
-
-_UNPAID_MARKERS_RE = re.compile(
-
-    r"\bwill\s+pay\b|\bdue\b|\boutstanding|\bpending\b|"
-
-    r"\bpay(?:ing)?\s+(?:it\s+)?(?:later|next|soon|after|tomorrow)\b|"
-
-    r"\bnext\s+(?:month|week)\b|\bon\s+credit\b|\bto\s+be\s+paid\b",
-
-    re.IGNORECASE,
-
-)
-
-_PAID_MARKERS_RE = re.compile(
-
-    r"\bpaid\b|\bpaying\s+now\b|\bpaid\s+now\b|\bsettled\s+now\b",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Public API
-
-# ---------------------------------------------------------------------------
-
-
-
-def split_batch_request(user_message: str) -> List[str]:
-
-    """Detect a MULTI-TRANSACTION request and split it into sub-requests.
-
-
-
-     Conservative by design - only confident enumeration
-
-    patterns are split:
-
-      * numbered lists on separate lines ("1) ... 2) ..."),
-
-      * inline enumerators between transactional clauses
-
-        ("...; also ...", "... and also ...", "... then ..."),
-
-        where EVERY segment carries transactional content.
-
-
-
-    Returns the list of sub-request strings (>= 2), or [] for a normal
-
-    single-transaction request. Item-quantity phrasing ("buy 3 chairs and
-
-    2 desks") is NOT split here - it stays with the existing per-item
-
-    item-intake protocol.
-
-    """
-
-    msg = (user_message or "").strip()
-
-    if not msg:
-
-        return []
-
-
-
-    # (a) Numbered enumeration, one document per line.
-
-    numbered = list(
-
-        re.finditer(r"^\s*\d{1,2}[\)\.]\s*(.+?)\s*$", msg, re.MULTILINE)
-
-    )
-
-    if len(numbered) >= 2:
-
-        segments = [m.group(1).strip(" ;,") for m in numbered]
-
-        segments = [s for s in segments if s]
-
-        if 2 <= len(segments) <= _BATCH_MAX_ITEMS:
-
-            return segments
-
-
-
-    # (b) Inline enumerators. Split, then require every segment to carry
-
-    #     transactional content (amount or a mutation keyword) so narrative
-
-    #     prose is never chopped into phantom transactions.
-
-    parts = re.split(
-
-        r";\s*(?:also\s+|then\s+)?"
-
-        r"|\band\s+also\s+"
-
-        r"|\balso,\s+"
-
-        r"|\bthen\s+",
-
-        msg,
-
-        flags=re.IGNORECASE,
-
-    )
-
-    parts = [p.strip(" .;,") for p in parts if p and p.strip(" .;,")]
-
-    if 2 <= len(parts) <= _BATCH_MAX_ITEMS:
-
-        transactional = re.compile(
-
-            r"rs\.?\s*\d|pkr\s*\d|\d{3,}"
-
-            r"|\b(bought|sold|paid|expense|invoice|purchase|sale|receipt|payment|bill|record|create)\b",
-
-            re.IGNORECASE,
-
-        )
-
-        if all(transactional.search(p) for p in parts):
-
-            return parts
-
-
-
-    return []
-
-
-
-
-
-def _plan_batch(
-
-    segments: List[str],
-
-    clarification_history: Optional[List[Dict[str, Any]]],
-
-    user_message: str = "",
-
-    org_preferences: Optional[Dict[str, str]] = None,
-
-) -> ExecutionPlan:
-
-    """Plan each enumerated sub-request and merge into ONE batch plan.
-
-
-
-    Extends (never forks) the existing pipeline: the merged plan reuses
-
-    the standard consolidated-clarification questionnaire (one box per
-
-    question, numbered per document so ``_explode_multi_answers`` maps
-
-    the answers back) and ONE confirmation gate covering all mutations.
-
-    Per-item entities are prefixed ``item_<n>_`` so sibling documents
-
-    never contaminate each other's values (no cross-item first-hit).
-
-
-
-    A segment fragment ("Office supplies Rs.5,000") may carry no verb on
-
-    its own - the HEADER line ("Record these 3 expenses:") declares the
-
-    transaction type, so unknown fragment intents inherit the header's
-
-    intent (genuinely generic: the header names the economic event).
-
-    """
-
-    header = ""
-
-    m = re.search(
-
-        r"^(.*?)(?=^\s*\d{1,2}[\)\.]\s)", user_message, re.MULTILINE | re.DOTALL
-
-    )
-
-    if m:
-
-        header = m.group(1).strip(" :\n\t")
-
-    header_plan = plan(header, org_preferences=org_preferences) if header else None
-
-
-
-    sub_plans: List[ExecutionPlan] = []
-
-    for seg in segments:
-
-        sub = plan(seg, clarification_history, org_preferences=org_preferences)
-
-        if (
-
-            sub.intent == "unknown"
-
-            and header_plan is not None
-
-            and header_plan.intent != "unknown"
-
-        ):
-
-            # Genuinely generic inheritance: the HEADER names the event
-
-            # ("record these 3 EXPENSES"); it is never a first-record
-
-            # fallback for accounts/parties - those still resolve per item.
-
-            sub.intent = header_plan.intent
-
-            sub.potential_tools = header_plan.potential_tools or sub.potential_tools
-
-            sub.required_context = header_plan.required_context or sub.required_context
-
-            # The sub-plan was planned as "unknown" and therefore asked
-
-            # nothing - recompute the material gaps (amount, date, ...) for
-
-            # the INHERITED intent so its questions join the merged
-
-            # questionnaire ("For document i: ...").
-
-            sub.missing_fields = _missing_fields(
-
-                sub.intent, sub.extracted_entities
-
-            )
-
-            sub.clarification_questions = _questions_for_fields(
-
-                sub.intent, sub.missing_fields, sub.extracted_entities
-
-            )
-
-            sub.requires_clarification = bool(sub.clarification_questions)
-
-            sub.requires_accounting_engine = (
-
-                sub.requires_accounting_engine
-
-                or header_plan.requires_accounting_engine
-
-            )
-
-            sub.requires_confirmation = (
-
-                sub.requires_confirmation or header_plan.requires_confirmation
-
-            )
-
-            sub.expected_outcome = header_plan.expected_outcome
-
-        sub_plans.append(sub)
-
-    merged = sub_plans[0].model_copy(deep=True)
-
-
-
-    batch_items: List[Dict[str, Any]] = []
-
-    missing: List[str] = []
-
-    questions: List[str] = []
-
-    tools: List[str] = []
-
-    context_srcs: List[str] = []
-
-    entities: Dict[str, Any] = {}
-
-    requires_confirmation = False
-
-    requires_validation = False
-
-    requires_accounting = False
-
-
-
-    for i, (seg, sub) in enumerate(zip(segments, sub_plans), start=1):
-
-        batch_items.append({
-
-            "position": i,
-
-            "segment": seg,
-
-            "intent": sub.intent,
-
-            "missing_fields": list(sub.missing_fields),
-
-            "requires_confirmation": sub.requires_confirmation,
-
-            "requires_clarification": sub.requires_clarification,
-
-        })
-
-        for f in sub.missing_fields:
-
-            key = f"item_{i}:{f}"
-
-            if key not in missing:
-
-                missing.append(key)
-
-        for q in sub.clarification_questions:
-
-            qq = f"For document {i}: {q}"
-
-            if qq not in questions:
-
-                questions.append(qq)
-
-        for t in sub.potential_tools:
-
-            if t not in tools:
-
-                tools.append(t)
-
-        for c in sub.required_context:
-
-            if c not in context_srcs:
-
-                context_srcs.append(c)
-
-        for k, v in (sub.extracted_entities or {}).items():
-
-            entities[f"item_{i}_{k}"] = v
-
-        requires_confirmation = requires_confirmation or sub.requires_confirmation
-
-        requires_validation = requires_validation or sub.requires_validation
-
-        requires_accounting = requires_accounting or sub.requires_accounting_engine
-
-
-
-    merged.batch_items = batch_items
-
-    merged.missing_fields = missing
-
-    merged.clarification_questions = questions
-
-    merged.requires_clarification = bool(questions) or any(
-
-        s.requires_clarification for s in sub_plans
-
-    )
-
-    merged.requires_confirmation = requires_confirmation
-
-    merged.requires_validation = requires_validation
-
-    merged.requires_accounting_engine = requires_accounting
-
-    merged.potential_tools = tools
-
-    merged.required_context = context_srcs
-
-    merged.extracted_entities = entities
-
-    merged.expected_outcome = (
-
-        f"Batch of {len(segments)} documents processed - one result per document "
-
-        "(a failed document never rolls back its successful siblings)"
-
-    )
-
-    return merged
-
-
-
-
-
-def plan(
-
-    user_message: str,
-
-    clarification_history: Optional[List[Dict[str, Any]]] = None,
-
-    org_preferences: Optional[Dict[str, str]] = None,
-
-    prefill_entities: Optional[Dict[str, Any]] = None,
-
-) -> ExecutionPlan:
-
-    """Analyse *user_message* (+ prior Q&A) and return an ``ExecutionPlan``.
-
-
-
-    ``clarification_history`` is a list of ``{"question": ..., "answer": ...}``
-
-    dicts from earlier clarification rounds in the same conversation.  Every
-
-    answered value is merged into the extracted entities so it is never
-
-    asked for again.
-
-
-
-    ``org_preferences`` carries learned organization-level
-
-    defaults; they are treated as answered-for entities UNLESS the user
-
-    explicitly said something different in the message or history.
-
-
-
-    ``prefill_entities`` carries grounded values produced by
-
-    the LLM entity-segregation stage. They are inserted with ``setdefault``
-
-    semantics — a value captured by regex from the message, answered in a
-
-    clarification round, or learned as an org preference always wins.
-
-    """
-
-    msg = user_message.strip()
-
-    msg_lower = msg.lower()
-
-
-
-    # 0. BATCH DETECTION: an enumerated multi-transaction
-
-    #    request is planned per sub-document and merged into ONE plan, so
-
-    #    the existing consolidated-clarification (one round for ALL gaps)
-
-    #    and ONE-confirmation machinery handle the batch unchanged.
-
-    segments = split_batch_request(user_message)
-
-    if len(segments) > 1:
-
-        return _plan_batch(
-
-            segments, clarification_history, user_message, org_preferences
-
-        )
-
-
-
-    # 1. Identify intent — LLM / SEMANTIC AUTHORITATIVE FIRST.
-    #    The LLM extraction layer perceives the business act in ERP vocabulary
-    #    ("payables for shabbir furnitures" -> supplier_balance, "create chart of account ..." -> create_account).
-    #    When the LLM yields a canonical intent, it WINS over regex patterns.
-    #    The keyword patterns stay the FALLBACK when the LLM is offline or unconfident.
-    _semantic_intent = (
-        (prefill_entities or {}).get("semantic_intent")
-        or (prefill_entities or {}).get("provisional_intent_hint")
-    )
-
-    if _semantic_intent and _semantic_intent in _SEMANTIC_INTENTS:
-        intent = _semantic_intent
-    else:
-        intent = _identify_intent(msg_lower)
-
-    payment_method = _extract_payment_method(msg_lower)
-
-    intent = _refine_intent(intent, payment_method)
-
-
-
-    # 2. Extract entities from the raw message
-
-    entities: Dict[str, Any] = _extract_entities(msg)
-
-    amount = _extract_amount(msg)
-
-    if amount is not None:
-
-        entities["amount"] = amount
-
-    if payment_method:
-
-        entities["payment_method"] = payment_method
-
-    txn_date = _extract_date(msg, msg_lower)
-
-    if txn_date:
-
-        entities["transaction_date"] = txn_date
-
-    # Report/list intents accept a relative period ("this month", "last
-
-    # quarter", …) which becomes an explicit date_from/date_to pair so the
-
-    # read-only fast path can filter deterministically ("current month"
-
-    # is normalised to "this month" by the parser).
-
-    _RANGE_INTENTS = {
-
-        "list_expenses", "generate_general_ledger",
-
-    }
-
-    if intent in _RANGE_INTENTS:
-
-        rng = resolve_date_range(msg)
-
-        if rng:
-
-            entities.setdefault("date_from", rng[0])
-
-            entities.setdefault("date_to", rng[1])
-
-    item = _extract_item(msg)
-
-    if item:
-
-        # The count in the item phrasing IS the quantity ("selling 2 ovens").
-
-        # It used to be discarded, which made the agent ask for a quantity the
-
-        # user had already given.
-
-        stated_qty = _extract_item_quantity(msg, item)
-
-        if stated_qty is not None:
-
-            # A WRITTEN count rides inside the item the extractor returned
-
-            # ("two motorbikes"), so it must come OUT of the description — the
-
-            # line is "motorbikes" x2, not "two motorbikes" x2.
-
-            clean_item, _ = _split_leading_count(item)
-
-            entities["item_description"] = clean_item or item
-
-            entities.setdefault("item_quantity", stated_qty)
-
-            entities.setdefault("quantity", stated_qty)
-
-        else:
-
-            entities["item_description"] = item
-
-    # several items stated in ONE
-
-    # request ("2 laptops at 5000 each and 3 mice at 500") are parsed into
-
-    # DISTINCT lines; the invoice total is DERIVED from them (Σ qty ×
-
-    # price) so the header can never disagree with its own lines.
-
-    if prefill_entities and prefill_entities.get("line_items"):
-        line_items = prefill_entities["line_items"]
-    else:
-        line_items = _extract_line_items(msg)
-
-    # ATTACHED DOCUMENTS: the vision-extracted block already carries the
-
-    # authoritative line-item table and supplier.  Parse it so a multi-line
-
-    # GRN/bill becomes DISTINCT lines with a DERIVED total (its own rows)
-
-    # instead of collapsing into the first line's amount - and so a supplier
-
-    # named on the document is never replaced by table furniture such as
-
-    # "line items".
-
-    if not line_items:
-
-        doc_lines, doc_supplier = _extract_document_lines(msg)
-
-        if doc_lines:
-
-            line_items = doc_lines
-
-        if doc_supplier:
-
-            existing_party = str(
-
-                entities.get("supplier_name") or ""
-
-            ).strip().lower()
-
-            if not existing_party or existing_party in _JUNK_PARTY_NAMES:
-
-                entities["supplier_name"] = doc_supplier
-
-    if line_items:
-
-        entities["line_items"] = line_items
-
-        if any(l.get("unit_price") is not None or l.get("total_amount") is not None for l in line_items):
-            _calc_tot = _line_items_total(line_items)
-            if _calc_tot > 0:
-                entities["amount"] = _calc_tot
-
-        if not entities.get("item_description"):
-
-            entities["item_description"] = " / ".join(
-
-                l["description"] for l in line_items
-
-            )
-
-    # Asset-lifecycle intents: the asset reference after "for"/"of" is the
-
-    # asset name (currency/amount shapes are explicitly excluded).
-
-    if intent in (
-
-        "register_fixed_asset", "dispose_fixed_asset",
-
-        "record_asset_depreciation",
-
-    ) and not entities.get("item_description"):
-
-        m = re.search(
-
-            r"(?:\bfor\b|\bof\b)\s+"
-
-            r"((?![Rr]s\b|PKR\b|₨|\d)[A-Za-z][\w&.-]*(?:\s+[\w&.-]+)*)\s*$",
-
-            msg, re.IGNORECASE,
-
-        )
-
-        if m:
-
-            entities["asset_name"] = m.group(1).strip()
-
-
-
-    # Project setup: the name after "called"/"named" IS the project name
-
-    # ("Set up a project called Mobile App for XYZ Client…").
-
-    if intent == "create_project" and not entities.get("project_name"):
-
-        m = re.search(
-
-            r"\b(?:called|named)\s+"
-
-            r"([A-Za-z][\w&.\-]*(?:\s+[A-Za-z][\w&.\-]*)*?)"
-
-            r"(?=\s+(?:for|with|and|at|by|budget|worth)\b|[,.!?;]|\s*$|\s+\d)",
-
-            msg,
-
-            re.IGNORECASE,
-
-        )
-
-        if m and m.group(1).strip():
-
-            entities["project_name"] = m.group(1).strip()
-
-    # Master data / Setup operational entity integration (LLM-Authoritative)
-    # The intelligent LLM perception stage (app/entity_segregation.py & app/llm_extraction.py)
-    # extracts names, counterparties, banks, employees, and accounts with full natural-language
-    # context. Quoted literals in the user message serve only as a minimal fallback.
-    if prefill_entities:
-        for _k in (
-            "account_name", "account_type", "code", "account_code",
-            "parent_account_name", "product_name", "service_name", "sales_price",
-            "bank_name", "employee_name", "project_name", "customer_name", "supplier_name",
-            "date_of_joining", "basic_salary", "invoice_number", "bill_number", "invoice_id", "bill_id"
-        ):
-            if prefill_entities.get(_k) is not None:
-                entities[_k] = prefill_entities[_k]
-
-    if intent in ("create_account", "create_customer", "create_supplier", "create_product", "create_service", "create_employee", "create_project"):
-        target_name_key = {
-            "create_account": "account_name",
-            "create_customer": "customer_name",
-            "create_supplier": "supplier_name",
-            "create_product": "product_name",
-            "create_service": "service_name",
-            "create_employee": "employee_name",
-            "create_project": "project_name",
-        }.get(intent)
-        if target_name_key and not entities.get(target_name_key):
-            q_m = re.search(r"['\"]([^'\"]+)['\"]", msg)
-            if q_m:
-                entities[target_name_key] = q_m.group(1).strip()
-            elif intent == "create_account":
-                m = re.search(r"\b(?:for|called|named)\s+([^,.!?;]+?)(?=\s+(?:under|with|code|parent|in\s+category)\b|[,.!?;]|$)", msg, re.IGNORECASE)
-                if m and m.group(1).strip().lower() not in ("chart of account", "chart of accounts", "account", "ledger"):
-                    entities["account_name"] = m.group(1).strip()
-
-
-
-    # 3. Merge answers from prior clarification rounds (never re-ask)
-
-    nature_source: Optional[str] = None
-
-    # settlement-party hygiene + extraction.  The loose
-
-    # entity extractor can fill supplier_name/customer_name with noise
-
-    # ("payment", "Rs.12"); a garbage name must never reach the party
-
-    # gate — it is dropped BEFORE the clarification merge so a real
-
-    # answered name is never blocked (R4.4).  "from <Name>" / "to <Name>"
-
-    # are the real party signals for settlements.
-
-    _PARTY_NOISE = (
-
-        "supplier", "the supplier", "vendor", "the vendor", "payment",
-
-        "customer", "the customer", "client", "party",
-
-    )
-
-    if intent == "record_payment":
-
-        name = str(entities.get("supplier_name") or "").strip()
-
-        if (
-
-            not name
-
-            or name.lower() in _PARTY_NOISE
-
-            or re.fullmatch(r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", name, re.IGNORECASE)
-
-        ):
-
-            entities.pop("supplier_name", None)
-
-        _pm = re.search(
-
-            r"\bto\s+([a-z][a-z0-9 .&'-]{1,30}?)"
-
-            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
-
-            msg_lower,
-
-        )
-
-        if _pm and not entities.get("supplier_name"):
-
-            candidate = _pm.group(1).strip()
-
-            if candidate.lower() not in _PARTY_NOISE:
-
-                entities["supplier_name"] = candidate
-
-    if intent == "record_receipt":
-
-        name = str(entities.get("customer_name") or "").strip()
-
-        if (
-
-            not name
-
-            or name.lower() in _PARTY_NOISE
-
-            or re.fullmatch(r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", name, re.IGNORECASE)
-
-        ):
-
-            entities.pop("customer_name", None)
-
-        _cm = re.search(
-
-            r"\bfrom\s+([a-z][a-z0-9 .&'-]{1,30}?)"
-
-            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
-
-            msg_lower,
-
-        )
-
-        if _cm and not entities.get("customer_name"):
-
-            candidate = _cm.group(1).strip()
-
-            if candidate.lower() not in _PARTY_NOISE:
-
-                entities["customer_name"] = candidate
-
-
-
-    # the "from X to Y" bank
-
-    # names are material for the deterministic transfer path (the trusted
-
-    # tool resolves names to ids and refuses unknown banks — accounts are
-
-    # never invented).  Extraction is best-effort; unresolved names keep
-
-    # the transfer on the model path.
-
-    if intent == "record_bank_transfer":
-
-        _tb = re.search(
-
-            r"from\s+([a-z0-9][a-z0-9 .&'-]{0,30}?)\s+to\s+"
-
-            r"([a-z0-9][a-z0-9 .&'-]{0,30}?)"
-
-            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
-
-            msg_lower,
-
-        )
-
-        if _tb:
-
-            entities.setdefault("source_bank_name", _tb.group(1).strip())
-
-            entities.setdefault(
-
-                "destination_bank_name", _tb.group(2).strip()
-
-            )
-
-
-
-    # LOAN TERM INTAKE — the record_loan contract needs its schedule terms.
-
-    # The Loans-page message enumerates them ("Narration: …", "Lender: …",
-
-    # "first repayment YYYY-MM-DD", "tenure N months", "frequency MONTHLY");
-
-    # chat states some of them.  Entity EXTRACTION only — the route itself
-
-    # stays the LLM's decision (semantic whitelist); anything still missing
-
-    # is asked in ONE consolidated round below, never assumed.
-
-    if intent == "record_loan":
-
-        _lm = re.search(r"narration\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
-
-        if _lm and not entities.get("narration"):
-
-            entities["narration"] = _lm.group(1).strip()
-
-        _lc = re.search(r"\b(?:lender|borrower)\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
-
-        if _lc and not entities.get("counterparty"):
-
-            entities["counterparty"] = _lc.group(1).strip()
-
-        _lf = re.search(
-
-            r"\bfirst\s+(?:repayment|payment)\s*(?:date\s*)?:?\s*"
-
-            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})",
-
-            msg, re.IGNORECASE,
-
-        )
-
-        if _lf and not entities.get("first_payment_date"):
-
-            _fparsed = parse_transaction_date(_lf.group(1))
-
-            entities["first_payment_date"] = (
-
-                _fparsed.iso_date if _fparsed.ok else _lf.group(1)
-
-            )
-
-        _lt = re.search(r"\btenure\s*(?:of\s*)?:?\s*(\d{1,3})\s*month", msg, re.IGNORECASE)
-
-        if _lt and not entities.get("tenure_months"):
-
-            entities["tenure_months"] = int(_lt.group(1))
-
-        _lq = re.search(
-
-            r"\bfrequency\s*(?:of\s*)?:?\s*"
-
-            r"(monthly|quarterly|semi[-_ ]?annual\w*|annually|yearly|custom)\b",
-
-            msg, re.IGNORECASE,
-
-        )
-
-        if _lq and not entities.get("frequency"):
-
-            _fq = _lq.group(1).upper().replace("-", "_").replace(" ", "_")
-
-            entities["frequency"] = "ANNUALLY" if _fq.startswith("YEAR") else _fq
-
-        # Direction from the USER'S OWN WORDS (page: "borrowed loan" /
-
-        # "loan given"; chat: "borrow loan", "we lent").  Never guessed when
-
-        # the wording does not say — it is asked below.
-
-        if not entities.get("loan_direction"):
-
-            if re.search(r"\bborrow", msg, re.IGNORECASE):
-
-                entities["loan_direction"] = "BORROWED"
-
-            elif re.search(
-
-                r"\b(?:give|gave|lend|lent)\b[^.\n]*\bloan\b|\bloan\s+given\b",
-
-                msg, re.IGNORECASE,
-
-            ):
-
-                entities["loan_direction"] = "GIVEN"
-
-        # A chat "borrow … from <party>" lands in supplier_name via the
-
-        # generic capture — the contract's parameter name is counterparty.
-
-        if not entities.get("counterparty"):
-
-            entities["counterparty"] = (
-
-                entities.get("supplier_name") or entities.get("customer_name") or None
-
-            )
-
-            if not entities["counterparty"]:
-
-                entities.pop("counterparty", None)
-
-    if intent == "get_inventory_status":
-        if re.search(r"\b(?:out\s+of\s+stock|low\s+stock|depleted)\b", msg, re.IGNORECASE):
-            entities["only_low_stock"] = True
-        _cleaned_msg = re.sub(r"[?!.,;]+$", "", msg.strip())
-        _pm = re.search(
-            r"(?:how\s+many(?:\s+units?\s+of|\s+pieces?\s+of|\s+pcs\s+of)?|"
-            r"check\s+stock\s+(?:for|of)|"
-            r"(?:stock|quantity|units?|count|balance|level)\s+(?:of|for)|"
-            r"status\s+of|any)\s+([a-zA-Z0-9_\s\-]+?)(?:\s+do\s+we\s+have|\s+in\s+stock|\s+on\s+hand|\s+available|\s+left|\?|$)",
-            _cleaned_msg,
-            re.IGNORECASE,
-        )
-        if _pm:
-            _cand = _pm.group(1).strip()
-            _cand = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", _cand, flags=re.IGNORECASE).strip()
-            if _cand.lower() not in ("items", "products", "goods", "inventory", "stock", "all", "everything"):
-                entities["product_name"] = _cand
-
-
-
-    nature_before_merge = entities.get("transaction_nature")
-
-    # Snapshot which entities a CLARIFICATION ANSWER owns, so the LLM-
-
-    # authoritative prefill below may override a regex capture but NEVER an
-
-    # explicitly answered value (an ANSWERED field outranks the model).
-
-    _pre_clarification = dict(entities)
-
-    if clarification_history:
-
-        # An explicit "SAME" reply reuses the learned value for that exact
-
-        # question (the memory hint's "reply SAME to reuse" contract) — the
-
-        # ONE way a preference may answer a field, and only on the user's
-
-        # explicit say-so.
-
-        clarification_history = _reuse_learned_answers(
-
-            clarification_history, org_preferences or {}
-
-        )
-
-        entities = _merge_clarification_answers(
-
-            entities, clarification_history, intent=intent
-
-        )
-
-        if not nature_before_merge and entities.get("transaction_nature"):
-
-            # the nature came from an explicit user answer
-
-            # to the consolidated decision tree - logged for the audit trail.
-
-            nature_source = "USER_ANSWER"
-
-        # A clarification answer may have resolved the payment treatment —
-
-        # re-specialise the generic intent so the downstream gates (required
-
-        # fields, confirmation) reflect the now-known treatment.
-
-        if intent in ("record_purchase", "record_sale") and entities.get("payment_method"):
-
-            intent = _refine_intent(intent, entities.get("payment_method"))
-
-
-
-    # The set of entities a CLARIFICATION ANSWER owns: any key whose value
-
-    # changed (or appeared) across the merge above.  The LLM-authoritative
-
-    # prefill may override a REGEX capture but never one of these.
-
-    _answered = {
-
-        k for k, v in entities.items()
-
-        if _pre_clarification.get(k) != v
-
-    }
-
-
-
-    # 2b. GROUNDED LLM PREFILL.
-
-    #     Facts segregated from the user's OWN sentence by app/semantic_layer.py
-
-    #     + app/entity_segregation.py (verbatim-grounded in Python) fill the
-
-    #     gaps BEFORE any questionnaire is computed, so fields the user
-
-    #     already stated flow to the next stages instead of being re-asked.
-
-    #     APPLICATION POINT: AFTER the clarification-answer merge and BEFORE
-
-    #     org preferences.  Precedence:
-
-    #       * LLM-AUTHORITATIVE keys (supplier_name / customer_name /
-
-    #         item_description / quantity / reason) — the model's reading
-
-    #         OVERRIDES the regex capture (which is only the fallback), so a
-
-    #         party the regex swallowed into the item still reaches the gate.
-
-    #         An ANSWERED value (_answered) still outranks the model.
-
-    #       * every other key keeps the old setdefault semantics — regex
-
-    #         wins on conflicts; an ANSWERED value is never clobbered.
-
-    _LLM_AUTHORITATIVE = {
-
-        "supplier_name", "customer_name", "item_description",
-
-        "quantity", "reason", "line_items",
-
-    }
-
-    for _pk, _pv in (prefill_entities or {}).items():
-
-        if _pv is None or _pv == "" or _pk == "semantic_intent":
-
-            continue
-
-        if _pk in ("supplier_name", "customer_name"):
-
-            # Guard: table furniture ("payment") and amount shapes ("Rs.12")
-
-            # must never reach the party gate.
-
-            _prefill_name = str(_pv).strip()
-
-            if (
-
-                not _prefill_name
-
-                or _prefill_name.lower() in _PARTY_NOISE
-
-                or re.fullmatch(
-
-                    r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?",
-
-                    _prefill_name,
-
-                    re.IGNORECASE,
-
-                )
-
-            ):
-
-                continue
-
-        if _pk == "item_quantity":
-
-            # Mirror the regex path, which fills the generic quantity alias
-
-            # alongside the item-scoped one.
-
-            if not entities.get("item_quantity"):
-
-                entities["item_quantity"] = _pv
-
-                if not entities.get("quantity"):
-
-                    entities["quantity"] = _pv
-
-            continue
-
-        # LLM-authoritative: the model's reading beats the regex capture,
-
-        # unless a clarification ANSWER owns the field.
-
-        if _pk in _LLM_AUTHORITATIVE and _pk not in _answered:
-
-            entities[_pk] = _pv
-
-            continue
-
-        if not entities.get(_pk):
-
-            if _pk == "transaction_nature":
-
-                _allowed_natures = accepted_nature_values(intent)
-
-                if _allowed_natures and str(_pv).strip().upper() not in {
-
-                    v.upper() for v in _allowed_natures
-
-                }:
-
-                    # A reading whose nature is outside this intent's family
-
-                    # is dropped, never translated: the deterministic
-
-                    # question still owns that decision.
-
-                    log.info(
-
-                        "planner.nature_prefill_rejected",
-
-                        intent=intent,
-
-                        value=str(_pv)[:40],
-
-                    )
-
-                    continue
-
-            if _pk == "transaction_purpose" and intent != "record_expense":
-
-                # The purpose-first ladder belongs to the generic expense
-
-                # path ONLY (it derives nature + description there); a
-
-                # purpose on any other route is meaningless and must never
-
-                # leak into that route's entities.
-
-                log.info(
-
-                    "planner.purpose_prefill_rejected",
-
-                    intent=intent,
-
-                    value=str(_pv)[:40],
-
-                )
-
-                continue
-
-            entities[_pk] = _pv
-
-
-
-    # 2c. NATURE FROM THE USER'S OWN WORDS (deterministic, typo-tolerant).
-
-    #     The intent family's keyword rules already existed but were only ever
-
-    #     used to interpret an ANSWER — so "Create an Invoice for 45000
-
-    #     against sale of tax services to Beta Traders" still asked "what is
-
-    #     the nature of this sale?" although the user had just said it.
-
-    #     Applying the SAME rules to the request answers it instead of
-
-    #     re-asking, and an explicit statement beats a learned preference
-
-    #     (which is why this sits BEFORE the preference block below).
-
-    if not entities.get("transaction_nature"):
-
-        _nature_text = " ".join(
-
-            str(x)
-
-            for x in (
-
-                entities.get("item_description"),
-
-                entities.get("description"),
-
-                msg,
-
-            )
-
-            if x
-
-        )
-
-        _derived_nature = derive_nature_from_text(intent, _nature_text)
-
-        if _derived_nature:
-
-            entities["transaction_nature"] = _derived_nature
-
-            # Audit trail: the nature came from the user's own wording.
-
-            nature_source = "TEXT_INFERENCE"
-
-            log.info(
-
-                "planner.nature_derived_from_text",
-
-                intent=intent,
-
-                nature=_derived_nature,
-
-            )
-
-
-
-    # 3a. ORG PREFERENCES — a learned ``transaction_nature`` is a HINT, NEVER
-
-    #     an answered entity (Fix 1 / RC-1, production 2026-10-06 sessions
-
-    #     62bc94c0 & 49775d68: the injected FIXED_ASSET preference routed
-
-    #     "shoes"/"60 shoes" into the register_fixed_asset ladder and the
-
-    #     nature question was never asked).  Nature is a per-transaction
-
-    #     user decision and is answered ONLY by
-
-    #       (a) the first LLM understanding hit (grounded prefill),
-
-    #       (b) the user's own words (TEXT_INFERENCE),
-
-    #       (c) an explicit user answer (USER_ANSWER), incl. an explicit
-
-    #       "SAME" reuse of the learned value via _reuse_learned_answers.
-
-    #     The learned value is otherwise merely OFFERED inside the question
-
-    #     through the clarification-memory hint ("previously: ... - reply
-
-    #     SAME to reuse").  It therefore never reaches the fixed-asset /
-
-    #     disposal re-route gates below (which additionally hard-block
-
-    #     nature_source == PREFERENCE as a belt-and-braces guard).
-
-    #     The payment TREATMENT is likewise a per-transaction question,
-
-    #     NEVER an assumed default — a learned payment_method stays
-
-    #     recorded for reporting only.  The transaction date is NEVER
-
-    #     defaulted — it is governed by the mandatory date protocol.
-
-    prefs = org_preferences or {}
-
-    if prefs.get("transaction_nature"):
-
-        log.info(
-
-            "planner.nature_preference_hint_only",
-
-            value=str(prefs.get("transaction_nature")),
-
-            intent=intent,
-
-        )
-
-
-
-    # 
-
-    # the org-set capitalization threshold governs when the R3.2
-
-    # question fires (small amounts auto-expense), and a learned
-
-    # capitalization decision for THIS purpose (preference key
-
-    # "capitalization:<PURPOSE>") stops the recurring re-ask.
-
-    entities.setdefault(
-
-        "capitalization_threshold",
-
-        capitalization_threshold_from_prefs(prefs),
-
-    )
-
-
-
-    # R4.12 RECEIPT PARTY HYGIENE — money-IN: the counterparty of a
-
-    # receipt is the CUSTOMER who paid, never a payee. The loose "from X"
-
-    # regex is a SUPPLIER pattern, and a supplier-kind "Party check"
-
-    # answer folded from earlier history can also land in supplier_name;
-
-    # either one reaching a supplier-side gate made "I received 60000 from
-
-    # FDS Labs Pvt" ask to create a SUPPLIER ledger while FDS Labs existed
-
-    # as a customer with an open receivable (Invoice 5). Move a genuine
-
-    # captured name across, then drop the supplier key entirely.
-
-    if intent == "record_receipt":
-
-        _payer = str(entities.get("supplier_name") or "").strip()
-
-        if (
-
-            _payer
-
-            and _payer.lower() not in _PARTY_NOISE
-
-            and not re.fullmatch(
-
-                r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", _payer, re.IGNORECASE
-
-            )
-
-        ):
-
-            entities.setdefault("customer_name", _payer)
-
-        entities.pop("supplier_name", None)
-
-
-
-    # CA-GRADE REASONING (expense path): when the message itself names a
-
-    # KNOWN expense category ("record electricity bill of 20,000"), the
-
-    # agent derives the purpose ITSELF — IFRS presentation gives every
-
-    # expense category its own line item and its own ledger — and never
-
-    # wastes a clarification round re-asking what the request already
-
-    # answered.  Only keyword-matched categories qualify; free text that
-
-    # matches no category still asks the purpose question.
-
-    if intent == "record_expense" and not entities.get("transaction_purpose"):
-
-        _cat_text = " ".join(
-
-            str(x) for x in (
-
-                entities.get("item_description"),
-
-                entities.get("description"),
-
-            ) if x
-
-        )
-
-        if _cat_text:
-
-            _derived = resolve_purpose_answer(purpose_question(), _cat_text)
-
-            _derived_opt = purpose_option(str(_derived)) if _derived else None
-
-            if _derived_opt is not None and _derived_opt.keywords:
-
-                entities["transaction_purpose"] = _derived
-
-
-
-    purpose_now = entities.get("transaction_purpose")
-
-    if (
-
-        isinstance(purpose_now, str)
-
-        and purpose_now.upper() not in ("OTHER", "OTHER_DURABLE")
-
-        and not entities.get("capitalization_decision")
-
-        and prefs.get(f"capitalization:{purpose_now.upper()}")
-
-    ):
-
-        entities["capitalization_decision"] = prefs[
-
-            f"capitalization:{purpose_now.upper()}"
-
-        ]
-
-
-
-    # the purpose answer DERIVES the transaction
-
-    # nature (before routing): ambiguous purposes follow the R3.2
-
-    # decision (CAPITALIZE -> FIXED_ASSET), everything else keeps its
-
-    # deterministic nature.  A purpose-derived nature is an explicit
-
-    # user decision for the audit trail.
-
-    purpose_now = entities.get("transaction_purpose")
-
-    if (
-
-        intent == "record_expense"
-
-        and isinstance(purpose_now, str)
-
-        and not entities.get("transaction_nature")
-
-    ):
-
-        capitalized = (
-
-            str(entities.get("capitalization_decision") or "").upper()
-
-            == "CAPITALIZE"
-
-        )
-
-        entities["transaction_nature"] = nature_for_purpose(
-
-            purpose_now, capitalized=capitalized
-
-        )
-
-        if not nature_source:
-
-            nature_source = "USER_ANSWER"
-
-
-
-    # R3.5 — description auto-fill: when the purpose was chosen from the
-
-    # option list the description is rarely needed; fill it from the
-
-    # purpose label (e.g. "Rent — August 2026") unless one was given.
-
-    purpose_now = entities.get("transaction_purpose")
-
-    if (
-
-        intent == "record_expense"
-
-        and isinstance(purpose_now, str)
-
-        and not entities.get("description")
-
-    ):
-
-        try:
-
-            when = entities.get("transaction_date") or ""
-
-            stamp = ""
-
-            if when:
-
-                d = parse_transaction_date(str(when))
-
-                if d.ok and d.date is not None:
-
-                    stamp = f" — {d.date.strftime('%B %Y')}"
-
-            entities["description"] = f"{purpose_label(purpose_now)}{stamp}"
-
-        except Exception:  # noqa: BLE001 — autofill must never break planning
-
-            entities["description"] = purpose_label(purpose_now)
-
-
-
-    # 3b. ITEM INTAKE ROUTING — the payment TREATMENT decides the
-
-    # destination (IFRS: treatment depends on the payment terms):
-
-    #   * CREDIT  -> ALWAYS the purchase-bill path: Dr account / Cr PARTY
-
-    #                PAYABLE (never a paid tool; settled later by a payment
-
-    #                entry: Dr party / Cr bank).
-
-    #   * CASH    -> the nature re-routes (capitalisable -> asset
-
-    #                registration; consumable/operating -> paid expense).
-
-    #   * UNKNOWN -> DEFER the route until the treatment is answered (an
-
-    #                unanswered treatment must never pick a paid tool).
-
-    #                Exception: the record_expense tool is by definition a
-
-    #                PAID expense, so its default treatment is cash.
-
-    # EXPENSE PAYMENT STATUS FROM THE USER'S OWN WORDS (mandate Cases A/B):
-
-    # "Paid 3000 ..." states paid-now; "we will pay it next month" / "due"
-
-    # states outstanding.  Fills an OPEN treatment only — an explicit answer
-
-    # or a settled position always wins, and silence still asks the
-
-    # settlement question (never guessed).  Payroll claims "paid … salary"
-
-    # higher up the ladder, so this runs only for record_expense.
-
-    if (
-
-        intent == "record_expense"
-
-        and not entities.get("payment_method")
-
-        and not entities.get("settlement_position")
-
-    ):
-
-        if _UNPAID_MARKERS_RE.search(msg_lower) and not _PAID_MARKERS_RE.search(
-
-            msg_lower
-
-        ):
-
-            entities["settlement_position"] = "OUTSTANDING"
-
-            entities["payment_method"] = "CREDIT"
-
-            log.info("planner.expense_settlement_from_text", position="OUTSTANDING")
-
-        elif _PAID_MARKERS_RE.search(msg_lower):
-
-            # "Paid" states paid-now, but HOW (cash vs bank) is NOT stated
-
-            # â€” the settlement question must ask explicitly.  Never derive
-
-            # payment_method from "Paid" alone.
-
-            entities["settlement_position"] = "PAID_NOW"
-
-            log.info("planner.expense_settlement_from_text", position="PAID_NOW")
-
-
-
-    nature = entities.get("transaction_nature")
-
-    payment = entities.get("payment_method")
-
-    _purchase_family = (
-
-        "record_purchase", "record_cash_purchase", "record_credit_purchase",
-
-    )
-
-    # Whether the CREDIT re-route below originates from an ORDINARY expense
-
-    # (mandate Case B) — its liability is the standing Local Vendor payable,
-
-    # never a supplier question.
-
-    _credit_from_expense = intent == "record_expense"
-
-    if (
-
-        intent == "record_expense" and payment is None
-
-        and str(entities.get("settlement_position") or "").upper()
-
-        != "SETTLE_EXISTING_PAYABLE"
-
-    ):
-
-        # CA treatment 3 guard: a settle-existing-payable answer must NOT
-
-        # default to a paid expense — the settlement path handles it.
-
-        payment = "CASH"
-
-
-
-    # A FIXED-ASSET purchase is a CAPITALIZATION, never a plain bill or
-
-    # expense — on cash OR credit.  (Before: only cash went to
-
-    # register_fixed_asset, so credit asset purchases landed as bills in an
-
-    # asset-named GL account with no asset record, no depreciation schedule
-
-    # and no disposal trail.  register_asset handles the payable itself.)
-
-    # HARD BLOCK: a PREFERENCE-sourced nature may never trigger this re-route
-
-    # (Fix 1: a learned default must not hijack the workflow — only the
-
-    # LLM's grounded reading, the user's words or an explicit user answer
-
-    # can).
-
-    if (
-
-        nature == "FIXED_ASSET"
-
-        and nature_source != "PREFERENCE"
-
-        and intent in (*_purchase_family, "record_expense", "record_credit_purchase")
-
-    ):
-
-        intent = "register_fixed_asset"
-
-        # ISSUE-1 FIX (2026-10-21): a purchase re-routed to capitalisation on
-
-        # a DERIVED nature (perception fact / text inference) — NOT an explicit
-
-        # user answer — must still pass the item-nature analyst's resale-vs-
-
-        # asset check before we commit.  When the user EXPLICITLY answered
-
-        # "FIXED ASSET" (nature_source=USER_ANSWER) the marker stays unset and
-
-        # their answer is respected with no re-ask.
-
-        if nature_source != "USER_ANSWER":
-
-            entities["asset_nature_unconfirmed"] = True
-
-        if not entities.get("asset_name") and entities.get("item_description"):
-
-            entities["asset_name"] = entities["item_description"]
-
-    elif payment == "CREDIT" and intent in (
-
-        "record_purchase", "record_cash_purchase", "record_expense",
-
-    ) and (
-
-        # An ORDINARY expense may only join the bill path once its nature is
-
-        # resolved (the purpose ladder runs under record_expense first) —
-
-        # re-routing earlier would swap the purpose question for the
-
-        # purchase-item nature menu (the exact misroute the mandate bans).
-
-        intent != "record_expense" or nature
-
-    ):
-
-        intent = "record_credit_purchase"
-
-        if _credit_from_expense and not entities.get("supplier_name"):
-
-            # Mandate Case B: an unpaid ordinary expense posts the liability
-
-            # WITHOUT a supplier question — the standing "Local Vendor"
-
-            # payable (the merge vocabulary's one-off party account, reused
-
-            # and created on first use) carries it; a NAMED provider stays
-
-            # captured as descriptive info.  Never a new dedicated ledger.
-
-            entities["supplier_name"] = "Local Vendor"
-
-    elif (
-
-        nature in ("OPERATING_EXPENSE", "CONSUMABLE") and payment == "CASH"
-
-        and intent in _purchase_family
-
-    ):
-
-        intent = "record_expense"
-
-
-
-    # a sale answered FIXED ASSET DISPOSAL is never a
-
-    # revenue sale - it re-routes to the asset-disposal lifecycle (gain/
-
-    # loss journal), with the named item becoming the asset reference.
-
-    if entities.get("transaction_nature") == "ASSET_DISPOSAL" and intent in (
-
-        "record_sale", "record_cash_sale", "record_credit_sale", "create_invoice",
-
-    ):
-
-        intent = "dispose_fixed_asset"
-
-        if not entities.get("asset_name") and entities.get("item_description"):
-
-            entities["asset_name"] = entities["item_description"]
-
-
-
-    # 3c. WORK STREAM A - MANDATORY TRANSACTION-DATE PROTOCOL: validate the
-
-    #     extracted/answered date through the deterministic parser (the LLM
-
-    #     never parses dates).  A date that fails validation is RECOVERED
-
-    #     from the user's own words before it is ever dropped: "yesterday",
-
-    #     "2 days ago", "26 sep", "26/09" etc. resolve through the free-text
-
-    #     resolver, so the standardized date question only exists when the
-
-    #     user truly never stated a date.  (An invalid date — a typo, or a
-
-    #     date fabricated by the semantic prefill — used to be popped and
-
-    #     the user was asked for a date they had already given.)
-
-    raw_date = entities.get("transaction_date")
-
-    if raw_date:
-
-        parsed = parse_transaction_date(str(raw_date))
-
-        if parsed.ok:
-
-            entities["transaction_date"] = parsed.iso_date
-
-        else:
-
-            recovered = resolve_relative_date_text(msg)
-
-            if recovered and recovered.ok:
-
-                entities["transaction_date"] = recovered.iso_date
-
-                log.info(
-
-                    "planner.transaction_date_recovered",
-
-                    raw=str(raw_date)[:64],
-
-                    recovered=recovered.iso_date,
-
-                    matched=recovered.matched_format,
-
-                )
-
-            else:
-
-                entities.pop("transaction_date", None)
-
-                log.info(
-
-                    "planner.transaction_date_invalid",
-
-                    raw=str(raw_date)[:64],
-
-                    error=parsed.error,
-
-                )
-
-    if not entities.get("transaction_date"):
-
-        # Nothing extracted/answered: the message itself may still carry a
-
-        # relative phrase ("on credit 2 days ago") the extractor missed.
-
-        recovered = resolve_relative_date_text(msg)
-
-        if recovered and recovered.ok:
-
-            entities["transaction_date"] = recovered.iso_date
-
-            log.info(
-
-                "planner.transaction_date_resolved_from_text",
-
-                date=recovered.iso_date,
-
-                matched=recovered.matched_format,
-
-            )
-
-
-
-    # 4. Determine requirements
-
-    requires_validation = intent not in (
-
-        "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
-
-        "generate_cash_flow", "generate_general_ledger", "customer_balance",
-
-        "supplier_balance", "project_profitability", "generate_customer_ledger",
-
-        "generate_supplier_ledger",
-
-    )
-
-    requires_accounting = intent in _TRANSACTION_INTENTS
-
-    requires_confirmation = intent in _CONFIRMATION_INTENTS
-
-
-
-    # 5. ECONOMIC EVENT CLASSIFICATION — BEFORE tool selection.
-
-    #    Determine what real-world event this request represents and which
-
-    #    ERP dimensions it can affect.  Tools are then selected for the
-
-    #    EVENT, not for the CRUD keyword.
-
-    from app.reasoning import build_event_profile
-
-
-
-    event_profile = build_event_profile(intent)
-
-
-
-    # 6. Determine tools + context sources
-
-    tools = _tools_for_intent(intent)
-
-    # EXECUTION-AGENT LOOP: a USER-CONFIRMED account creation must be
-
-    # offerable/plannable for EVERY intent — the shortlist may never narrow
-
-    # below a planner-listed tool (create_account then executes FIRST via
-
-    # the executor's tool-order guard).
-
-    if entities.get("create_account") and "create_account" not in tools:
-
-        tools = [*tools, "create_account"]
-
-    context = _context_for_intent(intent)
-
-
-
-    # 6. Clarification — DYNAMIC, MINIMAL and CONSOLIDATED:
-
-    #    only genuinely-missing material info, gathered into ONE
-
-    #    questionnaire (every independent gap in a single round — no
-
-    #    drip-feeding one question per turn).  The grounded LLM prefill
-
-    #    (step 2b) has already filled everything the user actually stated,
-
-    #    so the questionnaire below contains ONLY genuine gaps.
-
-    missing_fields = _missing_fields(intent, entities)
-
-    clarification_qs = _questions_for_fields(intent, missing_fields, entities)
-
-    clarification_needed = bool(clarification_qs)
-
-
-
-    plan_obj = ExecutionPlan(
-
-        intent=intent,
-
-        entity_type=_entity_type(intent),
-
-        entity_name=(
-
-            entities.get("customer_name")
-
-            or entities.get("supplier_name")
-
-            or entities.get("project_name")
-
-        ),
-
-        required_context=context,
-
-        potential_tools=tools,
-
-        requires_validation=requires_validation,
-
-        requires_accounting_engine=requires_accounting,
-
-        requires_confirmation=requires_confirmation,
-
-        requires_clarification=clarification_needed,
-
-        clarification_questions=clarification_qs,
-
-        missing_fields=missing_fields,
-
-        expected_outcome=_outcome(intent),
-
-        extracted_entities=entities,
-
-        transaction_nature=entities.get("transaction_nature"),
-
-        transaction_nature_source=nature_source,
-
-        economic_event=event_profile.event.value,
-
-        impact_map=dict(event_profile.affected),
-
-        prohibited_actions=[p.as_dict() for p in event_profile.prohibited],
-
-    )
-
-
-
-    log.info(
-
-        "planner.result",
-
-        intent=intent,
-
-        entity_name=plan_obj.entity_name,
-
-        amount=entities.get("amount"),
-
-        tools=tools,
-
-        clarification=clarification_needed,
-
-    )
-
-    return plan_obj
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Clarification gating — the anti-loop core
-
-# ---------------------------------------------------------------------------
-
-
-
-# Field names that are material enough to clarify, mapped to the question
-
-# asked for them.  A field appears here ONLY if no extraction pattern found
-
-# it anywhere in the request (including prior clarification answers, which
-
-# the Planner merges into the entity set before this runs).
-
-_FIELD_QUESTION = {
-
-    "amount": "What is the transaction amount?",
-
-    "supplier_name": (
-
-        "Who is the supplier? If this is a one-off purchase from a local "
-
-        "vendor, reply LOCAL VENDOR and it will be recorded against a "
-
-        "'Local Vendor' account (created automatically if it does not "
-
-        "exist yet)."
-
-    ),
-
-    "customer_name": "Who is the customer?",
-
-    # Loan contract fields (record_loan): asked in ONE consolidated round
-
-    # when the request genuinely omits them; the Loans-page message never
-
-    # does (its terms are extracted, not asked).
-
-    "loan_direction": (
-
-        "Is this loan BORROWED (money received by the business) or GIVEN "
-
-        "(money lent out)? Reply BORROWED or GIVEN."
-
-    ),
-
-    "counterparty": (
-
-        "Who is the counterparty of this loan (the lender for a borrowing, "
-
-        "the borrower for a lending)?"
-
-    ),
-
-    "first_payment_date": (
-
-        "What is the FIRST REPAYMENT date? Reply the date as YYYY-MM-DD or "
-
-        "DD/MM/YYYY (for example 2026-11-14)."
-
-    ),
-
-    "tenure_months": (
-
-        "Over how many MONTHS is this loan repaid (the tenure)? Reply with "
-
-        "just the number, e.g. 36."
-
-    ),
-
-    "frequency": (
-
-        "How often are the repayments? Reply MONTHLY, QUARTERLY, "
-
-        "SEMI_ANNUAL or ANNUALLY."
-
-    ),
-
-    # invoice LINE-DETAIL.  The manual invoice form
-
-    # mandates a line item (description + quantity); the AI path must ask
-
-    # for both in the SAME consolidated round instead of silently
-
-    # defaulting "Goods" x1.  Quantity is asked against the KNOWN total so
-
-    # the unit price is derived, not guessed.
-
-    "item_description": (
-
-        "What item or service is being invoiced? (description for the "
-
-        "invoice line — e.g. 'Web development services', 'HP laptops')"
-
-    ),
-
-    "quantity": (
-
-        "How many units are you invoicing? (quantity — reply with just "
-
-        "the number; the line total you gave is divided across the units)"
-
-    ),
-
-    "payment_type": "Was this paid in cash or on credit?",
-
-    "asset_name": "Which asset is this about (asset name or code)?",
-
-    # the standardized date question (exact shape per the
-
-    # protocol): joined to the consolidated questionnaire, never a
-
-    # standalone round.
-
-    "transaction_date": (
-
-        "What is the transaction date? Reply TODAY, or the date as "
-
-        "YYYY-MM-DD or DD/MM/YYYY (for example 2026-09-04 or 04/09/2026)."
-
-    ),
-
-    # Asset-acquisition policy — text lives in app/questionnaire.py (ONE
-
-    # bank for every consumer: the planner, the questionnaire renderer and
-
-    # the LLM phrasing prompt all read the same strings).
-
-    "useful_life_years": QUESTION_BANK["useful_life_years"].question,
-
-    "depreciation_method": QUESTION_BANK["depreciation_method"].question,
-
-    "salvage_value": QUESTION_BANK["salvage_value"].question,
-
-    # Master data / Setup and Operational field questions
-    "account_name": "What is the name of the new account you want to create in the Chart of Accounts?",
-    "account_type": (
-        "What type of account is this in the Chart of Accounts? "
-        "Reply with ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE."
-    ),
-    "account_code": (
-        "What account code should be assigned? (Or reply AUTO to automatically "
-        "assign the next available code in this category)."
-    ),
-    "product_name": "What is the name of the product you want to add to the catalogue?",
-    "service_name": "What is the name of the service you want to add to the catalogue?",
-    "sales_price": "What is the selling / sales price for this item?",
-    "bank_name": "What is the name of the bank (e.g. Meezan Bank, HBL, Standard Chartered)?",
-    "employee_name": "What is the full name of the employee to register?",
-    "date_of_joining": "What is the employee's date of joining? Reply with the date (e.g. YYYY-MM-DD or DD/MM/YYYY) or TODAY.",
-    "basic_salary": "What is the employee's basic monthly salary (amount)?",
-    "project_name": "What is the name of the project to set up?",
-}
-
-
-
-
-
-def _questions_for_fields(
-
-    intent: str,
-
-    fields: List[str],
-
-    entities: Optional[Dict[str, Any]] = None,
-
-) -> List[str]:
-
-    """Per-field question text for the consolidated questionnaire.
-
-
-
-    The nature/purpose question is FAMILY-SPECIFIC: the
-
-    question for a purchase (fixed asset vs inventory vs consumable vs
-
-    service) differs from a sale, expense, settlement, return or
-
-    quotation.  the generic expense path asks the
-
-    PURPOSE question (what is it actually for?), the CONDITIONAL
-
-    capitalization question and the settlement question instead of the
-
-    4-way nature tree.  Every other field uses its standard
-
-    `_FIELD_QUESTION` text.
-
-    """
-
-    ents = entities or {}
-
-    questions: List[str] = []
-
-    for f in fields:
-
-        if f == "transaction_nature":
-
-            questions.append(
-
-                nature_question_for_intent(intent) or NATURE_DECISION_QUESTION
-
-            )
-
-        elif f == "transaction_purpose":
-
-            questions.append(purpose_question())
-
-        elif f == "capitalization_decision":
-
-            questions.append(
-
-                capitalization_question_for(str(ents.get("transaction_purpose") or ""))
-
-            )
-
-        elif f == "settlement_position":
-
-            questions.append(SETTLEMENT_POSITION_QUESTION)
-
-        elif f == "payment_type" and (
-            intent in ("record_receipt", "record_payment")
-            or (
-                intent == "record_expense"
-                and str(ents.get("settlement_position") or "").upper()
-                in ("SETTLE_EXISTING_PAYABLE", "PAID_NOW")
-            )
-        ):
-
-            # the settlement CHANNEL decides which
-
-            # ledger the money hits (cash vs bank), so it is asked.
-
-            if intent == "record_receipt":
-
-                questions.append(
-
-                    "Was this received in cash, or through the bank? "
-
-                    "Reply CASH or BANK."
-
-                )
-
-            else:
-
-                questions.append(
-
-                    "Was this paid in cash, or through the bank? "
-
-                    "Reply CASH or BANK."
-
-                )
-
-        elif f == "transaction_date" and intent == "record_expense":
-
-            # R3.3: the underlying EVENT date, never the payment date.
-
-            questions.append(EXPENSE_EVENT_DATE_QUESTION)
-
-        elif f == "amount":
-            _l_items = ents.get("line_items")
-            if isinstance(_l_items, list) and len(_l_items) >= 2:
-                _desc_parts = []
-                for _it in _l_items:
-                    _q = _it.get("quantity")
-                    _q_str = str(int(_q)) if isinstance(_q, (int, float)) and float(_q).is_integer() else str(_q or '')
-                    _desc_parts.append(f"{_q_str} {_it.get('description', '')}".strip())
-                _items_desc = " and ".join(_desc_parts)
-                _supp = ents.get("supplier_name")
-                _supp_str = f" from {_supp}" if _supp else ""
-                _ex0 = _l_items[0].get('description', 'item 1')
-                _ex1 = _l_items[1].get('description', 'item 2')
-                questions.append(
-                    f"What is the price or total for the {_items_desc}{_supp_str}? (e.g. {_ex0}: Rs. 10,000 each or total; {_ex1}: Rs. 3,000 each or total)"
-                )
-            else:
-                questions.append(_FIELD_QUESTION[f])
-        elif f == "account_name" and intent == "create_bank_account":
-            questions.append("What is the account title or name for this bank account (e.g. Current Account, Operations)?")
-        else:
-            questions.append(_FIELD_QUESTION[f])
-
-    return questions
-
-
-
-
-
-def intent_for_message(user_message: str) -> str:
-
-    """The planner's own intent reading (public, for the understanding gate)."""
-
-    return _identify_intent((user_message or "").lower())
-
-
-
-
-
-def text_understanding_gaps(user_message: str) -> List[str]:
-
-    """Material fields the WORDS of *user_message* do not decide.
-
-
-
-    Pure and cheap (regex only).  ``[]`` means the deterministic pipeline
-
-    already read everything the request says, so the bounded understanding
-
-    call is NOT made at all — the call exists for wording it cannot read,
-
-    never as a toll on every turn.
-
-
-
-    INTENT UNKNOWN: the keyword ladder could not classify a material
-
-    recording request (Fix 4 — the loans case: "borrow loan from MCB of
-
-    300000" matched nothing, so no LLM was ever consulted and the run died
-
-    in the generic loop).  Such a request now opens the FIRST LLM HIT, which
-
-    classifies the nature AND delegates the route through the
-
-    ``_SEMANTIC_INTENTS`` whitelist — the Python ladder never invents a
-
-    route for it.  Report-shaped wording is excluded: a read must not cost
-
-    a call or risk a mutation route.
-
-    """
-
-    intent = intent_for_message(user_message)
-
-    if not intent or intent == "unknown":
-
-        msg = user_message or ""
-
-        # A MATERIAL MONEY-MOVEMENT phrase overrides the read gate.  "give a
-
-        # loan" / "lend money" / "advance funds" contain a report verb ("give")
-
-        # but are unambiguously mutations — and record_loan is reachable ONLY
-
-        # via this first LLM hit (the ladder carries no loan vocabulary by
-
-        # design).  Reading them as reports starved the call and dead-ended
-
-        # the request.  "give me the loan balance" still reads as a report
-
-        # (no lend/money movement verb), so reads never spend the call.
-
-        if _REPORT_HINT_RE.search(msg) and not _MUTATION_OVERRIDE_RE.search(msg):
-
-            return []
-
-        if _extract_amount(msg) is not None or _RECORDING_HINT_RE.search(msg):
-
-            return ["transaction_nature"]
-
-        return []
-
-    gaps: List[str] = []
-
-    if nature_family_for_intent(intent) and not derive_nature_from_text(
-
-        intent, user_message
-
-    ):
-
-        gaps.append("transaction_nature")
-
-    if intent in _ITEM_REQUIRED_INTENTS:
-
-        item = _extract_item(user_message)
-
-        if not item:
-
-            gaps.append("item_description")
-
-        elif (
-
-            _extract_item_quantity(user_message, item) is None
-
-            and _COUNT_WORD_HINT_RE.search(user_message)
-
-        ):
-
-            # The user DID state a count, in wording the deterministic reader
-
-            # could not take ("twenty-five bikes", "half a dozen").  Ask the
-
-            # understanding call rather than questioning the user about a
-
-            # number they have just given — this is the wording the call exists
-
-            # for, and without this gap it was never made.
-
-            gaps.append("quantity")
-
-    return gaps
-
-
-
-
-
-_ITEM_REQUIRED_INTENTS = frozenset({
-
-    "create_invoice", "record_sale", "record_cash_sale", "record_credit_sale",
-
-    "record_purchase", "record_cash_purchase", "record_credit_purchase",
-
-    "create_quotation",
-
-})
-
-
-
-# Read-shaped wording: a report/list request never triggers the first LLM
-
-# hit (cost control + a read can never be delegated to a mutation route).
-
-_REPORT_HINT_RE = re.compile(
-
-    r"(?:^|\s)(?:show|list|give|provide|tell|view|display|details?|summary|"
-
-    r"summar\w*|breakdown|report|what|which|who|when|where|how\s+much|"
-
-    r"balance|history)\b",
-
-    re.IGNORECASE,
-
-)
-
-
-
-# Recording-shaped wording for an UNCLASSIFIED request: enough to justify
-
-# the first LLM hit (which owns nature + route).  This gate only decides
-
-# WHETHER to spend the call — never WHERE the request routes; the LLM's
-
-# whitelisted identification decides that.
-
-_RECORDING_HINT_RE = re.compile(
-
-    r"\b(?:record|log|book|create|add|register|enter|pay|paid|pay(?:ing|ment)s?|"
-
-    r"receiv\w*|borrow\w*|lend\w*|lent|repay\w*|repayment|settle\w*|transfer|"
-
-    r"buy|bought|purchas\w*|sold|sell|selling|spent|spend|deposit|withdraw\w*|"
-
-    r"disburse\w*|invest\w*|owe|owed)\b",
-
-    re.IGNORECASE,
-
-)
-
-
-
-# A money-movement phrase that can never be a report, even though it contains
-
-# a report-shaped verb ("give").  Present only for genuine mutations: giving/
-
-# lending/advancing/granting a loan or money, or repaying.  A read like "give
-
-# me the loan balance" has no lend/money/repay verb, so it stays a report and
-
-# never spends the first LLM hit.
-
-_MUTATION_OVERRIDE_RE = re.compile(
-
-    r"\b(?:give|gave|grant|granted|lend|lent|advance|advanced|float|disburse)"
-
-    r"[^.!?\n]{0,40}?\b(?:loan|loans|money|funds|cash|advance|principal|amount)"
-
-    r"\b|\b(?:repay\w*|repayment)\b",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-def human_questions_for_missing(
-
-    intent: str,
-
-    fields: Optional[List[str]],
-
-    entities: Optional[Dict[str, Any]] = None,
-
-    *,
-
-    limit: int = 3,
-
-) -> List[str]:
-
-    """Human question text for the missing fields — never raw field names.
-
-
-
-    The plan-incomplete card used to print ``useful_life_years,
-
-    depreciation_method, salvage_value`` verbatim, which told the user nothing
-
-    about what to type.  This reuses the questionnaire's own question bank
-
-    (the text the user sees everywhere else) and caps the list so the card
-
-    stays readable; the caller reports how many were left out.
-
-    """
-
-    wanted = [str(f) for f in (fields or []) if f]
-
-    if not wanted:
-
-        return []
-
-    return _questions_for_fields(intent, wanted[: max(1, limit)], entities or {})
-
-
-
-
-
-def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
-
-    """Return the material fields genuinely missing for *intent*.
-
-
-
-    Rules (single source of truth for clarification):
-
-    * Nature/purpose comes FIRST: for EVERY intent that
-
-      creates, moves or classifies value the nature (fixed asset vs
-
-      inventory vs consumable vs expense vs settlement) is a user decision
-
-      - never guessed, never suppressed by other missing fields.  A learned
-
-      ``transaction_nature`` preference (or an explicit answer merged into
-
-      *entities*) answers it.
-
-    * Amount is only missing when NO extraction pattern found it anywhere
-
-      (including prior clarification answers merged into *entities*).
-
-    * Supplier is only required for credit purchases (a cash purchase
-
-      does not need a named supplier).
-
-    * Customer is only required for credit sales / invoices.
-
-    * Cash-vs-credit treatment changes the accounting entries (payable vs
-
-      immediate payment), so when NO payment keyword was found anywhere it
-
-      is material and MUST be asked — never guessed.
-
-    * Ordering is dependency-first: nature/purpose ->
-
-      cash-vs-credit -> party/asset reference -> amount -> transaction
-
-      date.
-
-    """
-
-    missing: List[str] = []
-
-
-
-    # 
-
-    #   1. PURPOSE (what is it actually for?) replaces the 4-way nature
-
-    #      tree for record_expense — the purpose answer DERIVES the nature.
-
-    #   2. CAPITALIZE-OR-EXPENSE — only when the purpose is ambiguous
-
-    #      (repairs / software / durable free text) AND the amount is at
-
-    #      or above the org's capitalization threshold (small amounts
-
-    #      auto-expense; never asked below it).
-
-    #   3. SETTLEMENT — paid now (cash/bank) vs outstanding vs prepaid;
-
-    #      the answer fills payment_method, so the step-3b routing and
-
-    #      the party gate see a normal treatment.
-
-    if intent == "record_expense":
-
-        if not entities.get("transaction_purpose"):
-
-            missing.append("transaction_purpose")
-
-        else:
-
-            needs_cap = purpose_requires_capitalization_question(
-
-                str(entities["transaction_purpose"]),
-
-                str(entities.get("item_description") or entities.get("description") or ""),
-
-                entities.get("amount"),
-
-                entities.get("capitalization_threshold")
-
-                if entities.get("capitalization_threshold") is not None
-
-                else capitalization_threshold_from_prefs(None),
-
-            )
-
-            if needs_cap and not entities.get("capitalization_decision"):
-
-                missing.append("capitalization_decision")
-
-        if not entities.get("payment_method"):
-            if (
-                str(entities.get("settlement_position") or "").upper()
-                in ("SETTLE_EXISTING_PAYABLE", "PAID_NOW")
-            ):
-                # The treatment is known (paid now / settle a payable) — only the
-                # settlement CHANNEL (cash vs bank ledger) is open.
-                missing.append("payment_type")
-            else:
-                missing.append("settlement_position")
-
-
-
-    # it
-
-    # re-routes the intent (fixed asset -> registration, consumable ->
-
-    # expense, disposal -> asset disposal) and the treatment.  The
-
-    # generic expense path is covered by the R3 ladder above (purpose
-
-    # derives the nature) — never ask both.
-
-    if (
-
-        intent != "record_expense"
-
-        and nature_family_for_intent(intent)
-
-        and not entities.get("transaction_nature")
-
-    ):
-
-        missing.append("transaction_nature")
-
-
-
-    if intent in ("record_purchase", "record_sale") and not entities.get("payment_method"):
-
-        # Generic intent means no payment keyword was found anywhere —
-
-        # the cash/credit treatment is genuinely unknown.
-
-        missing.append("payment_type")
-
-
-
-    # the settlement CHANNEL
-
-    # (cash vs bank) is ASKED, never defaulted — it decides which ledger
-
-    # the money hits (R4.1: cash ledger is separate from the bank
-
-    # ledger).  The PARTY is a NEXT-STAGE question: it is only material
-
-    # when the business operation is an invoice/bill SETTLEMENT (whose
-
-    # receivable/payable is being settled?) — an advance or loan does
-
-    # not name a customer/supplier up front.
-
-    if (
-
-        intent == "record_receipt"
-
-        and str(entities.get("transaction_nature") or "").upper() == "ALLOCATION"
-
-        and not entities.get("customer_name")
-
-    ):
-
-        missing.append("customer_name")
-
-    if (
-
-        intent == "record_payment"
-
-        and str(entities.get("transaction_nature") or "").upper() == "ALLOCATION"
-
-        and not entities.get("supplier_name")
-
-    ):
-
-        missing.append("supplier_name")
-
-    if intent in ("record_receipt", "record_payment") and not entities.get("payment_method"):
-
-        missing.append("payment_type")
-
-
-
-    if intent == "record_credit_purchase" and not entities.get("supplier_name"):
-
-        missing.append("supplier_name")
-
-
-
-    if intent in ("record_credit_sale", "create_invoice") and not entities.get("customer_name"):
-
-        missing.append("customer_name")
-
-
-
-    # 
-
-    # the description and quantity are MATERIAL for invoices (parity law:
-
-    # the manual form mandates a line item), so both are asked in the
-
-    # same consolidated round — after the party, before amount/date —
-
-    # and NEVER silently defaulted ("Goods" x1 was the old behaviour).
-
-    # R4.10: when DISTINCT lines were already parsed from the request
-
-    # (multi-item phrasing) the singular questions are suppressed —
-
-    # every line already carries its own description/quantity/price.
-
-    if intent in ("create_invoice", "record_credit_sale"):
-
-        if not entities.get("line_items"):
-
-            if not (
-
-                entities.get("item_description") or entities.get("description")
-
-            ):
-
-                missing.append("item_description")
-
-            if entities.get("quantity") is None:
-
-                missing.append("quantity")
-
-
-
-    # Asset lifecycle: the asset reference is material (which asset?), and
-
-    # an asset acquisition without any payment keyword cannot assume
-
-    # cash-vs-credit — the journal differs (payable vs immediate payment).
-
-    if intent in (
-
-        "register_fixed_asset", "dispose_fixed_asset",
-
-        "record_asset_depreciation",
-
-    ) and not (
-
-        entities.get("item_description") or entities.get("asset_name")
-
-    ):
-
-        missing.append("asset_name")
-
-
-
-    if intent == "register_fixed_asset" and not entities.get("payment_method"):
-
-        missing.append("payment_type")
-
-
-
-    if intent == "create_project" and not entities.get("project_name"):
-
-        # The project CODE is deliberately NOT asked: projects.project_code is
-
-        # NOT NULL, yet no natural-language request names one — the repository
-
-        # derives <STEM>-### when it is absent.
-
-        missing.append("project_name")
-
-    # Master data / Setup tasks: Anti-Blind-Assumption Guard
-    if intent == "create_account":
-        if not (entities.get("account_name") or entities.get("name")):
-            missing.append("account_name")
-        if not entities.get("account_type"):
-            missing.append("account_type")
-
-    if intent == "create_customer" and not (entities.get("customer_name") or entities.get("name")):
-        missing.append("customer_name")
-
-    if intent == "create_supplier" and not (entities.get("supplier_name") or entities.get("name")):
-        missing.append("supplier_name")
-
-    if intent == "create_product":
-        if not (entities.get("product_name") or entities.get("name")):
-            missing.append("product_name")
-        if entities.get("sales_price") is None and entities.get("unit_price") is None:
-            missing.append("sales_price")
-
-    if intent == "create_service":
-        if not (entities.get("service_name") or entities.get("name")):
-            missing.append("service_name")
-        if entities.get("sales_price") is None and entities.get("standard_rate") is None:
-            missing.append("sales_price")
-
-    if intent == "create_bank_account":
-        if not entities.get("bank_name"):
-            missing.append("bank_name")
-        if not (entities.get("account_name") or entities.get("name")):
-            missing.append("account_name")
-
-    if intent == "create_employee":
-        if not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
-            missing.append("employee_name")
-        if not (entities.get("date_of_joining") or entities.get("joining_date")):
-            missing.append("date_of_joining")
-        if entities.get("basic_salary") is None and entities.get("salary") is None:
-            missing.append("basic_salary")
-
-    if intent in ("supplier_balance", "generate_supplier_ledger") and not (entities.get("supplier_name") or entities.get("name")):
-        missing.append("supplier_name")
-
-    if intent in ("customer_balance", "generate_customer_ledger") and not (entities.get("customer_name") or entities.get("name")):
-        missing.append("customer_name")
-
-
-
-    # ASSET-ACQUISITION POLICY (never guessed): a capitalised asset needs a
-
-    # depreciation policy — useful life, method and (optionally) salvage —
-
-    # or an explicit "no schedule" decision.  A registered asset with no
-
-    # policy is undisposable later (its book value can never be corrected),
-
-    # which is why this is material rather than optional.
-
-    #
-
-    # ALL THREE are asked in ONE round (the whole point of the consolidated
-
-    # questionnaire): the old ladder asked life, then — after the answer —
-
-    # method, then salvage, so a single acquisition cost three clarifying
-
-    # turns.  The answers arrive together (the questionnaire is field-tagged),
-
-    # and answering "none" to any of them records the DECLINE, which settles
-
-    # the trio at once.
-
-    if intent == "register_fixed_asset":
-
-        declined = bool(entities.get("depreciation_declined"))
-
-        if not declined:
-
-            if entities.get("useful_life_years") is None:
-
-                missing.append("useful_life_years")
-
-            if not str(entities.get("depreciation_method") or ""):
-
-                missing.append("depreciation_method")
-
-            if entities.get("salvage_value") is None:
-
-                missing.append("salvage_value")
-
-
-
-
-
-    if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
-
-        missing.append("amount")
-
-
-
-    # LOAN CONTRACT FLOOR (record_loan): the schedule terms have no defaults
-
-    # — they are material inputs of the record_loan tool, asked in ONE
-
-    # consolidated round and merged back by field tag.  The Loans-page
-
-    # message states all of them (extracted above), so the page flow is
-
-    # never re-asked; a chat request asks only what it genuinely omitted.
-
-    # This is what removed the "lookup-only plan → dead-end card" loop for
-
-    # loans: the model receives a COMPLETE request on the next turn.
-
-    if intent == "record_loan":
-
-        for _loan_field in (
-
-            "loan_direction", "counterparty",
-
-            "first_payment_date", "tenure_months", "frequency",
-
-        ):
-
-            if not entities.get(_loan_field):
-
-                missing.append(_loan_field)
-
-
-
-    # the transaction date is material for EVERY mutation -
-
-    # an absent or unparseable date is asked (never silently defaulted).
-
-    if intent in DATE_REQUIRED_INTENTS and not entities.get("transaction_date"):
-
-        missing.append("transaction_date")
-
-
-
-    return missing
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Multi-question answer splitting — the consolidated questionnaire may be
-
-# answered in ONE message ("1) cash 2) 150,000" or "cash, 150000").  Each
-
-# part must be routed to ITS OWN question, or the second answer is lost and
-
-# the same question would be asked again.
-
-# ---------------------------------------------------------------------------
-
-
-
-_NUMBERED_Q_LINE = re.compile(r"^\s*\d+[.)]\s*(.+)$", re.MULTILINE)
-
-
-
-
-
-def _split_numbered_questions(text: str) -> List[str]:
-
-    """Return the individual questions of a numbered questionnaire."""
-
-    return [m.strip() for m in _NUMBERED_Q_LINE.findall(text or "")]
-
-
-
-
-
-def _split_answer_parts(answer: str) -> List[str]:
-
-    """Split a user reply into one part per answered question.
-
-
-
-    Handles "1) cash 2) 150000", newline-separated answers and
-
-    comma/and-separated answers.  Digit-grouping commas ("2,000") are
-
-    NEVER treated as separators.
-
-    """
-
-    text = (answer or "").strip()
-
-    if not text:
-
-        return []
-
-    # Numbered parts ("1) cash 2) yes" / "1. cash\n2. yes")
-
-    if re.search(r"(?:^|\s)1\s*[.)]\s*\S", text):
-
-        parts = [
-
-            p.strip(" ,;")
-
-            for p in re.split(r"\s*\d+\s*[.)]\s*", text)
-
-            if p.strip(" ,;")
-
-        ]
-
-        if len(parts) >= 2:
-
-            return parts
-
-    # Newline-separated parts
-
-    if "\n" in text:
-
-        parts = [p.strip(" ,;") for p in text.splitlines() if p.strip(" ,;")]
-
-        if len(parts) >= 2:
-
-            return parts
-
-    # Comma / "and" separated parts ("cash, 150000" / "cash and 150000")
-
-    segments = re.split(r",(?!\d)\s*|\s+and\s+", text)
-
-    parts = [p.strip(" ,;") for p in segments if p.strip(" ,;")]
-
-    return parts if len(parts) >= 2 else [text]
-
-
-
-
-
-def _explode_multi_answers(
-
-    qa_history: List[Dict[str, str]],
-
-) -> List[Dict[str, str]]:
-
-    """Pair each part of a multi-question answer with its own question.
-
-
-
-    A consolidated questionnaire ("...:\n1. Q1\n2. Q2") answered in one
-
-    line ("a, b" / "1) a 2) b") becomes two (question, answer) pairs so
-
-    the existing per-field matching resolves BOTH answers.
-
-    """
-
-    exploded: List[Dict[str, str]] = []
-
-    for qa in qa_history or []:
-
-        question = qa.get("question") or ""
-
-        answer = (qa.get("answer") or "").strip()
-
-        if not answer:
-
-            continue
-
-        sub_questions = _split_numbered_questions(question)
-
-        parts = _split_answer_parts(answer)
-
-        if len(sub_questions) >= 2 and len(parts) == len(sub_questions):
-
-            for sq, part in zip(sub_questions, parts):
-
-                exploded.append({"question": sq, "answer": part})
-
-        elif (
-
-            len(sub_questions) >= 2
-
-            and len(parts) == len(sub_questions) - 1
-
-            and "?" not in sub_questions[0]
-
-        ):
-
-            # A leading PREAMBLE is not a question ("To record this transaction
-
-            # I need a few things:\n1. …\n2. …\n3. …").  Dropping it makes the
-
-            # counts line up so each numbered answer still reaches its own
-
-            # field — without this, the whole consolidated answer fell through
-
-            # as one blob and the depreciation trio repeated forever
-
-            # (production 2026-10-01, building session 6b78909c).
-
-            # A first item that ASKS (contains "?") is a real question even
-
-            # when a trailing sentence follows the mark — dropping it paired
-
-            # a bare "Yes" with the WRONG question and silently lost the
-
-            # account-creation approval (Zameer Labs 2026-10-07).
-
-            for sq, part in zip(sub_questions[1:], parts):
-
-                exploded.append({"question": sq, "answer": part})
-
-        elif (
-
-            len(sub_questions) >= 2
-
-            and len(parts) == len(sub_questions) + 1
-
-            and re.match(r"supplier\s*:", parts[-1], re.IGNORECASE)
-
-        ):
-
-            # 
-
-            # choosing CREDIT on the payment question reveals an extra
-
-            # "N) supplier: X" part.  Pair the base parts with their
-
-            # questions and route the trailing part to the supplier field.
-
-            for sq, part in zip(sub_questions, parts[:-1]):
-
-                exploded.append({"question": sq, "answer": part})
-
-            value = re.split(
-
-                r"supplier\s*:", parts[-1], maxsplit=1, flags=re.IGNORECASE
-
-            )[1].strip()
-
-            if value:
-
-                exploded.append({
-
-                    "question": "Who is the supplier?",
-
-                    "answer": value,
-
-                })
-
-        else:
-
-            exploded.append({
-
-                "question": question,
-
-                "answer": answer,
-
-                # FIELD-TAGGED answers (fixed-format questionnaire) keep
-
-                # their field: the numbered-split branches cannot map a
-
-                # part to a field, but a single field question never has
-
-                # numbered sub-questions, so it always lands here intact.
-
-                "field": qa.get("field"),
-
-            })
-
-    return exploded
-
-
-
-
-
-def _resolve_same_answers(
-
-    qa_history: List[Dict[str, str]],
-
-) -> List[Dict[str, str]]:
-
-    """Resolve "SAME" answers to the prior answer for the same question.
-
-
-
-    The clarification-memory hint offers "reply SAME to reuse" for
-
-    preference-shaped questions.  The question text may
-
-    carry the "(previously: ...)" hint suffix, so matching normalises it
-
-    away.  A SAME with no resolvable prior is dropped (never guessed).
-
-    """
-
-    def _norm(q: str) -> str:
-
-        return (q or "").split("(previously")[0].strip().lower()
-
-
-
-    resolved: List[Dict[str, str]] = []
-
-    for qa in qa_history or []:
-
-        question = qa.get("question") or ""
-
-        answer = (qa.get("answer") or "").strip()
-
-        if answer.lower() == "same":
-
-            prior = next(
-
-                (
-
-                    p.get("answer") or ""
-
-                    for p in reversed(resolved)
-
-                    if _norm(p.get("question")) == _norm(question)
-
-                    and (p.get("answer") or "").strip().lower() != "same"
-
-                ),
-
-                None,
-
-            )
-
-            if prior:
-
-                resolved.append({
-
-                    "question": question, "answer": prior, "field": qa.get("field"),
-
-                })
-
-            continue
-
-        resolved.append({
-
-            "question": question, "answer": answer, "field": qa.get("field"),
-
-        })
-
-    return resolved
-
-
-
-
-
-# Field tags that are NOT entity fields: the plan-incomplete / model-failure
-
-# cards persist "missing_details" (and similar prose tags).  An answer to
-
-# such a card is conversation context — NEVER entity content (Fix 3 / RC-3:
-
-# the failure summary's own prose ("...search_supplier...") routed the
-
-# user's instruction "re-route it from expenses account" into
-
-# supplier_name through the keyword chain below).
-
-_NON_ENTITY_FIELD_TAGS = frozenset({
-
-    "missing_details", "missing information", "missing_information",
-
-    "information", "details", "missing",
-
-})
-
-
-
-# First words that can never lead a party NAME in an answer: instructions
-
-# and sentence openers (production RC-3 answers: "re-route it from expenses
-
-# account", "Create new Account in COA ...").  Extends _NON_PARTY_WORDS with
-
-# instruction vocabulary the capture-time guard never needed.
-
-_ANSWER_NON_NAME_WORDS = _NON_PARTY_WORDS | {
-
-    "please", "should", "would", "could", "you", "we", "they", "it", "this",
-
-    "that", "these", "those", "reroute", "route", "use", "using", "choose",
-
-    "select", "reply", "answer", "avoid", "fix", "correct", "update",
-
-    "change", "delete", "remove", "send", "move", "keep", "apply", "ensure",
-
-    "just", "also", "instead", "rather", "log", "book", "put",
-
-    "set", "check", "review", "confirm", "whether", "if", "when", "because",
-
-}
-
-
-
-
-
-def _is_party_name_answer(value: str) -> bool:
-
-    """True only when a typed answer reads like a party NAME.
-
-
-
-    Guards both merge routes (field tag + keyword chain): a real name is
-
-    short and name-shaped; an instruction or failure-prose reply ("re-route
-
-    it from expenses account", "Create new Account in COA ... and Record
-
-    it's Expense Paid") is rejected so the name stays unset and the gate
-
-    re-asks instead of writing prose into the party ledger (RC-3).
-
-    """
-
-    text = (value or "").strip()
-
-    if not text or _is_control_answer(text):
-
-        return False
-
-    if len(text) > 80:
-
-        return False
-
-    words = text.split()
-
-    if not words or len(words) > 8:
-
-        return False
-
-    if not _is_plausible_party(text):
-
-        return False
-
-    # Normalise the first word ("re-route" -> "reroute") so hyphenated
-
-    # instruction openers cannot slip past the vocabulary check.
-
-    first_word = re.sub(r"[^a-z]", "", words[0].lower())
-
-    return first_word not in _ANSWER_NON_NAME_WORDS
-
-
-
-
-
-def _reuse_learned_answers(
-
-    qa_history: List[Dict[str, str]],
-
-    prefs: Dict[str, str],
-
-) -> List[Dict[str, str]]:
-
-    """A "SAME" reply explicitly reuses the learned value for that question.
-
-
-
-    The clarification-memory hint offers "previously: <value> - reply SAME
-
-    to reuse".  A prior answer to the same question in THIS conversation
-
-    wins (``_resolve_same_answers``' contract); when the question is new,
-
-    the organization preference for that exact question supplies the value.
-
-    This is the ONLY path by which a learned preference may answer a field —
-
-    applied solely on the user's explicit SAME.
-
-    """
-
-    if not prefs or not qa_history:
-
-        return qa_history
-
-    try:
-
-        from app.services.preference_service import preference_key_for_question
-
-    except Exception:  # noqa: BLE001 — hint plumbing must never break planning
-
-        return qa_history
-
-
-
-    def _norm(q: str) -> str:
-
-        return (q or "").split("(previously")[0].strip().lower()
-
-
-
-    answered: Dict[str, str] = {}
-
-    out: List[Dict[str, str]] = []
-
-    for qa in qa_history:
-
-        question = qa.get("question") or ""
-
-        answer = (qa.get("answer") or "").strip()
-
-        if answer.lower() == "same":
-
-            prior = answered.get(_norm(question))
-
-            if prior:
-
-                answer = prior
-
-            else:
-
-                try:
-
-                    key = preference_key_for_question(_norm(question))
-
-                except Exception:  # noqa: BLE001
-
-                    key = None
-
-                learned = str(prefs.get(key) or "").strip() if key else ""
-
-                if learned:
-
-                    log.info(
-
-                        "planner.same_reuses_learned_value",
-
-                        field=key,
-
-                        value=learned[:60],
-
-                    )
-
-                    answer = learned
-
-        out.append({**qa, "answer": answer})
-
-        if answer and answer.lower() != "same":
-
-            answered[_norm(question)] = answer
-
-    return out
-
-
-
-
-
-def _party_name_candidate(answer: str) -> Optional[str]:
-
-    """A party NAME extracted from a party-check answer, or ``None``.
-
-
-
-    A pick ("ABC Traders"), a declined-then-renamed reply ("No, use FDS
-
-    Labs") and similar are stored verbatim so the next search finds the
-
-    EXACT match.  A sentence-shaped reply ("I am Receiving amount, not
-
-    paying") is FEEDBACK about the question itself — folding it into the
-
-    party-name entity used to create a ledger literally named after the
-
-    user's complaint, so it is rejected and the previously extracted name
-
-    is kept (the gate simply re-asks instead of adopting the reply).
-
-    """
-
-    candidate = re.sub(
-
-        r"^(?:(?:yes|y|no|n|ok|create|use|pick|existing)\b[,.:;! \t]*)+",
-
-        "",
-
-        answer.strip(),
-
-        flags=re.IGNORECASE,
-
-    ).strip()
-
-    if len(candidate) < 2 or len(candidate.split()) > 8:
-
-        return None
-
-    if re.match(
-
-        r"^(?:i|i'm|im|we|it|this|that|not|there|am|the)\b",
-
-        candidate,
-
-        re.IGNORECASE,
-
-    ):
-
-        return None
-
-    if not _is_plausible_party(candidate):
-
-        return None
-
-    # Name-shape guard (Fix 3 / RC-3): a party-check reply that is an
-
-    # instruction or sentence ("re-route it from expenses account") is
-
-    # never a ledger name — the gate re-asks instead.
-
-    if not _is_party_name_answer(candidate):
-
-        return None
-
-    return candidate
-
-
-
-
-
-#: Words that identify a depreciation-policy round (the consolidated
-
-#: "useful life / method / salvage" question and each of its parts).
-
-_DEPRECIATION_QUESTION_HINTS = (
-
-    "useful life", "depreciation method", "salvage", "residual",
-
-)
-
-_DEPRECIATION_FIELDS = frozenset(
-
-    {"useful_life_years", "depreciation_method", "salvage_value", "residual_value"}
-
-)
-
-
-
-
-
-def _merge_depreciation_policy_answer(
-
-    merged: Dict[str, Any], question: str, answer: str
-
-) -> bool:
-
-    """Fold a depreciation-policy answer into the entity set — however phrased.
-
-
-
-    The questionnaire asks useful life, method and salvage in ONE round, and
-
-    users answer that round in one line ("1) 8 / 2) STRAIGHT_LINE / 3) 500,000"
-
-    or "8 years, straight line, 1,000,000 salvage value").  Every shape of
-
-    that round — the natural-language question, its numbered parts, and the
-
-    persisted field-shaped rows — must land in the same three entities, or the
-
-    round repeats forever (production 2026-10-01, building session 6b78909c:
-
-    the user answered the trio three times and nothing was ever recorded).
-
-
-
-    Each part is parsed only when ITS question is being answered, so a
-
-    single-part round ("Which DEPRECIATION METHOD…?" → "STRAIGHT_LINE") never
-
-    invents the other two.  Returns True when at least one field was set.
-
-    """
-
-    text = str(question or "").strip()
-
-    if not text:
-
-        return False
-
-    bare = text.lower()
-
-    if bare in _DEPRECIATION_FIELDS:
-
-        return _merge_field_answer(merged, bare, answer)
-
-
-
-    low_q = text.lower()
-
-    hints = {h for h in _DEPRECIATION_QUESTION_HINTS if h in low_q}
-
-    if not hints:
-
-        return False
-
-    # Collapse the hints to the FIELDS they point at: "RESIDUAL / SALVAGE
-
-    # value" is ONE field answered by ONE value, not a consolidated round.
-
-    _field_for_hint = {
-
-        "useful life": "useful_life_years",
-
-        "depreciation method": "depreciation_method",
-
-        "salvage": "salvage_value",
-
-        "residual": "salvage_value",
-
-    }
-
-    fields_for_hints = {_field_for_hint[h] for h in hints}
-
-
-
-    raw = str(answer or "").strip()
-
-    if not raw:
-
-        return False
-
-    low = raw.lower().strip(" .)'\"")
-
-    # A typed numbered answer keeps its list marker through the newline/comma
-
-    # split ("1) 8") — strip it before parsing the value.
-
-    low = re.sub(r"^\d{1,2}\s*[.):\-]\s*", "", low).strip()
-
-    if low in _DECLINE_WORDS or low in ("c", "none for now"):
-
-        # The round's own decline vocabulary: "reply NONE if you do not want a
-
-        # depreciation schedule yet" settles the whole trio at once.
-
-        merged["depreciation_declined"] = True
-
-        return True
-
-
-
-    # ONE-PART ROUND (a sub-question of the consolidated ask, or a single
-
-    # field): route to that field's own parser — one source of truth.
-
-    if len(fields_for_hints) == 1:
-
-        return _merge_field_answer(merged, next(iter(fields_for_hints)), low)
-
-
-
-    # CONSOLIDATED ROUND answered in one line: every part must be
-
-    # independently recognisable, so a part is never inferred from a number
-
-    # that belongs to another part.
-
-    before = (
-
-        merged.get("useful_life_years"),
-
-        merged.get("depreciation_method"),
-
-        merged.get("salvage_value"),
-
-    )
-
-
-
-    _merge_field_answer(merged, "depreciation_method", low)
-
-
-
-    years = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", low)
-
-    if years and 1 <= int(years.group(1)) <= 60:
-
-        merged["useful_life_years"] = int(years.group(1))
-
-
-
-    adjacent = re.search(
-
-        r"([\d][\d,]*(?:\.\d+)?)\s*(?:rs\.?|pkr)?\s*(?:salvage|residual)", low
-
-    )
-
-    if adjacent:
-
-        number = _parse_bare_amount(adjacent.group(1))
-
-        if number is not None:
-
-            merged["salvage_value"] = number
-
-    elif re.search(r"\b(?:salvage|residual)\b[^\d]{0,20}\b(?:zero|nil|0)\b", low):
-
-        merged["salvage_value"] = 0.0
-
-
-
-    after = (
-
-        merged.get("useful_life_years"),
-
-        merged.get("depreciation_method"),
-
-        merged.get("salvage_value"),
-
-    )
-
-    handled = before != after
-
-    if handled:
-
-        log.info(
-
-            "planner.depreciation_policy_merged",
-
-            fields=[
-
-                f
-
-                for f in ("useful_life_years", "depreciation_method", "salvage_value")
-
-                if merged.get(f) is not None
-
-            ],
-
-        )
-
-    return handled
-
-
-
-
-
-#: Generic words that are never a ledger's NAME — "Yes, create it" folds
-
-#: nothing by itself and must reach the nature-name fallback instead.
-
-_CREATION_NAME_STOPWORDS = frozenset({
-
-    "it", "one", "this", "that", "new", "account", "ledger", "yes", "sure",
-
-    "ok", "okay", "please", "the", "a", "an", "some", "something", "item",
-
-})
-
-
-
-
-
-def _creation_name_from_answer(answer: str) -> Optional[str]:
-
-    """A ledger name the YES answer itself states.
-
-
-
-    ``"Yes, Create Inventory Account"`` -> ``"Inventory"``.  Only the
-
-    approval verb + NAME shape may name a ledger: prose that steers away
-
-    from creation ("use an existing account instead") never matches, and
-
-    the generic tail ("account"/"ledger") and articles are stripped so the
-
-    ledger is named by its content, not its plumbing.  Returns ``None``
-
-    whenever the answer carries no usable name — the caller then falls
-
-    back to the nature's canonical name or leaves the gap open.
-
-    """
-
-    text = " ".join(str(answer or "").split())
-
-    m = re.match(
-
-        r"^(?:yes\b[\s,:;-]*)?(?:please\s+)?create\s+(?P<name>\S.*)$",
-
-        text,
-
-        flags=re.IGNORECASE,
-
-    )
-
-    if not m:
-
-        return None
-
-    name = m.group("name").strip(" .,'\"")
-
-    name = re.sub(r"^(?:a|an|the)\s+", "", name, flags=re.IGNORECASE)
-
-    name = re.sub(r"\s+(?:account|ledger)$", "", name, flags=re.IGNORECASE).strip()
-
-    if not name or name.lower() in _CREATION_NAME_STOPWORDS:
-
-        return None
-
-    if (
-
-        len(name) > 60
-
-        or len(name.split()) > 6
-
-        or not re.search(r"[a-z]", name, re.IGNORECASE)
-
-    ):
-
-        return None
-
-    return name
-
-
-
-
-
-def _merge_clarification_answers(
-
-    entities: Dict[str, Any],
-
-    qa_history: List[Dict[str, str]],
-
-    intent: str = "",
-
-) -> Dict[str, Any]:
-
-    """Fold prior clarification answers into the entity set.
-
-
-
-    Each answer fills the field its question asked about (matched by
-
-    keyword), so a question is never repeated for the same conversation.
-
-    Multi-question rounds answered in a single message are split first
-
-    (see ``_explode_multi_answers``) so every part reaches its own field.
-
-    "SAME" answers reuse the prior value for the same question (Work
-
-    Stream F clarification memory).
-
-    """
-
-    merged = dict(entities)
-
-    for qa in _explode_multi_answers(_resolve_same_answers(qa_history)):
-
-        question = (qa.get("question") or "").lower()
-
-        answer = (qa.get("answer") or "").strip()
-
-        if not answer:
-
-            continue
-
-
-
-        # A DECISION CHIP of ANOTHER gate never becomes content: the catalog
-
-        # labels ("Yes - add to catalog" / "No - one-off lines only") may only
-
-        # be read by the catalog branch below.  Genuine refusals ("No",
-
-        # "neither", "None of those") stay valid answers for their own gates —
-
-        # they must keep flowing to the branch that parses them.
-
-        if _is_catalog_chip(answer) and "catalog check:" not in question:
-
-            log.info("planner.control_answer_dropped", answer=answer[:60])
-
-            continue
-
-
-
-        # FIELD-ROUTED ANSWER (fixed-format questionnaire): the answer
-
-        # carries the field it fills, so it lands in the right entity
-
-        # regardless of the question's wording — LLM-authored questions can
-
-        # be reworded freely.  Unknown fields fall through to the keyword
-
-        # chain below (never guessed).
-
-        field_tag = str(qa.get("field") or "").strip()
-        if not field_tag and qa.get("required_information"):
-            req_info = qa.get("required_information")
-            if isinstance(req_info, list) and len(req_info) == 1:
-                field_tag = str(req_info[0]).strip()
-            elif isinstance(req_info, str):
-                field_tag = req_info.strip()
-
-        if field_tag and _merge_field_answer(
-
-            merged, field_tag, answer, intent=intent
-
-        ):
-
-            continue
-
-        if "type of account" in question or "account type" in question:
-            for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
-                if t.lower() in answer.lower():
-                    merged["account_type"] = t
-                    break
-            else:
-                merged["account_type"] = answer.strip().upper()
-            continue
-
-
-
-        # NON-ENTITY TAG: an answer to a plan-incomplete / model-failure
-
-        # card (field "missing_details" and friends) is conversation
-
-        # context, NEVER entity content (Fix 3 / RC-3).  Falling into the
-
-        # keyword chain let the failure summary's own prose — which quoted
-
-        # the tool name "search_supplier" — claim supplier_name with the
-
-        # user's instruction text.
-
-        if field_tag and field_tag.lower() in _NON_ENTITY_FIELD_TAGS:
-
-            log.info(
-
-                "planner.non_entity_answer_dropped",
-
-                field=field_tag,
-
-                answer=answer[:80],
-
-            )
-
-            continue
-
-
-
-        # BARE FIELD-NAME QUESTION: a field-shaped answer survives a resumed
-
-        # round as ``question = <field name>`` (that is how positional and
-
-        # tap answers are persisted — see seed_clarification_history).  Route
-
-        # it through the SAME field router the live turn used: the keyword
-
-        # chain below can never recognise "useful_life_years" (production
-
-        # 2026-10-01, building session 6b78909c: the life/method/salvage
-
-        # answers were merged on the turn they were typed and then re-asked
-
-        # every round because this route did not exist).
-
-        _bare = (qa.get("question") or "").strip()
-
-        if re.fullmatch(r"[a-z][a-z0-9_]{2,40}", _bare):
-
-            if _merge_field_answer(merged, _bare, answer, intent=intent):
-
-                continue
-
-
-
-        # DEPRECIATION-POLICY ROUND: the consolidated "useful life / method /
-
-        # salvage" question, answered in ONE line — fill every part of the
-
-        # trio from that answer instead of losing it (the numbered split can
-
-        # only pair parts with sub-questions when the counts line up).
-
-        if _merge_depreciation_policy_answer(merged, qa.get("question") or "", answer):
-
-            continue
-
-
-
-        # the
-
-        # purpose answer is authoritative and DERIVES the transaction
-
-        # nature (equipment -> FIXED_ASSET, resale goods -> INVENTORY,
-
-        # everything else -> operating expense; ambiguous purposes wait
-
-        # for the capitalization decision).  The purpose label also
-
-        # becomes the item description so the classifier maps the right
-
-        # expense account family.
-
-        if "what is this expense for" in question:
-
-            resolved_purpose = resolve_purpose_answer(question, answer)
-
-            if resolved_purpose:
-
-                merged["transaction_purpose"] = resolved_purpose
-
-                if not merged.get("item_description"):
-
-                    merged["item_description"] = purpose_label(resolved_purpose)
-
-                continue
-
-
-
-        # authoritative for
-
-        # the ambiguous purposes (repairs / software / durable free text).
-
-        if "ordinary expense or capitalized" in question:
-
-            resolved_cap = resolve_capitalization_answer(question, answer)
-
-            if resolved_cap:
-
-                merged["capitalization_decision"] = resolved_cap
-
-                continue
-
-
-
-        # the CA-grade expense
-
-        # treatments (paid now cash/bank · payable now · SETTLEMENT of an
-
-        # expense already recorded as payable · prepaid) and the legacy
-
-        # wording, so history answers always resolve.  Plain payables,
-
-        # accruals, prepaids and payable-settlements stay distinguishable.
-
-        if (
-
-            "paid, or is it outstanding" in question
-
-            or "expense debit, cash credit" in question
-
-        ):
-
-            resolved_settle = resolve_settlement_answer(question, answer)
-
-            if resolved_settle:
-
-                if resolved_settle == "ACCRUAL_PREPAID":
-
-                    merged["settlement_position"] = "ACCRUAL_PREPAID"
-
-                    merged["transaction_nature"] = "PREPAID_EXPENSE"
-
-                    merged["payment_method"] = "CASH"
-
-                elif resolved_settle == "SETTLE_EXISTING_PAYABLE":
-
-                    # Treatment 3 — the SETTLEMENT of a previously
-
-                    # recorded payable.  payment_method stays EMPTY so
-
-                    # no paid tool ever fires; the reasoning path
-
-                    # locates the outstanding payable, confirms it with
-
-                    # the user, then settles it (Dr payables / Cr
-
-                    # cash-bank) — never a second expense.
-
-                    merged["settlement_position"] = "SETTLE_EXISTING_PAYABLE"
-
-                else:
-
-                    merged["payment_method"] = resolved_settle
-
-                    if resolved_settle == "CREDIT":
-
-                        merged["settlement_position"] = "OUTSTANDING"
-
-                continue
-
-
-
-        # OWNER POLICY — SETTLEMENT CHECK ("Settle this unpaid payable?"):
-
-        # YES confirms the located payable (the deterministic settlement
-
-        # call allocates the payment to it — Dr trade payables / Cr
-
-        # cash-bank, never a second expense).  NO re-routes to a NEW
-
-        # expense; a picked label (multi-bill list) confirms that bill.
-
-        if "settlement check:" in question:
-
-            low = answer.lower().strip(" .)'\"")
-
-            if low.startswith(("no", "cancel", "record as new", "different")):
-
-                merged["settlement_position"] = "OUTSTANDING"
-
-                merged["payment_method"] = "CREDIT"
-
-            else:
-
-                merged["settle_confirmed"] = True
-
-                if not low.startswith(("yes", "y", "ok")):
-
-                    merged["settle_pick"] = answer.strip()
-
-            continue
-
-
-
-        # SETTLEMENT FALLBACK — no unpaid payable exists in the books, so
-
-        # the (d) answer cannot be a settlement; the user re-picks the
-
-        # treatment and the request re-reasons from there.
-
-        if "settlement fallback:" in question:
-
-            low = answer.lower().strip(" .)'\"")
-
-            merged["settlement_position"] = None
-
-            if low.startswith("paid now — cash"):
-
-                merged["payment_method"] = "CASH"
-
-            elif low.startswith("paid now — bank"):
-
-                merged["payment_method"] = "BANK_TRANSFER"
-
-            else:
-
-                merged["payment_method"] = "CREDIT"
-
-                merged["settlement_position"] = "OUTSTANDING"
-
-            continue
-
-
-
-        # 
-
-        # cash hits the CASH ledger, bank hits the BANK ledger (R4.1) —
-
-        # the answer is authoritative and letter-tappable.
-
-        if "in cash, or through the bank" in question:
-
-            low = answer.lower().strip(" .)'\"")
-
-            if low in ("a", "1", "cash"):
-
-                merged["payment_method"] = "CASH"
-
-                continue
-
-            if low in ("b", "2", "bank", "bank transfer", "online", "transfer", "neft", "card"):
-
-                merged["payment_method"] = "BANK_TRANSFER"
-
-                continue
-
-
-
-        # OWNER POLICY — ACCOUNT-CREATION CONFIRMATION ("Should I create
-
-        # it, or do you want to use a specific existing account?"): the
-
-        # answer is authoritative.  YES confirms the classifier's proposed
-
-        # account (extracted from the question text) — execution runs
-
-        # create_account first (free code resolved automatically) and the
-
-        # tool-order guard blocks any default-account recording until it
-
-        # succeeds.  NO keeps the entry open: any extra wording names the
-
-        # existing account to use instead.
-
-        if "should i create" in question:
-
-            low = answer.lower().strip(" .)'\"")
-
-            if low.startswith(("yes", "y", "create", "ok")):
-
-                # Match on the RAW question — `question` is lowercased, and
-
-                # the extracted account name must keep the proposal's
-
-                # casing ("Office Chairs", never "office chairs").
-
-                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
-
-                if m:
-
-                    merged["create_account"] = m.group(1).strip()
-
-                    # PARENT PLACEMENT: "Should I create it under '<head>'"
-
-                    # - the child ledger is created UNDER that statement
-
-                    # heading (segregation of statement heads), never
-
-                    # top-level by omission.
-
-                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
-
-                    if pm and pm.group(1).strip():
-
-                        merged["create_parent_name"] = pm.group(1).strip()
-
-                elif not any(
-
-                    w in low for w in ("existing", "instead", "different")
-
-                ):
-
-                    # FALLBACK (production 2026-10-07, Zameer Labs session
-
-                    # afcfecae): a MODEL-AUTHORED question cannot carry the
-
-                    # `no '<name>' account` contract, so this YES used to
-
-                    # fold NOTHING and `create_account` was never granted.
-
-                    # The name comes from the ANSWER when it states one
-
-                    # ("Yes, Create Inventory Account" -> "Inventory"),
-
-                    # else from the nature's canonical ledger name.  A reply
-
-                    # that steers to an EXISTING account never reaches here,
-
-                    # and an unknown nature still leaves the gap open.
-
-                    fallback = _creation_name_from_answer(answer) or (
-
-                        NATURE_LEDGER_NAMES.get(
-
-                            str(merged.get("transaction_nature") or "")
-
-                            .strip()
-
-                            .upper()
-
-                        )
-
-                    )
-
-                    if fallback:
-
-                        merged["create_account"] = fallback
-
-            elif (
-
-                # REFUSED the closest-existing leg of a RELATED-treatment
-
-                # round (owner directive: refusing the near-relevant account
-
-                # falls back to CREATING the dedicated child). The question
-
-                # itself carries both the name and the heading, so the
-
-                # refusal confirms creation under the right statement
-
-                # section — never a silent re-pick of the refused ledger.
-
-                "closest existing" in question
-
-                and (
-
-                    low in (
-
-                        "no", "n", "nope", "nah", "neither", "none",
-
-                        "nothing", "dont", "do not", "don't", "skip",
-
-                        "skip it", "use something else",
-
-                    )
-
-                    or low.startswith(("no,", "no ", "neither ", "none of"))
-
-                )
-
-            ):
-
-                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
-
-                if m:
-
-                    merged["create_account"] = m.group(1).strip()
-
-                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
-
-                    if pm and pm.group(1).strip():
-
-                        merged["create_parent_name"] = pm.group(1).strip()
-
-            else:
-
-                named = re.sub(
-
-                    r"^(no|n|use|pick|existing)\b[,.:;! ]*", "", low
-
-                ).strip()
-
-                if named and "existing account" not in named:
-
-                    merged["account_name"] = named
-
-            continue
-
-
-
-        # the nature/purpose decision tree is resolved
-
-        # FIRST and FAMILY-AWARE ("b" means SERVICE in a sale round but
-
-        # INVENTORY in a purchase round; a credit-note question contains
-
-        # the word "credit" and must never be mistaken for the cash-vs-
-
-        # credit question).  An unresolvable answer is left unset so the
-
-        # planner re-asks - the nature is never guessed.
-
-        if not merged.get("transaction_nature"):
-
-            resolved_nature = resolve_nature_answer(question, answer)
-
-            if resolved_nature:
-
-                merged["transaction_nature"] = resolved_nature
-
-                continue
-
-
-
-        # ..."):
-
-        # the answer either PICKS an existing party (kept verbatim so the
-
-        # next search finds the EXACT match) or CONFIRMS creation of a new
-
-        # party ledger.  Authoritative - it overrides any earlier value.
-
-        # R4.5: the gate is party-kind aware (customers for receipts,
-
-        # suppliers for payments/purchases).
-
-        if "party check:" in question:
-
-            low = answer.lower()
-
-            is_customer = "customer" in question
-
-            if low.startswith(("yes", "create", "ok")):
-
-                merged["supplier_create_confirmed"] = True
-
-                if is_customer:
-
-                    merged["customer_create_confirmed"] = True
-
-            else:
-
-                named = _party_name_candidate(answer)
-
-                if named:
-
-                    if is_customer:
-
-                        merged["customer_name"] = named
-
-                    else:
-
-                        merged["supplier_name"] = named
-
-                # else: sentence-shaped feedback — keep the extracted name
-
-                # and let the gate re-ask; a reply like "I am Receiving
-
-                # amount, not paying" must never become a ledger name.
-
-            continue
-
-
-
-        # ..."):
-
-        # one or more invoice lines are not in the product/service
-
-        # catalog.  YES adds them (with the stated unit prices), NO keeps
-
-        # them as one-off free-text lines.  Either way the invoice line
-
-        # itself is never blocked — only the catalog linkage is decided.
-
-        if "catalog check:" in question:
-
-            low = answer.lower()
-
-            if low.startswith(("yes", "add", "create", "ok")):
-
-                merged["catalog_create_confirmed"] = True
-
-            else:
-
-                merged["catalog_skip"] = True
-
-            continue
-
-
-
-        # REVENUE-LEDGER round ("Revenue ledger check: ..."): reviews whether the
-
-        # stream that was sold deserves its OWN revenue ledger.  YES creates a
-
-        # dedicated child ledger under the revenue parent; any other answer names
-
-        # the existing revenue account to use instead.  Either way the decision is
-
-        # the user's — a sale is never silently booked to an arbitrary revenue
-
-        # account (a mobile-phone sale must not be credited to e.g. "Software
-
-        # Development Revenue").
-
-        if "revenue ledger check:" in question:
-
-            low = answer.lower()
-
-            # CHIP SHAPE: the proposed labels are themselves answers
-
-            # ("Create 'X' under Y" / "Use the existing 'X' account") — parse
-
-            # them into the decision + name instead of storing the whole chip
-
-            # as an account name.
-
-            if low.startswith("create '"):
-
-                merged["revenue_ledger_decision"] = "CREATE"
-
-                continue
-
-            if low.startswith("use the existing"):
-
-                import re as _re
-
-
-
-                _m = _re.search(r"'(.+?)'", answer)
-
-                merged["revenue_ledger_decision"] = "USE_EXISTING"
-
-                if _m:
-
-                    merged["revenue_account_name"] = _m.group(1)
-
-                continue
-
-            if low.startswith(("yes", "create", "ok", "y")):
-
-                merged["revenue_ledger_decision"] = "CREATE"
-
-            else:
-
-                merged["revenue_ledger_decision"] = "USE_EXISTING"
-
-                named = answer.strip()
-
-                if named:
-
-                    merged["revenue_account_name"] = named
-
-            continue
-
-
-
-        # the
-
-        # description and quantity are asked in the consolidated round
-
-        # and routed here.  A multi-item answer ("2 laptops at 5000 and
-
-        # 3 mice at 500") parses into DISTINCT lines instead of one
-
-        # description string.  The combined "quantity and price"
-
-        # question (below) keeps its own parser — the plain-quantity
-
-        # branch excludes it.
-
-        if "item or service" in question and not merged.get("item_description"):
-
-            multi = _extract_line_items(answer)
-
-            if multi:
-
-                merged["line_items"] = multi
-
-                # The per-line answer is the most specific statement of
-
-                # the transaction — it defines the total (Σ qty × price),
-
-                # overriding any earlier round's header amount.
-
-                merged["amount"] = _line_items_total(multi)
-
-            else:
-
-                merged["item_description"] = answer.strip()
-
-        elif (
-
-            "units are you invoicing" in question
-
-            or ("quantity" in question and "price" not in question)
-
-        ) and merged.get("quantity") is None:
-
-            qty_val = _parse_bare_amount(answer)
-
-            if qty_val is not None and qty_val > 0:
-
-                merged["quantity"] = qty_val
-
-        elif "amount" in question and merged.get("amount") is None:
-
-            value = _parse_bare_amount(answer)
-
-            if value is not None:
-
-                merged["amount"] = value
-
-        elif "supplier" in question and (
-
-            _is_control_answer(answer) or not merged.get("supplier_name")
-
-        ):
-
-            low = answer.lower().strip()
-
-            # A DECISION CHIP answers the party GATE — it is never the name.
-
-            # The field router rejects chips too, but a SEEDED bare row
-
-            # (question = "supplier_name") falls PAST that router into this
-
-            # keyword branch, which used to store the chip verbatim.
-
-            if _is_control_answer(answer):
-
-                if low.startswith(("yes", "create", "ok", "y")):
-
-                    merged["supplier_create_confirmed"] = True
-
-                # never stored as the supplier's name; an unrecognised chip
-
-                # leaves the name unset so the gate re-asks.
-
-            elif "local vendor" in low or low in ("local", "no party", "none"):
-
-                # fold into the
-
-                # standing 'Local Vendor' account (searched and created
-
-                # on first use by the deterministic executor).
-
-                merged["supplier_name"] = "Local Vendor"
-
-            elif _is_party_name_answer(answer):
-
-                merged["supplier_name"] = answer
-
-            else:
-
-                # Not a name-shaped reply (instruction/prose) — leave the
-
-                # name unset so the party gate re-asks (Fix 3 / RC-3).
-
-                log.info(
-
-                    "planner.party_answer_rejected",
-
-                    route="keyword:supplier",
-
-                    answer=answer[:80],
-
-                )
-
-        elif "customer" in question and (
-
-            _is_control_answer(answer) or not merged.get("customer_name")
-
-        ):
-
-            low = answer.lower().strip()
-
-            # Same chip guard as the supplier branch (AES production
-
-            # 2026-10-07: the bare row ``customer_name: Yes - create 'X'``
-
-            # was stored here verbatim, so the customer AND its AR ledger
-
-            # were created literally named "Yes - Create 'Haris & Co'").
-
-            # A yes-chip CONFIRMS the creation and leaves the name to the
-
-            # extraction/prefill that grounded it from the request.  The
-
-            # chip is handled even when a name is already set (confirmation
-
-            # must land); a genuine name never overwrites one that exists.
-
-            if _is_control_answer(answer):
-
-                if low.startswith(("yes", "create", "ok", "y")):
-
-                    merged["customer_create_confirmed"] = True
-
-            elif _is_party_name_answer(answer):
-
-                merged["customer_name"] = answer
-
-            else:
-
-                # Not a name-shaped reply (instruction/prose) — never stored
-
-                # as the customer ledger name (Fix 3 / RC-3).
-
-                log.info(
-
-                    "planner.party_answer_rejected",
-
-                    route="keyword:customer",
-
-                    answer=answer[:80],
-
-                )
-
-        elif "date" in question and not merged.get("transaction_date"):
-
-            # route the answer through the deterministic
-
-            # parser.  On failure keep the raw answer so the validation
-
-            # in plan() drops it and the date is re-asked (never guessed).
-
-            parsed = parse_transaction_date(answer)
-
-            merged["transaction_date"] = (
-
-                parsed.iso_date if parsed.ok else answer
-
-            )
-
-        elif ("payment" in question or "method" in question) and not merged.get("payment_method"):
-
-            merged["payment_method"] = _normalize_payment_method(answer)
-
-        elif (
-
-            "cash" in question or "credit" in question or "paid" in question
-
-        ) and not merged.get("payment_method"):
-
-            # Cash-vs-credit question: accept ONLY a confident answer.  An
-
-            # ambiguous reply is left unresolved so the planner re-asks —
-
-            # the treatment must never be guessed.
-
-            lower = answer.lower()
-
-            if "credit" in lower or "on account" in lower or "pay later" in lower:
-
-                merged["payment_method"] = "CREDIT"
-
-            elif "cash" in lower:
-
-                merged["payment_method"] = "CASH"
-
-            elif "bank" in lower or "transfer" in lower or "online" in lower:
-
-                merged["payment_method"] = "BANK_TRANSFER"
-
-            elif "cheque" in lower or "check" in lower:
-
-                merged["payment_method"] = "CHEQUE"
-
-            elif "card" in lower:
-
-                merged["payment_method"] = "CARD"
-
-        elif (
-
-            "quantity" in question and "price" in question
-
-        ) and (
-
-            merged.get("item_quantity") is None
-
-            or merged.get("item_unit_price") is None
-
-        ):
-
-            # Line-detail question: parse "5 at 2,000 each" / "qty 3 @ 500".
-
-            qty_m = re.search(
-
-                r"(?:qty|quantity)?\s*(\d+(?:\.\d+)?)\s*(?:x|units?|pcs?|@|at)\s+"
-
-                r"(?:rs\.?|pkr)?\s*([\d,]+(?:\.\d+)?)",
-
-                answer, re.IGNORECASE,
-
-            )
-
-            if qty_m:
-
-                try:
-
-                    merged["item_quantity"] = float(qty_m.group(1))
-
-                    merged["item_unit_price"] = float(
-
-                        qty_m.group(2).replace(",", "")
-
-                    )
-
-                except ValueError:
-
-                    pass
-
-    return merged
-
-
-
-
-
-def _parse_bare_amount(text: str) -> Optional[float]:
-
-    """Parse a number from a bare clarification answer like '20,000'."""
-
-    m = re.search(_NUM, text)
-
-    if m:
-
-        try:
-
-            return float(m.group(1).replace(",", ""))
-
-        except ValueError:
-
-            return None
-
-    return None
-
-
-
-
-
-def _parse_bare_date(text: str) -> Optional[str]:
-
-    """Parse a date from a bare clarification answer."""
-
-    # Delegate to the full date extractor
-
-    return _extract_date(text, text.lower())
-
-
-
-
-
-_NATURE_VALUES = frozenset({
-
-    "FIXED_ASSET", "INVENTORY", "CONSUMABLE", "SERVICE", "OPERATING_EXPENSE",
-
-    "REVENUE", "OTHER_INCOME", "PREPAYMENT", "DEPOSIT_ADVANCE",
-
-    "INTANGIBLE_ASSET", "ASSET_DISPOSAL",
-
-})
-
-_DECLINE_WORDS = frozenset({"none", "no", "n/a", "na", "skip", "declined", "not now"})
-
-_METHOD_VALUE_MAP = {
-
-    "STRAIGHT_LINE": "STRAIGHT_LINE",
-
-    "STRAIGHT-LINE": "STRAIGHT_LINE",
-
-    "STRAIGHT LINE": "STRAIGHT_LINE",
-
-    "REDUCING_BALANCE": "REDUCING_BALANCE",
-
-    "REDUCING-BALANCE": "REDUCING_BALANCE",
-
-    "REDUCING BALANCE": "REDUCING_BALANCE",
-
-    "WDV": "REDUCING_BALANCE",
-
-    "DIMINISHING": "REDUCING_BALANCE",
-
-    "DECLINING": "REDUCING_BALANCE",
-
-}
-
-
-
-
-
-def _is_control_answer(value: Any) -> bool:
-
-    """A reply that is a DECISION CHIP, not content.
-
-
-
-    "Yes - add to catalog", "No - one-off lines only", "Create 'X' under Y",
-
-    "Use the existing 'X' account" — these answer gates; they must never be
-
-    stored as an item, party or ledger name (an account proposed as
-
-    "Yes - add to catalog Sales" is exactly what this prevented).
-
-
-
-    Plain affirmations with a trailing action are chips too (live
-
-    2026-10-19: "yes, create it" answered the Party-check gate and became
-
-    a supplier literally named "yes, create it" instead of confirming the
-
-    creation of the party the question NAMED).  A decision-shaped reply
-
-    routes to the gate's confirmation branch; the name stays the one
-
-    grounded from the request.  Deliberately precise: a genuine name that
-
-    merely starts with a decision word ("Yes Bank") must still pass.
-
-    """
-
-    text = str(value or "").strip().lower()
-
-    if not text:
-
-        return False
-
-    if text.startswith(
-
-        ("yes -", "no -", "create '", "create new party", "use the existing")
-
-    ):
-
-        return True
-
-    if text in (
-
-        "yes", "no", "y", "n", "ok", "okay", "yep", "yeah", "sure",
-
-        "please", "confirm", "confirmed", "go ahead",
-
-    ):
-
-        return True
-
-    # "yes, create it" / "yes please" / "no dont create" / "ok, confirm it"
-
-    # — a decision word plus a trailing action/politeness tail, nothing
-
-    # name-shaped in between.
-
-    return bool(
-
-        re.fullmatch(
-
-            r"(?:yes|y|no|n|ok(ay)?|sure|yeah|yep|confirm(?:ed)?)"
-
-            r"[\s,.!:;-]*"
-
-            r"(?:create\s*(?:it|them)?|don'?t\s*create|please|go\s*ahead|"
-
-            r"do\s*it|confirm(?:ed)?(?:\s*(?:it|this))?|thanks?|proceed)?",
-
-            text,
-
-        )
-
-    )
-
-
-
-
-
-def _is_catalog_chip(value: Any) -> bool:
-
-    """The two labels of the CATALOG gate — chips, never content."""
-
-    text = str(value or "").strip().lower()
-
-    return text.startswith(("yes - add to catalog", "no - one-off"))
-
-
-
-
-
-def _merge_field_answer(
-
-    merged: Dict[str, Any], field_name: str, answer: str, intent: str = ""
-
-) -> bool:
-
-    """Route a FIELD-TAGGED clarification answer into the entity set.
-
-
-
-    The fixed-format questionnaire carries the field each answer fills, so
-
-    an answer reaches its entity regardless of the question's wording (the
-
-    old keyword matching could not: a reworded question lost its answer).
-
-    Returns True when the field was handled — False lets the keyword chain
-
-    have its say (unknown fields only).
-
-    """
-
-    field = (field_name or "").strip().lower()
-
-    raw = (answer or "").strip()
-
-    if not field or not raw:
-
-        return False
-
-    low = raw.lower().strip(" .)'\"")
-
-    value = raw.strip()
-
-
-
-    if field == "line_items":
-        if isinstance(answer, list):
-            merged["line_items"] = answer
-            merged["amount"] = _line_items_total(answer)
-            return True
-        elif isinstance(answer, dict) and "line_items" in answer:
-            merged["line_items"] = answer["line_items"]
-            merged["amount"] = answer.get("total_amount") or _line_items_total(answer["line_items"])
-            return True
-
-    # Master data / Setup and Operational field routing
-    if field == "account_type":
-        for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
-            if t.lower() in low:
-                merged["account_type"] = t
-                return True
-        merged["account_type"] = value.upper()
-        return True
-
-    if field in ("account_name", "product_name", "service_name", "employee_name", "bank_name", "project_name"):
-        merged[field] = value.strip(" '\"")
-        return True
-
-    if field in ("sales_price", "unit_price"):
-        amt = _parse_bare_amount(value)
-        if amt is not None:
-            merged[field] = amt
-            merged["sales_price"] = amt
-            merged["unit_price"] = amt
-            return True
-        try:
-            val_f = float(re.sub(r"[^\d.]", "", value))
-            merged[field] = val_f
-            merged["sales_price"] = val_f
-            merged["unit_price"] = val_f
-            return True
-        except ValueError:
-            return False
-
-    if field in ("account_code", "code"):
-        merged["code"] = value.strip(" '\"")
-        merged["account_code"] = value.strip(" '\"")
-        return True
-
-    if field == "transaction_date":
-
-        parsed = parse_transaction_date(value)
-
-        if not parsed.ok:
-
-            resolved = resolve_relative_date_text(value)
-
-            parsed = resolved if resolved is not None else parsed
-
-        merged["transaction_date"] = parsed.iso_date if parsed.ok else value
-
-        return True
-
-
-
-    if field == "useful_life_years":
-
-        # Same decline vocabulary as the method question — "(c) NONE for now"
-
-        # must settle the policy here too, or the answer falls through
-
-        # unmatched and the question repeats forever.
-
-        if low in _DECLINE_WORDS or low in ("c", "none for now"):
-
-            merged["depreciation_declined"] = True
-
-            return True
-
-        number = _parse_bare_amount(value)
-
-        if number is not None and 1 <= number <= 60:
-
-            merged["useful_life_years"] = int(number)
-
-            return True
-
-        # Stated-but-unparseable: the field is NOT handled.  Returning False
-
-        # keeps the contract honest — the keyword chain gets its say and the
-
-        # gap stays on the planner's list, instead of the answer being
-
-        # swallowed while the same question comes back forever.
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    if field == "depreciation_method":
-
-        if low in _DECLINE_WORDS or low in ("c", "none for now"):
-
-            merged["depreciation_declined"] = True
-
-            return True
-
-        if low in ("a", "1"):
-
-            merged["depreciation_method"] = "STRAIGHT_LINE"
-
-        elif low in ("b", "2"):
-
-            merged["depreciation_method"] = "REDUCING_BALANCE"
-
-        else:
-
-            for key, method in _METHOD_VALUE_MAP.items():
-
-                if key.lower() in low:
-
-                    merged["depreciation_method"] = method
-
-                    break
-
-        if not merged.get("depreciation_method"):
-
-            # Unrecognised method wording → re-asked (never guessed).
-
-            log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-            return False
-
-        rate = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", low)
-
-        if rate and merged.get("depreciation_method") == "REDUCING_BALANCE":
-
-            try:
-
-                merged["depreciation_rate_percent"] = float(rate.group(1))
-
-            except ValueError:
-
-                pass
-
-        return True
-
-
-
-    if field in ("salvage_value", "residual_value"):
-
-        if low in _DECLINE_WORDS:
-
-            merged["salvage_value"] = 0.0
-
-            return True
-
-        number = _parse_bare_amount(value)
-
-        if number is not None and number >= 0:
-
-            merged["salvage_value"] = number
-
-            return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    if field == "amount":
-
-        number = _parse_bare_amount(value)
-
-        if number is not None:
-
-            merged["amount"] = number
-
-            return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    if field == "quantity":
-
-        number = _parse_bare_amount(value)
-
-        if number is not None and number > 0:
-
-            merged["quantity"] = number
-
-            return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-    if field == "settlement_position":
-        candidate = low.replace(" ", "_").upper()
-        if candidate in ("PAID_NOW", "PAID", "SETTLED") or any(w in low for w in ("paid now", "paid", "cash", "bank")):
-            merged["settlement_position"] = "PAID_NOW"
-            return True
-        if candidate in ("OUTSTANDING", "PAYABLE", "CREDIT") or any(w in low for w in ("outstanding", "payable", "later", "credit")):
-            merged["settlement_position"] = "OUTSTANDING"
-            merged["payment_method"] = "CREDIT"
-            return True
-        if candidate in ("PREPAID", "ACCRUAL_PREPAID", "ADVANCE") or any(w in low for w in ("prepaid", "advance", "ahead")):
-            merged["settlement_position"] = "ACCRUAL_PREPAID"
-            merged["transaction_nature"] = "PREPAID_EXPENSE"
-            merged["payment_method"] = "CASH"
-            return True
-        if candidate in ("SETTLE_EXISTING_PAYABLE", "SETTLE_PAYABLE") or "earlier payable" in low:
-            merged["settlement_position"] = "SETTLE_EXISTING_PAYABLE"
-            return True
-        return False
-
-    if field in ("payment_type", "payment_method"):
-        if low in ("a", "1", "cash"):
-            merged["payment_method"] = "CASH"
-        elif low in ("b", "2", "bank", "bank transfer", "online"):
-            merged["payment_method"] = "BANK_TRANSFER"
-        elif low in ("c", "3", "credit"):
-            merged["payment_method"] = "CREDIT"
-            merged.setdefault("settlement_position", "OUTSTANDING")
-        else:
-            merged["payment_method"] = _normalize_payment_method(value)
-            if merged["payment_method"] == "CREDIT":
-                merged.setdefault("settlement_position", "OUTSTANDING")
-        return True
-
-
-
-    if field == "transaction_nature":
-
-        # FAMILY GUARD (production 2026-10-14, session ae043ec3): this
-
-        # field-tagged / bare-question route accepted ANY canonical nature,
-
-        # so an authored "transaction_nature" chip of INVENTORY landed on a
-
-        # SALE (sale family: GOODS / SERVICE / ASSET_DISPOSAL / OTHER_INCOME
-
-        # — INVENTORY is the PURCHASE family's value).  The deterministic
-
-        # invoice fast path (GOODS|SERVICE only) then refused the COMPLETE
-
-        # plan, which fell to the model, looped in lookups, and dead-ended
-
-        # with "please resend".  A family-invalid value is never stored and
-
-        # never translated: the family's own nature question re-asks and
-
-        # keeps owning the decision.  ``intent=""`` (legacy callers) keeps
-
-        # the unguarded behaviour — only the planner's own merge is family-
-
-        # aware.
-
-        _family = accepted_nature_values(intent) if intent else ()
-
-        # The family's OWN canonical values are the authority when known —
-
-        # ``_NATURE_VALUES`` below doesn't even contain GOODS/ASSET_DISPOSAL
-
-        # (the sale family's values), so a global-set membership test can
-
-        # never validate a sale answer.  Without an intent the legacy global
-
-        # set stands, unchanged for every existing caller.
-
-        _allowed = tuple(_family) if _family else tuple(_NATURE_VALUES)
-
-        candidate = low.replace(" ", "_").upper()
-
-        if candidate in _allowed:
-
-            merged["transaction_nature"] = candidate
-
-            return True
-
-        for nature in _allowed:  # "a fixed asset" / "the service"
-
-            if nature.lower().replace("_", " ") in low:
-
-                merged["transaction_nature"] = nature
-
-                return True
-
-        if _family and candidate in _NATURE_VALUES:
-
-            # Canonical, but for ANOTHER family — deliberately left unset so
-
-            # the deterministic family question re-asks (never guessed).
-
-            log.info(
-
-                "planner.nature_answer_outside_family",
-
-                intent=intent,
-
-                family=sorted(_family),
-
-                value=candidate,
-
-            )
-
-        return True  # unresolved → re-asked
-
-
-
-    # Loan contract answers (record_loan floor round): routed by field tag
-
-    # like every other fixed-format answer.
-
-    if field == "loan_direction":
-
-        if "borrow" in low:
-
-            merged["loan_direction"] = "BORROWED"
-
-            return True
-
-        if "lend" in low or "lent" in low or "given" in low or "give" in low:
-
-            merged["loan_direction"] = "GIVEN"
-
-            return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    if field == "counterparty":
-
-        if low in _DECLINE_WORDS:
-
-            return True
-
-        if _is_control_answer(value) or not _is_party_name_answer(value):
-
-            log.info("planner.party_answer_rejected", field=field, answer=raw[:80])
-
-            return False
-
-        merged["counterparty"] = value
-
-        return True
-
-
-
-    if field == "first_payment_date":
-
-        parsed = parse_transaction_date(value)
-
-        if not parsed.ok:
-
-            resolved = resolve_relative_date_text(value)
-
-            parsed = resolved if resolved is not None else parsed
-
-        merged["first_payment_date"] = (
-
-            parsed.iso_date if parsed.ok else value
-
-        )
-
-        return True
-
-
-
-    if field == "tenure_months":
-
-        number = _parse_bare_amount(value)
-
-        if number is not None and 1 <= number <= 600:
-
-            merged["tenure_months"] = int(number)
-
-            return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    if field == "frequency":
-
-        _freq = low.replace("-", "_").replace(" ", "_")
-
-        if _freq.startswith("year"):
-
-            _freq = "annually"
-
-        for _canon in ("monthly", "quarterly", "semi_annual", "annually", "custom"):
-
-            if _freq.startswith(_canon):
-
-                merged["frequency"] = _canon.upper()
-
-                return True
-
-        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
-
-        return False
-
-
-
-    return _merge_field_answer_tail(merged, field, low, value)
-
-
-
-
-
-def _merge_field_answer_tail(
-
-    merged: Dict[str, Any], field: str, low: str, value: str
-
-) -> bool:
-
-    """Second half of :func:`_merge_field_answer` (text/list fields)."""
-
-    if field in ("supplier_name", "customer_name"):
-
-        if field == "supplier_name" and (
-
-            "local vendor" in low or low in ("local", "no party", "none")
-
-        ):
-
-            merged["supplier_name"] = "Local Vendor"
-
-            return True
-
-        if low in _DECLINE_WORDS:
-
-            return True
-
-        # A DECISION CHIP IS NEVER A PARTY NAME (production 2026-10-04: the
-
-        # party gate's own option "Yes - create 'ABC Autos'" was stored here
-
-        # verbatim, became the customer ledger, and printed in the invoice's
-
-        # Bill To section).  Reject the chip so the keyword chain's
-
-        # "party check:" branch runs: it sets
-
-        # ``customer/supplier_create_confirmed`` from the answer while the
-
-        # name itself stays the one extracted from the request.
-
-        if _is_control_answer(value):
-
-            log.info(
-
-                "planner.control_answer_rejected",
-
-                field=field,
-
-                answer=value[:60],
-
-            )
-
-            return False
-
-        # A typed party answer must read like a NAME (Fix 3 / RC-3:
-
-        # "re-route it from expenses account" was stored verbatim as
-
-        # supplier_name and became the party-gate's ledger proposal).
-
-        # Instruction-shaped prose is rejected → the keyword chain gets no
-
-        # better reading either (it applies the same test) and the gate
-
-        # re-asks; the name extracted from the request stays authoritative.
-
-        if not _is_party_name_answer(value):
-
-            log.info(
-
-                "planner.party_answer_rejected",
-
-                field=field,
-
-                answer=value[:80],
-
-            )
-
-            return False
-
-        merged[field] = value
-
-        return True
-
-
-
-    if field == "item_description":
-
-        # NEVER let a decision chip become the item it was answering about
-
-        # ("Yes - add to catalog", "No - one-off lines only", a proposed
-
-        # account name).  A control answer is routed by the keyword chain to
-
-        # ITS decision field; overwriting real content with it is how an
-
-        # account got proposed as "Yes - add to catalog Sales".
-
-        if _is_control_answer(value):
-
-            log.info(
-
-                "planner.control_answer_rejected",
-
-                field=field,
-
-                answer=value[:60],
-
-            )
-
-            return False
-
-        existing = str(merged.get("item_description") or "").strip()
-
-        if existing and not _is_control_answer(existing):
-
-            # An already-stated item is content; a later control-shaped reply
-
-            # must never replace it.
-
-            return False
-
-        multi = _extract_line_items(value)
-
-        if multi:
-
-            merged["line_items"] = multi
-
-            merged["amount"] = _line_items_total(multi)
-
-        else:
-
-            merged["item_description"] = value
-
-        return True
-
-
-
-    if field in ("asset_name", "description", "note", "account_name",
-
-                 "revenue_account_name", "project_name", "period"):
-
-        if low in _DECLINE_WORDS:
-
-            return True
-
-        # Same contract as the party branch above: a control chip ("Yes - …",
-
-        # "Create 'X' …") answers a DECISION, it is never itself content.
-
-        if _is_control_answer(value):
-
-            log.info(
-
-                "planner.control_answer_rejected",
-
-                field=field,
-
-                answer=value[:60],
-
-            )
-
-            return False
-
-        merged[field] = value
-
-        return True
-
-
-
-    if field == "disposal_type":
-
-        if "write" in low:
-
-            merged["disposal_type"] = "WRITE_OFF"
-
-        elif "sale" in low or "sold" in low or "sell" in low:
-
-            merged["disposal_type"] = "SALE"
-
-        elif "dispos" in low or "scrap" in low:
-
-            merged["disposal_type"] = "DISPOSAL"
-
-        return True
-
-
-
-    if field in ("proceeds_amount", "disposal_amount", "depreciation_amount"):
-
-        number = _parse_bare_amount(value)
-
-        if number is not None:
-
-            merged[field] = number
-
-        return True
-
-
-
-    if field == "capitalization_decision":
-
-        candidate = low.upper()
-
-        if candidate.startswith("CAP"):
-
-            merged["capitalization_decision"] = "CAPITALIZE"
-
-        elif candidate.startswith(("EXP", "ORDINARY")):
-
-            merged["capitalization_decision"] = "EXPENSE"
-
-        return True
-
-
-
-    if field == "project_code":
-
-        # A stated code is honoured; NONE/decline leaves it unset so the
-
-        # repository derives <STEM>-### itself (never a blocking question).
-
-        if low in _DECLINE_WORDS:
-
-            return True
-
-        merged["project_code"] = value.strip().upper()
-
-        return True
-
-
-
-    if field == "project_name":
-
-        if low in _DECLINE_WORDS:
-
-            return True
-
-        merged["project_name"] = value
-
-        return True
-
-
-
-    return False
-
-
-
-
-
-def _normalize_payment_method(text: str) -> str:
-
-    lower = text.lower()
-
-    if "credit" in lower:
-
-        return "CREDIT"
-
-    if "cheque" in lower or "check" in lower:
-
-        return "CHEQUE"
-
-    if "card" in lower:
-
-        return "CARD"
-
-    if "bank" in lower or "transfer" in lower or "online" in lower:
-
-        return "BANK_TRANSFER"
-
-    return "CASH"
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# Extraction helpers
-
-# ---------------------------------------------------------------------------
-
-
-
-def _identify_intent(msg_lower: str) -> str:
-
-    for intent, patterns in _INTENT_PATTERNS:
-
-        for pat in patterns:
-
-            if re.search(pat, msg_lower):
-
-                return intent
-
-    # LOOSE expense phrasings.  A typo'd or unusual
-
-    # expense wording ("record an explanation of 25000" — the observed
-
-    # failure) contains no "expense" substring, so the strict patterns
-
-    # miss it and the request used to fall to the generic model path,
-
-    # which skipped the nature/purpose question entirely.  Route any
-
-    # expense-shaped, typo-tolerant phrasing to the purpose-first ladder
-
-    # instead — guarded by a 3+ digit figure so explanations without an
-
-    # amount are never mis-routed.
-
-    if re.search(r"\d{3,}", msg_lower) and re.search(
-
-        r"expens|expence|expenz|explan|expln|spent|spend\b", msg_lower
-
-    ):
-
-        # Query-shaped expense mentions are lookups, never recordings
-
-        # ("details of current month expences" with a typo'd spelling).
-
-        if re.search(
-
-            r"show|list|give|provide|tell|view|display|details?|summary|"
-
-            r"summar\w*|breakdown|report|what|which|how much",
-
-            msg_lower,
-
-        ):
-
-            return "list_expenses"
-
-        return "record_expense"
-
-    # "received payment" WITHOUT a sale/purchase verb
-
-    # is a customer receipt ("received payment of Rs.20,000"); a sale
-
-    # phrasing ("sold ... and received payment") belongs to the sale
-
-    # family and is handled by its own patterns above.
-
-    if re.search(r"received\s+payment", msg_lower) and not re.search(
-
-        r"\bsold\b|\bsale\b|\bsell\b|\bselling\b|\binvoice\b", msg_lower
-
-    ):
-
-        return "record_receipt"
-
-    return "unknown"
-
-
-
-
-
-def _refine_intent(intent: str, payment_method: Optional[str]) -> str:
-
-    """Specialise a generic purchase/sale intent when the payment method is clear."""
-
-    if intent == "record_purchase":
-
-        if payment_method == "CREDIT":
-
-            return "record_credit_purchase"
-
-        if payment_method == "CASH":
-
-            return "record_cash_purchase"
-
-    elif intent == "record_sale":
-
-        if payment_method == "CREDIT":
-
-            return "record_credit_sale"
-
-        if payment_method == "CASH":
-
-            return "record_cash_sale"
-
-    return intent
-
-
-
-
-
-def _extract_entities(msg: str) -> Dict[str, str]:
-
-    entities: Dict[str, str] = {}
-
-    for field, patterns in (
-
-        ("supplier_name", _SUPPLIER_PATTERNS),
-
-        ("customer_name", _CUSTOMER_PATTERNS),
-
-        ("party", _PARTY_PATTERNS),
-
-    ):
-
-        for pat in patterns:
-
-            m = pat.search(msg)
-
-            if m:
-
-                value = m.group(1).strip().rstrip(",.")
-
-                # Ignore obviously non-name captures (pronouns, and any
-
-                # capture led by a verb/document noun such as "selling").
-
-                if _is_plausible_party(value):
-
-                    entities[field] = value
-
-                    break
-
-    return entities
-
-
-
-
-
-def _is_plausible_item(value: str) -> bool:
-
-    """True when a captured string can plausibly be an item/description.
-
-
-
-    Reuses the party guard, so a PRONOUN or an ACTION-VERB-led capture is
-
-    never treated as a product.  Production 2026-10-14: ``create invoice for
-
-    zeta pvt ltd for selling them 2 laptops`` captured ``them`` as the item
-
-    (the sale-verb pattern's optional ``(an?|the|some|\\d+)?`` matched nothing,
-
-    so ``them`` filled the group and the lookahead stopped at ``2``).  ``them``
-
-    then named the revenue stream (``them Sales``) and the flow dead-ended.
-
-    A pronoun is never a product, so it must fall through to the same
-
-    ``item_description`` question a genuinely-unstated item gets.
-
-
-
-    A leading article/count (``a``, ``an``, ``the``, ``couple of``) is stripped
-
-    first: the count rides INSIDE the captured item (``a couple of bikes``) and
-
-    must not make the guard reject a genuine product.
-
-    """
-
-    text = re.sub(
-
-        r"^(?:(?:an?|the|some|couple|pair|dozen)\s+(?:of\s+)?)",
-
-        "",
-
-        (value or "").strip(),
-
-        flags=re.IGNORECASE,
-
-    )
-
-    return _is_plausible_party(text or value)
-
-
-
-
-
-# A legal-entity suffix: "zeta pvt ltd", "Beta Traders Inc".  A product is
-
-# never suffixed this way, so a capture carrying one is the COUNTERPARTY
-
-# that the "invoice for <party>" pattern mistook for the item.
-
-_COMPANY_SUFFIX_RE = re.compile(
-
-    r"(?:\s+(?:pvt\.?\s+)?(?:ltd|limited)|\s+inc\.?|\s+llc|\s+corp\.?"
-
-    r"|\s+company|\s+co\.?)\s*$",
-
-    re.IGNORECASE,
-
-)
-
-
-
-# A nested deal clause right after the captured span: "… for zeta pvt ltd
-
-# FOR SELLING them 2 laptops".  When the "invoice for <X>" span is followed
-
-# by a sale/purchase verb clause, <X> is the PARTY and the real item lives
-
-# in that clause — asking (or the bounded understanding call) beats naming
-
-# the revenue stream after the customer.
-
-_NESTED_DEAL_CLAUSE_RE = re.compile(
-
-    r"\s+(?:for|against|with|by)\s+"
-
-    r"(?:selling|sold|sell|sale|supply|supplies|supplying|providing|"
-
-    r"rendering|purchas\w*|buying|bought|buy)\b",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-def _extract_item(msg: str) -> Optional[str]:
-
-    candidate: Optional[str] = None
-
-    candidate_end = 0
-
-    for pat in _ITEM_PATTERNS:
-
-        m = pat.search(msg)
-
-        if m:
-
-            # Leading prepositions are captured with the noun phrasing
-
-            # ("purchase OF laptops", "invoice for inventory stock OF 50000")
-
-            # and trailing ones too — neither is part of the item name.
-
-            item = re.sub(
-
-                r"^(?:of|for|on|in|at|to|from|by|with)\s+",
-
-                "",
-
-                m.group(1).strip(),
-
-                flags=re.IGNORECASE,
-
-            )
-
-            item = re.sub(
-
-                r"\s+(?:of|for|on|in|at|to|from|by|with)$",
-
-                "",
-
-                item,
-
-                flags=re.IGNORECASE,
-
-            )
-
-            if item.lower() not in ("it", "something", "goods", "items", "stuff") and (
-
-                _is_plausible_item(item)
-
-            ):
-
-                candidate = item
-
-                candidate_end = m.end()
-
-                break
-
-    if not candidate:
-
-        return None
-
-    # PARTY, NOT PRODUCT (production 2026-10-14): "create invoice for zeta
-
-    # pvt ltd for selling them 2 laptops" — the "invoice for <item>" pattern
-
-    # captured the CUSTOMER ("zeta pvt ltd"), which then named the revenue
-
-    # stream and dead-ended the flow.  Two deterministic signals mark the
-
-    # capture as the counterparty: a legal-entity suffix, or a nested
-
-    # sale/purchase clause right after it.  Neither compares against the
-
-    # party extractor (which is itself wrong on "invoice for inventory
-
-    # stock of 50000 to X"), so a genuine item is never dropped.  Returning
-
-    # no item opens the item question — and the bounded understanding call,
-
-    # which proposes the real product from the user's words.
-
-    if _COMPANY_SUFFIX_RE.search(candidate):
-
-        log.info("planner.item_rejected", reason="company_suffix",
-
-                 value=candidate[:60])
-
-        return None
-
-    if _NESTED_DEAL_CLAUSE_RE.search(msg[candidate_end:candidate_end + 40]):
-
-        log.info("planner.item_rejected", reason="nested_deal_clause",
-
-                 value=candidate[:60])
-
-        return None
-
-    return candidate
-
-
-
-
-
-# "<count> <item>" — the count that precedes the item name in the request.
-
-_ITEM_QTY_RE = re.compile(
-
-    # The count may NOT start inside a bigger number: without the guard the
-
-    # thousands comma in "for 367,000 to be received..." yielded the fragment
-
-    # "000" as a count, paired with the trailing clause as its "item".
-
-    r"(?<![\d.,])(?P<qty>\d+(?:\.\d+)?)\s*"
-
-    r"(?:x\s+|pcs\b\s*|units?\b\s*|pieces\b\s*|nos\b\s*)?"
-
-    r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
-
-    r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-# Written counts ("sale of two motorbikes", "a couple of bikes", "a dozen
-
-# pens").  The digit pattern above cannot see them, and `_extract_item` KEEPS
-
-# the word inside the item it returns — so the count ended up inside the
-
-# DESCRIPTION and `quantity` stayed empty.  The agent then asked "How many
-
-# units are you invoicing?" for a count the user had already given.
-
-_COUNT_WORDS: Dict[str, int] = {
-
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-
-    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
-
-    "seventy": 70, "eighty": 80, "ninety": 90,
-
-    "couple": 2, "pair": 2, "dozen": 12,
-
-}
-
-
-
-# Longest first, so "seventeen" is never read as the prefix "seven".
-
-_COUNT_WORD_ALT = "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
-
-
-
-_ITEM_QTY_WORD_RE = re.compile(
-
-    # `(?<!-)` keeps a hyphenated compound intact: "twenty-five bikes" must not
-
-    # be read as FIVE (the count is 25, and the understanding call resolves it).
-
-    rf"(?<!-)\b(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+"
-
-    r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
-
-    r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
-
-    re.IGNORECASE,
-
-)
-
-
-
-#: Any written count word, as a hint that wording states a number we may not
-
-#: have been able to take (drives the understanding-call gap, never a guess).
-
-_COUNT_WORD_HINT_RE = re.compile(rf"\b(?:{_COUNT_WORD_ALT})\b", re.IGNORECASE)
-
-
-
-_COUNT_PREFIX_RE = re.compile(
-
-    rf"^\s*(?<!-)(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-def _split_leading_count(text: str) -> Tuple[str, Optional[float]]:
-
-    """Split a leading WRITTEN count off a phrase.
-
-
-
-        "two motorbikes"   -> ("motorbikes", 2.0)
-
-        "a couple of bikes" -> ("bikes", 2.0)
-
-        "motorbikes"       -> ("motorbikes", None)
-
-
-
-    The original text is returned unchanged when there is no written count, so
-
-    a caller may always use the first element as the (possibly unchanged) name.
-
-    """
-
-    raw = str(text or "").strip()
-
-    match = _COUNT_PREFIX_RE.match(raw)
-
-    if not match:
-
-        return raw, None
-
-    value = _COUNT_WORDS.get((match.group("qty") or "").lower())
-
-    if value is None:
-
-        return raw, None
-
-    return raw[match.end():].strip(), float(value)
-
-
-
-
-
-def _extract_item_quantity(msg: str, item: str) -> Optional[float]:
-
-    """Return the count stated with the item phrasing, when there is one.
-
-
-
-        "create an invoice for selling 2 ovens to lkj pvt limited" -> 2.0
-
-        "sold 5 chairs"                                          -> 5.0
-
-
-
-    The count used to be swallowed by the optional quantity group in
-
-    ``_ITEM_PATTERNS`` and thrown away, so ``item_quantity`` was only ever
-
-    populated from a clarification ANSWER — the agent therefore asked the
-
-    user for a quantity that was already in the original request.
-
-
-
-    The count is only accepted when the word following it is the SAME item
-
-    the item extractor found, so an unrelated number in the sentence can
-
-    never be mistaken for the line quantity.
-
-    """
-
-    target = (item or "").strip().lower()
-
-    if not target:
-
-        return None
-
-    # A WRITTEN count rides INSIDE the item the extractor returned
-
-    # ("two motorbikes"), so the phrase without it is a name to match too.
-
-    bare, _ = _split_leading_count(target)
-
-    names = {name for name in (target, bare) if name}
-
-
-
-    def _matches(name: str) -> bool:
-
-        return any(
-
-            name == candidate
-
-            or candidate.startswith(name)
-
-            or name.startswith(candidate)
-
-            for candidate in names
-
-        )
-
-
-
-    for m in _ITEM_QTY_RE.finditer(msg):
-
-        name = (m.group("name") or "").strip().lower()
-
-        if not name or not _matches(name):
-
-            continue
-
-        try:
-
-            qty = float(m.group("qty"))
-
-        except (TypeError, ValueError):
-
-            continue
-
-        if qty > 0:
-
-            return qty
-
-    # Written counts: "two motorbikes", "a couple of bikes", "a dozen pens".
-
-    for m in _ITEM_QTY_WORD_RE.finditer(msg):
-
-        prefix = (msg or "")[: m.start()].rstrip().lower()
-
-        # "half a dozen" is SIX — never silently read as twelve.
-
-        if prefix.endswith(("half", "quarter", "halve")):
-
-            continue
-
-        name = (m.group("name") or "").strip().lower()
-
-        if not name or not _matches(name):
-
-            continue
-
-        value = _COUNT_WORDS.get((m.group("qty") or "").lower())
-
-        if value:
-
-            return float(value)
-
-    return None
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# MULTI-LINE ITEM parsing
-
-# ---------------------------------------------------------------------------
-
-# Users state several line items in ONE request ("2 laptops at 5000 each
-
-# and 3 mice at 500", "1 laptop for 50,000, 2 keyboards for 2,000 each").
-
-# The planner must recognise EACH line — quantity, description and unit
-
-# price — instead of collapsing everything into one item + one amount.
-
-
-
-_LINE_SPLIT_RE = re.compile(
-
-    r"\s*(?:\n+|\band\b|,|;|\d+[\.\)]\s+)\s*", re.IGNORECASE
-
-)
-
-# Per segment:  QTY  NAME  (@|at|for|each|:)  UNIT-PRICE   [+ each/per unit]
-
-# Used with .search() — no ^ anchor — so the line can sit mid-sentence.
-
-_LINE_ITEM_RE = re.compile(
-
-    r"(?P<qty>\d+(?:\.\d+)?)\s*(?:x\b|pcs\b|units?\b|pieces\b|nos\b)?\s*"
-
-    r"(?P<name>[a-zA-Z][\w\s&\.\-/]*?)\s*"
-
-    r"(?:@|\bat\b|\bfor\b|\beach\b|:)\s*(?:rs\.?|pkr|₨)?\s*"
-
-    r"(?P<price>[\d,]+(?:\.\d+)?)\s*(?:each|per\s*unit)?\s*$",
-
-    re.IGNORECASE,
-
-)
-
-
-
-
-
-def _extract_line_items(text: str) -> Optional[List[Dict[str, Any]]]:
-
-    """Parse a request/answer into DISTINCT invoice lines.
-
-
-
-    Recognised shapes per segment (case/spacing tolerant):
-
-
-
-        2 laptops at 5000 each        3 x mouse @ 500
-
-        1 laptop for 50,000           5 units keyboard: 2,000
-
-
-
-    Returns ``None`` unless at least TWO complete lines parse (a single
-
-    item keeps riding the singular item/quantity ladder).  Each line is
-
-    ``{"description", "quantity", "unit_price"}``; line totals are left to
-
-    ``validate_document_items`` so the SAME arithmetic runs everywhere.
-
-    """
-
-    if not text:
-
-        return None
-
-    # Protect thousands separators ("50,000" -> "50000") so the comma
-
-    # separator can never split a number into two broken lines.
-
-    normalized = re.sub(r"(?<=\d),(?=\d)", "", text)
-
-    lines: List[Dict[str, Any]] = []
-
-    for segment in _LINE_SPLIT_RE.split(normalized.strip()):
-
-        segment = segment.strip()
-
-        if not segment:
-
-            continue
-
-        # SEARCH (not match): the item phrase may sit mid-sentence after
-
-        # "create invoice for ABC Traders for ..." — only the tail from
-
-        # the quantity onward is the line.
-
-        m = _LINE_ITEM_RE.search(segment)
-
-        if not m:
-
-            continue
-
-        try:
-
-            qty = float(m.group("qty"))
-
-            price = float(m.group("price").replace(",", ""))
-
-        except (TypeError, ValueError):
-
-            continue
-
-        name = m.group("name").strip(" -–:")
-
-        if qty <= 0 or price < 0 or not name:
-
-            continue
-
-        # A bare "2 at 5000" (no name) is not an item line.
-
-        if len(name) < 2:
-
-            continue
-
-        lines.append({
-
-            "description": name,
-
-            "quantity": qty,
-
-            "unit_price": price,
-
-        })
-
-    if len(lines) < 2:
-
-        return None
-
-    return lines
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-# ATTACHED-DOCUMENT LINE ITEMS (vision extraction block)
-
-# ---------------------------------------------------------------------------
-
-# A document upload reaches the planner as FACTUAL CONTEXT appended to the
-
-# message ("[Attached document information]") with an authoritative header
-
-# (Supplier / Subtotal / Discount / Total) and one row per line:
-
-#
-
-#     Line 1: Surf Excel 5 kg | qty 20 | unit 600.0 | amount 12600.0
-
-#
-
-# Without this parser the document collapsed to ONE line carrying whichever
-
-# amount the header patterns happened to match first (Line 1's amount), so a
-
-# 7-line GRN was recorded as a single-line bill for the first row and the
-
-# model had to reconcile the difference in a giant, timeout-prone round trip.
-
-# The printed line TOTAL is preferred over qty x unit_price because the
-
-# document's own rows are summed into its stated subtotal - deriving the unit
-
-# price from the line total keeps the recorded lines tied to the document
-
-# (parity law: the header can never disagree with its own lines).
-
-_DOC_LINE_RE = re.compile(
-
-    r"^[ \t]*line[ \t]*\d+[ \t]*:[ \t]*(?P<desc>.+?)"
-
-    r"(?:[ \t]*\|[ \t]*qty[ \t]*(?P<qty>[\d,]+(?:\.\d+)?))?"
-
-    r"(?:[ \t]*\|[ \t]*unit[ \t]*(?P<unit>[\d,]+(?:\.\d+)?))?"
-
-    r"(?:[ \t]*\|[ \t]*amount[ \t]*(?P<amount>[\d,]+(?:\.\d+)?))?"
-
-    r"[ \t]*$",
-
-    re.IGNORECASE | re.MULTILINE,
-
-)
-
-_DOC_SUPPLIER_RE = re.compile(
-
-    r"^[ \t]*supplier[ \t]*:[ \t]*(?P<name>.+?)[ \t]*$",
-
-    re.IGNORECASE | re.MULTILINE,
-
-)
-
-# Column headings / table furniture can never be a party ledger name.
-
-_JUNK_PARTY_NAMES = {
-
-    "line", "lines", "line item", "line items", "item", "items",
-
-    "description", "qty", "quantity", "unit", "amount", "total",
-
-    "subtotal", "discount", "tax", "unit price", "price", "particulars",
-
-}
-
-
-
-
-
-def _doc_number(raw: Optional[str]) -> Optional[float]:
-
-    """Parse a document row/header number, tolerating separators."""
-
-    if not raw:
-
-        return None
-
-    try:
-
-        value = float(str(raw).replace(",", "").strip())
-
-    except (TypeError, ValueError):
-
-        return None
-
-    return value if value >= 0 else None
-
-
-
-
-
-def _extract_document_lines(
-
-    text: str,
-
-) -> tuple:
-
-    """Parse the ATTACHED-DOCUMENT block into DISTINCT lines + supplier.
-
-
-
-    Returns ``(line_items | None, supplier_name | None)``.  Line items are
-
-    ``{"description", "quantity", "unit_price"}`` - the same shape the
-
-    multi-item phrasing parser produces, so every downstream consumer
-
-    (fast paths, validation, the document services) is unchanged.  Nothing is
-
-    ever invented: a row is only kept when its quantity and total/unit price
-
-    parse into sane numbers.
-
-    """
-
-    if not text or "[Attached document information]" not in text:
-
-        return None, None
-
-    supplier = None
-
-    m = _DOC_SUPPLIER_RE.search(text)
-
-    if m:
-
-        name = (m.group("name") or "").strip(" .;'\"")
-
-        if name and name.lower() not in _JUNK_PARTY_NAMES:
-
-            supplier = name
-
-    lines: List[Dict[str, Any]] = []
-
-    for match in _DOC_LINE_RE.finditer(text):
-
-        desc = (match.group("desc") or "").strip(" -:|.")
-
-        # A description may still carry a trailing column fragment; keep only
-
-        # the leading human-readable part.
-
-        desc = re.split(r"\s*\|\s*", desc)[0].strip()
-
-        if len(desc) < 2:
-
-            continue
-
-        qty = _doc_number(match.group("qty"))
-
-        unit = _doc_number(match.group("unit"))
-
-        amount = _doc_number(match.group("amount"))
-
-        # Printed line total wins (derives a unit price that ties the line to
-
-        # the document); otherwise quantity x unit price.
-
-        if amount is not None and qty and qty > 0:
-
-            unit_price = round(amount / qty, 2)
-
-        elif qty and qty > 0 and unit is not None:
-
-            unit_price = round(unit, 2)
-
-        else:
-
-            continue
-
-        if qty is None or qty <= 0 or unit_price < 0:
-
-            continue
-
-        lines.append({
-
-            "description": desc,
-
-            "quantity": qty,
-
-            "unit_price": unit_price,
-
-        })
-
-    return (lines or None), supplier
-
-
-
-
-
-def _line_items_total(lines: List[Dict[str, Any]]) -> float:
-
-    """Σ (quantity × unit_price or total_amount) over parsed line items."""
-
-    tot = 0.0
-    for l in lines or ():
-        if l.get("total_amount") is not None:
-            try:
-                tot += float(l["total_amount"])
-            except (ValueError, TypeError):
-                pass
-        elif l.get("quantity") is not None and l.get("unit_price") is not None:
-            try:
-                tot += float(l["quantity"]) * float(l["unit_price"])
-            except (ValueError, TypeError):
-                pass
-    return round(tot, 2)
-
-
-
-
-
-def _extract_amount(msg: str) -> Optional[float]:
-
-    """Try every amount format, highest-confidence pattern first."""
-
-    for pat in _AMOUNT_PATTERNS:
-
-        m = pat.search(msg)
-
-        if not m:
-
-            continue
-
-        try:
-
-            value = float(m.group(1).replace(",", ""))
-
-        except (ValueError, IndexError):
-
-            continue
-
-        # Apply multiplier suffix if the pattern captured one
-
-        if pat.groups >= 2:
-
-            suffix = m.group(2)
-
-            if suffix:
-
-                value *= _AMOUNT_MULTIPLIERS.get(suffix.lower(), 1)
-
-        if value > 0:
-
-            return value
-
-    return None
-
-
-
-
-
-def _extract_payment_method(msg_lower: str) -> Optional[str]:
-
-    for pat, method in _PAYMENT_METHOD_PATTERNS:
-
-        if pat.search(msg_lower):
-
-            return method
-
-    return None
-
-
-
-
-
-def _extract_date(msg: str, msg_lower: str) -> Optional[str]:
-
-    """Extract a transaction date as ISO ``YYYY-MM-DD`` (best effort)."""
-
-    # ISO format
-
-    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", msg)
-
-    if m:
-
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
-
-
-    # DD/MM/YYYY or DD/MM/YY (Pakistan convention: day first)
-
-    m = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b", msg)
-
-    if m:
-
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-        if 1 <= d <= 31 and 1 <= mo <= 12:
-
-            if y < 100:
-
-                y += 2000
-
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-
-
-
-    # "15 aug", "15th August 2026"
-
-    m = re.search(
-
-        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?\s*(\d{4})?\b", msg_lower
-
-    )
-
-    if m and m.group(2)[:3] in _MONTHS:
-
-        d = int(m.group(1))
-
-        mo = _MONTHS[m.group(2)[:3]]
-
-        y = int(m.group(3)) if m.group(3) else date.today().year
-
-        if 1 <= d <= 31:
-
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-
-
-
-    # "aug 15", "August 15th"
-
-    m = re.search(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", msg_lower)
-
-    if m and m.group(1)[:3] in _MONTHS:
-
-        d = int(m.group(2))
-
-        mo = _MONTHS[m.group(1)[:3]]
-
-        if 1 <= d <= 31:
-
-            return f"{date.today().year:04d}-{mo:02d}-{d:02d}"
-
-
-
-    # Relative keywords
-
-    if "day before yesterday" in msg_lower:
-
-        return (date.today() - timedelta(days=2)).isoformat()
-
-    if "yesterday" in msg_lower:
-
-        return (date.today() - timedelta(days=1)).isoformat()
-
-    if "tomorrow" in msg_lower:
-
-        return (date.today() + timedelta(days=1)).isoformat()
-
-    if re.search(r"\btoday\b", msg_lower):
-
-        return date.today().isoformat()
-
-    # Free-text relative forms the keyword scan above cannot see
-
-    # ("2 days ago", "3 weeks ago") — ONE resolver, never two parsers.
-
-    resolved = resolve_relative_date_text(msg)
-
-    if resolved and resolved.ok:
-
-        return resolved.iso_date
-
-    return None
-
-
-
-
-
-def _entity_type(intent: str) -> Optional[str]:
-
-    if "customer" in intent or "sale" in intent or "invoice" in intent or "receipt" in intent:
-
-        return "customer"
-
-    if "supplier" in intent or "purchase" in intent or "payment" in intent:
-
-        return "supplier"
-
-    if "project" in intent:
-
-        return "project"
-
-    if "account" in intent:
-
-        return "account"
-
-    return None
-
-
-
-
-
-def _tools_for_intent(intent: str) -> List[str]:
-
-    mapping = {
-
-        "create_purchase_order": ["search_supplier", "get_supplier", "search_product", "get_product", "create_purchase_order"],
-        "create_quotation": ["search_customer", "get_customer", "create_quotation"],
-
-        "convert_quotation": ["search_customer", "get_customer", "get_invoice", "convert_quotation", "prepare_journal", "validate_journal"],
-
-        # The CA flow for a return: READ the party's open invoices/ledger
-
-        # first, identify the sale being returned, then create the note
-
-        # against it.  `invoice_id` is optional in the service, but the model
-
-        # can only anchor the note when the readers are offered.
-
-        "create_credit_note": ["search_customer", "get_customer", "get_customer_ledger", "get_invoice", "create_credit_note", "prepare_journal", "post_journal"],
-
-        "create_purchase_return": ["search_supplier", "get_supplier", "get_supplier_ledger", "create_purchase_return", "prepare_journal", "post_journal"],
-
-        "record_expense_payment": ["search_supplier", "record_expense_payment", "prepare_journal", "post_journal"],
-
-        "create_invoice": ["search_customer", "get_customer", "create_invoice", "prepare_journal", "validate_journal"],
-
-        "record_credit_purchase": ["search_supplier", "get_supplier", "create_supplier", "search_account", "create_purchase_bill", "prepare_journal", "validate_journal", "post_journal"],
-
-        "record_cash_purchase": ["search_account", "record_cash_purchase", "prepare_journal", "validate_journal", "post_journal"],
-
-        "record_credit_sale": ["search_customer", "get_customer", "create_customer", "search_account", "create_invoice", "prepare_journal", "validate_journal", "post_journal"],
-
-        "record_cash_sale": ["search_customer", "record_cash_sale"],
-
-        "record_expense": ["search_account", "classify_expense", "create_expense", "prepare_journal", "validate_journal", "post_journal"],
-
-        "record_receipt": ["search_customer", "get_customer", "list_bank_accounts", "record_customer_receipt", "prepare_journal", "post_journal"],
-
-        "record_payment": ["search_supplier", "get_supplier", "list_bank_accounts", "record_supplier_payment", "prepare_journal", "post_journal"],
-
-        "record_bank_transfer": ["list_bank_accounts", "record_bank_transfer", "prepare_journal", "post_journal"],
-
-        "create_bank_account": ["create_bank_account"],
-
-        "list_bank_accounts": ["list_bank_accounts"],
-
-        "record_purchase": ["search_supplier", "search_account", "create_purchase_bill", "prepare_journal"],
-
-        "record_sale": ["search_customer", "search_account", "create_invoice", "prepare_journal"],
-
-        "register_fixed_asset": ["search_fixed_asset", "search_supplier", "search_account", "register_fixed_asset"],
-
-        "dispose_fixed_asset": ["search_fixed_asset", "search_account", "dispose_fixed_asset"],
-
-        "record_asset_depreciation": ["search_fixed_asset", "search_account", "record_asset_depreciation"],
-
-        "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
-
-        "update_document_status": ["update_document_status"],
-        "get_inventory_status": ["get_inventory_status", "search_product"],
-        "create_product": ["search_product", "create_product"],
-        "update_product": ["search_product", "update_product"],
-        "delete_product": ["search_product", "delete_product"],
-        "create_service": ["search_service", "create_service"],
-        "update_service": ["search_service", "update_service"],
-        "delete_service": ["search_service", "delete_service"],
-
-        "create_service": ["search_service", "create_service"],
-
-        "create_project": ["search_customer", "create_project"],
-        "create_account": ["search_account", "create_account"],
-        "get_chart_of_accounts": ["get_chart_of_accounts", "search_account"],
-        "create_customer": ["search_customer", "create_customer"],
-        "create_supplier": ["search_supplier", "create_supplier"],
-        "create_employee": ["search_employee", "create_employee"],
-        "create_recurring_template": ["create_recurring_template", "get_recurring_templates"],
-
-        # Loans (LLM-delegated route): the service builds the schedule and
-
-        # posts the opening journal itself; the readers let the model anchor
-
-        # an installment repayment to an existing facility.
-
-        "record_loan": [
-
-            "list_loans", "get_loan_schedule", "record_loan",
-
-            "list_bank_accounts", "search_account",
-
-            "prepare_journal", "validate_journal", "post_journal",
-
-        ],
-
-        "record_loan_repayment": [
-
-            "list_loans", "get_loan_schedule", "record_loan_repayment",
-
-            "list_bank_accounts", "prepare_journal", "post_journal",
-
-        ],
-
-        "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
-
-        "supplier_balance": ["search_supplier", "get_supplier", "get_supplier_ledger"],
-
-        "generate_trial_balance": ["get_trial_balance"],
-
-        "generate_balance_sheet": ["get_balance_sheet"],
-
-        "generate_profit_loss": ["get_profit_loss"],
-
-        "generate_cash_flow": ["get_cash_flow"],
-
-        "generate_general_ledger": ["get_general_ledger"],
-
-        "generate_customer_ledger": ["search_customer", "get_customer_ledger"],
-
-        "generate_supplier_ledger": ["search_supplier", "get_supplier_ledger"],
-
-        "list_expenses": ["list_expenses"],
-
-        "project_profitability": ["search_project", "get_project_profitability"],
-
-    }
-
-    return mapping.get(intent, [])
-
-
-
-
-
-def _context_for_intent(intent: str) -> List[str]:
-
-    mapping = {
-
-        "create_quotation": ["customer_master"],
-
-        "convert_quotation": ["customer_master", "chart_of_accounts", "accounting_periods"],
-
-        # A return is identified FROM the party's records: the invoices and
-
-        # the party ledger are what let the agent find the sale/purchase
-
-        # being reversed (never invented from the request alone).
-
-        "create_credit_note": ["customer_master", "invoices", "customer_ledger", "chart_of_accounts", "accounting_periods"],
-
-        "create_purchase_return": ["supplier_master", "purchase_bills", "supplier_ledger", "chart_of_accounts", "accounting_periods"],
-
-        "record_expense_payment": ["supplier_master", "bank_accounts", "accounting_periods"],
-
-        "create_invoice": ["customer_master", "chart_of_accounts", "accounting_periods"],
-
-        "record_credit_purchase": ["supplier_master", "chart_of_accounts", "accounting_periods"],
-
-        "record_cash_purchase": ["chart_of_accounts", "accounting_periods"],
-
-        "record_credit_sale": ["customer_master", "chart_of_accounts", "accounting_periods"],
-
-        "record_cash_sale": ["chart_of_accounts", "accounting_periods"],
-
-        "record_expense": ["chart_of_accounts", "accounting_periods"],
-
-        "record_receipt": ["customer_master", "bank_accounts", "invoices", "accounting_periods"],
-
-        "record_payment": ["supplier_master", "bank_accounts", "purchase_bills", "accounting_periods"],
-
-        "record_bank_transfer": ["bank_accounts", "accounting_periods"],
-
-        "register_fixed_asset": ["chart_of_accounts", "supplier_master", "bank_accounts", "accounting_periods"],
-
-        "dispose_fixed_asset": ["chart_of_accounts", "bank_accounts", "accounting_periods"],
-
-        "record_asset_depreciation": ["chart_of_accounts", "accounting_periods"],
-
-        "run_payroll": ["employee_master", "chart_of_accounts", "bank_accounts", "accounting_periods"],
-
-        "create_product": ["chart_of_accounts"],
-
-        "create_service": ["chart_of_accounts"],
-
-        "create_project": ["projects", "customer_master"],
-
-        "record_loan": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
-
-        "record_loan_repayment": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
-
-        "create_bank_account": ["chart_of_accounts"],
-
-        "list_bank_accounts": ["bank_accounts"],
-
-        "customer_balance": ["customer_master", "customer_ledger", "invoices", "receipts"],
-
-        "supplier_balance": ["supplier_master", "supplier_ledger", "purchase_bills", "payments"],
-
-        "generate_trial_balance": ["trial_balance", "accounting_periods"],
-
-        "generate_balance_sheet": ["balance_sheet", "accounting_periods"],
-
-        "generate_profit_loss": ["income_statement", "accounting_periods"],
-
-        "generate_cash_flow": ["cash_flow", "balance_sheet", "income_statement", "accounting_periods"],
-
-        "project_profitability": ["projects", "general_ledger", "accounting_periods"],
-
-    }
-
-    return mapping.get(intent, [])
-
-
-
-
-
-def _outcome(intent: str) -> str:
-
-    outcomes = {
-
-        "create_purchase_order": "Purchase order / vendor quotation created with status RFQ",
-        "create_quotation": "Sales quotation created and ready to send",
-
-        "convert_quotation": "Quotation converted to a sales invoice with posted receivable journal",
-
-        "create_credit_note": "Credit note created reducing customer receivable",
-
-        "create_purchase_return": "Purchase return created reducing supplier payable",
-
-        "record_expense_payment": "Expense/bill payment recorded",
-
-        "create_invoice": "Sales invoice created with journal entry",
-
-        "record_credit_purchase": "Purchase bill and payable recorded",
-
-        "record_cash_purchase": "Purchase recorded as cash expense",
-
-        "record_credit_sale": "Credit sale and receivable recorded",
-
-        "record_cash_sale": "Cash sale recorded",
-
-        "record_expense": "Expense recorded with journal entry",
-
-        "record_receipt": "Customer receipt recorded with journal entry and allocation",
-
-        "record_payment": "Supplier payment recorded with journal entry and allocation",
-
-        "record_bank_transfer": "Bank-to-bank transfer recorded with journal entry",
-
-        "register_fixed_asset": "Fixed asset registered and capitalised with journal entry",
-
-        "record_loan": "Loan recorded with amortization schedule and opening journal",
-
-        "record_loan_repayment": "Loan installment recorded with principal/interest split",
-
-        "dispose_fixed_asset": "Fixed asset disposed of with gain/loss journal entry",
-
-        "record_asset_depreciation": "Asset depreciation recorded with journal entry",
-
-        "run_payroll": "Payroll run recorded with journal entry",
-
-        "create_product": "Product added to the catalog",
-        "update_product": "Product updated in the catalog",
-        "delete_product": "Product removed or deactivated in the catalog",
-        "create_service": "Service added to the catalog",
-        "update_service": "Service updated in the catalog",
-        "delete_service": "Service removed or deactivated in the catalog",
-
-        "create_service": "Service added to the catalog",
-
-        "create_project": "Project created",
-        "create_account": "Account created in the Chart of Accounts",
-        "get_chart_of_accounts": "Chart of Accounts retrieved",
-        "update_document_status": "Document status updated and audit entry recorded",
-        "get_inventory_status": "Inventory status and stock levels retrieved",
-        "create_customer": "Customer registered in CRM directory",
-        "create_supplier": "Supplier registered in vendor directory",
-        "create_employee": "Employee registered in personnel roster",
-        "create_bank_account": "Bank account configured",
-        "create_recurring_template": "Recurring template created",
-
-        "create_bank_account": "Bank account created with linked GL account",
-
-        "list_bank_accounts": "Bank account list retrieved",
-
-        "customer_balance": "Customer outstanding balance calculated",
-
-        "supplier_balance": "Supplier outstanding balance calculated",
-
-        "generate_trial_balance": "Trial balance report generated",
-
-        "generate_balance_sheet": "Balance sheet generated",
-
-        "generate_profit_loss": "Profit & Loss statement generated",
-
-        "list_expenses": "Expense details retrieved",
-
-    }
-
+"""
+
+ERP AI Agent — Planner
+
+========================
+
+Translates natural language into an execution plan.
+
+
+
+The Planner determines:
+
+* Intent
+
+* Extracted entities (amount, supplier, customer, item, date, payment method)
+
+* Required context sources
+
+* Potentially required tools
+
+* Whether validation / accounting engine / confirmation is needed
+
+* Clarification questions (ONLY for genuinely missing material information)
+
+
+
+Clarification philosophy (anti-loop guarantees):
+
+* Extract FIRST — every entity format variant is attempted before
+
+  deciding anything is missing.
+
+* Reuse — values answered in prior clarification rounds are merged into
+
+  the entity set and NEVER re-asked.
+
+* Minimal & consolidated — ALL independently-missing material fields are
+
+  gathered into ONE questionnaire per round (dependency-first ordering,
+
+  no fixed question sequence, no drip-feeding one question per turn).
+
+* Trust the LLM — when extraction is inconclusive the request is passed
+
+  to Gemini with all extracted hints rather than blocked here.
+
+
+
+The Planner does NOT directly execute database mutations.
+
+"""
+
+
+
+from __future__ import annotations
+
+
+
+import re
+
+from datetime import date, timedelta
+
+from typing import Any, Dict, List, Optional, Tuple
+
+
+
+import structlog
+
+
+
+from app.accounting_vocabulary import NATURE_LEDGER_NAMES
+
+from app.date_parser import (
+
+    parse_transaction_date,
+
+    resolve_date_range,
+
+    resolve_relative_date_text,
+
+)
+
+from app.questionnaire import QUESTION_BANK
+
+from app.reasoning import (
+
+    DATE_REQUIRED_INTENTS,
+
+    NATURE_DECISION_QUESTION,
+
+    EXPENSE_EVENT_DATE_QUESTION,
+
+    SETTLEMENT_POSITION_QUESTION,
+
+    capitalization_question_for,
+
+    capitalization_threshold_from_prefs,
+
+    accepted_nature_values,
+
+    derive_nature_from_text,
+
+    nature_family_for_intent,
+
+    nature_for_purpose,
+
+    nature_question_for_intent,
+
+    purpose_label,
+
+    purpose_option,
+
+    purpose_question,
+
+    purpose_requires_capitalization_question,
+
+    resolve_capitalization_answer,
+
+    resolve_nature_answer,
+
+    resolve_purpose_answer,
+
+    resolve_settlement_answer,
+
+)
+
+from app.models.schemas import ExecutionPlan
+
+
+
+log = structlog.get_logger(__name__)
+
+
+
+
+
+# Intents whose nature comes from the EXPENSE decision tree
+
+# (FIXED_ASSET / INVENTORY / CONSUMABLE / OPERATING_EXPENSE / SERVICE).
+
+#
+
+# A LEARNED nature preference is only meaningful inside this family.  It must
+
+# never answer a SALE: a sale's nature vocabulary is
+
+# GOODS / SERVICE / ASSET_DISPOSAL / OTHER_INCOME, and applying an expense
+
+# nature to one both mislabels the transaction ("Nature: Operating Expense" on
+
+# a sale) and suppresses the sale-type question, which then lets the revenue
+
+# account be resolved silently by fuzzy name match.
+
+_EXPENSE_NATURE_INTENTS = frozenset({
+
+    "record_expense",
+
+    "record_purchase",
+
+    "record_cash_purchase",
+
+    "record_credit_purchase",
+
+    "register_fixed_asset",
+
+})
+
+
+
+# Intents that require explicit user authorization BEFORE any mutation
+
+# (the PHASE 5 confirmation gate).  Exported through
+
+# intent_requires_confirmation() so the agent can RE-EVALUATE the
+
+# requirement after FIX-5 reconciliation (when the planned tools reveal a
+
+# confirmation-class event under a non-confirmation intent, e.g. a
+
+# register_fixed_asset plan living under record_expense).
+
+_CONFIRMATION_INTENTS = frozenset({
+
+    "record_credit_purchase", "record_credit_sale", "create_invoice",
+
+    "record_receipt", "record_payment",
+
+    "create_credit_note", "create_purchase_return", "record_expense_payment",
+
+    "record_bank_transfer", "create_bank_account",
+
+    "register_fixed_asset", "dispose_fixed_asset",
+
+    "record_asset_depreciation",
+
+    # Payroll moves real money (or books the salary liability) and is
+
+    # computed from the roster — the user always authorizes the run first.
+
+    "run_payroll",
+
+    # Quotation → invoice conversion posts a receivable journal, so the
+
+    # user confirms before the accounting mutation (same as create_invoice).
+
+    "convert_quotation",
+    "delete_product", "delete_service",
+
+    # Loans move real money (opening journal / installment settlement) and
+
+    # create or settle a liability or loan receivable — the user always
+
+    # authorizes first (same class as record_receipt / record_payment).
+
+    "record_loan", "record_loan_repayment",
+
+})
+
+
+
+
+
+def intent_requires_confirmation(intent: str) -> bool:
+
+    """Does *intent* require user authorization before mutating?"""
+
+    return intent in _CONFIRMATION_INTENTS
+
+
+
+
+
+# hard ceiling on batch size - beyond this the request is
+
+# treated as a single (possibly itemised) transaction instead of N
+
+# documents, preventing pathological N-document explosions.
+
+_BATCH_MAX_ITEMS = 10
+
+
+
+# ---------------------------------------------------------------------------
+
+# Intent patterns — order matters (more specific first)
+
+# ---------------------------------------------------------------------------
+
+_INTENT_PATTERNS: List[tuple[str, list[str]]] = [
+
+    # Reports (read-only, no mutation)
+
+    ("generate_trial_balance", [r"trial\s*balance"]),
+
+    ("generate_balance_sheet", [r"balance\s*sheet"]),
+
+    ("generate_profit_loss", [r"profit.*loss", r"\bp\s*&?\s*l\b", r"income\s*statement"]),
+
+    ("generate_cash_flow", [r"cash\s*flow"]),
+
+    ("generate_general_ledger", [r"general\s*ledger"]),
+
+    # "owe" with WORD BOUNDARIES (Fix 5): the bare substring `owe` matched
+
+    # inside "borrow**owe**d", so every borrowing phrasing was routed to the
+
+    # customer-ledger report.  owe/owes/owed/owing still match.
+
+    ("customer_balance", [r"\bowe(?:s|d|ing)?\b", r"receivable", r"customer.*ledger", r"how much.*\bowe"]),
+
+    ("supplier_balance", [r"supplier.*ledger", r"\bpayables?\b", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
+
+    ("project_profitability", [r"project.*profit", r"profitability"]),
+
+    ("generate_customer_ledger", [r"customer.*ledger"]),
+
+    ("generate_supplier_ledger", [r"supplier.*ledger"]),
+
+    # Expense LOOKUPS must win over record_expense: the bare "expense"
+
+    # keyword in record_expense used to swallow query phrasings like
+
+    # "provide details of current month expenses" and drag them into the
+
+    # recording clarification ladder.  Query-shaped
+
+    # phrasings are matched FIRST and routed to the read-only listing.
+
+    ("list_expenses", [
+
+        r"(?:show|list|give|provide|tell|view|display|details?|summary|"
+
+        r"summar\w*|breakdown|what|which|how much|any|all)[^.\n]*expenses?",
+
+        r"expenses?[^.\n]*\b(?:details?|report|summary|list|history|"
+
+        r"breakdown|this month|last month|this week|last month)",
+
+        r"expense\s+report",
+
+        r"(?:how much|what|total)[^.\n]*\bspen[td]\b",
+
+    ]),
+
+    # New document types
+
+    # convert_quotation MUST precede create_quotation: "convert quotation to
+
+    # invoice" also matches the generic quotation pattern below.
+
+    ("create_purchase_order", [
+        r"(?:purchase|vendor|supplier)\s*(?:quotation|quote|rfq|order|po)",
+        r"(?:quotation|quote|rfq|order|po)\s+(?:for\s+purchasing|for\s+buying|from\s+supplier|from\s+vendor)",
+        r"(?:prepare|create|make|issue|draft)\s*(?:a\s+)?(?:quotation|quote|rfq|order)\s+(?:for\s+purchasing|for\s+buying|from)",
+        r"\bpurchas(?:e|ing)\s+quotation\b",
+        r"\brfq\b",
+    ]),
+    ("convert_quotation", [r"convert.*(?:quotation|quote)", r"(?:quotation|quote).*invoice", r"accept.*(?:quotation|quote).*invoice"]),
+
+    ("create_quotation", [r"quotation", r"quote", r"price\s*quote", r"create.*quote", r"send.*quotation"]),
+
+    # RETURNS — the SIDE is decided by who sent the goods back:
+
+    #   "<party> returned X"          → they returned goods to us → SALE return
+
+    #                                   (credit note against their invoice)
+
+    #   "we returned X" / "…to <supplier>" → we sent goods back → PURCHASE return
+
+    # create_purchase_return MUST precede create_credit_note: both now
+
+    # recognise the bare verb, so the "we"/supplier phrasings have to be
+
+    # claimed first.  Production 2026-09-30 (session 387b7cb8): "Alpha
+
+    # Associates Returned Chairs amounting to 34000" matched NOTHING — the
+
+    # old patterns demanded the literal words "goods"+"customer" — so intent
+
+    # stayed unknown, every deterministic gate (party check, questionnaire,
+
+    # confirmation) was skipped and the run fell into the generic LLM tool
+
+    # loop and died at the 120s execution budget.
+
+    ("create_purchase_return", [
+
+        r"purchase\s*return",
+
+        r"return.*goods.*supplier",
+
+        r"return.*to.*supplier",
+
+        r"send.*back.*supplier",
+
+        r"\bsent\b[^.]*\bback\b",
+
+        r"\bwe\s+return(?:ed|s|ing)?\b",
+
+    ]),
+
+    ("create_credit_note", [
+
+        r"credit\s*note", r"refund", r"return.*goods.*customer", r"issue.*credit\s*note",
+
+        # "<party> returned/returns/refunded …" and "return of <items>".
+
+        r"\breturned\b",
+
+        r"\breturn\s+of\b",
+
+        r"\breturns?\s+(?:the\s+)?(?:goods|items?|stock|merchandise|units?)\b",
+
+    ]),
+
+    # Payroll (Employees Phase 2).  An ACTION verb is required — a bare
+
+    # "payroll" keyword would swallow query phrasings ("show payroll") and
+
+    # drag them into a mutation's confirmation ladder.  A plan that names the
+
+    # payroll TOOL under any other intent is reconciled to this intent by
+
+    # tool_selector.reconcile_intent_with_tools (FIX-5), which then applies
+
+    # the confirmation gate.
+
+    ("run_payroll", [
+
+        r"(?:run|process|do|make|execute|prepare|record)[^.\n]*\bpayroll\b",
+
+        r"\bpayroll\b[^.\n]*\b(?:run|processing)\b",
+
+        r"\bpa(?:y|id|ying)\b[^.\n]{0,40}\bsalar(?:y|ies)\b",
+
+        r"\bsalar(?:y|ies)\b[^.\n]{0,20}\b(?:payment|disburs\w*|payout|run)\b",
+
+        r"pay\s+(?:the\s+)?(?:staff|employees|workers|team)\b",
+
+        r"\bwages\b[^.\n]{0,20}\b(?:pay|paying|disburs\w*)\b",
+
+    ]),
+
+    # Settlement of an ALREADY-RECORDED expense liability (mandate Case C):
+
+    # only UNMISTAKABLE settlement wording claims this family deterministically
+
+    # — "settled the bill", "expense payment".  A bare "paid ... bill/expense"
+
+    # phrasing is a NEW event whose nature (expense vs purchase vs settlement)
+
+    # is the LLM understanding stage's decision via the semantic-intent
+
+    # whitelist (planner._SEMANTIC_INTENTS) — never a Python keyword guess
+
+    # (production 2026-10-14: `paid.*bill` hijacked "Paid 3000 against monthly
+
+    # internet bill of flash fibre" into the supplier-settlement family and
+
+    # dead-ended the whole app).
+
+    ("record_expense_payment", [r"expense\s+payment", r"settled?\s+[^.\n]*\bbill\b"]),
+
+    # Mutations
+
+    ("create_invoice", [r"create.*invoice", r"invoice.*for", r"bill.*customer"]),
+
+    ("record_credit_sale", [r"sold.*credit", r"credit\s*sale", r"on\s*credit.*sold"]),
+
+    # "received payment for X" claims the sale family ONLY when X is
+
+    # actually sale vocabulary (Fix 5/6, RC-4: "Received payment for loan
+
+    # repayment" matched the loose `.*for` pattern, took the sale nature
+
+    # ladder and asked "nature of this sale?" on a borrowing).  Without a
+
+    # sale marker the phrase falls through to the receipt family (the
+
+    # operation question — which offers LOAN as a settlement — decides).
+
+    ("record_cash_sale", [
+
+        r"sold.*cash", r"cash\s*sale",
+
+        r"received\s*payment[^.\n]*\b(?:sale|invoice|goods|services?|stock|products?|items?)\b",
+
+    ]),
+
+    ("record_credit_purchase", [r"bought.*credit", r"credit\s*purchase", r"on\s*credit.*bought", r"purchased.*credit"]),
+
+    ("record_cash_purchase", [r"bought.*cash", r"cash\s*purchase", r"purchased.*cash", r"bought.*paid"]),
+
+    # record_expense requires a RECORDING verb (or an amount-bearing
+
+    # "expense of/for <figure>" phrasing) — a bare "expense" keyword
+
+    # swallowed query phrasings and sent them into the recording ladder.
+
+    ("record_expense", [
+
+        r"record[^.\n]*expense",
+
+        r"(?:log|book|add|track|enter|submit|file)[^.\n]*expense",
+
+        r"expense\s+(?:of|for)\s+(?:rs\.?|pkr)?\s*[\d,]",
+
+        r"spent",
+
+        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b[^.\n]*\b[\d,]+(?:\.\d+)?\b",
+
+        r"^(?!.*\b(?:paid|pay|paying|against)\b).*\b[\d,]+(?:\.\d+)?\b[^.\n]*\b(?:bill|rent|fare|fee|charges?|subscription|sub|uber|careem|petrol|diesel|fuel|repair|tea|refreshment|cleaning)\b",
+
+    ]),
+
+    (
+        "record_receipt",
+        [
+            r"receipt",
+            r"(?:receive|received|collect|collected)\b[^.\n]*\b(?:payment|amount|money|cash)\b",
+            r"received.*from.*customer",
+            r"customer.*paid",
+            r"payment.*received",
+            r"(?:payment\s+)?receipt\s+against\s+(?:invoice|sale)",
+            r"(?:receive|received|record)\s+(?:payment|receipt)\s+against\s+invoice",
+            r"(?:receive|received|collect|collected)\s+(?:against\s+)?(?:invoice|inv\b)",
+            r"\breceived\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?\s+from\b",
+        ],
+    ),
+    (
+        "record_payment",
+        [
+            r"paid.*supplier",
+            r"supplier.*payment",
+            r"payment.*to.*supplier",
+            r"(?:record|make|send)?\s*payment\s+against\s+(?:bill|purchase)",
+            r"(?:pay|paid|settle|settled|cleared?)\s+(?:against\s+)?(?:bill|purchase\s+bill|pur\b)",
+            r"\bpay\s+supplier\b",
+        ],
+    ),
+
+    ("record_bank_transfer", [r"transfer.*bank", r"bank.*transfer", r"transfer.*from.*to.*account", r"move.*money.*from", r"transfer.*hbl\b", r"transfer.*meezan\b"]),
+
+    ("create_bank_account", [r"add.*bank.*account", r"create.*bank.*account", r"new.*bank.*account", r"open.*bank.*account"]),
+
+    ("list_bank_accounts", [r"bank.*account", r"list.*bank", r"show.*bank"]),
+
+    # Fixed-asset lifecycle + product catalog (BEFORE generic buy/sell so
+
+    # the specific economic event wins)
+
+    ("dispose_fixed_asset", [r"dispos.*asset", r"sell.*(?:asset|machinery|vehicle|equipment|furniture)", r"sold.*(?:asset|machinery|vehicle|equipment|furniture)", r"write.?off.*asset", r"scrap.*asset"]),
+
+    ("record_asset_depreciation", [r"depreciat"]),
+
+    ("update_document_status", [
+        r"\b(?:mark|change|set|update|convert)\b[^.\n]*\b(?:status|paid|void|approved|cancelled|ordered|rfq)\b",
+        r"\b(?:mark|change|set)\s+(?:bills?|invoices?|orders?|pos?|rfqs?)\b[^.\n]*\bas\s+(?:paid|void|open|approved|cancelled)\b",
+    ]),
+
+    ("register_fixed_asset", [
+        r"fixed\s*asset", r"register.*asset", r"capitaliz.*asset", r"capitalis.*asset",
+        r"new.*(?:machinery|generator|delivery van|forklift)",
+    ]),
+
+    # Master data / Setup & Configuration intents across all ERP modules
+    ("create_account", [
+        r"(?:create|add|new|setup|open)\b[^.\n]*\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b",
+        r"\b(?:chart\s+of\s+accounts?|coa|account|ledger)\b[^.\n]*\b(?:create|add|new|setup|open)\b",
+        r"\bnew\s+(?:account|ledger)\b",
+    ]),
+    ("get_chart_of_accounts", [
+        r"(?:show|view|list|get|display|fetch|see)\b[^.\n]*\bchart\s+of\s+accounts?\b",
+        r"\bchart\s+of\s+accounts?\b[^.\n]*\b(?:list|summary|view|overview)\b",
+    ]),
+    ("create_customer", [
+        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:customer|client|buyer)\b",
+        r"\bnew\s+(?:customer|client|buyer)\b",
+    ]),
+    ("create_supplier", [
+        r"(?:create|add|new|register|onboard)\b[^.\n]*\b(?:supplier|vendor|seller)\b",
+        r"\bnew\s+(?:supplier|vendor|seller)\b",
+    ]),
+    ("create_employee", [
+        r"(?:create|add|new|register|hire|onboard|record)\b[^.\n]*\b(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\bnew\s+(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\brecord\s+(?:an?\s+)?(?:employee|staff|worker|personnel|emplyee|employe)\b",
+        r"\b(?:employee|staff|worker|personnel|emplyee|employe)\s+(?:setup|registration|onboarding)\b",
+    ]),
+    ("create_recurring_template", [
+        r"(?:create|add|new|setup)\s+(?:a\s+)?recurring\b",
+    ]),
+
+    ("get_inventory_status", [
+        r"(?:show|view|list|get|display|fetch|check|what\s+is|what's|how\s+much|how\s+many)\b[^.\n]*\b(?:inventory|stock|units\s+on\s+hand|in\s+stock|out\s+of\s+stock|low\s+stock|stock\s+movements?)\b",
+        r"\b(?:inventory|stock)\b[^.\n]*\b(?:status|valuation|value|on\s+hand|summary|balance|level|position|movements?)\b",
+        r"\b(?:out\s+of\s+stock|low\s+stock|depleted\s+stock)\b",
+        r"\bhow\s+many\b[^.\n]*\b(?:units?|items?|pieces?|pcs|in\s+stock|on\s+hand|left|remaining|available|we\s+have|there\s+are)\b",
+        r"\bhow\s+many\b\s+([a-zA-Z0-9_\s\-]+?)\??$",
+        r"\b(?:units?|quantity|count|balance|level)\s+of\b[^.\n]*\b(?:stock|inventory|[a-zA-Z0-9_\-]+)\b",
+    ]),
+
+    ("delete_product", [r"delete.*product", r"remove.*product", r"delete.*item", r"remove.*item.*(?:from|catalogue|catalog)"]),
+    ("update_product", [r"update.*product", r"edit.*product", r"change.*product", r"update.*item.*price"]),
+    ("delete_service", [r"delete.*service", r"remove.*service"]),
+    ("update_service", [r"update.*service", r"edit.*service", r"change.*service"]),
+    ("create_product", [r"add.*product", r"create.*product", r"new product", r"register.*product"]),
+
+    ("create_service", [r"add.*service", r"create.*service", r"new service", r"register.*service"]),
+
+    # PROJECT SETUP — non-financial, but it needs its own intent: without one
+
+    # the request fell to intent=unknown (no keyword route, no field ladder,
+
+    # no context) and the model invented the call until the DB refused
+
+    # project_code (production 2026-10-01, "Set up a project called Mobile App
+
+    # for XYZ Client with a budget of Rs. 2,000,000", sessions 500d0aa4 /
+
+    # 03221efb).  An ACTION verb (or "new project") is required so query
+
+    # phrasings ("show the project budget") are never dragged into a mutation.
+
+    ("create_project", [
+
+        r"(?:set\s*up|create|start|open|register|add|make|launch)\b[^.\n]*\bprojects?\b",
+
+        r"\bnew\s+project\b",
+
+    ]),
+
+    # "we BUY a car …" (production 2026-09-30, session f2166d3f): the ladder
+
+    # had purchase/bought/purchased but NOT "buy", so even after four
+
+    # clarified answers (amount, CASH, FIXED_ASSET, account "Vehicle - Car")
+
+    # the final turn still ran intent=unknown → no deterministic gate → the
+
+    # LLM tool loop → 120s timeout.  The generic purchase intent is the
+
+    # right home: the nature ladder decides fixed-asset vs inventory vs
+
+    # expense, and the payment method refines it to cash/credit.
+
+    ("record_purchase", [r"purchase", r"bought", r"purchased", r"\bbuy(?:s|ing)?\b"]),
+
+    ("record_sale", [r"sold", r"sale"]),
+
+]
+
+
+
+# Intents for which a missing amount is material enough to clarify.
+
+_TRANSACTION_INTENTS = {
+
+    "record_credit_purchase", "record_cash_purchase", "record_purchase",
+
+    "record_credit_sale", "record_cash_sale", "record_sale",
+
+    "record_expense", "record_receipt", "record_payment",
+
+    "create_invoice", "create_credit_note", "create_purchase_return",
+
+    "record_expense_payment", "record_bank_transfer",
+
+    "register_fixed_asset",
+
+    # Loans are material money movements — a missing amount is worth
+
+    # clarifying exactly like any other transaction intent.
+
+    "record_loan", "record_loan_repayment",
+
+}
+
+
+
+# planner intents the SEMANTIC layer may set. This is the
+
+# deterministic whitelist: a semantic intent outside it is ignored and the
+
+# keyword extractor decides (the LLM cannot invent an intent).
+
+# record_loan / record_loan_repayment are intentionally reachable ONLY via
+
+# this whitelist (LLM-identified route): the keyword ladder carries no
+
+# borrowing vocabulary by design — nature/route identification for loans
+
+# belongs to the understanding stage, never to substring routing.
+
+_SEMANTIC_INTENTS = frozenset({
+
+    "record_credit_sale", "record_cash_sale", "record_sale",
+
+    "record_credit_purchase", "record_cash_purchase", "record_purchase",
+
+    "record_expense", "record_receipt", "record_payment",
+
+    "create_invoice", "create_purchase_bill", "create_credit_note",
+
+    "create_purchase_return", "run_payroll",
+
+    "record_loan", "record_loan_repayment",
+
+    # record_expense_payment is reachable ONLY via this whitelist (LLM-
+
+    # identified route): a bare "paid ... bill" must never be claimed by the
+
+    # keyword ladder, but when the understanding stage DOES identify it as the
+
+    # settlement of an already-recorded expense liability (mandate Case C) the
+
+    # whitelist must carry it to the settlement workflow — dropping it to
+
+    # `unknown` would dead-end the exact decision the LLM just made.
+
+    "record_expense_payment",
+
+    # Master data / Setup and Operational intents across all ERP modules
+    "create_account", "get_chart_of_accounts", "create_customer", "create_supplier",
+    "create_product", "create_service", "create_employee", "create_project",
+    "create_recurring_template", "get_recurring_templates", "create_bank_account",
+    "list_bank_accounts", "list_expenses", "list_customers", "list_suppliers",
+    "list_employees", "get_inventory_status", "supplier_balance", "customer_balance",
+    "generate_supplier_ledger", "generate_customer_ledger", "generate_general_ledger",
+    "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
+    "generate_cash_flow", "project_profitability", "record_bank_transfer",
+    "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
+    "record_adjustment", "record_correction", "reverse_journal",
+    "update_product", "delete_product", "update_service", "delete_service",
+    "create_purchase_order", "create_quotation", "convert_quotation",
+})
+
+
+
+# every mutation
+
+# intent must resolve an explicit accounting date before any tool call.
+
+# Canonical set lives in app.reasoning (DATE_REQUIRED_INTENTS) so the
+
+# dependency graph and the planner can never drift apart.
+
+
+
+# ---------------------------------------------------------------------------
+
+# Amount extraction — ordered by confidence (highest first)
+
+# ---------------------------------------------------------------------------
+
+_NUM = r"([\d,]+(?:\.\d+)?)"
+
+
+
+_AMOUNT_PATTERNS = [
+
+    # Explicit clarification answer (highest confidence — it IS the answer)
+
+    re.compile(
+
+        r"(?:clarification|answer)\s*:?[^.\n]*?" + _NUM, re.IGNORECASE
+
+    ),
+
+    # Currency BEFORE number: "Rs 20000", "Rs. 20,000", "PKR 20000", "₨ 20000"
+
+    re.compile(r"(?:Rs\.?|PKR|₨)\s*" + _NUM + r"\s*(k|thousand|lac|lakh|million)?\b", re.IGNORECASE),
+
+    # Number BEFORE currency: "20000 rs", "20,000 Rs.", "20000 PKR"
+
+    re.compile(r"\b" + _NUM + r"\s*(?:rs\.?|pkr|₨)\b", re.IGNORECASE),
+
+    # South-Asian suffix: "20000/-"
+
+    re.compile(r"\b" + _NUM + r"\s*/-"),
+
+    # Multiplier suffix: "20k", "1.5 lac"
+
+    re.compile(r"\b" + _NUM + r"\s*(k|lac|lakh|million)\b", re.IGNORECASE),
+
+    # Strong money context words: "total 15000", "worth 20000", "paid 5000",
+
+    # "received payment of 8000", ...  (allows filler like "a payment of")
+
+    re.compile(
+
+        r"\b(?:total(?:ing|led)?|worth|amount(?:ing)?\s+to|paid|paying|"
+
+        r"price(?:\s+of|\s+is)?|cost(?:ing)?|spent|received|receiving|"
+
+        r"deposit(?:ed)?|withdr(?:ew|awn|aw)|transfer(?:red)?)\s+"
+
+        r"(?:an?\s+)?(?:payment\s+)?(?:of\s+)?(?:rs\.?\s*|pkr\s*)?" + _NUM,
+
+        re.IGNORECASE,
+
+    ),
+
+    # R4.9 — labelled amount cue: "AMOUNT 20,000", "amount: 15000",
+
+    # "amount - 8000".  3+ digits so counts ("amount 2 items") never match.
+
+    re.compile(
+
+        r"\bamount\s*[:\-]?\s*(?:rs\.?\s*|pkr\s*)?([\d,]{3,}(?:\.\d+)?)\b",
+
+        re.IGNORECASE,
+
+    ),
+
+    # "for <number>" — classic price position ("bought X for 20000").
+
+    # Requires 3+ digits to avoid matching counts ("for 3 items").
+
+    re.compile(r"\bfor\s+(?:rs\.?\s*|pkr\s*)?([\d,]{3,}(?:\.\d+)?)\b", re.IGNORECASE),
+
+    # R3.1 — loose expense phrasings put the figure after "of"
+
+    # ("record an expense of 25000", "an explanation of 25000").
+
+    # Requires 4+ digits so counts ("a batch of 100 items") never match.
+
+    re.compile(r"\bof\s+(?:rs\.?\s*|pkr\s*)?([\d,]{4,}(?:\.\d+)?)\b", re.IGNORECASE),
+
+    # "record expense: 5000" — a bare figure directly after the colon.
+
+    re.compile(r":\s*(?:rs\.?\s*|pkr\s*)?([\d,]{4,}(?:\.\d+)?)\s*$", re.IGNORECASE),
+
+]
+
+
+
+_AMOUNT_MULTIPLIERS = {
+
+    "k": 1_000,
+
+    "thousand": 1_000,
+
+    "lac": 100_000,
+
+    "lakh": 100_000,
+
+    "million": 1_000_000,
+
+}
+
+
+
+# ---------------------------------------------------------------------------
+
+# Entity (name) extraction — case-insensitive, position-aware
+
+# ---------------------------------------------------------------------------
+
+_NAME = r"([a-zA-Z][\w&.]*(?:\s+[a-zA-Z][\w&.]*)*?)"
+
+_NAME_STOP = (
+
+    r"(?=\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|and|at)\b"
+
+    r"|[,.!?;]|\s*$|\s+\d)"
+
+)
+
+
+
+_SUPPLIER_PATTERNS = [
+
+    re.compile(r"\bfrom\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
+
+    re.compile(r"\bsupplier\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
+
+    # "we returned/sent back/gave back … to <Party>" — the goods went TO
+
+    # the supplier (purchase-return phrasing).  Live 2026-10-19: the debit
+
+    # note message extracted NO supplier_name at all (the "we" subject
+
+    # blocked the customer rule and nothing owned the "to <Party>" side),
+
+    # so the DN lane fell to the lossy model path every turn.  Own stop
+
+    # set: the sentence's dash ("SHABBIR FURNITURES - create a debit
+
+    # note…") is not one of _NAME_STOP's boundaries.
+
+    re.compile(
+
+        r"\b(?:returned|sent\s+back|gave\s+back)\b[^.]*?\bto\s+"
+
+        + _NAME
+
+        + r"(?=\s*[-\u2013\u2014]"
+
+        + r"|\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|"
+
+        r"and|at|with|create|against)\b"
+
+        + r"|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+]
+
+
+
+# Action verbs, gerunds and document nouns can never START a party name.
+
+# Without this guard, "create an invoice for selling 2 ovens to lkj pvt
+
+# limited" captured "selling" as the customer: _NAME_STOP's `\s+\d`
+
+# lookahead ends the name at the quantity that follows the verb, so the
+
+# regex never reached the real party after "to".
+
+_NON_PARTY_WORDS = {
+
+    "selling", "sold", "sale", "sells", "sell", "buying", "bought", "buy",
+
+    "purchasing", "purchased", "purchase", "procuring", "acquired",
+
+    "invoice", "invoicing", "bill", "billing", "quotation", "quote",
+
+    "creating", "create", "record", "recording", "issue", "issuing",
+
+    "raise", "raising", "make", "making", "add", "adding", "enter",
+
+    "entering", "post", "posting", "be", "is", "are", "was", "were",
+
+    "to", "the", "a", "an", "and", "or",
+
+}
+
+
+
+
+
+def _is_plausible_party(value: str) -> bool:
+
+    """True when a captured string can plausibly be a party name.
+
+
+
+    Rejects pronouns / short filler and any capture whose FIRST word is an
+
+    action verb or document noun (``selling``, ``invoice``, ``bought`` ...).
+
+    That is exactly how "create an invoice for selling 2 ovens to lkj pvt
+
+    limited" used to produce the customer name "selling".
+
+    """
+
+    text = (value or "").strip()
+
+    if len(text) < 2:
+
+        return False
+
+    words = text.split()
+
+    if not words:
+
+        return False
+
+    if text.lower() in (
+
+        "the", "a", "an", "it", "us", "we", "you", "they", "i",
+
+        "me", "him", "her", "them", "our", "your", "their",
+
+    ):
+
+        return False
+
+    return words[0].strip(",.").lower() not in _NON_PARTY_WORDS
+
+
+
+_CUSTOMER_PATTERNS = [
+
+    # "invoice/quote/bill ... to <party>" — the party is often stated at the
+
+    # END, after the goods being invoiced ("create an invoice for selling
+
+    # 2 ovens to lkj pvt limited").  MUST precede the
+
+    # "invoice ... for <party>" rule below, which would otherwise capture the
+
+    # verb ("selling") that follows "for".
+
+    re.compile(
+
+        r"\b(?:invoice|bill|quotation|quote)\b[^.]*?\bto\s+" + _NAME + _NAME_STOP,
+
+        re.IGNORECASE,
+
+    ),
+
+    re.compile(
+
+        r"\bsold\b[^.]*?\bto\s+" + _NAME + _NAME_STOP, re.IGNORECASE
+
+    ),
+
+    re.compile(r"\bcustomer\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
+
+    re.compile(
+
+        r"\b(?:invoice|bill|quotation|quote)\s+(?:for|to)\s+" + _NAME + _NAME_STOP,
+
+        re.IGNORECASE,
+
+    ),
+
+    # "<Proper Name> owes/ledger/receivable/balance" — every word of the
+
+    # name must be capitalised (Title or ACRONYM) so ordinary sentences
+
+    # like "Show me the trial balance" are not captured as customer names.
+
+    re.compile(
+
+        r"\b([A-Z][a-z&.]*|[A-Z]{2,})(?:\s+(?:[A-Z][a-z&.]*|[A-Z]{2,}))+"
+
+        r"\s+(?:owes?|ledger|receivable|balance)\b"
+
+    ),
+
+    # "<Party> returned/returns/refunded <items>" — the customer sent the
+
+    # goods back to us, so the name ending at the return verb IS the
+
+    # customer ("Alpha Associates Returned Chairs amounting to 34000").
+
+    # The returned item itself is captured by _ITEM_PATTERNS; the side of
+
+    # the return is decided by _INTENT_PATTERNS ("we returned" = purchase
+
+    # return, so the "we" capture is rejected as a party below).
+
+    re.compile(r"\b" + _NAME + r"\s+(?:returned|returns|refunded)\b", re.IGNORECASE),
+
+]
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Generic party capture â€” any named counterparty that does not already
+
+# match the supplier / customer patterns above (e.g. "paid Zameer Labs",
+
+# "paid to Acme Traders", "received from Delta Corp").  Surfaced as a
+
+# standalone ``party`` entity so the initial LLM call can see the named
+
+# counterparty even when it does not cleanly fit the supplier/customer
+
+# regex shapes.
+
+# ---------------------------------------------------------------------------
+
+_PARTY_PATTERNS = [
+
+    re.compile(
+
+        r"\b(?:paid|payment)\s+to\s+" + _NAME + _NAME_STOP, re.IGNORECASE
+
+    ),
+
+    re.compile(
+
+        r"\breceived\s+from\s+" + _NAME + _NAME_STOP, re.IGNORECASE
+
+    ),
+
+    # "paid <Party> <amount>" â€” the name is directly after "paid" and
+
+    # before a figure (stop on \s+\d so the amount is not swallowed).
+
+    re.compile(r"\bpaid\s+" + _NAME + r"(?=\s+\d)", re.IGNORECASE),
+
+]
+
+
+
+_ITEM_PATTERNS = [
+
+    re.compile(
+
+        r"\b(?:purchas(?:e|es|ed|ing)|bought|buy(?:ing)?|procured?|acquired?)\s+"
+
+        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+
+        # (2026-10-07, AES) — never capture the SOURCE side as the item:
+
+        # "bought from Dell" used to capture "from Dell", the leading-
+
+        # preposition strip removed "from " and the SUPPLIER became
+
+        # item_description.  A standalone to/from right after the verb means
+
+        # the sentence states no object — ask, never guess.
+
+        r"(?!from\b|to\b)"
+
+        r"([\w][\w\s-]*?)(?=\s+(?:from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+    re.compile(
+
+        r"\b(?:sold|sells?|selling)\s+(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+
+        # (2026-10-07, AES production) — same guard on the sale verb:
+
+        # "Sold to Murkez Technologies pvt Limited" captured "to Murkez …",
+
+        # the strip removed "to " and the CUSTOMER became item_description
+
+        # (product, catalog gate and revenue gate all then named the party).
+
+        r"(?!to\b|from\b)"
+
+        r"([\w][\w\s-]*?)(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+    # NOUN phrasing — "create an invoice for 45000 against SALE OF tax
+
+    # services", "supply of cement to X", "purchase of laptops".  Only the
+
+    # verb forms above were recognised, so a request that plainly names its
+
+    # item still got asked "What item or service is being invoiced?".  The
+
+    # captured item must start with a LETTER, so the amount in
+
+    # "invoice for 45000 …" can never be mistaken for the item.
+
+    re.compile(
+
+        r"\b(?:sale|sales|supply|supplies|purchase|purchases|rendering|"
+
+        r"provision|delivery|invoice|bill|return(?:s)?)\s+of\s+"
+
+        r"([a-zA-Z][\w\s-]*?)"
+
+        r"(?=\s+(?:to|from|for|on|in|at|via|against|amounting|worth|total)\b"
+
+        r"|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+    # "invoice/bill for <item>" — same noun phrasing with "for".  The lookahead
+
+    # also stops at a NESTED transaction preposition followed by a number or a
+
+    # clause: "create invoice for zeta pvt ltd for selling them 2 laptops" —
+
+    # "…ltd for selling them" is not an item (it swallowed the party + a
+
+    # pronoun and dead-ended the flow), and "invoice for inventory stock of
+
+    # 50000 to X" — "inventory stock of 50000" stops at "of 5000".  A real
+
+    # "invoice for <item>" keeps its own tail or is read by the verb/noun
+
+    # patterns above.
+
+    re.compile(
+
+        r"\b(?:invoice|bill)\s+for\s+"
+
+        r"([a-zA-Z][\w\s-]*?)"
+
+        r"(?=\s+(?:to|from|for|on|in|at|via|against)\b"
+
+        r"|\s+(?:of|for|worth|total|amounting)\s+(?:\d|[Rr]s\b|PKR\b|₨)"
+
+        r"|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+    # "<party> returned <items>" — the goods that came back, so a return can
+
+    # be anchored to an item instead of being swallowed by the party capture
+
+    # ("Alpha Associates Returned Chairs amounting to 34000" → "chairs").
+
+    # `amounting|worth|total` end the capture, so the item is never
+
+    # "chairs amounting".
+
+    re.compile(
+
+        r"\b(?:returned|returns|refunded)\s+"
+
+        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+
+        r"([a-zA-Z][\w\s-]*?)"
+
+        r"(?=\s+(?:amounting|worth|total|for|on|in|at|via|to|from|against)\b"
+
+        r"|[,.!?;]|\s*$|\s+\d)",
+
+        re.IGNORECASE,
+
+    ),
+
+]
+
+
+
+_MONTHS = {
+
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+
+}
+
+
+
+# ---------------------------------------------------------------------------
+
+# Payment method detection
+
+# ---------------------------------------------------------------------------
+
+_PAYMENT_METHOD_PATTERNS = [
+
+    (re.compile(r"\bon\s+credit\b|\bcredit\s+(?:purchase|sale|basis|terms)\b|\bkhata\b|\budhaar\b", re.IGNORECASE), "CREDIT"),
+
+    (re.compile(r"\bin\s+cash\b|\bcash\s+(?:purchase|sale|payment)\b|\bpaid\s+(?:in\s+)?cash\b|\bcash\b", re.IGNORECASE), "CASH"),
+
+    (re.compile(r"\bbank\s+transfer\b|\bwire\s+transfer\b|\bonline\s+banking\b|\btransfer(?:red)?\s+(?:to|from)\b", re.IGNORECASE), "BANK_TRANSFER"),
+
+    (re.compile(r"\bcheque\b|\bcheck\b", re.IGNORECASE), "CHEQUE"),
+
+    (re.compile(r"\b(?:credit|debit)\s+card\b|\bcard\s+payment\b|\bby\s+card\b", re.IGNORECASE), "CARD"),
+
+]
+
+
+
+# ---------------------------------------------------------------------------
+
+# Expense payment-status markers (mandate Cases A/B): the user's OWN words
+
+# decide paid-now vs outstanding when they say it — "Paid 3000 ..." states
+
+# the payment happened; "will pay … next month" / "due" states it has not.
+
+# Explicit answer text always wins (the derivation only fills an open
+
+# treatment), and when neither is stated the settlement question is still
+
+# asked — never guessed.
+
+# ---------------------------------------------------------------------------
+
+_UNPAID_MARKERS_RE = re.compile(
+
+    r"\bwill\s+pay\b|\bdue\b|\boutstanding|\bpending\b|"
+
+    r"\bpay(?:ing)?\s+(?:it\s+)?(?:later|next|soon|after|tomorrow)\b|"
+
+    r"\bnext\s+(?:month|week)\b|\bon\s+credit\b|\bto\s+be\s+paid\b",
+
+    re.IGNORECASE,
+
+)
+
+_PAID_MARKERS_RE = re.compile(
+
+    r"\bpaid\b|\bpaying\s+now\b|\bpaid\s+now\b|\bsettled\s+now\b",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Public API
+
+# ---------------------------------------------------------------------------
+
+
+
+def split_batch_request(user_message: str) -> List[str]:
+
+    """Detect a MULTI-TRANSACTION request and split it into sub-requests.
+
+
+
+     Conservative by design - only confident enumeration
+
+    patterns are split:
+
+      * numbered lists on separate lines ("1) ... 2) ..."),
+
+      * inline enumerators between transactional clauses
+
+        ("...; also ...", "... and also ...", "... then ..."),
+
+        where EVERY segment carries transactional content.
+
+
+
+    Returns the list of sub-request strings (>= 2), or [] for a normal
+
+    single-transaction request. Item-quantity phrasing ("buy 3 chairs and
+
+    2 desks") is NOT split here - it stays with the existing per-item
+
+    item-intake protocol.
+
+    """
+
+    msg = (user_message or "").strip()
+
+    if not msg:
+
+        return []
+
+
+
+    # (a) Numbered enumeration, one document per line.
+
+    numbered = list(
+
+        re.finditer(r"^\s*\d{1,2}[\)\.]\s*(.+?)\s*$", msg, re.MULTILINE)
+
+    )
+
+    if len(numbered) >= 2:
+
+        segments = [m.group(1).strip(" ;,") for m in numbered]
+
+        segments = [s for s in segments if s]
+
+        if 2 <= len(segments) <= _BATCH_MAX_ITEMS:
+
+            return segments
+
+
+
+    # (b) Inline enumerators. Split, then require every segment to carry
+
+    #     transactional content (amount or a mutation keyword) so narrative
+
+    #     prose is never chopped into phantom transactions.
+
+    parts = re.split(
+
+        r";\s*(?:also\s+|then\s+)?"
+
+        r"|\band\s+also\s+"
+
+        r"|\balso,\s+"
+
+        r"|\bthen\s+",
+
+        msg,
+
+        flags=re.IGNORECASE,
+
+    )
+
+    parts = [p.strip(" .;,") for p in parts if p and p.strip(" .;,")]
+
+    if 2 <= len(parts) <= _BATCH_MAX_ITEMS:
+
+        transactional = re.compile(
+
+            r"rs\.?\s*\d|pkr\s*\d|\d{3,}"
+
+            r"|\b(bought|sold|paid|expense|invoice|purchase|sale|receipt|payment|bill|record|create)\b",
+
+            re.IGNORECASE,
+
+        )
+
+        if all(transactional.search(p) for p in parts):
+
+            return parts
+
+
+
+    return []
+
+
+
+
+
+def _plan_batch(
+
+    segments: List[str],
+
+    clarification_history: Optional[List[Dict[str, Any]]],
+
+    user_message: str = "",
+
+    org_preferences: Optional[Dict[str, str]] = None,
+
+) -> ExecutionPlan:
+
+    """Plan each enumerated sub-request and merge into ONE batch plan.
+
+
+
+    Extends (never forks) the existing pipeline: the merged plan reuses
+
+    the standard consolidated-clarification questionnaire (one box per
+
+    question, numbered per document so ``_explode_multi_answers`` maps
+
+    the answers back) and ONE confirmation gate covering all mutations.
+
+    Per-item entities are prefixed ``item_<n>_`` so sibling documents
+
+    never contaminate each other's values (no cross-item first-hit).
+
+
+
+    A segment fragment ("Office supplies Rs.5,000") may carry no verb on
+
+    its own - the HEADER line ("Record these 3 expenses:") declares the
+
+    transaction type, so unknown fragment intents inherit the header's
+
+    intent (genuinely generic: the header names the economic event).
+
+    """
+
+    header = ""
+
+    m = re.search(
+
+        r"^(.*?)(?=^\s*\d{1,2}[\)\.]\s)", user_message, re.MULTILINE | re.DOTALL
+
+    )
+
+    if m:
+
+        header = m.group(1).strip(" :\n\t")
+
+    header_plan = plan(header, org_preferences=org_preferences) if header else None
+
+
+
+    sub_plans: List[ExecutionPlan] = []
+
+    for seg in segments:
+
+        sub = plan(seg, clarification_history, org_preferences=org_preferences)
+
+        if (
+
+            sub.intent == "unknown"
+
+            and header_plan is not None
+
+            and header_plan.intent != "unknown"
+
+        ):
+
+            # Genuinely generic inheritance: the HEADER names the event
+
+            # ("record these 3 EXPENSES"); it is never a first-record
+
+            # fallback for accounts/parties - those still resolve per item.
+
+            sub.intent = header_plan.intent
+
+            sub.potential_tools = header_plan.potential_tools or sub.potential_tools
+
+            sub.required_context = header_plan.required_context or sub.required_context
+
+            # The sub-plan was planned as "unknown" and therefore asked
+
+            # nothing - recompute the material gaps (amount, date, ...) for
+
+            # the INHERITED intent so its questions join the merged
+
+            # questionnaire ("For document i: ...").
+
+            sub.missing_fields = _missing_fields(
+
+                sub.intent, sub.extracted_entities
+
+            )
+
+            sub.clarification_questions = _questions_for_fields(
+
+                sub.intent, sub.missing_fields, sub.extracted_entities
+
+            )
+
+            sub.requires_clarification = bool(sub.clarification_questions)
+
+            sub.requires_accounting_engine = (
+
+                sub.requires_accounting_engine
+
+                or header_plan.requires_accounting_engine
+
+            )
+
+            sub.requires_confirmation = (
+
+                sub.requires_confirmation or header_plan.requires_confirmation
+
+            )
+
+            sub.expected_outcome = header_plan.expected_outcome
+
+        sub_plans.append(sub)
+
+    merged = sub_plans[0].model_copy(deep=True)
+
+
+
+    batch_items: List[Dict[str, Any]] = []
+
+    missing: List[str] = []
+
+    questions: List[str] = []
+
+    tools: List[str] = []
+
+    context_srcs: List[str] = []
+
+    entities: Dict[str, Any] = {}
+
+    requires_confirmation = False
+
+    requires_validation = False
+
+    requires_accounting = False
+
+
+
+    for i, (seg, sub) in enumerate(zip(segments, sub_plans), start=1):
+
+        batch_items.append({
+
+            "position": i,
+
+            "segment": seg,
+
+            "intent": sub.intent,
+
+            "missing_fields": list(sub.missing_fields),
+
+            "requires_confirmation": sub.requires_confirmation,
+
+            "requires_clarification": sub.requires_clarification,
+
+        })
+
+        for f in sub.missing_fields:
+
+            key = f"item_{i}:{f}"
+
+            if key not in missing:
+
+                missing.append(key)
+
+        for q in sub.clarification_questions:
+
+            qq = f"For document {i}: {q}"
+
+            if qq not in questions:
+
+                questions.append(qq)
+
+        for t in sub.potential_tools:
+
+            if t not in tools:
+
+                tools.append(t)
+
+        for c in sub.required_context:
+
+            if c not in context_srcs:
+
+                context_srcs.append(c)
+
+        for k, v in (sub.extracted_entities or {}).items():
+
+            entities[f"item_{i}_{k}"] = v
+
+        requires_confirmation = requires_confirmation or sub.requires_confirmation
+
+        requires_validation = requires_validation or sub.requires_validation
+
+        requires_accounting = requires_accounting or sub.requires_accounting_engine
+
+
+
+    merged.batch_items = batch_items
+
+    merged.missing_fields = missing
+
+    merged.clarification_questions = questions
+
+    merged.requires_clarification = bool(questions) or any(
+
+        s.requires_clarification for s in sub_plans
+
+    )
+
+    merged.requires_confirmation = requires_confirmation
+
+    merged.requires_validation = requires_validation
+
+    merged.requires_accounting_engine = requires_accounting
+
+    merged.potential_tools = tools
+
+    merged.required_context = context_srcs
+
+    merged.extracted_entities = entities
+
+    merged.expected_outcome = (
+
+        f"Batch of {len(segments)} documents processed - one result per document "
+
+        "(a failed document never rolls back its successful siblings)"
+
+    )
+
+    return merged
+
+
+
+
+
+def plan(
+
+    user_message: str,
+
+    clarification_history: Optional[List[Dict[str, Any]]] = None,
+
+    org_preferences: Optional[Dict[str, str]] = None,
+
+    prefill_entities: Optional[Dict[str, Any]] = None,
+
+) -> ExecutionPlan:
+
+    """Analyse *user_message* (+ prior Q&A) and return an ``ExecutionPlan``.
+
+
+
+    ``clarification_history`` is a list of ``{"question": ..., "answer": ...}``
+
+    dicts from earlier clarification rounds in the same conversation.  Every
+
+    answered value is merged into the extracted entities so it is never
+
+    asked for again.
+
+
+
+    ``org_preferences`` carries learned organization-level
+
+    defaults; they are treated as answered-for entities UNLESS the user
+
+    explicitly said something different in the message or history.
+
+
+
+    ``prefill_entities`` carries grounded values produced by
+
+    the LLM entity-segregation stage. They are inserted with ``setdefault``
+
+    semantics — a value captured by regex from the message, answered in a
+
+    clarification round, or learned as an org preference always wins.
+
+    """
+
+    msg = user_message.strip()
+
+    msg_lower = msg.lower()
+
+
+
+    # 0. BATCH DETECTION: an enumerated multi-transaction
+
+    #    request is planned per sub-document and merged into ONE plan, so
+
+    #    the existing consolidated-clarification (one round for ALL gaps)
+
+    #    and ONE-confirmation machinery handle the batch unchanged.
+
+    segments = split_batch_request(user_message)
+
+    if len(segments) > 1:
+
+        return _plan_batch(
+
+            segments, clarification_history, user_message, org_preferences
+
+        )
+
+
+
+    # 1. Identify intent — LLM / SEMANTIC AUTHORITATIVE FIRST.
+    #    The LLM extraction layer perceives the business act in ERP vocabulary
+    #    ("payables for shabbir furnitures" -> supplier_balance, "create chart of account ..." -> create_account).
+    #    When the LLM yields a canonical intent, it WINS over regex patterns.
+    #    The keyword patterns stay the FALLBACK when the LLM is offline or unconfident.
+    _semantic_intent = (
+        (prefill_entities or {}).get("semantic_intent")
+        or (prefill_entities or {}).get("provisional_intent_hint")
+    )
+
+    if _semantic_intent and _semantic_intent in _SEMANTIC_INTENTS:
+        intent = _semantic_intent
+    else:
+        intent = _identify_intent(msg_lower)
+
+    payment_method = _extract_payment_method(msg_lower)
+
+    intent = _refine_intent(intent, payment_method)
+
+
+
+    # 2. Extract entities from the raw message
+
+    entities: Dict[str, Any] = _extract_entities(msg)
+
+    amount = _extract_amount(msg)
+
+    if amount is not None:
+
+        entities["amount"] = amount
+
+    if payment_method:
+
+        entities["payment_method"] = payment_method
+
+    txn_date = _extract_date(msg, msg_lower)
+
+    if txn_date:
+
+        entities["transaction_date"] = txn_date
+
+    # Report/list intents accept a relative period ("this month", "last
+
+    # quarter", …) which becomes an explicit date_from/date_to pair so the
+
+    # read-only fast path can filter deterministically ("current month"
+
+    # is normalised to "this month" by the parser).
+
+    _RANGE_INTENTS = {
+
+        "list_expenses", "generate_general_ledger",
+
+    }
+
+    if intent in _RANGE_INTENTS:
+
+        rng = resolve_date_range(msg)
+
+        if rng:
+
+            entities.setdefault("date_from", rng[0])
+
+            entities.setdefault("date_to", rng[1])
+
+    item = _extract_item(msg)
+
+    if item:
+
+        # The count in the item phrasing IS the quantity ("selling 2 ovens").
+
+        # It used to be discarded, which made the agent ask for a quantity the
+
+        # user had already given.
+
+        stated_qty = _extract_item_quantity(msg, item)
+
+        if stated_qty is not None:
+
+            # A WRITTEN count rides inside the item the extractor returned
+
+            # ("two motorbikes"), so it must come OUT of the description — the
+
+            # line is "motorbikes" x2, not "two motorbikes" x2.
+
+            clean_item, _ = _split_leading_count(item)
+
+            entities["item_description"] = clean_item or item
+
+            entities.setdefault("item_quantity", stated_qty)
+
+            entities.setdefault("quantity", stated_qty)
+
+        else:
+
+            entities["item_description"] = item
+
+    # several items stated in ONE
+
+    # request ("2 laptops at 5000 each and 3 mice at 500") are parsed into
+
+    # DISTINCT lines; the invoice total is DERIVED from them (Σ qty ×
+
+    # price) so the header can never disagree with its own lines.
+
+    if prefill_entities and prefill_entities.get("line_items"):
+        line_items = prefill_entities["line_items"]
+    else:
+        line_items = _extract_line_items(msg)
+
+    # ATTACHED DOCUMENTS: the vision-extracted block already carries the
+
+    # authoritative line-item table and supplier.  Parse it so a multi-line
+
+    # GRN/bill becomes DISTINCT lines with a DERIVED total (its own rows)
+
+    # instead of collapsing into the first line's amount - and so a supplier
+
+    # named on the document is never replaced by table furniture such as
+
+    # "line items".
+
+    if not line_items:
+
+        doc_lines, doc_supplier = _extract_document_lines(msg)
+
+        if doc_lines:
+
+            line_items = doc_lines
+
+        if doc_supplier:
+
+            existing_party = str(
+
+                entities.get("supplier_name") or ""
+
+            ).strip().lower()
+
+            if not existing_party or existing_party in _JUNK_PARTY_NAMES:
+
+                entities["supplier_name"] = doc_supplier
+
+    if line_items:
+
+        entities["line_items"] = line_items
+
+        if any(l.get("unit_price") is not None or l.get("total_amount") is not None for l in line_items):
+            _calc_tot = _line_items_total(line_items)
+            if _calc_tot > 0:
+                entities["amount"] = _calc_tot
+
+        if not entities.get("item_description"):
+
+            entities["item_description"] = " / ".join(
+
+                l["description"] for l in line_items
+
+            )
+
+    # Asset-lifecycle intents: the asset reference after "for"/"of" is the
+
+    # asset name (currency/amount shapes are explicitly excluded).
+
+    if intent in (
+
+        "register_fixed_asset", "dispose_fixed_asset",
+
+        "record_asset_depreciation",
+
+    ) and not entities.get("item_description"):
+
+        m = re.search(
+
+            r"(?:\bfor\b|\bof\b)\s+"
+
+            r"((?![Rr]s\b|PKR\b|₨|\d)[A-Za-z][\w&.-]*(?:\s+[\w&.-]+)*)\s*$",
+
+            msg, re.IGNORECASE,
+
+        )
+
+        if m:
+
+            entities["asset_name"] = m.group(1).strip()
+
+
+
+    # Project setup: the name after "called"/"named" IS the project name
+
+    # ("Set up a project called Mobile App for XYZ Client…").
+
+    if intent == "create_project" and not entities.get("project_name"):
+
+        m = re.search(
+
+            r"\b(?:called|named)\s+"
+
+            r"([A-Za-z][\w&.\-]*(?:\s+[A-Za-z][\w&.\-]*)*?)"
+
+            r"(?=\s+(?:for|with|and|at|by|budget|worth)\b|[,.!?;]|\s*$|\s+\d)",
+
+            msg,
+
+            re.IGNORECASE,
+
+        )
+
+        if m and m.group(1).strip():
+
+            entities["project_name"] = m.group(1).strip()
+
+    # Master data / Setup operational entity integration (LLM-Authoritative)
+    # The intelligent LLM perception stage (app/entity_segregation.py & app/llm_extraction.py)
+    # extracts names, counterparties, banks, employees, and accounts with full natural-language
+    # context. Quoted literals in the user message serve only as a minimal fallback.
+    if prefill_entities:
+        for _k in (
+            "account_name", "account_type", "code", "account_code",
+            "parent_account_name", "product_name", "service_name", "sales_price",
+            "bank_name", "employee_name", "project_name", "customer_name", "supplier_name",
+            "date_of_joining", "basic_salary", "invoice_number", "bill_number", "invoice_id", "bill_id"
+        ):
+            if prefill_entities.get(_k) is not None:
+                entities[_k] = prefill_entities[_k]
+
+    if intent in ("create_account", "create_customer", "create_supplier", "create_product", "create_service", "create_employee", "create_project"):
+        target_name_key = {
+            "create_account": "account_name",
+            "create_customer": "customer_name",
+            "create_supplier": "supplier_name",
+            "create_product": "product_name",
+            "create_service": "service_name",
+            "create_employee": "employee_name",
+            "create_project": "project_name",
+        }.get(intent)
+        if target_name_key and not entities.get(target_name_key):
+            q_m = re.search(r"['\"]([^'\"]+)['\"]", msg)
+            if q_m:
+                entities[target_name_key] = q_m.group(1).strip()
+            elif intent == "create_account":
+                m = re.search(r"\b(?:for|called|named)\s+([^,.!?;]+?)(?=\s+(?:under|with|code|parent|in\s+category)\b|[,.!?;]|$)", msg, re.IGNORECASE)
+                if m and m.group(1).strip().lower() not in ("chart of account", "chart of accounts", "account", "ledger"):
+                    entities["account_name"] = m.group(1).strip()
+
+
+
+    # 3. Merge answers from prior clarification rounds (never re-ask)
+
+    nature_source: Optional[str] = None
+
+    # settlement-party hygiene + extraction.  The loose
+
+    # entity extractor can fill supplier_name/customer_name with noise
+
+    # ("payment", "Rs.12"); a garbage name must never reach the party
+
+    # gate — it is dropped BEFORE the clarification merge so a real
+
+    # answered name is never blocked (R4.4).  "from <Name>" / "to <Name>"
+
+    # are the real party signals for settlements.
+
+    _PARTY_NOISE = (
+
+        "supplier", "the supplier", "vendor", "the vendor", "payment",
+
+        "customer", "the customer", "client", "party",
+
+    )
+
+    if intent == "record_payment":
+
+        name = str(entities.get("supplier_name") or "").strip()
+
+        if (
+
+            not name
+
+            or name.lower() in _PARTY_NOISE
+
+            or re.fullmatch(r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", name, re.IGNORECASE)
+
+        ):
+
+            entities.pop("supplier_name", None)
+
+        _pm = re.search(
+
+            r"\bto\s+([a-z][a-z0-9 .&'-]{1,30}?)"
+
+            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
+
+            msg_lower,
+
+        )
+
+        if _pm and not entities.get("supplier_name"):
+
+            candidate = _pm.group(1).strip()
+
+            if candidate.lower() not in _PARTY_NOISE:
+
+                entities["supplier_name"] = candidate
+
+    if intent == "record_receipt":
+
+        name = str(entities.get("customer_name") or "").strip()
+
+        if (
+
+            not name
+
+            or name.lower() in _PARTY_NOISE
+
+            or re.fullmatch(r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", name, re.IGNORECASE)
+
+        ):
+
+            entities.pop("customer_name", None)
+
+        _cm = re.search(
+
+            r"\bfrom\s+([a-z][a-z0-9 .&'-]{1,30}?)"
+
+            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
+
+            msg_lower,
+
+        )
+
+        if _cm and not entities.get("customer_name"):
+
+            candidate = _cm.group(1).strip()
+
+            if candidate.lower() not in _PARTY_NOISE:
+
+                entities["customer_name"] = candidate
+
+
+
+    # the "from X to Y" bank
+
+    # names are material for the deterministic transfer path (the trusted
+
+    # tool resolves names to ids and refuses unknown banks — accounts are
+
+    # never invented).  Extraction is best-effort; unresolved names keep
+
+    # the transfer on the model path.
+
+    if intent == "record_bank_transfer":
+
+        _tb = re.search(
+
+            r"from\s+([a-z0-9][a-z0-9 .&'-]{0,30}?)\s+to\s+"
+
+            r"([a-z0-9][a-z0-9 .&'-]{0,30}?)"
+
+            r"(?:\s+(?:rs|pkr|for|today|yesterday|tomorrow)\b|\s*[\d,]|\s*$)",
+
+            msg_lower,
+
+        )
+
+        if _tb:
+
+            entities.setdefault("source_bank_name", _tb.group(1).strip())
+
+            entities.setdefault(
+
+                "destination_bank_name", _tb.group(2).strip()
+
+            )
+
+
+
+    # LOAN TERM INTAKE — the record_loan contract needs its schedule terms.
+
+    # The Loans-page message enumerates them ("Narration: …", "Lender: …",
+
+    # "first repayment YYYY-MM-DD", "tenure N months", "frequency MONTHLY");
+
+    # chat states some of them.  Entity EXTRACTION only — the route itself
+
+    # stays the LLM's decision (semantic whitelist); anything still missing
+
+    # is asked in ONE consolidated round below, never assumed.
+
+    if intent == "record_loan":
+
+        _lm = re.search(r"narration\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
+
+        if _lm and not entities.get("narration"):
+
+            entities["narration"] = _lm.group(1).strip()
+
+        _lc = re.search(r"\b(?:lender|borrower)\s*:\s*([^.,\n]+)", msg, re.IGNORECASE)
+
+        if _lc and not entities.get("counterparty"):
+
+            entities["counterparty"] = _lc.group(1).strip()
+
+        _lf = re.search(
+
+            r"\bfirst\s+(?:repayment|payment)\s*(?:date\s*)?:?\s*"
+
+            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})",
+
+            msg, re.IGNORECASE,
+
+        )
+
+        if _lf and not entities.get("first_payment_date"):
+
+            _fparsed = parse_transaction_date(_lf.group(1))
+
+            entities["first_payment_date"] = (
+
+                _fparsed.iso_date if _fparsed.ok else _lf.group(1)
+
+            )
+
+        _lt = re.search(r"\btenure\s*(?:of\s*)?:?\s*(\d{1,3})\s*month", msg, re.IGNORECASE)
+
+        if _lt and not entities.get("tenure_months"):
+
+            entities["tenure_months"] = int(_lt.group(1))
+
+        _lq = re.search(
+
+            r"\bfrequency\s*(?:of\s*)?:?\s*"
+
+            r"(monthly|quarterly|semi[-_ ]?annual\w*|annually|yearly|custom)\b",
+
+            msg, re.IGNORECASE,
+
+        )
+
+        if _lq and not entities.get("frequency"):
+
+            _fq = _lq.group(1).upper().replace("-", "_").replace(" ", "_")
+
+            entities["frequency"] = "ANNUALLY" if _fq.startswith("YEAR") else _fq
+
+        # Direction from the USER'S OWN WORDS (page: "borrowed loan" /
+
+        # "loan given"; chat: "borrow loan", "we lent").  Never guessed when
+
+        # the wording does not say — it is asked below.
+
+        if not entities.get("loan_direction"):
+
+            if re.search(r"\bborrow", msg, re.IGNORECASE):
+
+                entities["loan_direction"] = "BORROWED"
+
+            elif re.search(
+
+                r"\b(?:give|gave|lend|lent)\b[^.\n]*\bloan\b|\bloan\s+given\b",
+
+                msg, re.IGNORECASE,
+
+            ):
+
+                entities["loan_direction"] = "GIVEN"
+
+        # A chat "borrow … from <party>" lands in supplier_name via the
+
+        # generic capture — the contract's parameter name is counterparty.
+
+        if not entities.get("counterparty"):
+
+            entities["counterparty"] = (
+
+                entities.get("supplier_name") or entities.get("customer_name") or None
+
+            )
+
+            if not entities["counterparty"]:
+
+                entities.pop("counterparty", None)
+
+    if intent == "get_inventory_status":
+        if re.search(r"\b(?:out\s+of\s+stock|low\s+stock|depleted)\b", msg, re.IGNORECASE):
+            entities["only_low_stock"] = True
+        _cleaned_msg = re.sub(r"[?!.,;]+$", "", msg.strip())
+        _pm = re.search(
+            r"(?:how\s+many(?:\s+units?\s+of|\s+pieces?\s+of|\s+pcs\s+of)?|"
+            r"check\s+stock\s+(?:for|of)|"
+            r"(?:stock|quantity|units?|count|balance|level)\s+(?:of|for)|"
+            r"status\s+of|any)\s+([a-zA-Z0-9_\s\-]+?)(?:\s+do\s+we\s+have|\s+in\s+stock|\s+on\s+hand|\s+available|\s+left|\?|$)",
+            _cleaned_msg,
+            re.IGNORECASE,
+        )
+        if _pm:
+            _cand = _pm.group(1).strip()
+            _cand = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", _cand, flags=re.IGNORECASE).strip()
+            if _cand.lower() not in ("items", "products", "goods", "inventory", "stock", "all", "everything"):
+                entities["product_name"] = _cand
+
+
+
+    nature_before_merge = entities.get("transaction_nature")
+
+    # Snapshot which entities a CLARIFICATION ANSWER owns, so the LLM-
+
+    # authoritative prefill below may override a regex capture but NEVER an
+
+    # explicitly answered value (an ANSWERED field outranks the model).
+
+    _pre_clarification = dict(entities)
+
+    if clarification_history:
+
+        # An explicit "SAME" reply reuses the learned value for that exact
+
+        # question (the memory hint's "reply SAME to reuse" contract) — the
+
+        # ONE way a preference may answer a field, and only on the user's
+
+        # explicit say-so.
+
+        clarification_history = _reuse_learned_answers(
+
+            clarification_history, org_preferences or {}
+
+        )
+
+        entities = _merge_clarification_answers(
+
+            entities, clarification_history, intent=intent
+
+        )
+
+        if not nature_before_merge and entities.get("transaction_nature"):
+
+            # the nature came from an explicit user answer
+
+            # to the consolidated decision tree - logged for the audit trail.
+
+            nature_source = "USER_ANSWER"
+
+        # A clarification answer may have resolved the payment treatment —
+
+        # re-specialise the generic intent so the downstream gates (required
+
+        # fields, confirmation) reflect the now-known treatment.
+
+        if intent in ("record_purchase", "record_sale") and entities.get("payment_method"):
+
+            intent = _refine_intent(intent, entities.get("payment_method"))
+
+
+
+    # The set of entities a CLARIFICATION ANSWER owns: any key whose value
+
+    # changed (or appeared) across the merge above.  The LLM-authoritative
+
+    # prefill may override a REGEX capture but never one of these.
+
+    _answered = {
+
+        k for k, v in entities.items()
+
+        if _pre_clarification.get(k) != v
+
+    }
+
+
+
+    # 2b. GROUNDED LLM PREFILL.
+
+    #     Facts segregated from the user's OWN sentence by app/semantic_layer.py
+
+    #     + app/entity_segregation.py (verbatim-grounded in Python) fill the
+
+    #     gaps BEFORE any questionnaire is computed, so fields the user
+
+    #     already stated flow to the next stages instead of being re-asked.
+
+    #     APPLICATION POINT: AFTER the clarification-answer merge and BEFORE
+
+    #     org preferences.  Precedence:
+
+    #       * LLM-AUTHORITATIVE keys (supplier_name / customer_name /
+
+    #         item_description / quantity / reason) — the model's reading
+
+    #         OVERRIDES the regex capture (which is only the fallback), so a
+
+    #         party the regex swallowed into the item still reaches the gate.
+
+    #         An ANSWERED value (_answered) still outranks the model.
+
+    #       * every other key keeps the old setdefault semantics — regex
+
+    #         wins on conflicts; an ANSWERED value is never clobbered.
+
+    _LLM_AUTHORITATIVE = {
+
+        "supplier_name", "customer_name", "item_description",
+
+        "quantity", "reason", "line_items",
+
+    }
+
+    for _pk, _pv in (prefill_entities or {}).items():
+
+        if _pv is None or _pv == "" or _pk == "semantic_intent":
+
+            continue
+
+        if _pk in ("supplier_name", "customer_name"):
+
+            # Guard: table furniture ("payment") and amount shapes ("Rs.12")
+
+            # must never reach the party gate.
+
+            _prefill_name = str(_pv).strip()
+
+            if (
+
+                not _prefill_name
+
+                or _prefill_name.lower() in _PARTY_NOISE
+
+                or re.fullmatch(
+
+                    r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?",
+
+                    _prefill_name,
+
+                    re.IGNORECASE,
+
+                )
+
+            ):
+
+                continue
+
+        if _pk == "item_quantity":
+
+            # Mirror the regex path, which fills the generic quantity alias
+
+            # alongside the item-scoped one.
+
+            if not entities.get("item_quantity"):
+
+                entities["item_quantity"] = _pv
+
+                if not entities.get("quantity"):
+
+                    entities["quantity"] = _pv
+
+            continue
+
+        # LLM-authoritative: the model's reading beats the regex capture,
+
+        # unless a clarification ANSWER owns the field.
+
+        if _pk in _LLM_AUTHORITATIVE and _pk not in _answered:
+
+            entities[_pk] = _pv
+
+            continue
+
+        if not entities.get(_pk):
+
+            if _pk == "transaction_nature":
+
+                _allowed_natures = accepted_nature_values(intent)
+
+                if _allowed_natures and str(_pv).strip().upper() not in {
+
+                    v.upper() for v in _allowed_natures
+
+                }:
+
+                    # A reading whose nature is outside this intent's family
+
+                    # is dropped, never translated: the deterministic
+
+                    # question still owns that decision.
+
+                    log.info(
+
+                        "planner.nature_prefill_rejected",
+
+                        intent=intent,
+
+                        value=str(_pv)[:40],
+
+                    )
+
+                    continue
+
+            if _pk == "transaction_purpose" and intent != "record_expense":
+
+                # The purpose-first ladder belongs to the generic expense
+
+                # path ONLY (it derives nature + description there); a
+
+                # purpose on any other route is meaningless and must never
+
+                # leak into that route's entities.
+
+                log.info(
+
+                    "planner.purpose_prefill_rejected",
+
+                    intent=intent,
+
+                    value=str(_pv)[:40],
+
+                )
+
+                continue
+
+            entities[_pk] = _pv
+
+
+
+    # 2c. NATURE FROM THE USER'S OWN WORDS (deterministic, typo-tolerant).
+
+    #     The intent family's keyword rules already existed but were only ever
+
+    #     used to interpret an ANSWER — so "Create an Invoice for 45000
+
+    #     against sale of tax services to Beta Traders" still asked "what is
+
+    #     the nature of this sale?" although the user had just said it.
+
+    #     Applying the SAME rules to the request answers it instead of
+
+    #     re-asking, and an explicit statement beats a learned preference
+
+    #     (which is why this sits BEFORE the preference block below).
+
+    if not entities.get("transaction_nature"):
+
+        _nature_text = " ".join(
+
+            str(x)
+
+            for x in (
+
+                entities.get("item_description"),
+
+                entities.get("description"),
+
+                msg,
+
+            )
+
+            if x
+
+        )
+
+        _derived_nature = derive_nature_from_text(intent, _nature_text)
+
+        if _derived_nature:
+
+            entities["transaction_nature"] = _derived_nature
+
+            # Audit trail: the nature came from the user's own wording.
+
+            nature_source = "TEXT_INFERENCE"
+
+            log.info(
+
+                "planner.nature_derived_from_text",
+
+                intent=intent,
+
+                nature=_derived_nature,
+
+            )
+
+
+
+    # 3a. ORG PREFERENCES — a learned ``transaction_nature`` is a HINT, NEVER
+
+    #     an answered entity (Fix 1 / RC-1, production 2026-10-06 sessions
+
+    #     62bc94c0 & 49775d68: the injected FIXED_ASSET preference routed
+
+    #     "shoes"/"60 shoes" into the register_fixed_asset ladder and the
+
+    #     nature question was never asked).  Nature is a per-transaction
+
+    #     user decision and is answered ONLY by
+
+    #       (a) the first LLM understanding hit (grounded prefill),
+
+    #       (b) the user's own words (TEXT_INFERENCE),
+
+    #       (c) an explicit user answer (USER_ANSWER), incl. an explicit
+
+    #       "SAME" reuse of the learned value via _reuse_learned_answers.
+
+    #     The learned value is otherwise merely OFFERED inside the question
+
+    #     through the clarification-memory hint ("previously: ... - reply
+
+    #     SAME to reuse").  It therefore never reaches the fixed-asset /
+
+    #     disposal re-route gates below (which additionally hard-block
+
+    #     nature_source == PREFERENCE as a belt-and-braces guard).
+
+    #     The payment TREATMENT is likewise a per-transaction question,
+
+    #     NEVER an assumed default — a learned payment_method stays
+
+    #     recorded for reporting only.  The transaction date is NEVER
+
+    #     defaulted — it is governed by the mandatory date protocol.
+
+    prefs = org_preferences or {}
+
+    if prefs.get("transaction_nature"):
+
+        log.info(
+
+            "planner.nature_preference_hint_only",
+
+            value=str(prefs.get("transaction_nature")),
+
+            intent=intent,
+
+        )
+
+
+
+    # 
+
+    # the org-set capitalization threshold governs when the R3.2
+
+    # question fires (small amounts auto-expense), and a learned
+
+    # capitalization decision for THIS purpose (preference key
+
+    # "capitalization:<PURPOSE>") stops the recurring re-ask.
+
+    entities.setdefault(
+
+        "capitalization_threshold",
+
+        capitalization_threshold_from_prefs(prefs),
+
+    )
+
+
+
+    # R4.12 RECEIPT PARTY HYGIENE — money-IN: the counterparty of a
+
+    # receipt is the CUSTOMER who paid, never a payee. The loose "from X"
+
+    # regex is a SUPPLIER pattern, and a supplier-kind "Party check"
+
+    # answer folded from earlier history can also land in supplier_name;
+
+    # either one reaching a supplier-side gate made "I received 60000 from
+
+    # FDS Labs Pvt" ask to create a SUPPLIER ledger while FDS Labs existed
+
+    # as a customer with an open receivable (Invoice 5). Move a genuine
+
+    # captured name across, then drop the supplier key entirely.
+
+    if intent == "record_receipt":
+
+        _payer = str(entities.get("supplier_name") or "").strip()
+
+        if (
+
+            _payer
+
+            and _payer.lower() not in _PARTY_NOISE
+
+            and not re.fullmatch(
+
+                r"(rs\.?|pkr)?\s*[\d,]+(?:\.\d+)?", _payer, re.IGNORECASE
+
+            )
+
+        ):
+
+            entities.setdefault("customer_name", _payer)
+
+        entities.pop("supplier_name", None)
+
+
+
+    # CA-GRADE REASONING (expense path): when the message itself names a
+
+    # KNOWN expense category ("record electricity bill of 20,000"), the
+
+    # agent derives the purpose ITSELF — IFRS presentation gives every
+
+    # expense category its own line item and its own ledger — and never
+
+    # wastes a clarification round re-asking what the request already
+
+    # answered.  Only keyword-matched categories qualify; free text that
+
+    # matches no category still asks the purpose question.
+
+    if intent == "record_expense" and not entities.get("transaction_purpose"):
+
+        _cat_text = " ".join(
+
+            str(x) for x in (
+
+                entities.get("item_description"),
+
+                entities.get("description"),
+
+            ) if x
+
+        )
+
+        if _cat_text:
+
+            _derived = resolve_purpose_answer(purpose_question(), _cat_text)
+
+            _derived_opt = purpose_option(str(_derived)) if _derived else None
+
+            if _derived_opt is not None and _derived_opt.keywords:
+
+                entities["transaction_purpose"] = _derived
+
+
+
+    purpose_now = entities.get("transaction_purpose")
+
+    if (
+
+        isinstance(purpose_now, str)
+
+        and purpose_now.upper() not in ("OTHER", "OTHER_DURABLE")
+
+        and not entities.get("capitalization_decision")
+
+        and prefs.get(f"capitalization:{purpose_now.upper()}")
+
+    ):
+
+        entities["capitalization_decision"] = prefs[
+
+            f"capitalization:{purpose_now.upper()}"
+
+        ]
+
+
+
+    # the purpose answer DERIVES the transaction
+
+    # nature (before routing): ambiguous purposes follow the R3.2
+
+    # decision (CAPITALIZE -> FIXED_ASSET), everything else keeps its
+
+    # deterministic nature.  A purpose-derived nature is an explicit
+
+    # user decision for the audit trail.
+
+    purpose_now = entities.get("transaction_purpose")
+
+    if (
+
+        intent == "record_expense"
+
+        and isinstance(purpose_now, str)
+
+        and not entities.get("transaction_nature")
+
+    ):
+
+        capitalized = (
+
+            str(entities.get("capitalization_decision") or "").upper()
+
+            == "CAPITALIZE"
+
+        )
+
+        entities["transaction_nature"] = nature_for_purpose(
+
+            purpose_now, capitalized=capitalized
+
+        )
+
+        if not nature_source:
+
+            nature_source = "USER_ANSWER"
+
+
+
+    # R3.5 — description auto-fill: when the purpose was chosen from the
+
+    # option list the description is rarely needed; fill it from the
+
+    # purpose label (e.g. "Rent — August 2026") unless one was given.
+
+    purpose_now = entities.get("transaction_purpose")
+
+    if (
+
+        intent == "record_expense"
+
+        and isinstance(purpose_now, str)
+
+        and not entities.get("description")
+
+    ):
+
+        try:
+
+            when = entities.get("transaction_date") or ""
+
+            stamp = ""
+
+            if when:
+
+                d = parse_transaction_date(str(when))
+
+                if d.ok and d.date is not None:
+
+                    stamp = f" — {d.date.strftime('%B %Y')}"
+
+            entities["description"] = f"{purpose_label(purpose_now)}{stamp}"
+
+        except Exception:  # noqa: BLE001 — autofill must never break planning
+
+            entities["description"] = purpose_label(purpose_now)
+
+
+
+    # 3b. ITEM INTAKE ROUTING — the payment TREATMENT decides the
+
+    # destination (IFRS: treatment depends on the payment terms):
+
+    #   * CREDIT  -> ALWAYS the purchase-bill path: Dr account / Cr PARTY
+
+    #                PAYABLE (never a paid tool; settled later by a payment
+
+    #                entry: Dr party / Cr bank).
+
+    #   * CASH    -> the nature re-routes (capitalisable -> asset
+
+    #                registration; consumable/operating -> paid expense).
+
+    #   * UNKNOWN -> DEFER the route until the treatment is answered (an
+
+    #                unanswered treatment must never pick a paid tool).
+
+    #                Exception: the record_expense tool is by definition a
+
+    #                PAID expense, so its default treatment is cash.
+
+    # EXPENSE PAYMENT STATUS FROM THE USER'S OWN WORDS (mandate Cases A/B):
+
+    # "Paid 3000 ..." states paid-now; "we will pay it next month" / "due"
+
+    # states outstanding.  Fills an OPEN treatment only — an explicit answer
+
+    # or a settled position always wins, and silence still asks the
+
+    # settlement question (never guessed).  Payroll claims "paid … salary"
+
+    # higher up the ladder, so this runs only for record_expense.
+
+    if (
+
+        intent == "record_expense"
+
+        and not entities.get("payment_method")
+
+        and not entities.get("settlement_position")
+
+    ):
+
+        if _UNPAID_MARKERS_RE.search(msg_lower) and not _PAID_MARKERS_RE.search(
+
+            msg_lower
+
+        ):
+
+            entities["settlement_position"] = "OUTSTANDING"
+
+            entities["payment_method"] = "CREDIT"
+
+            log.info("planner.expense_settlement_from_text", position="OUTSTANDING")
+
+        elif _PAID_MARKERS_RE.search(msg_lower):
+
+            # "Paid" states paid-now, but HOW (cash vs bank) is NOT stated
+
+            # â€” the settlement question must ask explicitly.  Never derive
+
+            # payment_method from "Paid" alone.
+
+            entities["settlement_position"] = "PAID_NOW"
+
+            log.info("planner.expense_settlement_from_text", position="PAID_NOW")
+
+
+
+    nature = entities.get("transaction_nature")
+
+    payment = entities.get("payment_method")
+
+    _purchase_family = (
+
+        "record_purchase", "record_cash_purchase", "record_credit_purchase",
+
+    )
+
+    # Whether the CREDIT re-route below originates from an ORDINARY expense
+
+    # (mandate Case B) — its liability is the standing Local Vendor payable,
+
+    # never a supplier question.
+
+    _credit_from_expense = intent == "record_expense"
+
+    if (
+
+        intent == "record_expense" and payment is None
+
+        and str(entities.get("settlement_position") or "").upper()
+
+        != "SETTLE_EXISTING_PAYABLE"
+
+    ):
+
+        # CA treatment 3 guard: a settle-existing-payable answer must NOT
+
+        # default to a paid expense — the settlement path handles it.
+
+        payment = "CASH"
+
+
+
+    # A FIXED-ASSET purchase is a CAPITALIZATION, never a plain bill or
+
+    # expense — on cash OR credit.  (Before: only cash went to
+
+    # register_fixed_asset, so credit asset purchases landed as bills in an
+
+    # asset-named GL account with no asset record, no depreciation schedule
+
+    # and no disposal trail.  register_asset handles the payable itself.)
+
+    # HARD BLOCK: a PREFERENCE-sourced nature may never trigger this re-route
+
+    # (Fix 1: a learned default must not hijack the workflow — only the
+
+    # LLM's grounded reading, the user's words or an explicit user answer
+
+    # can).
+
+    if (
+
+        nature == "FIXED_ASSET"
+
+        and nature_source != "PREFERENCE"
+
+        and intent in (*_purchase_family, "record_expense", "record_credit_purchase")
+
+    ):
+
+        intent = "register_fixed_asset"
+
+        # ISSUE-1 FIX (2026-10-21): a purchase re-routed to capitalisation on
+
+        # a DERIVED nature (perception fact / text inference) — NOT an explicit
+
+        # user answer — must still pass the item-nature analyst's resale-vs-
+
+        # asset check before we commit.  When the user EXPLICITLY answered
+
+        # "FIXED ASSET" (nature_source=USER_ANSWER) the marker stays unset and
+
+        # their answer is respected with no re-ask.
+
+        if nature_source != "USER_ANSWER":
+
+            entities["asset_nature_unconfirmed"] = True
+
+        if not entities.get("asset_name") and entities.get("item_description"):
+
+            entities["asset_name"] = entities["item_description"]
+
+    elif payment == "CREDIT" and intent in (
+
+        "record_purchase", "record_cash_purchase", "record_expense",
+
+    ) and (
+
+        # An ORDINARY expense may only join the bill path once its nature is
+
+        # resolved (the purpose ladder runs under record_expense first) —
+
+        # re-routing earlier would swap the purpose question for the
+
+        # purchase-item nature menu (the exact misroute the mandate bans).
+
+        intent != "record_expense" or nature
+
+    ):
+
+        intent = "record_credit_purchase"
+
+        if _credit_from_expense and not entities.get("supplier_name"):
+
+            # Mandate Case B: an unpaid ordinary expense posts the liability
+
+            # WITHOUT a supplier question — the standing "Local Vendor"
+
+            # payable (the merge vocabulary's one-off party account, reused
+
+            # and created on first use) carries it; a NAMED provider stays
+
+            # captured as descriptive info.  Never a new dedicated ledger.
+
+            entities["supplier_name"] = "Local Vendor"
+
+    elif (
+
+        nature in ("OPERATING_EXPENSE", "CONSUMABLE") and payment == "CASH"
+
+        and intent in _purchase_family
+
+    ):
+
+        intent = "record_expense"
+
+
+
+    # a sale answered FIXED ASSET DISPOSAL is never a
+
+    # revenue sale - it re-routes to the asset-disposal lifecycle (gain/
+
+    # loss journal), with the named item becoming the asset reference.
+
+    if entities.get("transaction_nature") == "ASSET_DISPOSAL" and intent in (
+
+        "record_sale", "record_cash_sale", "record_credit_sale", "create_invoice",
+
+    ):
+
+        intent = "dispose_fixed_asset"
+
+        if not entities.get("asset_name") and entities.get("item_description"):
+
+            entities["asset_name"] = entities["item_description"]
+
+
+
+    # 3c. WORK STREAM A - MANDATORY TRANSACTION-DATE PROTOCOL: validate the
+
+    #     extracted/answered date through the deterministic parser (the LLM
+
+    #     never parses dates).  A date that fails validation is RECOVERED
+
+    #     from the user's own words before it is ever dropped: "yesterday",
+
+    #     "2 days ago", "26 sep", "26/09" etc. resolve through the free-text
+
+    #     resolver, so the standardized date question only exists when the
+
+    #     user truly never stated a date.  (An invalid date — a typo, or a
+
+    #     date fabricated by the semantic prefill — used to be popped and
+
+    #     the user was asked for a date they had already given.)
+
+    raw_date = entities.get("transaction_date")
+
+    if raw_date:
+
+        parsed = parse_transaction_date(str(raw_date))
+
+        if parsed.ok:
+
+            entities["transaction_date"] = parsed.iso_date
+
+        else:
+
+            recovered = resolve_relative_date_text(msg)
+
+            if recovered and recovered.ok:
+
+                entities["transaction_date"] = recovered.iso_date
+
+                log.info(
+
+                    "planner.transaction_date_recovered",
+
+                    raw=str(raw_date)[:64],
+
+                    recovered=recovered.iso_date,
+
+                    matched=recovered.matched_format,
+
+                )
+
+            else:
+
+                entities.pop("transaction_date", None)
+
+                log.info(
+
+                    "planner.transaction_date_invalid",
+
+                    raw=str(raw_date)[:64],
+
+                    error=parsed.error,
+
+                )
+
+    if not entities.get("transaction_date"):
+
+        # Nothing extracted/answered: the message itself may still carry a
+
+        # relative phrase ("on credit 2 days ago") the extractor missed.
+
+        recovered = resolve_relative_date_text(msg)
+
+        if recovered and recovered.ok:
+
+            entities["transaction_date"] = recovered.iso_date
+
+            log.info(
+
+                "planner.transaction_date_resolved_from_text",
+
+                date=recovered.iso_date,
+
+                matched=recovered.matched_format,
+
+            )
+
+
+
+    # 4. Determine requirements
+
+    requires_validation = intent not in (
+
+        "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
+
+        "generate_cash_flow", "generate_general_ledger", "customer_balance",
+
+        "supplier_balance", "project_profitability", "generate_customer_ledger",
+
+        "generate_supplier_ledger",
+
+    )
+
+    requires_accounting = intent in _TRANSACTION_INTENTS
+
+    requires_confirmation = intent in _CONFIRMATION_INTENTS
+
+
+
+    # 5. ECONOMIC EVENT CLASSIFICATION — BEFORE tool selection.
+
+    #    Determine what real-world event this request represents and which
+
+    #    ERP dimensions it can affect.  Tools are then selected for the
+
+    #    EVENT, not for the CRUD keyword.
+
+    from app.reasoning import build_event_profile
+
+
+
+    event_profile = build_event_profile(intent)
+
+
+
+    # 6. Determine tools + context sources
+
+    tools = _tools_for_intent(intent)
+
+    # EXECUTION-AGENT LOOP: a USER-CONFIRMED account creation must be
+
+    # offerable/plannable for EVERY intent — the shortlist may never narrow
+
+    # below a planner-listed tool (create_account then executes FIRST via
+
+    # the executor's tool-order guard).
+
+    if entities.get("create_account") and "create_account" not in tools:
+
+        tools = [*tools, "create_account"]
+
+    context = _context_for_intent(intent)
+
+
+
+    # 6. Clarification — DYNAMIC, MINIMAL and CONSOLIDATED:
+
+    #    only genuinely-missing material info, gathered into ONE
+
+    #    questionnaire (every independent gap in a single round — no
+
+    #    drip-feeding one question per turn).  The grounded LLM prefill
+
+    #    (step 2b) has already filled everything the user actually stated,
+
+    #    so the questionnaire below contains ONLY genuine gaps.
+
+    missing_fields = _missing_fields(intent, entities)
+
+    clarification_qs = _questions_for_fields(intent, missing_fields, entities)
+
+    clarification_needed = bool(clarification_qs)
+
+
+
+    plan_obj = ExecutionPlan(
+
+        intent=intent,
+
+        entity_type=_entity_type(intent),
+
+        entity_name=(
+
+            entities.get("customer_name")
+
+            or entities.get("supplier_name")
+
+            or entities.get("project_name")
+
+        ),
+
+        required_context=context,
+
+        potential_tools=tools,
+
+        requires_validation=requires_validation,
+
+        requires_accounting_engine=requires_accounting,
+
+        requires_confirmation=requires_confirmation,
+
+        requires_clarification=clarification_needed,
+
+        clarification_questions=clarification_qs,
+
+        missing_fields=missing_fields,
+
+        expected_outcome=_outcome(intent),
+
+        extracted_entities=entities,
+
+        transaction_nature=entities.get("transaction_nature"),
+
+        transaction_nature_source=nature_source,
+
+        economic_event=event_profile.event.value,
+
+        impact_map=dict(event_profile.affected),
+
+        prohibited_actions=[p.as_dict() for p in event_profile.prohibited],
+
+    )
+
+
+
+    log.info(
+
+        "planner.result",
+
+        intent=intent,
+
+        entity_name=plan_obj.entity_name,
+
+        amount=entities.get("amount"),
+
+        tools=tools,
+
+        clarification=clarification_needed,
+
+    )
+
+    return plan_obj
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Clarification gating — the anti-loop core
+
+# ---------------------------------------------------------------------------
+
+
+
+# Field names that are material enough to clarify, mapped to the question
+
+# asked for them.  A field appears here ONLY if no extraction pattern found
+
+# it anywhere in the request (including prior clarification answers, which
+
+# the Planner merges into the entity set before this runs).
+
+_FIELD_QUESTION = {
+
+    "amount": "What is the transaction amount?",
+
+    "supplier_name": (
+
+        "Who is the supplier? If this is a one-off purchase from a local "
+
+        "vendor, reply LOCAL VENDOR and it will be recorded against a "
+
+        "'Local Vendor' account (created automatically if it does not "
+
+        "exist yet)."
+
+    ),
+
+    "customer_name": "Who is the customer?",
+
+    # Loan contract fields (record_loan): asked in ONE consolidated round
+
+    # when the request genuinely omits them; the Loans-page message never
+
+    # does (its terms are extracted, not asked).
+
+    "loan_direction": (
+
+        "Is this loan BORROWED (money received by the business) or GIVEN "
+
+        "(money lent out)? Reply BORROWED or GIVEN."
+
+    ),
+
+    "counterparty": (
+
+        "Who is the counterparty of this loan (the lender for a borrowing, "
+
+        "the borrower for a lending)?"
+
+    ),
+
+    "first_payment_date": (
+
+        "What is the FIRST REPAYMENT date? Reply the date as YYYY-MM-DD or "
+
+        "DD/MM/YYYY (for example 2026-11-14)."
+
+    ),
+
+    "tenure_months": (
+
+        "Over how many MONTHS is this loan repaid (the tenure)? Reply with "
+
+        "just the number, e.g. 36."
+
+    ),
+
+    "frequency": (
+
+        "How often are the repayments? Reply MONTHLY, QUARTERLY, "
+
+        "SEMI_ANNUAL or ANNUALLY."
+
+    ),
+
+    # invoice LINE-DETAIL.  The manual invoice form
+
+    # mandates a line item (description + quantity); the AI path must ask
+
+    # for both in the SAME consolidated round instead of silently
+
+    # defaulting "Goods" x1.  Quantity is asked against the KNOWN total so
+
+    # the unit price is derived, not guessed.
+
+    "item_description": (
+
+        "What item or service is being invoiced? (description for the "
+
+        "invoice line — e.g. 'Web development services', 'HP laptops')"
+
+    ),
+
+    "quantity": (
+
+        "How many units are you invoicing? (quantity — reply with just "
+
+        "the number; the line total you gave is divided across the units)"
+
+    ),
+
+    "payment_type": "Was this paid in cash or on credit?",
+
+    "asset_name": "Which asset is this about (asset name or code)?",
+
+    # the standardized date question (exact shape per the
+
+    # protocol): joined to the consolidated questionnaire, never a
+
+    # standalone round.
+
+    "transaction_date": (
+
+        "What is the transaction date? Reply TODAY, or the date as "
+
+        "YYYY-MM-DD or DD/MM/YYYY (for example 2026-09-04 or 04/09/2026)."
+
+    ),
+
+    # Asset-acquisition policy — text lives in app/questionnaire.py (ONE
+
+    # bank for every consumer: the planner, the questionnaire renderer and
+
+    # the LLM phrasing prompt all read the same strings).
+
+    "useful_life_years": QUESTION_BANK["useful_life_years"].question,
+
+    "depreciation_method": QUESTION_BANK["depreciation_method"].question,
+
+    "salvage_value": QUESTION_BANK["salvage_value"].question,
+
+    # Master data / Setup and Operational field questions
+    "account_name": "What is the name of the new account you want to create in the Chart of Accounts?",
+    "account_type": (
+        "What type of account is this in the Chart of Accounts? "
+        "Reply with ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE."
+    ),
+    "account_code": (
+        "What account code should be assigned? (Or reply AUTO to automatically "
+        "assign the next available code in this category)."
+    ),
+    "product_name": "What is the name of the product you want to add to the catalogue?",
+    "service_name": "What is the name of the service you want to add to the catalogue?",
+    "cost_price": "What is the purchase price / cost per unit for this item?",
+    "sales_price": "What is the selling / sales price for this item?",
+    "bank_name": "What is the name of the bank (e.g. Meezan Bank, HBL, Standard Chartered)?",
+    "employee_name": "What is the full name of the employee to register?",
+    "date_of_joining": "What is the employee's date of joining? Reply with the date (e.g. YYYY-MM-DD or DD/MM/YYYY) or TODAY.",
+    "basic_salary": "What is the employee's basic monthly salary (amount)?",
+    "project_name": "What is the name of the project to set up?",
+}
+
+
+
+
+
+def _questions_for_fields(
+
+    intent: str,
+
+    fields: List[str],
+
+    entities: Optional[Dict[str, Any]] = None,
+
+) -> List[str]:
+
+    """Per-field question text for the consolidated questionnaire.
+
+
+
+    The nature/purpose question is FAMILY-SPECIFIC: the
+
+    question for a purchase (fixed asset vs inventory vs consumable vs
+
+    service) differs from a sale, expense, settlement, return or
+
+    quotation.  the generic expense path asks the
+
+    PURPOSE question (what is it actually for?), the CONDITIONAL
+
+    capitalization question and the settlement question instead of the
+
+    4-way nature tree.  Every other field uses its standard
+
+    `_FIELD_QUESTION` text.
+
+    """
+
+    ents = entities or {}
+
+    questions: List[str] = []
+
+    for f in fields:
+
+        if f == "transaction_nature":
+
+            questions.append(
+
+                nature_question_for_intent(intent) or NATURE_DECISION_QUESTION
+
+            )
+
+        elif f == "transaction_purpose":
+
+            questions.append(purpose_question())
+
+        elif f == "capitalization_decision":
+
+            questions.append(
+
+                capitalization_question_for(str(ents.get("transaction_purpose") or ""))
+
+            )
+
+        elif f == "settlement_position":
+
+            questions.append(SETTLEMENT_POSITION_QUESTION)
+
+        elif f == "payment_type" and (
+            intent in ("record_receipt", "record_payment")
+            or (
+                intent == "record_expense"
+                and str(ents.get("settlement_position") or "").upper()
+                in ("SETTLE_EXISTING_PAYABLE", "PAID_NOW")
+            )
+        ):
+
+            # the settlement CHANNEL decides which
+
+            # ledger the money hits (cash vs bank), so it is asked.
+
+            if intent == "record_receipt":
+
+                questions.append(
+
+                    "Was this received in cash, or through the bank? "
+
+                    "Reply CASH or BANK."
+
+                )
+
+            else:
+
+                questions.append(
+
+                    "Was this paid in cash, or through the bank? "
+
+                    "Reply CASH or BANK."
+
+                )
+
+        elif f == "transaction_date" and intent == "record_expense":
+
+            # R3.3: the underlying EVENT date, never the payment date.
+
+            questions.append(EXPENSE_EVENT_DATE_QUESTION)
+
+        elif f == "amount":
+            _l_items = ents.get("line_items")
+            if isinstance(_l_items, list) and len(_l_items) >= 2:
+                _desc_parts = []
+                for _it in _l_items:
+                    _q = _it.get("quantity")
+                    _q_str = str(int(_q)) if isinstance(_q, (int, float)) and float(_q).is_integer() else str(_q or '')
+                    _desc_parts.append(f"{_q_str} {_it.get('description', '')}".strip())
+                _items_desc = " and ".join(_desc_parts)
+                _supp = ents.get("supplier_name")
+                _supp_str = f" from {_supp}" if _supp else ""
+                _ex0 = _l_items[0].get('description', 'item 1')
+                _ex1 = _l_items[1].get('description', 'item 2')
+                questions.append(
+                    f"What is the price or total for the {_items_desc}{_supp_str}? (e.g. {_ex0}: Rs. 10,000 each or total; {_ex1}: Rs. 3,000 each or total)"
+                )
+            else:
+                questions.append(_FIELD_QUESTION[f])
+        elif f == "account_name" and intent == "create_bank_account":
+            questions.append("What is the account title or name for this bank account (e.g. Current Account, Operations)?")
+        else:
+            questions.append(_FIELD_QUESTION[f])
+
+    return questions
+
+
+
+
+
+def intent_for_message(user_message: str) -> str:
+
+    """The planner's own intent reading (public, for the understanding gate)."""
+
+    return _identify_intent((user_message or "").lower())
+
+
+
+
+
+def text_understanding_gaps(user_message: str) -> List[str]:
+
+    """Material fields the WORDS of *user_message* do not decide.
+
+
+
+    Pure and cheap (regex only).  ``[]`` means the deterministic pipeline
+
+    already read everything the request says, so the bounded understanding
+
+    call is NOT made at all — the call exists for wording it cannot read,
+
+    never as a toll on every turn.
+
+
+
+    INTENT UNKNOWN: the keyword ladder could not classify a material
+
+    recording request (Fix 4 — the loans case: "borrow loan from MCB of
+
+    300000" matched nothing, so no LLM was ever consulted and the run died
+
+    in the generic loop).  Such a request now opens the FIRST LLM HIT, which
+
+    classifies the nature AND delegates the route through the
+
+    ``_SEMANTIC_INTENTS`` whitelist — the Python ladder never invents a
+
+    route for it.  Report-shaped wording is excluded: a read must not cost
+
+    a call or risk a mutation route.
+
+    """
+
+    intent = intent_for_message(user_message)
+
+    if not intent or intent == "unknown":
+
+        msg = user_message or ""
+
+        # A MATERIAL MONEY-MOVEMENT phrase overrides the read gate.  "give a
+
+        # loan" / "lend money" / "advance funds" contain a report verb ("give")
+
+        # but are unambiguously mutations — and record_loan is reachable ONLY
+
+        # via this first LLM hit (the ladder carries no loan vocabulary by
+
+        # design).  Reading them as reports starved the call and dead-ended
+
+        # the request.  "give me the loan balance" still reads as a report
+
+        # (no lend/money movement verb), so reads never spend the call.
+
+        if _REPORT_HINT_RE.search(msg) and not _MUTATION_OVERRIDE_RE.search(msg):
+
+            return []
+
+        if _extract_amount(msg) is not None or _RECORDING_HINT_RE.search(msg):
+
+            return ["transaction_nature"]
+
+        return []
+
+    gaps: List[str] = []
+
+    if nature_family_for_intent(intent) and not derive_nature_from_text(
+
+        intent, user_message
+
+    ):
+
+        gaps.append("transaction_nature")
+
+    if intent in _ITEM_REQUIRED_INTENTS:
+
+        item = _extract_item(user_message)
+
+        if not item:
+
+            gaps.append("item_description")
+
+        elif (
+
+            _extract_item_quantity(user_message, item) is None
+
+            and _COUNT_WORD_HINT_RE.search(user_message)
+
+        ):
+
+            # The user DID state a count, in wording the deterministic reader
+
+            # could not take ("twenty-five bikes", "half a dozen").  Ask the
+
+            # understanding call rather than questioning the user about a
+
+            # number they have just given — this is the wording the call exists
+
+            # for, and without this gap it was never made.
+
+            gaps.append("quantity")
+
+    return gaps
+
+
+
+
+
+_ITEM_REQUIRED_INTENTS = frozenset({
+
+    "create_invoice", "record_sale", "record_cash_sale", "record_credit_sale",
+
+    "record_purchase", "record_cash_purchase", "record_credit_purchase",
+
+    "create_quotation",
+
+})
+
+
+
+# Read-shaped wording: a report/list request never triggers the first LLM
+
+# hit (cost control + a read can never be delegated to a mutation route).
+
+_REPORT_HINT_RE = re.compile(
+
+    r"(?:^|\s)(?:show|list|give|provide|tell|view|display|details?|summary|"
+
+    r"summar\w*|breakdown|report|what|which|who|when|where|how\s+much|"
+
+    r"balance|history)\b",
+
+    re.IGNORECASE,
+
+)
+
+
+
+# Recording-shaped wording for an UNCLASSIFIED request: enough to justify
+
+# the first LLM hit (which owns nature + route).  This gate only decides
+
+# WHETHER to spend the call — never WHERE the request routes; the LLM's
+
+# whitelisted identification decides that.
+
+_RECORDING_HINT_RE = re.compile(
+
+    r"\b(?:record|log|book|create|add|register|enter|pay|paid|pay(?:ing|ment)s?|"
+
+    r"receiv\w*|borrow\w*|lend\w*|lent|repay\w*|repayment|settle\w*|transfer|"
+
+    r"buy|bought|purchas\w*|sold|sell|selling|spent|spend|deposit|withdraw\w*|"
+
+    r"disburse\w*|invest\w*|owe|owed)\b",
+
+    re.IGNORECASE,
+
+)
+
+
+
+# A money-movement phrase that can never be a report, even though it contains
+
+# a report-shaped verb ("give").  Present only for genuine mutations: giving/
+
+# lending/advancing/granting a loan or money, or repaying.  A read like "give
+
+# me the loan balance" has no lend/money/repay verb, so it stays a report and
+
+# never spends the first LLM hit.
+
+_MUTATION_OVERRIDE_RE = re.compile(
+
+    r"\b(?:give|gave|grant|granted|lend|lent|advance|advanced|float|disburse)"
+
+    r"[^.!?\n]{0,40}?\b(?:loan|loans|money|funds|cash|advance|principal|amount)"
+
+    r"\b|\b(?:repay\w*|repayment)\b",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+def human_questions_for_missing(
+
+    intent: str,
+
+    fields: Optional[List[str]],
+
+    entities: Optional[Dict[str, Any]] = None,
+
+    *,
+
+    limit: int = 3,
+
+) -> List[str]:
+
+    """Human question text for the missing fields — never raw field names.
+
+
+
+    The plan-incomplete card used to print ``useful_life_years,
+
+    depreciation_method, salvage_value`` verbatim, which told the user nothing
+
+    about what to type.  This reuses the questionnaire's own question bank
+
+    (the text the user sees everywhere else) and caps the list so the card
+
+    stays readable; the caller reports how many were left out.
+
+    """
+
+    wanted = [str(f) for f in (fields or []) if f]
+
+    if not wanted:
+
+        return []
+
+    return _questions_for_fields(intent, wanted[: max(1, limit)], entities or {})
+
+
+
+
+
+def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
+
+    """Return the material fields genuinely missing for *intent*.
+
+
+
+    Rules (single source of truth for clarification):
+
+    * Nature/purpose comes FIRST: for EVERY intent that
+
+      creates, moves or classifies value the nature (fixed asset vs
+
+      inventory vs consumable vs expense vs settlement) is a user decision
+
+      - never guessed, never suppressed by other missing fields.  A learned
+
+      ``transaction_nature`` preference (or an explicit answer merged into
+
+      *entities*) answers it.
+
+    * Amount is only missing when NO extraction pattern found it anywhere
+
+      (including prior clarification answers merged into *entities*).
+
+    * Supplier is only required for credit purchases (a cash purchase
+
+      does not need a named supplier).
+
+    * Customer is only required for credit sales / invoices.
+
+    * Cash-vs-credit treatment changes the accounting entries (payable vs
+
+      immediate payment), so when NO payment keyword was found anywhere it
+
+      is material and MUST be asked — never guessed.
+
+    * Ordering is dependency-first: nature/purpose ->
+
+      cash-vs-credit -> party/asset reference -> amount -> transaction
+
+      date.
+
+    """
+
+    missing: List[str] = []
+
+
+
+    # 
+
+    #   1. PURPOSE (what is it actually for?) replaces the 4-way nature
+
+    #      tree for record_expense — the purpose answer DERIVES the nature.
+
+    #   2. CAPITALIZE-OR-EXPENSE — only when the purpose is ambiguous
+
+    #      (repairs / software / durable free text) AND the amount is at
+
+    #      or above the org's capitalization threshold (small amounts
+
+    #      auto-expense; never asked below it).
+
+    #   3. SETTLEMENT — paid now (cash/bank) vs outstanding vs prepaid;
+
+    #      the answer fills payment_method, so the step-3b routing and
+
+    #      the party gate see a normal treatment.
+
+    if intent == "record_expense":
+
+        if not entities.get("transaction_purpose"):
+
+            missing.append("transaction_purpose")
+
+        else:
+
+            needs_cap = purpose_requires_capitalization_question(
+
+                str(entities["transaction_purpose"]),
+
+                str(entities.get("item_description") or entities.get("description") or ""),
+
+                entities.get("amount"),
+
+                entities.get("capitalization_threshold")
+
+                if entities.get("capitalization_threshold") is not None
+
+                else capitalization_threshold_from_prefs(None),
+
+            )
+
+            if needs_cap and not entities.get("capitalization_decision"):
+
+                missing.append("capitalization_decision")
+
+        if not entities.get("payment_method"):
+            if (
+                str(entities.get("settlement_position") or "").upper()
+                in ("SETTLE_EXISTING_PAYABLE", "PAID_NOW")
+            ):
+                # The treatment is known (paid now / settle a payable) — only the
+                # settlement CHANNEL (cash vs bank ledger) is open.
+                missing.append("payment_type")
+            else:
+                missing.append("settlement_position")
+
+
+
+    # it
+
+    # re-routes the intent (fixed asset -> registration, consumable ->
+
+    # expense, disposal -> asset disposal) and the treatment.  The
+
+    # generic expense path is covered by the R3 ladder above (purpose
+
+    # derives the nature) — never ask both.
+
+    if (
+
+        intent != "record_expense"
+
+        and nature_family_for_intent(intent)
+
+        and not entities.get("transaction_nature")
+
+    ):
+
+        missing.append("transaction_nature")
+
+
+
+    if intent in ("record_purchase", "record_sale") and not entities.get("payment_method"):
+
+        # Generic intent means no payment keyword was found anywhere —
+
+        # the cash/credit treatment is genuinely unknown.
+
+        missing.append("payment_type")
+
+
+
+    # the settlement CHANNEL
+
+    # (cash vs bank) is ASKED, never defaulted — it decides which ledger
+
+    # the money hits (R4.1: cash ledger is separate from the bank
+
+    # ledger).  The PARTY is a NEXT-STAGE question: it is only material
+
+    # when the business operation is an invoice/bill SETTLEMENT (whose
+
+    # receivable/payable is being settled?) — an advance or loan does
+
+    # not name a customer/supplier up front.
+
+    if (
+
+        intent == "record_receipt"
+
+        and str(entities.get("transaction_nature") or "").upper() == "ALLOCATION"
+
+        and not entities.get("customer_name")
+
+    ):
+
+        missing.append("customer_name")
+
+    if (
+
+        intent == "record_payment"
+
+        and str(entities.get("transaction_nature") or "").upper() == "ALLOCATION"
+
+        and not entities.get("supplier_name")
+
+    ):
+
+        missing.append("supplier_name")
+
+    if intent in ("record_receipt", "record_payment") and not entities.get("payment_method"):
+
+        missing.append("payment_type")
+
+
+
+    if intent == "record_credit_purchase" and not entities.get("supplier_name"):
+
+        missing.append("supplier_name")
+
+
+
+    if intent in ("record_credit_sale", "create_invoice") and not entities.get("customer_name"):
+
+        missing.append("customer_name")
+
+
+
+    # 
+
+    # the description and quantity are MATERIAL for invoices (parity law:
+
+    # the manual form mandates a line item), so both are asked in the
+
+    # same consolidated round — after the party, before amount/date —
+
+    # and NEVER silently defaulted ("Goods" x1 was the old behaviour).
+
+    # R4.10: when DISTINCT lines were already parsed from the request
+
+    # (multi-item phrasing) the singular questions are suppressed —
+
+    # every line already carries its own description/quantity/price.
+
+    if intent in ("create_invoice", "record_credit_sale"):
+
+        if not entities.get("line_items"):
+
+            if not (
+
+                entities.get("item_description") or entities.get("description")
+
+            ):
+
+                missing.append("item_description")
+
+            if entities.get("quantity") is None:
+
+                missing.append("quantity")
+
+
+
+    # Asset lifecycle: the asset reference is material (which asset?), and
+
+    # an asset acquisition without any payment keyword cannot assume
+
+    # cash-vs-credit — the journal differs (payable vs immediate payment).
+
+    if intent in (
+
+        "register_fixed_asset", "dispose_fixed_asset",
+
+        "record_asset_depreciation",
+
+    ) and not (
+
+        entities.get("item_description") or entities.get("asset_name")
+
+    ):
+
+        missing.append("asset_name")
+
+
+
+    if intent == "register_fixed_asset" and not entities.get("payment_method"):
+
+        missing.append("payment_type")
+
+
+
+    if intent == "create_project" and not entities.get("project_name"):
+
+        # The project CODE is deliberately NOT asked: projects.project_code is
+
+        # NOT NULL, yet no natural-language request names one — the repository
+
+        # derives <STEM>-### when it is absent.
+
+        missing.append("project_name")
+
+    # Master data / Setup tasks: Anti-Blind-Assumption Guard
+    if intent == "create_account":
+        if not (entities.get("account_name") or entities.get("name")):
+            missing.append("account_name")
+        if not entities.get("account_type"):
+            missing.append("account_type")
+
+    if intent == "create_customer" and not (entities.get("customer_name") or entities.get("name")):
+        missing.append("customer_name")
+
+    if intent == "create_supplier" and not (entities.get("supplier_name") or entities.get("name")):
+        missing.append("supplier_name")
+
+    if intent == "create_product":
+        if not (entities.get("product_name") or entities.get("name")):
+            missing.append("product_name")
+        # In purchasing/inbound context: goods are recorded at cost, never ask for sales price!
+        is_purchase_context = bool(
+            entities.get("is_purchase")
+            or entities.get("supplier_name")
+            or entities.get("vendor_name")
+            or "purchase" in str(intent).lower()
+        )
+        if not is_purchase_context:
+            if (
+                entities.get("sales_price") is None
+                and entities.get("unit_price") is None
+                and entities.get("cost_price") is None
+            ):
+                missing.append("sales_price")
+        else:
+            if (
+                entities.get("cost_price") is None
+                and entities.get("unit_price") is None
+            ):
+                missing.append("cost_price")
+
+    if intent == "create_service":
+        if not (entities.get("service_name") or entities.get("name")):
+            missing.append("service_name")
+        if entities.get("sales_price") is None and entities.get("standard_rate") is None:
+            missing.append("sales_price")
+
+    if intent == "create_bank_account":
+        if not entities.get("bank_name"):
+            missing.append("bank_name")
+        if not (entities.get("account_name") or entities.get("name")):
+            missing.append("account_name")
+
+    if intent == "create_employee":
+        if not (entities.get("employee_name") or entities.get("name") or entities.get("full_name")):
+            missing.append("employee_name")
+        if not (entities.get("date_of_joining") or entities.get("joining_date")):
+            missing.append("date_of_joining")
+        if entities.get("basic_salary") is None and entities.get("salary") is None:
+            missing.append("basic_salary")
+
+    if intent in ("supplier_balance", "generate_supplier_ledger") and not (entities.get("supplier_name") or entities.get("name")):
+        missing.append("supplier_name")
+
+    if intent in ("customer_balance", "generate_customer_ledger") and not (entities.get("customer_name") or entities.get("name")):
+        missing.append("customer_name")
+
+
+
+    # ASSET-ACQUISITION POLICY (never guessed): a capitalised asset needs a
+
+    # depreciation policy — useful life, method and (optionally) salvage —
+
+    # or an explicit "no schedule" decision.  A registered asset with no
+
+    # policy is undisposable later (its book value can never be corrected),
+
+    # which is why this is material rather than optional.
+
+    #
+
+    # ALL THREE are asked in ONE round (the whole point of the consolidated
+
+    # questionnaire): the old ladder asked life, then — after the answer —
+
+    # method, then salvage, so a single acquisition cost three clarifying
+
+    # turns.  The answers arrive together (the questionnaire is field-tagged),
+
+    # and answering "none" to any of them records the DECLINE, which settles
+
+    # the trio at once.
+
+    if intent == "register_fixed_asset":
+
+        declined = bool(entities.get("depreciation_declined"))
+
+        if not declined:
+
+            if entities.get("useful_life_years") is None:
+
+                missing.append("useful_life_years")
+
+            if not str(entities.get("depreciation_method") or ""):
+
+                missing.append("depreciation_method")
+
+            if entities.get("salvage_value") is None:
+
+                missing.append("salvage_value")
+
+
+
+
+
+    if intent in _TRANSACTION_INTENTS and entities.get("amount") is None:
+
+        missing.append("amount")
+
+
+
+    # LOAN CONTRACT FLOOR (record_loan): the schedule terms have no defaults
+
+    # — they are material inputs of the record_loan tool, asked in ONE
+
+    # consolidated round and merged back by field tag.  The Loans-page
+
+    # message states all of them (extracted above), so the page flow is
+
+    # never re-asked; a chat request asks only what it genuinely omitted.
+
+    # This is what removed the "lookup-only plan → dead-end card" loop for
+
+    # loans: the model receives a COMPLETE request on the next turn.
+
+    if intent == "record_loan":
+
+        for _loan_field in (
+
+            "loan_direction", "counterparty",
+
+            "first_payment_date", "tenure_months", "frequency",
+
+        ):
+
+            if not entities.get(_loan_field):
+
+                missing.append(_loan_field)
+
+
+
+    # the transaction date is material for EVERY mutation -
+
+    # an absent or unparseable date is asked (never silently defaulted).
+
+    if intent in DATE_REQUIRED_INTENTS and not entities.get("transaction_date"):
+
+        missing.append("transaction_date")
+
+
+
+    return missing
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Multi-question answer splitting — the consolidated questionnaire may be
+
+# answered in ONE message ("1) cash 2) 150,000" or "cash, 150000").  Each
+
+# part must be routed to ITS OWN question, or the second answer is lost and
+
+# the same question would be asked again.
+
+# ---------------------------------------------------------------------------
+
+
+
+_NUMBERED_Q_LINE = re.compile(r"^\s*\d+[.)]\s*(.+)$", re.MULTILINE)
+
+
+
+
+
+def _split_numbered_questions(text: str) -> List[str]:
+
+    """Return the individual questions of a numbered questionnaire."""
+
+    return [m.strip() for m in _NUMBERED_Q_LINE.findall(text or "")]
+
+
+
+
+
+def _split_answer_parts(answer: str) -> List[str]:
+
+    """Split a user reply into one part per answered question.
+
+
+
+    Handles "1) cash 2) 150000", newline-separated answers and
+
+    comma/and-separated answers.  Digit-grouping commas ("2,000") are
+
+    NEVER treated as separators.
+
+    """
+
+    text = (answer or "").strip()
+
+    if not text:
+
+        return []
+
+    # Numbered parts ("1) cash 2) yes" / "1. cash\n2. yes")
+
+    if re.search(r"(?:^|\s)1\s*[.)]\s*\S", text):
+
+        parts = [
+
+            p.strip(" ,;")
+
+            for p in re.split(r"\s*\d+\s*[.)]\s*", text)
+
+            if p.strip(" ,;")
+
+        ]
+
+        if len(parts) >= 2:
+
+            return parts
+
+    # Newline-separated parts
+
+    if "\n" in text:
+
+        parts = [p.strip(" ,;") for p in text.splitlines() if p.strip(" ,;")]
+
+        if len(parts) >= 2:
+
+            return parts
+
+    # Comma / "and" separated parts ("cash, 150000" / "cash and 150000")
+
+    segments = re.split(r",(?!\d)\s*|\s+and\s+", text)
+
+    parts = [p.strip(" ,;") for p in segments if p.strip(" ,;")]
+
+    return parts if len(parts) >= 2 else [text]
+
+
+
+
+
+def _explode_multi_answers(
+
+    qa_history: List[Dict[str, str]],
+
+) -> List[Dict[str, str]]:
+
+    """Pair each part of a multi-question answer with its own question.
+
+
+
+    A consolidated questionnaire ("...:\n1. Q1\n2. Q2") answered in one
+
+    line ("a, b" / "1) a 2) b") becomes two (question, answer) pairs so
+
+    the existing per-field matching resolves BOTH answers.
+
+    """
+
+    exploded: List[Dict[str, str]] = []
+
+    for qa in qa_history or []:
+
+        question = qa.get("question") or ""
+
+        answer = (qa.get("answer") or "").strip()
+
+        if not answer:
+
+            continue
+
+        sub_questions = _split_numbered_questions(question)
+
+        parts = _split_answer_parts(answer)
+
+        if len(sub_questions) >= 2 and len(parts) == len(sub_questions):
+
+            for sq, part in zip(sub_questions, parts):
+
+                exploded.append({"question": sq, "answer": part})
+
+        elif (
+
+            len(sub_questions) >= 2
+
+            and len(parts) == len(sub_questions) - 1
+
+            and "?" not in sub_questions[0]
+
+        ):
+
+            # A leading PREAMBLE is not a question ("To record this transaction
+
+            # I need a few things:\n1. …\n2. …\n3. …").  Dropping it makes the
+
+            # counts line up so each numbered answer still reaches its own
+
+            # field — without this, the whole consolidated answer fell through
+
+            # as one blob and the depreciation trio repeated forever
+
+            # (production 2026-10-01, building session 6b78909c).
+
+            # A first item that ASKS (contains "?") is a real question even
+
+            # when a trailing sentence follows the mark — dropping it paired
+
+            # a bare "Yes" with the WRONG question and silently lost the
+
+            # account-creation approval (Zameer Labs 2026-10-07).
+
+            for sq, part in zip(sub_questions[1:], parts):
+
+                exploded.append({"question": sq, "answer": part})
+
+        elif (
+
+            len(sub_questions) >= 2
+
+            and len(parts) == len(sub_questions) + 1
+
+            and re.match(r"supplier\s*:", parts[-1], re.IGNORECASE)
+
+        ):
+
+            # 
+
+            # choosing CREDIT on the payment question reveals an extra
+
+            # "N) supplier: X" part.  Pair the base parts with their
+
+            # questions and route the trailing part to the supplier field.
+
+            for sq, part in zip(sub_questions, parts[:-1]):
+
+                exploded.append({"question": sq, "answer": part})
+
+            value = re.split(
+
+                r"supplier\s*:", parts[-1], maxsplit=1, flags=re.IGNORECASE
+
+            )[1].strip()
+
+            if value:
+
+                exploded.append({
+
+                    "question": "Who is the supplier?",
+
+                    "answer": value,
+
+                })
+
+        else:
+
+            exploded.append({
+
+                "question": question,
+
+                "answer": answer,
+
+                # FIELD-TAGGED answers (fixed-format questionnaire) keep
+
+                # their field: the numbered-split branches cannot map a
+
+                # part to a field, but a single field question never has
+
+                # numbered sub-questions, so it always lands here intact.
+
+                "field": qa.get("field"),
+
+            })
+
+    return exploded
+
+
+
+
+
+def _resolve_same_answers(
+
+    qa_history: List[Dict[str, str]],
+
+) -> List[Dict[str, str]]:
+
+    """Resolve "SAME" answers to the prior answer for the same question.
+
+
+
+    The clarification-memory hint offers "reply SAME to reuse" for
+
+    preference-shaped questions.  The question text may
+
+    carry the "(previously: ...)" hint suffix, so matching normalises it
+
+    away.  A SAME with no resolvable prior is dropped (never guessed).
+
+    """
+
+    def _norm(q: str) -> str:
+
+        return (q or "").split("(previously")[0].strip().lower()
+
+
+
+    resolved: List[Dict[str, str]] = []
+
+    for qa in qa_history or []:
+
+        question = qa.get("question") or ""
+
+        answer = (qa.get("answer") or "").strip()
+
+        if answer.lower() == "same":
+
+            prior = next(
+
+                (
+
+                    p.get("answer") or ""
+
+                    for p in reversed(resolved)
+
+                    if _norm(p.get("question")) == _norm(question)
+
+                    and (p.get("answer") or "").strip().lower() != "same"
+
+                ),
+
+                None,
+
+            )
+
+            if prior:
+
+                resolved.append({
+
+                    "question": question, "answer": prior, "field": qa.get("field"),
+
+                })
+
+            continue
+
+        resolved.append({
+
+            "question": question, "answer": answer, "field": qa.get("field"),
+
+        })
+
+    return resolved
+
+
+
+
+
+# Field tags that are NOT entity fields: the plan-incomplete / model-failure
+
+# cards persist "missing_details" (and similar prose tags).  An answer to
+
+# such a card is conversation context — NEVER entity content (Fix 3 / RC-3:
+
+# the failure summary's own prose ("...search_supplier...") routed the
+
+# user's instruction "re-route it from expenses account" into
+
+# supplier_name through the keyword chain below).
+
+_NON_ENTITY_FIELD_TAGS = frozenset({
+
+    "missing_details", "missing information", "missing_information",
+
+    "information", "details", "missing",
+
+})
+
+
+
+# First words that can never lead a party NAME in an answer: instructions
+
+# and sentence openers (production RC-3 answers: "re-route it from expenses
+
+# account", "Create new Account in COA ...").  Extends _NON_PARTY_WORDS with
+
+# instruction vocabulary the capture-time guard never needed.
+
+_ANSWER_NON_NAME_WORDS = _NON_PARTY_WORDS | {
+
+    "please", "should", "would", "could", "you", "we", "they", "it", "this",
+
+    "that", "these", "those", "reroute", "route", "use", "using", "choose",
+
+    "select", "reply", "answer", "avoid", "fix", "correct", "update",
+
+    "change", "delete", "remove", "send", "move", "keep", "apply", "ensure",
+
+    "just", "also", "instead", "rather", "log", "book", "put",
+
+    "set", "check", "review", "confirm", "whether", "if", "when", "because",
+
+}
+
+
+
+
+
+def _is_party_name_answer(value: str) -> bool:
+
+    """True only when a typed answer reads like a party NAME.
+
+
+
+    Guards both merge routes (field tag + keyword chain): a real name is
+
+    short and name-shaped; an instruction or failure-prose reply ("re-route
+
+    it from expenses account", "Create new Account in COA ... and Record
+
+    it's Expense Paid") is rejected so the name stays unset and the gate
+
+    re-asks instead of writing prose into the party ledger (RC-3).
+
+    """
+
+    text = (value or "").strip()
+
+    if not text or _is_control_answer(text):
+
+        return False
+
+    if len(text) > 80:
+
+        return False
+
+    words = text.split()
+
+    if not words or len(words) > 8:
+
+        return False
+
+    if not _is_plausible_party(text):
+
+        return False
+
+    # Normalise the first word ("re-route" -> "reroute") so hyphenated
+
+    # instruction openers cannot slip past the vocabulary check.
+
+    first_word = re.sub(r"[^a-z]", "", words[0].lower())
+
+    return first_word not in _ANSWER_NON_NAME_WORDS
+
+
+
+
+
+def _reuse_learned_answers(
+
+    qa_history: List[Dict[str, str]],
+
+    prefs: Dict[str, str],
+
+) -> List[Dict[str, str]]:
+
+    """A "SAME" reply explicitly reuses the learned value for that question.
+
+
+
+    The clarification-memory hint offers "previously: <value> - reply SAME
+
+    to reuse".  A prior answer to the same question in THIS conversation
+
+    wins (``_resolve_same_answers``' contract); when the question is new,
+
+    the organization preference for that exact question supplies the value.
+
+    This is the ONLY path by which a learned preference may answer a field —
+
+    applied solely on the user's explicit SAME.
+
+    """
+
+    if not prefs or not qa_history:
+
+        return qa_history
+
+    try:
+
+        from app.services.preference_service import preference_key_for_question
+
+    except Exception:  # noqa: BLE001 — hint plumbing must never break planning
+
+        return qa_history
+
+
+
+    def _norm(q: str) -> str:
+
+        return (q or "").split("(previously")[0].strip().lower()
+
+
+
+    answered: Dict[str, str] = {}
+
+    out: List[Dict[str, str]] = []
+
+    for qa in qa_history:
+
+        question = qa.get("question") or ""
+
+        answer = (qa.get("answer") or "").strip()
+
+        if answer.lower() == "same":
+
+            prior = answered.get(_norm(question))
+
+            if prior:
+
+                answer = prior
+
+            else:
+
+                try:
+
+                    key = preference_key_for_question(_norm(question))
+
+                except Exception:  # noqa: BLE001
+
+                    key = None
+
+                learned = str(prefs.get(key) or "").strip() if key else ""
+
+                if learned:
+
+                    log.info(
+
+                        "planner.same_reuses_learned_value",
+
+                        field=key,
+
+                        value=learned[:60],
+
+                    )
+
+                    answer = learned
+
+        out.append({**qa, "answer": answer})
+
+        if answer and answer.lower() != "same":
+
+            answered[_norm(question)] = answer
+
+    return out
+
+
+
+
+
+def _party_name_candidate(answer: str) -> Optional[str]:
+
+    """A party NAME extracted from a party-check answer, or ``None``.
+
+
+
+    A pick ("ABC Traders"), a declined-then-renamed reply ("No, use FDS
+
+    Labs") and similar are stored verbatim so the next search finds the
+
+    EXACT match.  A sentence-shaped reply ("I am Receiving amount, not
+
+    paying") is FEEDBACK about the question itself — folding it into the
+
+    party-name entity used to create a ledger literally named after the
+
+    user's complaint, so it is rejected and the previously extracted name
+
+    is kept (the gate simply re-asks instead of adopting the reply).
+
+    """
+
+    candidate = re.sub(
+
+        r"^(?:(?:yes|y|no|n|ok|create|use|pick|existing)\b[,.:;! \t]*)+",
+
+        "",
+
+        answer.strip(),
+
+        flags=re.IGNORECASE,
+
+    ).strip()
+
+    if len(candidate) < 2 or len(candidate.split()) > 8:
+
+        return None
+
+    if re.match(
+
+        r"^(?:i|i'm|im|we|it|this|that|not|there|am|the)\b",
+
+        candidate,
+
+        re.IGNORECASE,
+
+    ):
+
+        return None
+
+    if not _is_plausible_party(candidate):
+
+        return None
+
+    # Name-shape guard (Fix 3 / RC-3): a party-check reply that is an
+
+    # instruction or sentence ("re-route it from expenses account") is
+
+    # never a ledger name — the gate re-asks instead.
+
+    if not _is_party_name_answer(candidate):
+
+        return None
+
+    return candidate
+
+
+
+
+
+#: Words that identify a depreciation-policy round (the consolidated
+
+#: "useful life / method / salvage" question and each of its parts).
+
+_DEPRECIATION_QUESTION_HINTS = (
+
+    "useful life", "depreciation method", "salvage", "residual",
+
+)
+
+_DEPRECIATION_FIELDS = frozenset(
+
+    {"useful_life_years", "depreciation_method", "salvage_value", "residual_value"}
+
+)
+
+
+
+
+
+def _merge_depreciation_policy_answer(
+
+    merged: Dict[str, Any], question: str, answer: str
+
+) -> bool:
+
+    """Fold a depreciation-policy answer into the entity set — however phrased.
+
+
+
+    The questionnaire asks useful life, method and salvage in ONE round, and
+
+    users answer that round in one line ("1) 8 / 2) STRAIGHT_LINE / 3) 500,000"
+
+    or "8 years, straight line, 1,000,000 salvage value").  Every shape of
+
+    that round — the natural-language question, its numbered parts, and the
+
+    persisted field-shaped rows — must land in the same three entities, or the
+
+    round repeats forever (production 2026-10-01, building session 6b78909c:
+
+    the user answered the trio three times and nothing was ever recorded).
+
+
+
+    Each part is parsed only when ITS question is being answered, so a
+
+    single-part round ("Which DEPRECIATION METHOD…?" → "STRAIGHT_LINE") never
+
+    invents the other two.  Returns True when at least one field was set.
+
+    """
+
+    text = str(question or "").strip()
+
+    if not text:
+
+        return False
+
+    bare = text.lower()
+
+    if bare in _DEPRECIATION_FIELDS:
+
+        return _merge_field_answer(merged, bare, answer)
+
+
+
+    low_q = text.lower()
+
+    hints = {h for h in _DEPRECIATION_QUESTION_HINTS if h in low_q}
+
+    if not hints:
+
+        return False
+
+    # Collapse the hints to the FIELDS they point at: "RESIDUAL / SALVAGE
+
+    # value" is ONE field answered by ONE value, not a consolidated round.
+
+    _field_for_hint = {
+
+        "useful life": "useful_life_years",
+
+        "depreciation method": "depreciation_method",
+
+        "salvage": "salvage_value",
+
+        "residual": "salvage_value",
+
+    }
+
+    fields_for_hints = {_field_for_hint[h] for h in hints}
+
+
+
+    raw = str(answer or "").strip()
+
+    if not raw:
+
+        return False
+
+    low = raw.lower().strip(" .)'\"")
+
+    # A typed numbered answer keeps its list marker through the newline/comma
+
+    # split ("1) 8") — strip it before parsing the value.
+
+    low = re.sub(r"^\d{1,2}\s*[.):\-]\s*", "", low).strip()
+
+    if low in _DECLINE_WORDS or low in ("c", "none for now"):
+
+        # The round's own decline vocabulary: "reply NONE if you do not want a
+
+        # depreciation schedule yet" settles the whole trio at once.
+
+        merged["depreciation_declined"] = True
+
+        return True
+
+
+
+    # ONE-PART ROUND (a sub-question of the consolidated ask, or a single
+
+    # field): route to that field's own parser — one source of truth.
+
+    if len(fields_for_hints) == 1:
+
+        return _merge_field_answer(merged, next(iter(fields_for_hints)), low)
+
+
+
+    # CONSOLIDATED ROUND answered in one line: every part must be
+
+    # independently recognisable, so a part is never inferred from a number
+
+    # that belongs to another part.
+
+    before = (
+
+        merged.get("useful_life_years"),
+
+        merged.get("depreciation_method"),
+
+        merged.get("salvage_value"),
+
+    )
+
+
+
+    _merge_field_answer(merged, "depreciation_method", low)
+
+
+
+    years = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", low)
+
+    if years and 1 <= int(years.group(1)) <= 60:
+
+        merged["useful_life_years"] = int(years.group(1))
+
+
+
+    adjacent = re.search(
+
+        r"([\d][\d,]*(?:\.\d+)?)\s*(?:rs\.?|pkr)?\s*(?:salvage|residual)", low
+
+    )
+
+    if adjacent:
+
+        number = _parse_bare_amount(adjacent.group(1))
+
+        if number is not None:
+
+            merged["salvage_value"] = number
+
+    elif re.search(r"\b(?:salvage|residual)\b[^\d]{0,20}\b(?:zero|nil|0)\b", low):
+
+        merged["salvage_value"] = 0.0
+
+
+
+    after = (
+
+        merged.get("useful_life_years"),
+
+        merged.get("depreciation_method"),
+
+        merged.get("salvage_value"),
+
+    )
+
+    handled = before != after
+
+    if handled:
+
+        log.info(
+
+            "planner.depreciation_policy_merged",
+
+            fields=[
+
+                f
+
+                for f in ("useful_life_years", "depreciation_method", "salvage_value")
+
+                if merged.get(f) is not None
+
+            ],
+
+        )
+
+    return handled
+
+
+
+
+
+#: Generic words that are never a ledger's NAME — "Yes, create it" folds
+
+#: nothing by itself and must reach the nature-name fallback instead.
+
+_CREATION_NAME_STOPWORDS = frozenset({
+
+    "it", "one", "this", "that", "new", "account", "ledger", "yes", "sure",
+
+    "ok", "okay", "please", "the", "a", "an", "some", "something", "item",
+
+})
+
+
+
+
+
+def _creation_name_from_answer(answer: str) -> Optional[str]:
+
+    """A ledger name the YES answer itself states.
+
+
+
+    ``"Yes, Create Inventory Account"`` -> ``"Inventory"``.  Only the
+
+    approval verb + NAME shape may name a ledger: prose that steers away
+
+    from creation ("use an existing account instead") never matches, and
+
+    the generic tail ("account"/"ledger") and articles are stripped so the
+
+    ledger is named by its content, not its plumbing.  Returns ``None``
+
+    whenever the answer carries no usable name — the caller then falls
+
+    back to the nature's canonical name or leaves the gap open.
+
+    """
+
+    text = " ".join(str(answer or "").split())
+
+    m = re.match(
+
+        r"^(?:yes\b[\s,:;-]*)?(?:please\s+)?create\s+(?P<name>\S.*)$",
+
+        text,
+
+        flags=re.IGNORECASE,
+
+    )
+
+    if not m:
+
+        return None
+
+    name = m.group("name").strip(" .,'\"")
+
+    name = re.sub(r"^(?:a|an|the)\s+", "", name, flags=re.IGNORECASE)
+
+    name = re.sub(r"\s+(?:account|ledger)$", "", name, flags=re.IGNORECASE).strip()
+
+    if not name or name.lower() in _CREATION_NAME_STOPWORDS:
+
+        return None
+
+    if (
+
+        len(name) > 60
+
+        or len(name.split()) > 6
+
+        or not re.search(r"[a-z]", name, re.IGNORECASE)
+
+    ):
+
+        return None
+
+    return name
+
+
+
+
+
+def _merge_clarification_answers(
+
+    entities: Dict[str, Any],
+
+    qa_history: List[Dict[str, str]],
+
+    intent: str = "",
+
+) -> Dict[str, Any]:
+
+    """Fold prior clarification answers into the entity set.
+
+
+
+    Each answer fills the field its question asked about (matched by
+
+    keyword), so a question is never repeated for the same conversation.
+
+    Multi-question rounds answered in a single message are split first
+
+    (see ``_explode_multi_answers``) so every part reaches its own field.
+
+    "SAME" answers reuse the prior value for the same question (Work
+
+    Stream F clarification memory).
+
+    """
+
+    merged = dict(entities)
+
+    for qa in _explode_multi_answers(_resolve_same_answers(qa_history)):
+
+        question = (qa.get("question") or "").lower()
+
+        answer = (qa.get("answer") or "").strip()
+
+        if not answer:
+
+            continue
+
+
+
+        # A DECISION CHIP of ANOTHER gate never becomes content: the catalog
+
+        # labels ("Yes - add to catalog" / "No - one-off lines only") may only
+
+        # be read by the catalog branch below.  Genuine refusals ("No",
+
+        # "neither", "None of those") stay valid answers for their own gates —
+
+        # they must keep flowing to the branch that parses them.
+
+        if _is_catalog_chip(answer) and "catalog check:" not in question:
+
+            log.info("planner.control_answer_dropped", answer=answer[:60])
+
+            continue
+
+
+
+        # FIELD-ROUTED ANSWER (fixed-format questionnaire): the answer
+
+        # carries the field it fills, so it lands in the right entity
+
+        # regardless of the question's wording — LLM-authored questions can
+
+        # be reworded freely.  Unknown fields fall through to the keyword
+
+        # chain below (never guessed).
+
+        field_tag = str(qa.get("field") or "").strip()
+        if not field_tag and qa.get("required_information"):
+            req_info = qa.get("required_information")
+            if isinstance(req_info, list) and len(req_info) == 1:
+                field_tag = str(req_info[0]).strip()
+            elif isinstance(req_info, str):
+                field_tag = req_info.strip()
+
+        if field_tag and _merge_field_answer(
+
+            merged, field_tag, answer, intent=intent
+
+        ):
+
+            continue
+
+        if "type of account" in question or "account type" in question:
+            for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+                if t.lower() in answer.lower():
+                    merged["account_type"] = t
+                    break
+            else:
+                merged["account_type"] = answer.strip().upper()
+            continue
+
+
+
+        # NON-ENTITY TAG: an answer to a plan-incomplete / model-failure
+
+        # card (field "missing_details" and friends) is conversation
+
+        # context, NEVER entity content (Fix 3 / RC-3).  Falling into the
+
+        # keyword chain let the failure summary's own prose — which quoted
+
+        # the tool name "search_supplier" — claim supplier_name with the
+
+        # user's instruction text.
+
+        if field_tag and field_tag.lower() in _NON_ENTITY_FIELD_TAGS:
+
+            log.info(
+
+                "planner.non_entity_answer_dropped",
+
+                field=field_tag,
+
+                answer=answer[:80],
+
+            )
+
+            continue
+
+
+
+        # BARE FIELD-NAME QUESTION: a field-shaped answer survives a resumed
+
+        # round as ``question = <field name>`` (that is how positional and
+
+        # tap answers are persisted — see seed_clarification_history).  Route
+
+        # it through the SAME field router the live turn used: the keyword
+
+        # chain below can never recognise "useful_life_years" (production
+
+        # 2026-10-01, building session 6b78909c: the life/method/salvage
+
+        # answers were merged on the turn they were typed and then re-asked
+
+        # every round because this route did not exist).
+
+        _bare = (qa.get("question") or "").strip()
+
+        if re.fullmatch(r"[a-z][a-z0-9_]{2,40}", _bare):
+
+            if _merge_field_answer(merged, _bare, answer, intent=intent):
+
+                continue
+
+
+
+        # DEPRECIATION-POLICY ROUND: the consolidated "useful life / method /
+
+        # salvage" question, answered in ONE line — fill every part of the
+
+        # trio from that answer instead of losing it (the numbered split can
+
+        # only pair parts with sub-questions when the counts line up).
+
+        if _merge_depreciation_policy_answer(merged, qa.get("question") or "", answer):
+
+            continue
+
+
+
+        # the
+
+        # purpose answer is authoritative and DERIVES the transaction
+
+        # nature (equipment -> FIXED_ASSET, resale goods -> INVENTORY,
+
+        # everything else -> operating expense; ambiguous purposes wait
+
+        # for the capitalization decision).  The purpose label also
+
+        # becomes the item description so the classifier maps the right
+
+        # expense account family.
+
+        if "what is this expense for" in question:
+
+            resolved_purpose = resolve_purpose_answer(question, answer)
+
+            if resolved_purpose:
+
+                merged["transaction_purpose"] = resolved_purpose
+
+                if not merged.get("item_description"):
+
+                    merged["item_description"] = purpose_label(resolved_purpose)
+
+                continue
+
+
+
+        # authoritative for
+
+        # the ambiguous purposes (repairs / software / durable free text).
+
+        if "ordinary expense or capitalized" in question:
+
+            resolved_cap = resolve_capitalization_answer(question, answer)
+
+            if resolved_cap:
+
+                merged["capitalization_decision"] = resolved_cap
+
+                continue
+
+
+
+        # the CA-grade expense
+
+        # treatments (paid now cash/bank · payable now · SETTLEMENT of an
+
+        # expense already recorded as payable · prepaid) and the legacy
+
+        # wording, so history answers always resolve.  Plain payables,
+
+        # accruals, prepaids and payable-settlements stay distinguishable.
+
+        if (
+
+            "paid, or is it outstanding" in question
+
+            or "expense debit, cash credit" in question
+
+        ):
+
+            resolved_settle = resolve_settlement_answer(question, answer)
+
+            if resolved_settle:
+
+                if resolved_settle == "ACCRUAL_PREPAID":
+
+                    merged["settlement_position"] = "ACCRUAL_PREPAID"
+
+                    merged["transaction_nature"] = "PREPAID_EXPENSE"
+
+                    merged["payment_method"] = "CASH"
+
+                elif resolved_settle == "SETTLE_EXISTING_PAYABLE":
+
+                    # Treatment 3 — the SETTLEMENT of a previously
+
+                    # recorded payable.  payment_method stays EMPTY so
+
+                    # no paid tool ever fires; the reasoning path
+
+                    # locates the outstanding payable, confirms it with
+
+                    # the user, then settles it (Dr payables / Cr
+
+                    # cash-bank) — never a second expense.
+
+                    merged["settlement_position"] = "SETTLE_EXISTING_PAYABLE"
+
+                else:
+
+                    merged["payment_method"] = resolved_settle
+
+                    if resolved_settle == "CREDIT":
+
+                        merged["settlement_position"] = "OUTSTANDING"
+
+                continue
+
+
+
+        # OWNER POLICY — SETTLEMENT CHECK ("Settle this unpaid payable?"):
+
+        # YES confirms the located payable (the deterministic settlement
+
+        # call allocates the payment to it — Dr trade payables / Cr
+
+        # cash-bank, never a second expense).  NO re-routes to a NEW
+
+        # expense; a picked label (multi-bill list) confirms that bill.
+
+        if "settlement check:" in question:
+
+            low = answer.lower().strip(" .)'\"")
+
+            if low.startswith(("no", "cancel", "record as new", "different")):
+
+                merged["settlement_position"] = "OUTSTANDING"
+
+                merged["payment_method"] = "CREDIT"
+
+            else:
+
+                merged["settle_confirmed"] = True
+
+                if not low.startswith(("yes", "y", "ok")):
+
+                    merged["settle_pick"] = answer.strip()
+
+            continue
+
+
+
+        # SETTLEMENT FALLBACK — no unpaid payable exists in the books, so
+
+        # the (d) answer cannot be a settlement; the user re-picks the
+
+        # treatment and the request re-reasons from there.
+
+        if "settlement fallback:" in question:
+
+            low = answer.lower().strip(" .)'\"")
+
+            merged["settlement_position"] = None
+
+            if low.startswith("paid now — cash"):
+
+                merged["payment_method"] = "CASH"
+
+            elif low.startswith("paid now — bank"):
+
+                merged["payment_method"] = "BANK_TRANSFER"
+
+            else:
+
+                merged["payment_method"] = "CREDIT"
+
+                merged["settlement_position"] = "OUTSTANDING"
+
+            continue
+
+
+
+        # 
+
+        # cash hits the CASH ledger, bank hits the BANK ledger (R4.1) —
+
+        # the answer is authoritative and letter-tappable.
+
+        if "in cash, or through the bank" in question:
+
+            low = answer.lower().strip(" .)'\"")
+
+            if low in ("a", "1", "cash"):
+
+                merged["payment_method"] = "CASH"
+
+                continue
+
+            if low in ("b", "2", "bank", "bank transfer", "online", "transfer", "neft", "card"):
+
+                merged["payment_method"] = "BANK_TRANSFER"
+
+                continue
+
+
+
+        # OWNER POLICY — ACCOUNT-CREATION CONFIRMATION ("Should I create
+
+        # it, or do you want to use a specific existing account?"): the
+
+        # answer is authoritative.  YES confirms the classifier's proposed
+
+        # account (extracted from the question text) — execution runs
+
+        # create_account first (free code resolved automatically) and the
+
+        # tool-order guard blocks any default-account recording until it
+
+        # succeeds.  NO keeps the entry open: any extra wording names the
+
+        # existing account to use instead.
+
+        if "should i create" in question:
+
+            low = answer.lower().strip(" .)'\"")
+
+            if low.startswith(("yes", "y", "create", "ok")):
+
+                # Match on the RAW question — `question` is lowercased, and
+
+                # the extracted account name must keep the proposal's
+
+                # casing ("Office Chairs", never "office chairs").
+
+                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
+
+                if m:
+
+                    merged["create_account"] = m.group(1).strip()
+
+                    # PARENT PLACEMENT: "Should I create it under '<head>'"
+
+                    # - the child ledger is created UNDER that statement
+
+                    # heading (segregation of statement heads), never
+
+                    # top-level by omission.
+
+                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
+
+                    if pm and pm.group(1).strip():
+
+                        merged["create_parent_name"] = pm.group(1).strip()
+
+                elif not any(
+
+                    w in low for w in ("existing", "instead", "different")
+
+                ):
+
+                    # FALLBACK (production 2026-10-07, Zameer Labs session
+
+                    # afcfecae): a MODEL-AUTHORED question cannot carry the
+
+                    # `no '<name>' account` contract, so this YES used to
+
+                    # fold NOTHING and `create_account` was never granted.
+
+                    # The name comes from the ANSWER when it states one
+
+                    # ("Yes, Create Inventory Account" -> "Inventory"),
+
+                    # else from the nature's canonical ledger name.  A reply
+
+                    # that steers to an EXISTING account never reaches here,
+
+                    # and an unknown nature still leaves the gap open.
+
+                    fallback = _creation_name_from_answer(answer) or (
+
+                        NATURE_LEDGER_NAMES.get(
+
+                            str(merged.get("transaction_nature") or "")
+
+                            .strip()
+
+                            .upper()
+
+                        )
+
+                    )
+
+                    if fallback:
+
+                        merged["create_account"] = fallback
+
+            elif (
+
+                # REFUSED the closest-existing leg of a RELATED-treatment
+
+                # round (owner directive: refusing the near-relevant account
+
+                # falls back to CREATING the dedicated child). The question
+
+                # itself carries both the name and the heading, so the
+
+                # refusal confirms creation under the right statement
+
+                # section — never a silent re-pick of the refused ledger.
+
+                "closest existing" in question
+
+                and (
+
+                    low in (
+
+                        "no", "n", "nope", "nah", "neither", "none",
+
+                        "nothing", "dont", "do not", "don't", "skip",
+
+                        "skip it", "use something else",
+
+                    )
+
+                    or low.startswith(("no,", "no ", "neither ", "none of"))
+
+                )
+
+            ):
+
+                m = re.search(r"no '(.+?)' account", qa.get("question") or "")
+
+                if m:
+
+                    merged["create_account"] = m.group(1).strip()
+
+                    pm = re.search(r"under '(.+?)'", qa.get("question") or "")
+
+                    if pm and pm.group(1).strip():
+
+                        merged["create_parent_name"] = pm.group(1).strip()
+
+            else:
+
+                named = re.sub(
+
+                    r"^(no|n|use|pick|existing)\b[,.:;! ]*", "", low
+
+                ).strip()
+
+                if named and "existing account" not in named:
+
+                    merged["account_name"] = named
+
+            continue
+
+
+
+        # the nature/purpose decision tree is resolved
+
+        # FIRST and FAMILY-AWARE ("b" means SERVICE in a sale round but
+
+        # INVENTORY in a purchase round; a credit-note question contains
+
+        # the word "credit" and must never be mistaken for the cash-vs-
+
+        # credit question).  An unresolvable answer is left unset so the
+
+        # planner re-asks - the nature is never guessed.
+
+        if not merged.get("transaction_nature"):
+
+            resolved_nature = resolve_nature_answer(question, answer)
+
+            if resolved_nature:
+
+                merged["transaction_nature"] = resolved_nature
+
+                continue
+
+
+
+        # ..."):
+
+        # the answer either PICKS an existing party (kept verbatim so the
+
+        # next search finds the EXACT match) or CONFIRMS creation of a new
+
+        # party ledger.  Authoritative - it overrides any earlier value.
+
+        # R4.5: the gate is party-kind aware (customers for receipts,
+
+        # suppliers for payments/purchases).
+
+        if "party check:" in question:
+
+            low = answer.lower()
+
+            is_customer = "customer" in question
+
+            if low.startswith(("yes", "create", "ok")):
+
+                merged["supplier_create_confirmed"] = True
+
+                if is_customer:
+
+                    merged["customer_create_confirmed"] = True
+
+            else:
+
+                named = _party_name_candidate(answer)
+
+                if named:
+
+                    if is_customer:
+
+                        merged["customer_name"] = named
+
+                    else:
+
+                        merged["supplier_name"] = named
+
+                # else: sentence-shaped feedback — keep the extracted name
+
+                # and let the gate re-ask; a reply like "I am Receiving
+
+                # amount, not paying" must never become a ledger name.
+
+            continue
+
+
+
+        # ..."):
+
+        # one or more invoice lines are not in the product/service
+
+        # catalog.  YES adds them (with the stated unit prices), NO keeps
+
+        # them as one-off free-text lines.  Either way the invoice line
+
+        # itself is never blocked — only the catalog linkage is decided.
+
+        if "catalog check:" in question:
+
+            low = answer.lower()
+
+            if low.startswith(("yes", "add", "create", "ok")):
+
+                merged["catalog_create_confirmed"] = True
+
+            else:
+
+                merged["catalog_skip"] = True
+
+            continue
+
+
+
+        # REVENUE-LEDGER round ("Revenue ledger check: ..."): reviews whether the
+
+        # stream that was sold deserves its OWN revenue ledger.  YES creates a
+
+        # dedicated child ledger under the revenue parent; any other answer names
+
+        # the existing revenue account to use instead.  Either way the decision is
+
+        # the user's — a sale is never silently booked to an arbitrary revenue
+
+        # account (a mobile-phone sale must not be credited to e.g. "Software
+
+        # Development Revenue").
+
+        if "revenue ledger check:" in question:
+
+            low = answer.lower()
+
+            # CHIP SHAPE: the proposed labels are themselves answers
+
+            # ("Create 'X' under Y" / "Use the existing 'X' account") — parse
+
+            # them into the decision + name instead of storing the whole chip
+
+            # as an account name.
+
+            if low.startswith("create '"):
+
+                merged["revenue_ledger_decision"] = "CREATE"
+
+                continue
+
+            if low.startswith("use the existing"):
+
+                import re as _re
+
+
+
+                _m = _re.search(r"'(.+?)'", answer)
+
+                merged["revenue_ledger_decision"] = "USE_EXISTING"
+
+                if _m:
+
+                    merged["revenue_account_name"] = _m.group(1)
+
+                continue
+
+            if low.startswith(("yes", "create", "ok", "y")):
+
+                merged["revenue_ledger_decision"] = "CREATE"
+
+            else:
+
+                merged["revenue_ledger_decision"] = "USE_EXISTING"
+
+                named = answer.strip()
+
+                if named:
+
+                    merged["revenue_account_name"] = named
+
+            continue
+
+
+
+        # the
+
+        # description and quantity are asked in the consolidated round
+
+        # and routed here.  A multi-item answer ("2 laptops at 5000 and
+
+        # 3 mice at 500") parses into DISTINCT lines instead of one
+
+        # description string.  The combined "quantity and price"
+
+        # question (below) keeps its own parser — the plain-quantity
+
+        # branch excludes it.
+
+        if "item or service" in question and not merged.get("item_description"):
+
+            multi = _extract_line_items(answer)
+
+            if multi:
+
+                merged["line_items"] = multi
+
+                # The per-line answer is the most specific statement of
+
+                # the transaction — it defines the total (Σ qty × price),
+
+                # overriding any earlier round's header amount.
+
+                merged["amount"] = _line_items_total(multi)
+
+            else:
+
+                merged["item_description"] = answer.strip()
+
+        elif (
+
+            "units are you invoicing" in question
+
+            or ("quantity" in question and "price" not in question)
+
+        ) and merged.get("quantity") is None:
+
+            qty_val = _parse_bare_amount(answer)
+
+            if qty_val is not None and qty_val > 0:
+
+                merged["quantity"] = qty_val
+
+        elif "amount" in question and merged.get("amount") is None:
+
+            value = _parse_bare_amount(answer)
+
+            if value is not None:
+
+                merged["amount"] = value
+
+        elif "supplier" in question and (
+
+            _is_control_answer(answer) or not merged.get("supplier_name")
+
+        ):
+
+            low = answer.lower().strip()
+
+            # A DECISION CHIP answers the party GATE — it is never the name.
+
+            # The field router rejects chips too, but a SEEDED bare row
+
+            # (question = "supplier_name") falls PAST that router into this
+
+            # keyword branch, which used to store the chip verbatim.
+
+            if _is_control_answer(answer):
+
+                if low.startswith(("yes", "create", "ok", "y")):
+
+                    merged["supplier_create_confirmed"] = True
+
+                # never stored as the supplier's name; an unrecognised chip
+
+                # leaves the name unset so the gate re-asks.
+
+            elif "local vendor" in low or low in ("local", "no party", "none"):
+
+                # fold into the
+
+                # standing 'Local Vendor' account (searched and created
+
+                # on first use by the deterministic executor).
+
+                merged["supplier_name"] = "Local Vendor"
+
+            elif _is_party_name_answer(answer):
+
+                merged["supplier_name"] = answer
+
+            else:
+
+                # Not a name-shaped reply (instruction/prose) — leave the
+
+                # name unset so the party gate re-asks (Fix 3 / RC-3).
+
+                log.info(
+
+                    "planner.party_answer_rejected",
+
+                    route="keyword:supplier",
+
+                    answer=answer[:80],
+
+                )
+
+        elif "customer" in question and (
+
+            _is_control_answer(answer) or not merged.get("customer_name")
+
+        ):
+
+            low = answer.lower().strip()
+
+            # Same chip guard as the supplier branch (AES production
+
+            # 2026-10-07: the bare row ``customer_name: Yes - create 'X'``
+
+            # was stored here verbatim, so the customer AND its AR ledger
+
+            # were created literally named "Yes - Create 'Haris & Co'").
+
+            # A yes-chip CONFIRMS the creation and leaves the name to the
+
+            # extraction/prefill that grounded it from the request.  The
+
+            # chip is handled even when a name is already set (confirmation
+
+            # must land); a genuine name never overwrites one that exists.
+
+            if _is_control_answer(answer):
+
+                if low.startswith(("yes", "create", "ok", "y")):
+
+                    merged["customer_create_confirmed"] = True
+
+            elif _is_party_name_answer(answer):
+
+                merged["customer_name"] = answer
+
+            else:
+
+                # Not a name-shaped reply (instruction/prose) — never stored
+
+                # as the customer ledger name (Fix 3 / RC-3).
+
+                log.info(
+
+                    "planner.party_answer_rejected",
+
+                    route="keyword:customer",
+
+                    answer=answer[:80],
+
+                )
+
+        elif "date" in question and not merged.get("transaction_date"):
+
+            # route the answer through the deterministic
+
+            # parser.  On failure keep the raw answer so the validation
+
+            # in plan() drops it and the date is re-asked (never guessed).
+
+            parsed = parse_transaction_date(answer)
+
+            merged["transaction_date"] = (
+
+                parsed.iso_date if parsed.ok else answer
+
+            )
+
+        elif ("payment" in question or "method" in question) and not merged.get("payment_method"):
+
+            merged["payment_method"] = _normalize_payment_method(answer)
+
+        elif (
+
+            "cash" in question or "credit" in question or "paid" in question
+
+        ) and not merged.get("payment_method"):
+
+            # Cash-vs-credit question: accept ONLY a confident answer.  An
+
+            # ambiguous reply is left unresolved so the planner re-asks —
+
+            # the treatment must never be guessed.
+
+            lower = answer.lower()
+
+            if "credit" in lower or "on account" in lower or "pay later" in lower:
+
+                merged["payment_method"] = "CREDIT"
+
+            elif "cash" in lower:
+
+                merged["payment_method"] = "CASH"
+
+            elif "bank" in lower or "transfer" in lower or "online" in lower:
+
+                merged["payment_method"] = "BANK_TRANSFER"
+
+            elif "cheque" in lower or "check" in lower:
+
+                merged["payment_method"] = "CHEQUE"
+
+            elif "card" in lower:
+
+                merged["payment_method"] = "CARD"
+
+        elif (
+
+            "quantity" in question and "price" in question
+
+        ) and (
+
+            merged.get("item_quantity") is None
+
+            or merged.get("item_unit_price") is None
+
+        ):
+
+            # Line-detail question: parse "5 at 2,000 each" / "qty 3 @ 500".
+
+            qty_m = re.search(
+
+                r"(?:qty|quantity)?\s*(\d+(?:\.\d+)?)\s*(?:x|units?|pcs?|@|at)\s+"
+
+                r"(?:rs\.?|pkr)?\s*([\d,]+(?:\.\d+)?)",
+
+                answer, re.IGNORECASE,
+
+            )
+
+            if qty_m:
+
+                try:
+
+                    merged["item_quantity"] = float(qty_m.group(1))
+
+                    merged["item_unit_price"] = float(
+
+                        qty_m.group(2).replace(",", "")
+
+                    )
+
+                except ValueError:
+
+                    pass
+
+    return merged
+
+
+
+
+
+def _parse_bare_amount(text: str) -> Optional[float]:
+
+    """Parse a number from a bare clarification answer like '20,000'."""
+
+    m = re.search(_NUM, text)
+
+    if m:
+
+        try:
+
+            return float(m.group(1).replace(",", ""))
+
+        except ValueError:
+
+            return None
+
+    return None
+
+
+
+
+
+def _parse_bare_date(text: str) -> Optional[str]:
+
+    """Parse a date from a bare clarification answer."""
+
+    # Delegate to the full date extractor
+
+    return _extract_date(text, text.lower())
+
+
+
+
+
+_NATURE_VALUES = frozenset({
+
+    "FIXED_ASSET", "INVENTORY", "CONSUMABLE", "SERVICE", "OPERATING_EXPENSE",
+
+    "REVENUE", "OTHER_INCOME", "PREPAYMENT", "DEPOSIT_ADVANCE",
+
+    "INTANGIBLE_ASSET", "ASSET_DISPOSAL",
+
+})
+
+_DECLINE_WORDS = frozenset({"none", "no", "n/a", "na", "skip", "declined", "not now"})
+
+_METHOD_VALUE_MAP = {
+
+    "STRAIGHT_LINE": "STRAIGHT_LINE",
+
+    "STRAIGHT-LINE": "STRAIGHT_LINE",
+
+    "STRAIGHT LINE": "STRAIGHT_LINE",
+
+    "REDUCING_BALANCE": "REDUCING_BALANCE",
+
+    "REDUCING-BALANCE": "REDUCING_BALANCE",
+
+    "REDUCING BALANCE": "REDUCING_BALANCE",
+
+    "WDV": "REDUCING_BALANCE",
+
+    "DIMINISHING": "REDUCING_BALANCE",
+
+    "DECLINING": "REDUCING_BALANCE",
+
+}
+
+
+
+
+
+def _is_control_answer(value: Any) -> bool:
+
+    """A reply that is a DECISION CHIP, not content.
+
+
+
+    "Yes - add to catalog", "No - one-off lines only", "Create 'X' under Y",
+
+    "Use the existing 'X' account" — these answer gates; they must never be
+
+    stored as an item, party or ledger name (an account proposed as
+
+    "Yes - add to catalog Sales" is exactly what this prevented).
+
+
+
+    Plain affirmations with a trailing action are chips too (live
+
+    2026-10-19: "yes, create it" answered the Party-check gate and became
+
+    a supplier literally named "yes, create it" instead of confirming the
+
+    creation of the party the question NAMED).  A decision-shaped reply
+
+    routes to the gate's confirmation branch; the name stays the one
+
+    grounded from the request.  Deliberately precise: a genuine name that
+
+    merely starts with a decision word ("Yes Bank") must still pass.
+
+    """
+
+    text = str(value or "").strip().lower()
+
+    if not text:
+
+        return False
+
+    if text.startswith(
+
+        ("yes -", "no -", "create '", "create new party", "use the existing")
+
+    ):
+
+        return True
+
+    if text in (
+
+        "yes", "no", "y", "n", "ok", "okay", "yep", "yeah", "sure",
+
+        "please", "confirm", "confirmed", "go ahead",
+
+    ):
+
+        return True
+
+    # "yes, create it" / "yes please" / "no dont create" / "ok, confirm it"
+
+    # — a decision word plus a trailing action/politeness tail, nothing
+
+    # name-shaped in between.
+
+    return bool(
+
+        re.fullmatch(
+
+            r"(?:yes|y|no|n|ok(ay)?|sure|yeah|yep|confirm(?:ed)?)"
+
+            r"[\s,.!:;-]*"
+
+            r"(?:create\s*(?:it|them)?|don'?t\s*create|please|go\s*ahead|"
+
+            r"do\s*it|confirm(?:ed)?(?:\s*(?:it|this))?|thanks?|proceed)?",
+
+            text,
+
+        )
+
+    )
+
+
+
+
+
+def _is_catalog_chip(value: Any) -> bool:
+
+    """The two labels of the CATALOG gate — chips, never content."""
+
+    text = str(value or "").strip().lower()
+
+    return text.startswith(("yes - add to catalog", "no - one-off"))
+
+
+
+
+
+def _merge_field_answer(
+
+    merged: Dict[str, Any], field_name: str, answer: str, intent: str = ""
+
+) -> bool:
+
+    """Route a FIELD-TAGGED clarification answer into the entity set.
+
+
+
+    The fixed-format questionnaire carries the field each answer fills, so
+
+    an answer reaches its entity regardless of the question's wording (the
+
+    old keyword matching could not: a reworded question lost its answer).
+
+    Returns True when the field was handled — False lets the keyword chain
+
+    have its say (unknown fields only).
+
+    """
+
+    field = (field_name or "").strip().lower()
+
+    raw = (answer or "").strip()
+
+    if not field or not raw:
+
+        return False
+
+    low = raw.lower().strip(" .)'\"")
+
+    value = raw.strip()
+
+
+
+    if field == "line_items":
+        if isinstance(answer, list):
+            merged["line_items"] = answer
+            merged["amount"] = _line_items_total(answer)
+            return True
+        elif isinstance(answer, dict) and "line_items" in answer:
+            merged["line_items"] = answer["line_items"]
+            merged["amount"] = answer.get("total_amount") or _line_items_total(answer["line_items"])
+            return True
+
+    # Master data / Setup and Operational field routing
+    if field == "account_type":
+        for t in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
+            if t.lower() in low:
+                merged["account_type"] = t
+                return True
+        merged["account_type"] = value.upper()
+        return True
+
+    if field in ("account_name", "product_name", "service_name", "employee_name", "bank_name", "project_name"):
+        merged[field] = value.strip(" '\"")
+        return True
+
+    if field in ("sales_price", "unit_price"):
+        amt = _parse_bare_amount(value)
+        if amt is not None:
+            merged[field] = amt
+            merged["sales_price"] = amt
+            merged["unit_price"] = amt
+            return True
+        try:
+            val_f = float(re.sub(r"[^\d.]", "", value))
+            merged[field] = val_f
+            merged["sales_price"] = val_f
+            merged["unit_price"] = val_f
+            return True
+        except ValueError:
+            return False
+
+    if field in ("account_code", "code"):
+        merged["code"] = value.strip(" '\"")
+        merged["account_code"] = value.strip(" '\"")
+        return True
+
+    if field == "transaction_date":
+
+        parsed = parse_transaction_date(value)
+
+        if not parsed.ok:
+
+            resolved = resolve_relative_date_text(value)
+
+            parsed = resolved if resolved is not None else parsed
+
+        merged["transaction_date"] = parsed.iso_date if parsed.ok else value
+
+        return True
+
+
+
+    if field == "useful_life_years":
+
+        # Same decline vocabulary as the method question — "(c) NONE for now"
+
+        # must settle the policy here too, or the answer falls through
+
+        # unmatched and the question repeats forever.
+
+        if low in _DECLINE_WORDS or low in ("c", "none for now"):
+
+            merged["depreciation_declined"] = True
+
+            return True
+
+        number = _parse_bare_amount(value)
+
+        if number is not None and 1 <= number <= 60:
+
+            merged["useful_life_years"] = int(number)
+
+            return True
+
+        # Stated-but-unparseable: the field is NOT handled.  Returning False
+
+        # keeps the contract honest — the keyword chain gets its say and the
+
+        # gap stays on the planner's list, instead of the answer being
+
+        # swallowed while the same question comes back forever.
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    if field == "depreciation_method":
+
+        if low in _DECLINE_WORDS or low in ("c", "none for now"):
+
+            merged["depreciation_declined"] = True
+
+            return True
+
+        if low in ("a", "1"):
+
+            merged["depreciation_method"] = "STRAIGHT_LINE"
+
+        elif low in ("b", "2"):
+
+            merged["depreciation_method"] = "REDUCING_BALANCE"
+
+        else:
+
+            for key, method in _METHOD_VALUE_MAP.items():
+
+                if key.lower() in low:
+
+                    merged["depreciation_method"] = method
+
+                    break
+
+        if not merged.get("depreciation_method"):
+
+            # Unrecognised method wording → re-asked (never guessed).
+
+            log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+            return False
+
+        rate = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", low)
+
+        if rate and merged.get("depreciation_method") == "REDUCING_BALANCE":
+
+            try:
+
+                merged["depreciation_rate_percent"] = float(rate.group(1))
+
+            except ValueError:
+
+                pass
+
+        return True
+
+
+
+    if field in ("salvage_value", "residual_value"):
+
+        if low in _DECLINE_WORDS:
+
+            merged["salvage_value"] = 0.0
+
+            return True
+
+        number = _parse_bare_amount(value)
+
+        if number is not None and number >= 0:
+
+            merged["salvage_value"] = number
+
+            return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    if field == "amount":
+
+        number = _parse_bare_amount(value)
+
+        if number is not None:
+
+            merged["amount"] = number
+
+            return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    if field == "quantity":
+
+        number = _parse_bare_amount(value)
+
+        if number is not None and number > 0:
+
+            merged["quantity"] = number
+
+            return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+    if field == "settlement_position":
+        candidate = low.replace(" ", "_").upper()
+        if candidate in ("PAID_NOW", "PAID", "SETTLED") or any(w in low for w in ("paid now", "paid", "cash", "bank")):
+            merged["settlement_position"] = "PAID_NOW"
+            return True
+        if candidate in ("OUTSTANDING", "PAYABLE", "CREDIT") or any(w in low for w in ("outstanding", "payable", "later", "credit")):
+            merged["settlement_position"] = "OUTSTANDING"
+            merged["payment_method"] = "CREDIT"
+            return True
+        if candidate in ("PREPAID", "ACCRUAL_PREPAID", "ADVANCE") or any(w in low for w in ("prepaid", "advance", "ahead")):
+            merged["settlement_position"] = "ACCRUAL_PREPAID"
+            merged["transaction_nature"] = "PREPAID_EXPENSE"
+            merged["payment_method"] = "CASH"
+            return True
+        if candidate in ("SETTLE_EXISTING_PAYABLE", "SETTLE_PAYABLE") or "earlier payable" in low:
+            merged["settlement_position"] = "SETTLE_EXISTING_PAYABLE"
+            return True
+        return False
+
+    if field in ("payment_type", "payment_method"):
+        if low in ("a", "1", "cash"):
+            merged["payment_method"] = "CASH"
+        elif low in ("b", "2", "bank", "bank transfer", "online"):
+            merged["payment_method"] = "BANK_TRANSFER"
+        elif low in ("c", "3", "credit"):
+            merged["payment_method"] = "CREDIT"
+            merged.setdefault("settlement_position", "OUTSTANDING")
+        else:
+            merged["payment_method"] = _normalize_payment_method(value)
+            if merged["payment_method"] == "CREDIT":
+                merged.setdefault("settlement_position", "OUTSTANDING")
+        return True
+
+
+
+    if field == "transaction_nature":
+
+        # FAMILY GUARD (production 2026-10-14, session ae043ec3): this
+
+        # field-tagged / bare-question route accepted ANY canonical nature,
+
+        # so an authored "transaction_nature" chip of INVENTORY landed on a
+
+        # SALE (sale family: GOODS / SERVICE / ASSET_DISPOSAL / OTHER_INCOME
+
+        # — INVENTORY is the PURCHASE family's value).  The deterministic
+
+        # invoice fast path (GOODS|SERVICE only) then refused the COMPLETE
+
+        # plan, which fell to the model, looped in lookups, and dead-ended
+
+        # with "please resend".  A family-invalid value is never stored and
+
+        # never translated: the family's own nature question re-asks and
+
+        # keeps owning the decision.  ``intent=""`` (legacy callers) keeps
+
+        # the unguarded behaviour — only the planner's own merge is family-
+
+        # aware.
+
+        _family = accepted_nature_values(intent) if intent else ()
+
+        # The family's OWN canonical values are the authority when known —
+
+        # ``_NATURE_VALUES`` below doesn't even contain GOODS/ASSET_DISPOSAL
+
+        # (the sale family's values), so a global-set membership test can
+
+        # never validate a sale answer.  Without an intent the legacy global
+
+        # set stands, unchanged for every existing caller.
+
+        _allowed = tuple(_family) if _family else tuple(_NATURE_VALUES)
+
+        candidate = low.replace(" ", "_").upper()
+
+        if candidate in _allowed:
+
+            merged["transaction_nature"] = candidate
+
+            return True
+
+        for nature in _allowed:  # "a fixed asset" / "the service"
+
+            if nature.lower().replace("_", " ") in low:
+
+                merged["transaction_nature"] = nature
+
+                return True
+
+        if _family and candidate in _NATURE_VALUES:
+
+            # Canonical, but for ANOTHER family — deliberately left unset so
+
+            # the deterministic family question re-asks (never guessed).
+
+            log.info(
+
+                "planner.nature_answer_outside_family",
+
+                intent=intent,
+
+                family=sorted(_family),
+
+                value=candidate,
+
+            )
+
+        return True  # unresolved → re-asked
+
+
+
+    # Loan contract answers (record_loan floor round): routed by field tag
+
+    # like every other fixed-format answer.
+
+    if field == "loan_direction":
+
+        if "borrow" in low:
+
+            merged["loan_direction"] = "BORROWED"
+
+            return True
+
+        if "lend" in low or "lent" in low or "given" in low or "give" in low:
+
+            merged["loan_direction"] = "GIVEN"
+
+            return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    if field == "counterparty":
+
+        if low in _DECLINE_WORDS:
+
+            return True
+
+        if _is_control_answer(value) or not _is_party_name_answer(value):
+
+            log.info("planner.party_answer_rejected", field=field, answer=raw[:80])
+
+            return False
+
+        merged["counterparty"] = value
+
+        return True
+
+
+
+    if field == "first_payment_date":
+
+        parsed = parse_transaction_date(value)
+
+        if not parsed.ok:
+
+            resolved = resolve_relative_date_text(value)
+
+            parsed = resolved if resolved is not None else parsed
+
+        merged["first_payment_date"] = (
+
+            parsed.iso_date if parsed.ok else value
+
+        )
+
+        return True
+
+
+
+    if field == "tenure_months":
+
+        number = _parse_bare_amount(value)
+
+        if number is not None and 1 <= number <= 600:
+
+            merged["tenure_months"] = int(number)
+
+            return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    if field == "frequency":
+
+        _freq = low.replace("-", "_").replace(" ", "_")
+
+        if _freq.startswith("year"):
+
+            _freq = "annually"
+
+        for _canon in ("monthly", "quarterly", "semi_annual", "annually", "custom"):
+
+            if _freq.startswith(_canon):
+
+                merged["frequency"] = _canon.upper()
+
+                return True
+
+        log.info("planner.field_answer_unmatched", field=field, answer=raw[:80])
+
+        return False
+
+
+
+    return _merge_field_answer_tail(merged, field, low, value)
+
+
+
+
+
+def _merge_field_answer_tail(
+
+    merged: Dict[str, Any], field: str, low: str, value: str
+
+) -> bool:
+
+    """Second half of :func:`_merge_field_answer` (text/list fields)."""
+
+    if field in ("supplier_name", "customer_name"):
+
+        if field == "supplier_name" and (
+
+            "local vendor" in low or low in ("local", "no party", "none")
+
+        ):
+
+            merged["supplier_name"] = "Local Vendor"
+
+            return True
+
+        if low in _DECLINE_WORDS:
+
+            return True
+
+        # A DECISION CHIP IS NEVER A PARTY NAME (production 2026-10-04: the
+
+        # party gate's own option "Yes - create 'ABC Autos'" was stored here
+
+        # verbatim, became the customer ledger, and printed in the invoice's
+
+        # Bill To section).  Reject the chip so the keyword chain's
+
+        # "party check:" branch runs: it sets
+
+        # ``customer/supplier_create_confirmed`` from the answer while the
+
+        # name itself stays the one extracted from the request.
+
+        if _is_control_answer(value):
+
+            log.info(
+
+                "planner.control_answer_rejected",
+
+                field=field,
+
+                answer=value[:60],
+
+            )
+
+            return False
+
+        # A typed party answer must read like a NAME (Fix 3 / RC-3:
+
+        # "re-route it from expenses account" was stored verbatim as
+
+        # supplier_name and became the party-gate's ledger proposal).
+
+        # Instruction-shaped prose is rejected → the keyword chain gets no
+
+        # better reading either (it applies the same test) and the gate
+
+        # re-asks; the name extracted from the request stays authoritative.
+
+        if not _is_party_name_answer(value):
+
+            log.info(
+
+                "planner.party_answer_rejected",
+
+                field=field,
+
+                answer=value[:80],
+
+            )
+
+            return False
+
+        merged[field] = value
+
+        return True
+
+
+
+    if field == "item_description":
+
+        # NEVER let a decision chip become the item it was answering about
+
+        # ("Yes - add to catalog", "No - one-off lines only", a proposed
+
+        # account name).  A control answer is routed by the keyword chain to
+
+        # ITS decision field; overwriting real content with it is how an
+
+        # account got proposed as "Yes - add to catalog Sales".
+
+        if _is_control_answer(value):
+
+            log.info(
+
+                "planner.control_answer_rejected",
+
+                field=field,
+
+                answer=value[:60],
+
+            )
+
+            return False
+
+        existing = str(merged.get("item_description") or "").strip()
+
+        if existing and not _is_control_answer(existing):
+
+            # An already-stated item is content; a later control-shaped reply
+
+            # must never replace it.
+
+            return False
+
+        multi = _extract_line_items(value)
+
+        if multi:
+
+            merged["line_items"] = multi
+
+            merged["amount"] = _line_items_total(multi)
+
+        else:
+
+            merged["item_description"] = value
+
+        return True
+
+
+
+    if field in ("asset_name", "description", "note", "account_name",
+
+                 "revenue_account_name", "project_name", "period"):
+
+        if low in _DECLINE_WORDS:
+
+            return True
+
+        # Same contract as the party branch above: a control chip ("Yes - …",
+
+        # "Create 'X' …") answers a DECISION, it is never itself content.
+
+        if _is_control_answer(value):
+
+            log.info(
+
+                "planner.control_answer_rejected",
+
+                field=field,
+
+                answer=value[:60],
+
+            )
+
+            return False
+
+        merged[field] = value
+
+        return True
+
+
+
+    if field == "disposal_type":
+
+        if "write" in low:
+
+            merged["disposal_type"] = "WRITE_OFF"
+
+        elif "sale" in low or "sold" in low or "sell" in low:
+
+            merged["disposal_type"] = "SALE"
+
+        elif "dispos" in low or "scrap" in low:
+
+            merged["disposal_type"] = "DISPOSAL"
+
+        return True
+
+
+
+    if field in ("proceeds_amount", "disposal_amount", "depreciation_amount"):
+
+        number = _parse_bare_amount(value)
+
+        if number is not None:
+
+            merged[field] = number
+
+        return True
+
+
+
+    if field == "capitalization_decision":
+
+        candidate = low.upper()
+
+        if candidate.startswith("CAP"):
+
+            merged["capitalization_decision"] = "CAPITALIZE"
+
+        elif candidate.startswith(("EXP", "ORDINARY")):
+
+            merged["capitalization_decision"] = "EXPENSE"
+
+        return True
+
+
+
+    if field == "project_code":
+
+        # A stated code is honoured; NONE/decline leaves it unset so the
+
+        # repository derives <STEM>-### itself (never a blocking question).
+
+        if low in _DECLINE_WORDS:
+
+            return True
+
+        merged["project_code"] = value.strip().upper()
+
+        return True
+
+
+
+    if field == "project_name":
+
+        if low in _DECLINE_WORDS:
+
+            return True
+
+        merged["project_name"] = value
+
+        return True
+
+
+
+    return False
+
+
+
+
+
+def _normalize_payment_method(text: str) -> str:
+
+    lower = text.lower()
+
+    if "credit" in lower:
+
+        return "CREDIT"
+
+    if "cheque" in lower or "check" in lower:
+
+        return "CHEQUE"
+
+    if "card" in lower:
+
+        return "CARD"
+
+    if "bank" in lower or "transfer" in lower or "online" in lower:
+
+        return "BANK_TRANSFER"
+
+    return "CASH"
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# Extraction helpers
+
+# ---------------------------------------------------------------------------
+
+
+
+def _identify_intent(msg_lower: str) -> str:
+
+    for intent, patterns in _INTENT_PATTERNS:
+
+        for pat in patterns:
+
+            if re.search(pat, msg_lower):
+
+                return intent
+
+    # LOOSE expense phrasings.  A typo'd or unusual
+
+    # expense wording ("record an explanation of 25000" — the observed
+
+    # failure) contains no "expense" substring, so the strict patterns
+
+    # miss it and the request used to fall to the generic model path,
+
+    # which skipped the nature/purpose question entirely.  Route any
+
+    # expense-shaped, typo-tolerant phrasing to the purpose-first ladder
+
+    # instead — guarded by a 3+ digit figure so explanations without an
+
+    # amount are never mis-routed.
+
+    if re.search(r"\d{3,}", msg_lower) and re.search(
+
+        r"expens|expence|expenz|explan|expln|spent|spend\b", msg_lower
+
+    ):
+
+        # Query-shaped expense mentions are lookups, never recordings
+
+        # ("details of current month expences" with a typo'd spelling).
+
+        if re.search(
+
+            r"show|list|give|provide|tell|view|display|details?|summary|"
+
+            r"summar\w*|breakdown|report|what|which|how much",
+
+            msg_lower,
+
+        ):
+
+            return "list_expenses"
+
+        return "record_expense"
+
+    # "received payment" WITHOUT a sale/purchase verb
+
+    # is a customer receipt ("received payment of Rs.20,000"); a sale
+
+    # phrasing ("sold ... and received payment") belongs to the sale
+
+    # family and is handled by its own patterns above.
+
+    if re.search(r"received\s+payment", msg_lower) and not re.search(
+
+        r"\bsold\b|\bsale\b|\bsell\b|\bselling\b|\binvoice\b", msg_lower
+
+    ):
+
+        return "record_receipt"
+
+    return "unknown"
+
+
+
+
+
+def _refine_intent(intent: str, payment_method: Optional[str]) -> str:
+
+    """Specialise a generic purchase/sale intent when the payment method is clear."""
+
+    if intent == "record_purchase":
+
+        if payment_method == "CREDIT":
+
+            return "record_credit_purchase"
+
+        if payment_method == "CASH":
+
+            return "record_cash_purchase"
+
+    elif intent == "record_sale":
+
+        if payment_method == "CREDIT":
+
+            return "record_credit_sale"
+
+        if payment_method == "CASH":
+
+            return "record_cash_sale"
+
+    return intent
+
+
+
+
+
+def _extract_entities(msg: str) -> Dict[str, str]:
+
+    entities: Dict[str, str] = {}
+
+    for field, patterns in (
+
+        ("supplier_name", _SUPPLIER_PATTERNS),
+
+        ("customer_name", _CUSTOMER_PATTERNS),
+
+        ("party", _PARTY_PATTERNS),
+
+    ):
+
+        for pat in patterns:
+
+            m = pat.search(msg)
+
+            if m:
+
+                value = m.group(1).strip().rstrip(",.")
+
+                # Ignore obviously non-name captures (pronouns, and any
+
+                # capture led by a verb/document noun such as "selling").
+
+                if _is_plausible_party(value):
+
+                    entities[field] = value
+
+                    break
+
+    return entities
+
+
+
+
+
+def _is_plausible_item(value: str) -> bool:
+
+    """True when a captured string can plausibly be an item/description.
+
+
+
+    Reuses the party guard, so a PRONOUN or an ACTION-VERB-led capture is
+
+    never treated as a product.  Production 2026-10-14: ``create invoice for
+
+    zeta pvt ltd for selling them 2 laptops`` captured ``them`` as the item
+
+    (the sale-verb pattern's optional ``(an?|the|some|\\d+)?`` matched nothing,
+
+    so ``them`` filled the group and the lookahead stopped at ``2``).  ``them``
+
+    then named the revenue stream (``them Sales``) and the flow dead-ended.
+
+    A pronoun is never a product, so it must fall through to the same
+
+    ``item_description`` question a genuinely-unstated item gets.
+
+
+
+    A leading article/count (``a``, ``an``, ``the``, ``couple of``) is stripped
+
+    first: the count rides INSIDE the captured item (``a couple of bikes``) and
+
+    must not make the guard reject a genuine product.
+
+    """
+
+    text = re.sub(
+
+        r"^(?:(?:an?|the|some|couple|pair|dozen)\s+(?:of\s+)?)",
+
+        "",
+
+        (value or "").strip(),
+
+        flags=re.IGNORECASE,
+
+    )
+
+    return _is_plausible_party(text or value)
+
+
+
+
+
+# A legal-entity suffix: "zeta pvt ltd", "Beta Traders Inc".  A product is
+
+# never suffixed this way, so a capture carrying one is the COUNTERPARTY
+
+# that the "invoice for <party>" pattern mistook for the item.
+
+_COMPANY_SUFFIX_RE = re.compile(
+
+    r"(?:\s+(?:pvt\.?\s+)?(?:ltd|limited)|\s+inc\.?|\s+llc|\s+corp\.?"
+
+    r"|\s+company|\s+co\.?)\s*$",
+
+    re.IGNORECASE,
+
+)
+
+
+
+# A nested deal clause right after the captured span: "… for zeta pvt ltd
+
+# FOR SELLING them 2 laptops".  When the "invoice for <X>" span is followed
+
+# by a sale/purchase verb clause, <X> is the PARTY and the real item lives
+
+# in that clause — asking (or the bounded understanding call) beats naming
+
+# the revenue stream after the customer.
+
+_NESTED_DEAL_CLAUSE_RE = re.compile(
+
+    r"\s+(?:for|against|with|by)\s+"
+
+    r"(?:selling|sold|sell|sale|supply|supplies|supplying|providing|"
+
+    r"rendering|purchas\w*|buying|bought|buy)\b",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+def _extract_item(msg: str) -> Optional[str]:
+
+    candidate: Optional[str] = None
+
+    candidate_end = 0
+
+    for pat in _ITEM_PATTERNS:
+
+        m = pat.search(msg)
+
+        if m:
+
+            # Leading prepositions are captured with the noun phrasing
+
+            # ("purchase OF laptops", "invoice for inventory stock OF 50000")
+
+            # and trailing ones too — neither is part of the item name.
+
+            item = re.sub(
+
+                r"^(?:of|for|on|in|at|to|from|by|with)\s+",
+
+                "",
+
+                m.group(1).strip(),
+
+                flags=re.IGNORECASE,
+
+            )
+
+            item = re.sub(
+
+                r"\s+(?:of|for|on|in|at|to|from|by|with)$",
+
+                "",
+
+                item,
+
+                flags=re.IGNORECASE,
+
+            )
+
+            if item.lower() not in ("it", "something", "goods", "items", "stuff") and (
+
+                _is_plausible_item(item)
+
+            ):
+
+                candidate = item
+
+                candidate_end = m.end()
+
+                break
+
+    if not candidate:
+
+        return None
+
+    # PARTY, NOT PRODUCT (production 2026-10-14): "create invoice for zeta
+
+    # pvt ltd for selling them 2 laptops" — the "invoice for <item>" pattern
+
+    # captured the CUSTOMER ("zeta pvt ltd"), which then named the revenue
+
+    # stream and dead-ended the flow.  Two deterministic signals mark the
+
+    # capture as the counterparty: a legal-entity suffix, or a nested
+
+    # sale/purchase clause right after it.  Neither compares against the
+
+    # party extractor (which is itself wrong on "invoice for inventory
+
+    # stock of 50000 to X"), so a genuine item is never dropped.  Returning
+
+    # no item opens the item question — and the bounded understanding call,
+
+    # which proposes the real product from the user's words.
+
+    if _COMPANY_SUFFIX_RE.search(candidate):
+
+        log.info("planner.item_rejected", reason="company_suffix",
+
+                 value=candidate[:60])
+
+        return None
+
+    if _NESTED_DEAL_CLAUSE_RE.search(msg[candidate_end:candidate_end + 40]):
+
+        log.info("planner.item_rejected", reason="nested_deal_clause",
+
+                 value=candidate[:60])
+
+        return None
+
+    return candidate
+
+
+
+
+
+# "<count> <item>" — the count that precedes the item name in the request.
+
+_ITEM_QTY_RE = re.compile(
+
+    # The count may NOT start inside a bigger number: without the guard the
+
+    # thousands comma in "for 367,000 to be received..." yielded the fragment
+
+    # "000" as a count, paired with the trailing clause as its "item".
+
+    r"(?<![\d.,])(?P<qty>\d+(?:\.\d+)?)\s*"
+
+    r"(?:x\s+|pcs\b\s*|units?\b\s*|pieces\b\s*|nos\b\s*)?"
+
+    r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
+
+    r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+# Written counts ("sale of two motorbikes", "a couple of bikes", "a dozen
+
+# pens").  The digit pattern above cannot see them, and `_extract_item` KEEPS
+
+# the word inside the item it returns — so the count ended up inside the
+
+# DESCRIPTION and `quantity` stayed empty.  The agent then asked "How many
+
+# units are you invoicing?" for a count the user had already given.
+
+_COUNT_WORDS: Dict[str, int] = {
+
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+
+    "seventy": 70, "eighty": 80, "ninety": 90,
+
+    "couple": 2, "pair": 2, "dozen": 12,
+
+}
+
+
+
+# Longest first, so "seventeen" is never read as the prefix "seven".
+
+_COUNT_WORD_ALT = "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+
+
+
+_ITEM_QTY_WORD_RE = re.compile(
+
+    # `(?<!-)` keeps a hyphenated compound intact: "twenty-five bikes" must not
+
+    # be read as FIVE (the count is 25, and the understanding call resolves it).
+
+    rf"(?<!-)\b(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+"
+
+    r"(?P<name>[a-zA-Z][\w\s&.\-/]*?)"
+
+    r"(?=\s+(?:to|from|for|on|in|at|via)\b|[,.!?;]|\s*$)",
+
+    re.IGNORECASE,
+
+)
+
+
+
+#: Any written count word, as a hint that wording states a number we may not
+
+#: have been able to take (drives the understanding-call gap, never a guess).
+
+_COUNT_WORD_HINT_RE = re.compile(rf"\b(?:{_COUNT_WORD_ALT})\b", re.IGNORECASE)
+
+
+
+_COUNT_PREFIX_RE = re.compile(
+
+    rf"^\s*(?<!-)(?:a\s+)?(?P<qty>{_COUNT_WORD_ALT})(?:\s+of)?\s+",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+def _split_leading_count(text: str) -> Tuple[str, Optional[float]]:
+
+    """Split a leading WRITTEN count off a phrase.
+
+
+
+        "two motorbikes"   -> ("motorbikes", 2.0)
+
+        "a couple of bikes" -> ("bikes", 2.0)
+
+        "motorbikes"       -> ("motorbikes", None)
+
+
+
+    The original text is returned unchanged when there is no written count, so
+
+    a caller may always use the first element as the (possibly unchanged) name.
+
+    """
+
+    raw = str(text or "").strip()
+
+    match = _COUNT_PREFIX_RE.match(raw)
+
+    if not match:
+
+        return raw, None
+
+    value = _COUNT_WORDS.get((match.group("qty") or "").lower())
+
+    if value is None:
+
+        return raw, None
+
+    return raw[match.end():].strip(), float(value)
+
+
+
+
+
+def _extract_item_quantity(msg: str, item: str) -> Optional[float]:
+
+    """Return the count stated with the item phrasing, when there is one.
+
+
+
+        "create an invoice for selling 2 ovens to lkj pvt limited" -> 2.0
+
+        "sold 5 chairs"                                          -> 5.0
+
+
+
+    The count used to be swallowed by the optional quantity group in
+
+    ``_ITEM_PATTERNS`` and thrown away, so ``item_quantity`` was only ever
+
+    populated from a clarification ANSWER — the agent therefore asked the
+
+    user for a quantity that was already in the original request.
+
+
+
+    The count is only accepted when the word following it is the SAME item
+
+    the item extractor found, so an unrelated number in the sentence can
+
+    never be mistaken for the line quantity.
+
+    """
+
+    target = (item or "").strip().lower()
+
+    if not target:
+
+        return None
+
+    # A WRITTEN count rides INSIDE the item the extractor returned
+
+    # ("two motorbikes"), so the phrase without it is a name to match too.
+
+    bare, _ = _split_leading_count(target)
+
+    names = {name for name in (target, bare) if name}
+
+
+
+    def _matches(name: str) -> bool:
+
+        return any(
+
+            name == candidate
+
+            or candidate.startswith(name)
+
+            or name.startswith(candidate)
+
+            for candidate in names
+
+        )
+
+
+
+    for m in _ITEM_QTY_RE.finditer(msg):
+
+        name = (m.group("name") or "").strip().lower()
+
+        if not name or not _matches(name):
+
+            continue
+
+        try:
+
+            qty = float(m.group("qty"))
+
+        except (TypeError, ValueError):
+
+            continue
+
+        if qty > 0:
+
+            return qty
+
+    # Written counts: "two motorbikes", "a couple of bikes", "a dozen pens".
+
+    for m in _ITEM_QTY_WORD_RE.finditer(msg):
+
+        prefix = (msg or "")[: m.start()].rstrip().lower()
+
+        # "half a dozen" is SIX — never silently read as twelve.
+
+        if prefix.endswith(("half", "quarter", "halve")):
+
+            continue
+
+        name = (m.group("name") or "").strip().lower()
+
+        if not name or not _matches(name):
+
+            continue
+
+        value = _COUNT_WORDS.get((m.group("qty") or "").lower())
+
+        if value:
+
+            return float(value)
+
+    return None
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# MULTI-LINE ITEM parsing
+
+# ---------------------------------------------------------------------------
+
+# Users state several line items in ONE request ("2 laptops at 5000 each
+
+# and 3 mice at 500", "1 laptop for 50,000, 2 keyboards for 2,000 each").
+
+# The planner must recognise EACH line — quantity, description and unit
+
+# price — instead of collapsing everything into one item + one amount.
+
+
+
+_LINE_SPLIT_RE = re.compile(
+
+    r"\s*(?:\n+|\band\b|,|;|\d+[\.\)]\s+)\s*", re.IGNORECASE
+
+)
+
+# Per segment:  QTY  NAME  (@|at|for|each|:)  UNIT-PRICE   [+ each/per unit]
+
+# Used with .search() — no ^ anchor — so the line can sit mid-sentence.
+
+_LINE_ITEM_RE = re.compile(
+
+    r"(?P<qty>\d+(?:\.\d+)?)\s*(?:x\b|pcs\b|units?\b|pieces\b|nos\b)?\s*"
+
+    r"(?P<name>[a-zA-Z][\w\s&\.\-/]*?)\s*"
+
+    r"(?:@|\bat\b|\bfor\b|\beach\b|:)\s*(?:rs\.?|pkr|₨)?\s*"
+
+    r"(?P<price>[\d,]+(?:\.\d+)?)\s*(?:each|per\s*unit)?\s*$",
+
+    re.IGNORECASE,
+
+)
+
+
+
+
+
+def _extract_line_items(text: str) -> Optional[List[Dict[str, Any]]]:
+
+    """Parse a request/answer into DISTINCT invoice lines.
+
+
+
+    Recognised shapes per segment (case/spacing tolerant):
+
+
+
+        2 laptops at 5000 each        3 x mouse @ 500
+
+        1 laptop for 50,000           5 units keyboard: 2,000
+
+
+
+    Returns ``None`` unless at least TWO complete lines parse (a single
+
+    item keeps riding the singular item/quantity ladder).  Each line is
+
+    ``{"description", "quantity", "unit_price"}``; line totals are left to
+
+    ``validate_document_items`` so the SAME arithmetic runs everywhere.
+
+    """
+
+    if not text:
+
+        return None
+
+    # Protect thousands separators ("50,000" -> "50000") so the comma
+
+    # separator can never split a number into two broken lines.
+
+    normalized = re.sub(r"(?<=\d),(?=\d)", "", text)
+
+    lines: List[Dict[str, Any]] = []
+
+    for segment in _LINE_SPLIT_RE.split(normalized.strip()):
+
+        segment = segment.strip()
+
+        if not segment:
+
+            continue
+
+        # SEARCH (not match): the item phrase may sit mid-sentence after
+
+        # "create invoice for ABC Traders for ..." — only the tail from
+
+        # the quantity onward is the line.
+
+        m = _LINE_ITEM_RE.search(segment)
+
+        if not m:
+
+            continue
+
+        try:
+
+            qty = float(m.group("qty"))
+
+            price = float(m.group("price").replace(",", ""))
+
+        except (TypeError, ValueError):
+
+            continue
+
+        name = m.group("name").strip(" -–:")
+
+        if qty <= 0 or price < 0 or not name:
+
+            continue
+
+        # A bare "2 at 5000" (no name) is not an item line.
+
+        if len(name) < 2:
+
+            continue
+
+        lines.append({
+
+            "description": name,
+
+            "quantity": qty,
+
+            "unit_price": price,
+
+        })
+
+    if len(lines) < 2:
+
+        return None
+
+    return lines
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# ATTACHED-DOCUMENT LINE ITEMS (vision extraction block)
+
+# ---------------------------------------------------------------------------
+
+# A document upload reaches the planner as FACTUAL CONTEXT appended to the
+
+# message ("[Attached document information]") with an authoritative header
+
+# (Supplier / Subtotal / Discount / Total) and one row per line:
+
+#
+
+#     Line 1: Surf Excel 5 kg | qty 20 | unit 600.0 | amount 12600.0
+
+#
+
+# Without this parser the document collapsed to ONE line carrying whichever
+
+# amount the header patterns happened to match first (Line 1's amount), so a
+
+# 7-line GRN was recorded as a single-line bill for the first row and the
+
+# model had to reconcile the difference in a giant, timeout-prone round trip.
+
+# The printed line TOTAL is preferred over qty x unit_price because the
+
+# document's own rows are summed into its stated subtotal - deriving the unit
+
+# price from the line total keeps the recorded lines tied to the document
+
+# (parity law: the header can never disagree with its own lines).
+
+_DOC_LINE_RE = re.compile(
+
+    r"^[ \t]*line[ \t]*\d+[ \t]*:[ \t]*(?P<desc>.+?)"
+
+    r"(?:[ \t]*\|[ \t]*qty[ \t]*(?P<qty>[\d,]+(?:\.\d+)?))?"
+
+    r"(?:[ \t]*\|[ \t]*unit[ \t]*(?P<unit>[\d,]+(?:\.\d+)?))?"
+
+    r"(?:[ \t]*\|[ \t]*amount[ \t]*(?P<amount>[\d,]+(?:\.\d+)?))?"
+
+    r"[ \t]*$",
+
+    re.IGNORECASE | re.MULTILINE,
+
+)
+
+_DOC_SUPPLIER_RE = re.compile(
+
+    r"^[ \t]*supplier[ \t]*:[ \t]*(?P<name>.+?)[ \t]*$",
+
+    re.IGNORECASE | re.MULTILINE,
+
+)
+
+# Column headings / table furniture can never be a party ledger name.
+
+_JUNK_PARTY_NAMES = {
+
+    "line", "lines", "line item", "line items", "item", "items",
+
+    "description", "qty", "quantity", "unit", "amount", "total",
+
+    "subtotal", "discount", "tax", "unit price", "price", "particulars",
+
+}
+
+
+
+
+
+def _doc_number(raw: Optional[str]) -> Optional[float]:
+
+    """Parse a document row/header number, tolerating separators."""
+
+    if not raw:
+
+        return None
+
+    try:
+
+        value = float(str(raw).replace(",", "").strip())
+
+    except (TypeError, ValueError):
+
+        return None
+
+    return value if value >= 0 else None
+
+
+
+
+
+def _extract_document_lines(
+
+    text: str,
+
+) -> tuple:
+
+    """Parse the ATTACHED-DOCUMENT block into DISTINCT lines + supplier.
+
+
+
+    Returns ``(line_items | None, supplier_name | None)``.  Line items are
+
+    ``{"description", "quantity", "unit_price"}`` - the same shape the
+
+    multi-item phrasing parser produces, so every downstream consumer
+
+    (fast paths, validation, the document services) is unchanged.  Nothing is
+
+    ever invented: a row is only kept when its quantity and total/unit price
+
+    parse into sane numbers.
+
+    """
+
+    if not text or "[Attached document information]" not in text:
+
+        return None, None
+
+    supplier = None
+
+    m = _DOC_SUPPLIER_RE.search(text)
+
+    if m:
+
+        name = (m.group("name") or "").strip(" .;'\"")
+
+        if name and name.lower() not in _JUNK_PARTY_NAMES:
+
+            supplier = name
+
+    lines: List[Dict[str, Any]] = []
+
+    for match in _DOC_LINE_RE.finditer(text):
+
+        desc = (match.group("desc") or "").strip(" -:|.")
+
+        # A description may still carry a trailing column fragment; keep only
+
+        # the leading human-readable part.
+
+        desc = re.split(r"\s*\|\s*", desc)[0].strip()
+
+        if len(desc) < 2:
+
+            continue
+
+        qty = _doc_number(match.group("qty"))
+
+        unit = _doc_number(match.group("unit"))
+
+        amount = _doc_number(match.group("amount"))
+
+        # Printed line total wins (derives a unit price that ties the line to
+
+        # the document); otherwise quantity x unit price.
+
+        if amount is not None and qty and qty > 0:
+
+            unit_price = round(amount / qty, 2)
+
+        elif qty and qty > 0 and unit is not None:
+
+            unit_price = round(unit, 2)
+
+        else:
+
+            continue
+
+        if qty is None or qty <= 0 or unit_price < 0:
+
+            continue
+
+        lines.append({
+
+            "description": desc,
+
+            "quantity": qty,
+
+            "unit_price": unit_price,
+
+        })
+
+    return (lines or None), supplier
+
+
+
+
+
+def _line_items_total(lines: List[Dict[str, Any]]) -> float:
+
+    """Σ (quantity × unit_price or total_amount) over parsed line items."""
+
+    tot = 0.0
+    for l in lines or ():
+        if l.get("total_amount") is not None:
+            try:
+                tot += float(l["total_amount"])
+            except (ValueError, TypeError):
+                pass
+        elif l.get("quantity") is not None and l.get("unit_price") is not None:
+            try:
+                tot += float(l["quantity"]) * float(l["unit_price"])
+            except (ValueError, TypeError):
+                pass
+    return round(tot, 2)
+
+
+
+
+
+def _extract_amount(msg: str) -> Optional[float]:
+
+    """Try every amount format, highest-confidence pattern first."""
+
+    for pat in _AMOUNT_PATTERNS:
+
+        m = pat.search(msg)
+
+        if not m:
+
+            continue
+
+        try:
+
+            value = float(m.group(1).replace(",", ""))
+
+        except (ValueError, IndexError):
+
+            continue
+
+        # Apply multiplier suffix if the pattern captured one
+
+        if pat.groups >= 2:
+
+            suffix = m.group(2)
+
+            if suffix:
+
+                value *= _AMOUNT_MULTIPLIERS.get(suffix.lower(), 1)
+
+        if value > 0:
+
+            return value
+
+    return None
+
+
+
+
+
+def _extract_payment_method(msg_lower: str) -> Optional[str]:
+
+    for pat, method in _PAYMENT_METHOD_PATTERNS:
+
+        if pat.search(msg_lower):
+
+            return method
+
+    return None
+
+
+
+
+
+def _extract_date(msg: str, msg_lower: str) -> Optional[str]:
+
+    """Extract a transaction date as ISO ``YYYY-MM-DD`` (best effort)."""
+
+    # ISO format
+
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", msg)
+
+    if m:
+
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+
+    # DD/MM/YYYY or DD/MM/YY (Pakistan convention: day first)
+
+    m = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b", msg)
+
+    if m:
+
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+
+            if y < 100:
+
+                y += 2000
+
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+
+    # "15 aug", "15th August 2026"
+
+    m = re.search(
+
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?\s*(\d{4})?\b", msg_lower
+
+    )
+
+    if m and m.group(2)[:3] in _MONTHS:
+
+        d = int(m.group(1))
+
+        mo = _MONTHS[m.group(2)[:3]]
+
+        y = int(m.group(3)) if m.group(3) else date.today().year
+
+        if 1 <= d <= 31:
+
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+
+    # "aug 15", "August 15th"
+
+    m = re.search(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", msg_lower)
+
+    if m and m.group(1)[:3] in _MONTHS:
+
+        d = int(m.group(2))
+
+        mo = _MONTHS[m.group(1)[:3]]
+
+        if 1 <= d <= 31:
+
+            return f"{date.today().year:04d}-{mo:02d}-{d:02d}"
+
+
+
+    # Relative keywords
+
+    if "day before yesterday" in msg_lower:
+
+        return (date.today() - timedelta(days=2)).isoformat()
+
+    if "yesterday" in msg_lower:
+
+        return (date.today() - timedelta(days=1)).isoformat()
+
+    if "tomorrow" in msg_lower:
+
+        return (date.today() + timedelta(days=1)).isoformat()
+
+    if re.search(r"\btoday\b", msg_lower):
+
+        return date.today().isoformat()
+
+    # Free-text relative forms the keyword scan above cannot see
+
+    # ("2 days ago", "3 weeks ago") — ONE resolver, never two parsers.
+
+    resolved = resolve_relative_date_text(msg)
+
+    if resolved and resolved.ok:
+
+        return resolved.iso_date
+
+    return None
+
+
+
+
+
+def _entity_type(intent: str) -> Optional[str]:
+
+    if "customer" in intent or "sale" in intent or "invoice" in intent or "receipt" in intent:
+
+        return "customer"
+
+    if "supplier" in intent or "purchase" in intent or "payment" in intent:
+
+        return "supplier"
+
+    if "project" in intent:
+
+        return "project"
+
+    if "account" in intent:
+
+        return "account"
+
+    return None
+
+
+
+
+
+def _tools_for_intent(intent: str) -> List[str]:
+
+    mapping = {
+
+        "create_purchase_order": ["search_supplier", "get_supplier", "search_product", "get_product", "create_purchase_order"],
+        "create_quotation": ["search_customer", "get_customer", "create_quotation"],
+
+        "convert_quotation": ["search_customer", "get_customer", "get_invoice", "convert_quotation", "prepare_journal", "validate_journal"],
+
+        # The CA flow for a return: READ the party's open invoices/ledger
+
+        # first, identify the sale being returned, then create the note
+
+        # against it.  `invoice_id` is optional in the service, but the model
+
+        # can only anchor the note when the readers are offered.
+
+        "create_credit_note": ["search_customer", "get_customer", "get_customer_ledger", "get_invoice", "create_credit_note", "prepare_journal", "post_journal"],
+
+        "create_purchase_return": ["search_supplier", "get_supplier", "get_supplier_ledger", "create_purchase_return", "prepare_journal", "post_journal"],
+
+        "record_expense_payment": ["search_supplier", "record_expense_payment", "prepare_journal", "post_journal"],
+
+        "create_invoice": ["search_customer", "get_customer", "create_invoice", "prepare_journal", "validate_journal"],
+
+        "record_credit_purchase": ["search_supplier", "get_supplier", "create_supplier", "search_account", "create_purchase_bill", "prepare_journal", "validate_journal", "post_journal"],
+
+        "record_cash_purchase": ["search_account", "record_cash_purchase", "prepare_journal", "validate_journal", "post_journal"],
+
+        "record_credit_sale": ["search_customer", "get_customer", "create_customer", "search_account", "create_invoice", "prepare_journal", "validate_journal", "post_journal"],
+
+        "record_cash_sale": ["search_customer", "record_cash_sale"],
+
+        "record_expense": ["search_account", "classify_expense", "create_expense", "prepare_journal", "validate_journal", "post_journal"],
+
+        "record_receipt": ["search_customer", "get_customer", "list_bank_accounts", "record_customer_receipt", "prepare_journal", "post_journal"],
+
+        "record_payment": ["search_supplier", "get_supplier", "list_bank_accounts", "record_supplier_payment", "prepare_journal", "post_journal"],
+
+        "record_bank_transfer": ["list_bank_accounts", "record_bank_transfer", "prepare_journal", "post_journal"],
+
+        "create_bank_account": ["create_bank_account"],
+
+        "list_bank_accounts": ["list_bank_accounts"],
+
+        "record_purchase": ["search_supplier", "search_account", "create_purchase_bill", "prepare_journal"],
+
+        "record_sale": ["search_customer", "search_account", "create_invoice", "prepare_journal"],
+
+        "register_fixed_asset": ["search_fixed_asset", "search_supplier", "search_account", "register_fixed_asset"],
+
+        "dispose_fixed_asset": ["search_fixed_asset", "search_account", "dispose_fixed_asset"],
+
+        "record_asset_depreciation": ["search_fixed_asset", "search_account", "record_asset_depreciation"],
+
+        "run_payroll": ["search_employee", "get_employee", "list_bank_accounts", "search_account", "run_payroll", "pay_employee_salary"],
+
+        "update_document_status": ["update_document_status"],
+        "get_inventory_status": ["get_inventory_status", "search_product"],
+        "create_product": ["search_product", "create_product"],
+        "update_product": ["search_product", "update_product"],
+        "delete_product": ["search_product", "delete_product"],
+        "create_service": ["search_service", "create_service"],
+        "update_service": ["search_service", "update_service"],
+        "delete_service": ["search_service", "delete_service"],
+
+        "create_service": ["search_service", "create_service"],
+
+        "create_project": ["search_customer", "create_project"],
+        "create_account": ["search_account", "create_account"],
+        "get_chart_of_accounts": ["get_chart_of_accounts", "search_account"],
+        "create_customer": ["search_customer", "create_customer"],
+        "create_supplier": ["search_supplier", "create_supplier"],
+        "create_employee": ["search_employee", "create_employee"],
+        "create_recurring_template": ["create_recurring_template", "get_recurring_templates"],
+
+        # Loans (LLM-delegated route): the service builds the schedule and
+
+        # posts the opening journal itself; the readers let the model anchor
+
+        # an installment repayment to an existing facility.
+
+        "record_loan": [
+
+            "list_loans", "get_loan_schedule", "record_loan",
+
+            "list_bank_accounts", "search_account",
+
+            "prepare_journal", "validate_journal", "post_journal",
+
+        ],
+
+        "record_loan_repayment": [
+
+            "list_loans", "get_loan_schedule", "record_loan_repayment",
+
+            "list_bank_accounts", "prepare_journal", "post_journal",
+
+        ],
+
+        "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
+
+        "supplier_balance": ["search_supplier", "get_supplier", "get_supplier_ledger"],
+
+        "generate_trial_balance": ["get_trial_balance"],
+
+        "generate_balance_sheet": ["get_balance_sheet"],
+
+        "generate_profit_loss": ["get_profit_loss"],
+
+        "generate_cash_flow": ["get_cash_flow"],
+
+        "generate_general_ledger": ["get_general_ledger"],
+
+        "generate_customer_ledger": ["search_customer", "get_customer_ledger"],
+
+        "generate_supplier_ledger": ["search_supplier", "get_supplier_ledger"],
+
+        "list_expenses": ["list_expenses"],
+
+        "project_profitability": ["search_project", "get_project_profitability"],
+
+    }
+
+    return mapping.get(intent, [])
+
+
+
+
+
+def _context_for_intent(intent: str) -> List[str]:
+
+    mapping = {
+
+        "create_quotation": ["customer_master"],
+
+        "convert_quotation": ["customer_master", "chart_of_accounts", "accounting_periods"],
+
+        # A return is identified FROM the party's records: the invoices and
+
+        # the party ledger are what let the agent find the sale/purchase
+
+        # being reversed (never invented from the request alone).
+
+        "create_credit_note": ["customer_master", "invoices", "customer_ledger", "chart_of_accounts", "accounting_periods"],
+
+        "create_purchase_return": ["supplier_master", "purchase_bills", "supplier_ledger", "chart_of_accounts", "accounting_periods"],
+
+        "record_expense_payment": ["supplier_master", "bank_accounts", "accounting_periods"],
+
+        "create_invoice": ["customer_master", "chart_of_accounts", "accounting_periods"],
+
+        "record_credit_purchase": ["supplier_master", "chart_of_accounts", "accounting_periods"],
+
+        "record_cash_purchase": ["chart_of_accounts", "accounting_periods"],
+
+        "record_credit_sale": ["customer_master", "chart_of_accounts", "accounting_periods"],
+
+        "record_cash_sale": ["chart_of_accounts", "accounting_periods"],
+
+        "record_expense": ["chart_of_accounts", "accounting_periods"],
+
+        "record_receipt": ["customer_master", "bank_accounts", "invoices", "accounting_periods"],
+
+        "record_payment": ["supplier_master", "bank_accounts", "purchase_bills", "accounting_periods"],
+
+        "record_bank_transfer": ["bank_accounts", "accounting_periods"],
+
+        "register_fixed_asset": ["chart_of_accounts", "supplier_master", "bank_accounts", "accounting_periods"],
+
+        "dispose_fixed_asset": ["chart_of_accounts", "bank_accounts", "accounting_periods"],
+
+        "record_asset_depreciation": ["chart_of_accounts", "accounting_periods"],
+
+        "run_payroll": ["employee_master", "chart_of_accounts", "bank_accounts", "accounting_periods"],
+
+        "create_product": ["chart_of_accounts"],
+
+        "create_service": ["chart_of_accounts"],
+
+        "create_project": ["projects", "customer_master"],
+
+        "record_loan": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
+
+        "record_loan_repayment": ["bank_accounts", "chart_of_accounts", "accounting_periods"],
+
+        "create_bank_account": ["chart_of_accounts"],
+
+        "list_bank_accounts": ["bank_accounts"],
+
+        "customer_balance": ["customer_master", "customer_ledger", "invoices", "receipts"],
+
+        "supplier_balance": ["supplier_master", "supplier_ledger", "purchase_bills", "payments"],
+
+        "generate_trial_balance": ["trial_balance", "accounting_periods"],
+
+        "generate_balance_sheet": ["balance_sheet", "accounting_periods"],
+
+        "generate_profit_loss": ["income_statement", "accounting_periods"],
+
+        "generate_cash_flow": ["cash_flow", "balance_sheet", "income_statement", "accounting_periods"],
+
+        "project_profitability": ["projects", "general_ledger", "accounting_periods"],
+
+    }
+
+    return mapping.get(intent, [])
+
+
+
+
+
+def _outcome(intent: str) -> str:
+
+    outcomes = {
+
+        "create_purchase_order": "Purchase order / vendor quotation created with status RFQ",
+        "create_quotation": "Sales quotation created and ready to send",
+
+        "convert_quotation": "Quotation converted to a sales invoice with posted receivable journal",
+
+        "create_credit_note": "Credit note created reducing customer receivable",
+
+        "create_purchase_return": "Purchase return created reducing supplier payable",
+
+        "record_expense_payment": "Expense/bill payment recorded",
+
+        "create_invoice": "Sales invoice created with journal entry",
+
+        "record_credit_purchase": "Purchase bill and payable recorded",
+
+        "record_cash_purchase": "Purchase recorded as cash expense",
+
+        "record_credit_sale": "Credit sale and receivable recorded",
+
+        "record_cash_sale": "Cash sale recorded",
+
+        "record_expense": "Expense recorded with journal entry",
+
+        "record_receipt": "Customer receipt recorded with journal entry and allocation",
+
+        "record_payment": "Supplier payment recorded with journal entry and allocation",
+
+        "record_bank_transfer": "Bank-to-bank transfer recorded with journal entry",
+
+        "register_fixed_asset": "Fixed asset registered and capitalised with journal entry",
+
+        "record_loan": "Loan recorded with amortization schedule and opening journal",
+
+        "record_loan_repayment": "Loan installment recorded with principal/interest split",
+
+        "dispose_fixed_asset": "Fixed asset disposed of with gain/loss journal entry",
+
+        "record_asset_depreciation": "Asset depreciation recorded with journal entry",
+
+        "run_payroll": "Payroll run recorded with journal entry",
+
+        "create_product": "Product added to the catalog",
+        "update_product": "Product updated in the catalog",
+        "delete_product": "Product removed or deactivated in the catalog",
+        "create_service": "Service added to the catalog",
+        "update_service": "Service updated in the catalog",
+        "delete_service": "Service removed or deactivated in the catalog",
+
+        "create_service": "Service added to the catalog",
+
+        "create_project": "Project created",
+        "create_account": "Account created in the Chart of Accounts",
+        "get_chart_of_accounts": "Chart of Accounts retrieved",
+        "update_document_status": "Document status updated and audit entry recorded",
+        "get_inventory_status": "Inventory status and stock levels retrieved",
+        "create_customer": "Customer registered in CRM directory",
+        "create_supplier": "Supplier registered in vendor directory",
+        "create_employee": "Employee registered in personnel roster",
+        "create_bank_account": "Bank account configured",
+        "create_recurring_template": "Recurring template created",
+
+        "create_bank_account": "Bank account created with linked GL account",
+
+        "list_bank_accounts": "Bank account list retrieved",
+
+        "customer_balance": "Customer outstanding balance calculated",
+
+        "supplier_balance": "Supplier outstanding balance calculated",
+
+        "generate_trial_balance": "Trial balance report generated",
+
+        "generate_balance_sheet": "Balance sheet generated",
+
+        "generate_profit_loss": "Profit & Loss statement generated",
+
+        "list_expenses": "Expense details retrieved",
+
+    }
+
     return outcomes.get(intent, "Operation completed")

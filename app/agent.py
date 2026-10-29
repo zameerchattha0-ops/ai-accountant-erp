@@ -3227,6 +3227,26 @@ def _looks_like_question(text: str) -> bool:
 
 
 
+def _clean_user_facing_text(text: Optional[str]) -> str:
+    """Sanitize user-facing summary text.
+
+    Removes internal reasoning monologue and cleans raw asterisk clutter
+    for clear, non-accountant friendly presentation.
+    """
+    if not text:
+        return ""
+    t = str(text).strip()
+    t = re.sub(
+        r"(?i)^(?:I'll look into this|Let me check the live records first|Let me check live records|Checking the live records)[^.\n]*[.\n]*",
+        "",
+        t,
+    ).strip()
+    t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+    t = re.sub(r"(?<!\w)\*([^*]+)\*(?!\w)", r"\1", t)
+    t = re.sub(r"^\s*\*\s+", "- ", t, flags=re.MULTILINE)
+    return t.strip()
+
+
 def _usable_question(text: str) -> Optional[str]:
 
     """Return the model's question if it is real and meaningful.
@@ -12771,7 +12791,7 @@ async def execute(
 
                 },
 
-                summary=llm_text or execution_plan.expected_outcome or "Done.",
+                summary=_clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Done.",
 
                 action_type=execution_plan.intent,
 
@@ -12789,7 +12809,7 @@ async def execute(
 
                 action=execution_plan.intent,
 
-                summary=llm_text or execution_plan.expected_outcome or "Done.",
+                summary=_clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Done.",
 
                 verification_status="UNVERIFIED",
 
@@ -13616,7 +13636,7 @@ async def execute(
 
 
 
-        result_summary = llm_text or execution_plan.expected_outcome or "Operation completed."
+        result_summary = _clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Operation completed."
 
         from app.erp_endpoints import is_operational_task, format_operational_summary
         if is_operational_task(execution_plan.intent) and successful_results:
