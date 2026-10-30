@@ -8852,30 +8852,29 @@ async def execute(
         # ---- PHASE 2c: DETERMINISTIC REPORT FAST-PATH ----
 
         # Plain reports/lookups with no open questions skip the LLM: the
-
         # planner's intent directly drives the read-only tools and the
-
         # rows are formatted deterministically.  Returns None for anything
-
         # ambiguous - the normal model path then handles it.
-
-        fast_response = await _try_report_fast_path(
-
-            execution_plan=execution_plan,
-
-            session_id=session_id,
-
-            organization_id=organization_id,
-
-            user_id=user_id,
-
-            auth=auth,
-
+        #
+        # CA COGNITIVE RULE: An analytical or filtered user inquiry
+        # (e.g. "what are the last 3 entries", "show recent transactions",
+        # "who are top customers?") is an intelligent question requiring LLM
+        # reasoning and synthesis — NEVER hijack it with a raw database dump!
+        _msg_lower = (user_message or "").strip().lower()
+        _is_analytical_inquiry = any(
+            kw in _msg_lower
+            for kw in ("last", "recent", "latest", "what", "which", "how", "why", "who", "top", "tell me", "?")
         )
-
-        if fast_response is not None:
-
-            return fast_response
+        if not _is_analytical_inquiry:
+            fast_response = await _try_report_fast_path(
+                execution_plan=execution_plan,
+                session_id=session_id,
+                organization_id=organization_id,
+                user_id=user_id,
+                auth=auth,
+            )
+            if fast_response is not None:
+                return fast_response
 
 
 
