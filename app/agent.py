@@ -3204,41 +3204,32 @@ def _count_clarification_turns(prior_qa: List[Dict[str, Any]]) -> int:
 
 
 def _looks_like_question(text: str) -> bool:
-
     """Heuristic: does this model response ask the user for information or clarification?
 
-
-
     The model response may contain questions with or without question marks (e.g.
-
     numbered requirements '1. The price per door... 2. Whether supplier should be added...').
-
     Routes model responses asking for missing facts or confirmations into the clarification
-
     mechanism instead of prematurely terminating with an unverified informational completion.
-
     """
-
     t = str(text or "").strip()
-
     if not t:
-
         return False
 
+    low = t.lower()
+    # Informational report guard: If it's presenting records without asking anything, it's not a question
+    if any(m in low for m in ("here are the", "here is the", "most recently recorded", "journal entries in your books", "records found", "retrieved ")) and "?" not in t:
+        return False
+    if re.search(r"\b(?:JV-\d+|INV-\d+|BILL-\d+|PO-\d+|EMP-\d+|PRD-\d+|SUP-\d+|CUST-\d+)\b", t):
+        if "?" not in t and not re.search(r"\b(?:please provide|confirm whether|tell me which|specify)\b", low):
+            return False
+
     if "?" in t:
-
         return True
-
     if re.search(r"\b(?:missing|tell me|confirm|provide|specify|what is|how should|please answer|let me know)\b", t, re.I):
-
         if re.search(r"(?:^|\n)\s*(?:1[.)]|[-*•])\s+", t):
-
             return True
-
     from app.questionnaire import parse_model_question_text
-
     parsed = parse_model_question_text(t)
-
     return bool(parsed and not parsed.is_empty())
 
 
@@ -12716,6 +12707,22 @@ async def execute(
 
         if not _mutation_executed(tool_calls):
             model_question = _usable_question(llm_text)
+            # Analytical / reporting inquiry guard:
+            # If the intent is reporting/analytical or the user asked for records and the model answered
+            # factually without asking a question mark, it is a completed informational response, NOT a questionnaire.
+            _is_analytical = (
+                execution_plan.intent in (
+                    "generate_general_ledger", "get_general_ledger", "get_trial_balance",
+                    "get_profit_loss", "get_balance_sheet", "get_cash_flow", "generate_report",
+                    "get_customer_ledger", "get_supplier_ledger", "get_health", "calculate_health",
+                    "list_loans", "get_loan_schedule", "get_inventory_status",
+                )
+                or "ledger" in execution_plan.intent
+                or "entries" in execution_plan.intent
+            )
+            if _is_analytical and "?" not in (llm_text or ""):
+                model_question = None
+
             if model_question and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
                 from app.questionnaire import parse_model_question_text
                 _parsed_q = parse_model_question_text(model_question, intent=execution_plan.intent)

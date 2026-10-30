@@ -1248,6 +1248,13 @@ def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionn
             if not block:
                 continue
 
+            # Check if this block is actually an interrogative question rather than an informational record
+            # (e.g. "JV-000074 — posted 27 Oct 2026...", "INV-00001...", "Office supplies expense...")
+            if re.match(r"^(?:JV-\d+|INV-\d+|BILL-\d+|PO-\d+|PRD-\d+|EMP-\d+|SUP-\d+|CUST-\d+|RET-\d+)\b", block, re.I):
+                continue
+            if "?" not in block and not re.search(r"\b(?:please|confirm|specify|tell me|choose|select|state|what is|which|how was|how should|missing)\b", block, re.I):
+                continue
+
             # Look for sub-options inside the question block, e.g. "- (a) ...", "(a) ...", "a) ..."
             opt_matches = list(re.finditer(r"(?:^|\n)\s*[-*•]?\s*\(?([a-zA-Z0-9])\)?[.)]\s*(.+)", block))
             if opt_matches:
