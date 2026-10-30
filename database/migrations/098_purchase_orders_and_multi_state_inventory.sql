@@ -151,8 +151,8 @@ left join (
   group by im.organization_id, im.product_id
 ) cp on cp.product_id = p.id and cp.organization_id = p.organization_id;
 
-grant select on public.purchase_orders to authenticated, service_role;
-grant select on public.purchase_order_items to authenticated, service_role;
+grant select, insert, update, delete on public.purchase_orders to authenticated, service_role;
+grant select, insert, update, delete on public.purchase_order_items to authenticated, service_role;
 grant select on public.v_product_stock_pipeline to authenticated, service_role;
 revoke all on public.v_product_stock_pipeline from anon;
 

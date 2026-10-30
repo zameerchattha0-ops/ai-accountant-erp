@@ -592,6 +592,10 @@ _STEP_TYPE_MAP: Dict[str, str] = {
 }
 
 
+_session_step_locks: Dict[str, asyncio.Lock] = {}
+_session_step_orders: Dict[str, int] = {}
+
+
 async def create_execution_step(
     *,
     session_id: uuid.UUID,
@@ -601,37 +605,48 @@ async def create_execution_step(
 ) -> Dict[str, Any]:
     """Record an execution step within a session.
 
-    ``step_order`` has no database default — it is computed from the number of
-    existing steps for the session.
+    Concurrency-safe: uses a per-session lock and monotonically tracks
+    step_order so parallel asyncio stages (e.g. PLANNING, ROUTING, ENRICHMENT)
+    never collide on the same step index.
     """
-    existing = await fetch_many(
-        "ai_execution_steps",
-        filters={"execution_session_id": str(session_id)},
-        select="id",
-        limit=1000,
-    )
-    # P1-⑤: the cross-turn evidence memo rides this payload and must arrive
-    # as VALID JSON — the default 2000-char cap would shear it mid-record.
-    # ONLY payloads that actually carry the memo get the raised cap (120KB,
-    # and the serializer bounds itself well under that); every other step
-    # keeps the original 2000-char behaviour untouched.
-    cap = (
-        120_000
-        if isinstance(step_data, dict) and "evidence_full" in step_data
-        else 2000
-    )
-    summary = json.dumps(step_data, default=str)[:cap] if step_data else None
-    return await insert_one(
-        "ai_execution_steps",
-        data={
-            "execution_session_id": str(session_id),
-            "step_order": len(existing) + 1,
-            "step_type": _STEP_TYPE_MAP.get(step_type, "REASON"),
-            "description": step_type,
-            "input_summary": summary,
-            "status": status,
-        },
-    )
+    session_key = str(session_id)
+    if session_key not in _session_step_locks:
+        _session_step_locks[session_key] = asyncio.Lock()
+
+    async with _session_step_locks[session_key]:
+        existing = await fetch_many(
+            "ai_execution_steps",
+            filters={"execution_session_id": session_key},
+            select="step_order",
+            order="step_order.desc",
+            limit=1,
+        )
+        db_last_order = existing[0].get("step_order") or 0 if existing else 0
+        next_order = max(db_last_order + 1, _session_step_orders.get(session_key, 0) + 1)
+        _session_step_orders[session_key] = next_order
+
+        # P1-⑤: the cross-turn evidence memo rides this payload and must arrive
+        # as VALID JSON — the default 2000-char cap would shear it mid-record.
+        # ONLY payloads that actually carry the memo get the raised cap (120KB,
+        # and the serializer bounds itself well under that); every other step
+        # keeps the original 2000-char behaviour untouched.
+        cap = (
+            120_000
+            if isinstance(step_data, dict) and "evidence_full" in step_data
+            else 2000
+        )
+        summary = json.dumps(step_data, default=str)[:cap] if step_data else None
+        return await insert_one(
+            "ai_execution_steps",
+            data={
+                "execution_session_id": session_key,
+                "step_order": next_order,
+                "step_type": _STEP_TYPE_MAP.get(step_type, "REASON"),
+                "description": step_type,
+                "input_summary": summary,
+                "status": status,
+            },
+        )
 
 
 async def create_tool_call(
