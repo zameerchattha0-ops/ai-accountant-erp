@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -500,7 +500,7 @@ class TransactionClassification(BaseModel):
     # stock - inventory, or a fixed asset this time?"). A hint only SHAPES
     # the question; the nature is still the user's per-transaction answer.
     catalogue_hint: Optional[Dict[str, Any]] = None
-    confidence: str = "LOW"  # HIGH | MEDIUM | LOW
+    confidence: Union[str, float] = "LOW"  # HIGH | MEDIUM | LOW
     source: str = "INFERENCE"  # USER_ANSWER | ERP_CONFIGURATION | ITEM_MAPPING | DETERMINISTIC_RULE | INFERENCE
     # Phase 1 telemetry contract: provenance of the ACCOUNT decision.
     # "LLM_DECISION" when the model's validated account pick was actually
@@ -533,6 +533,23 @@ class TransactionClassification(BaseModel):
     create_account_confirmed: bool = False
     requires_clarification: bool = False
     clarification_reason: Optional[str] = None
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence_str(cls, value: Any) -> str:
+        """Tolerate float or int confidence scores (e.g. 1.0, 0.95) from models or routing."""
+        if isinstance(value, (int, float)):
+            if value >= 0.8:
+                return "HIGH"
+            elif value >= 0.5:
+                return "MEDIUM"
+            return "LOW"
+        if not value:
+            return "LOW"
+        s = str(value).strip().upper()
+        if s in ("HIGH", "MEDIUM", "LOW"):
+            return s
+        return str(value)
 
 
 # ===================================================================

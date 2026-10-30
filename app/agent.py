@@ -103,6 +103,7 @@ from app.ai_orchestrator import get_client
 from app.error_normalizer import build_missing_field_question
 
 from app.reasoning import options_for_question, purpose_label, purpose_option, strip_markdown
+from app.erp_endpoints import format_operational_summary, is_operational_task
 
 
 
@@ -6985,7 +6986,8 @@ async def execute(
                 log.warning(
                     "agent.preliminary_enrichment_failed", error=str(exc)[:200]
                 )
-        await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
+        if not _is_read_only_inquiry(user_message):
+            await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
         # ---- ROUTING + ANALYTICS AGENT (flag-gated) ------------------------
         # LLM-FIRST: EVERY message goes through a short bounded routing call
@@ -7950,7 +7952,8 @@ async def execute(
 
         # (AUDIT_REPORT §8).  Payload carries intents only, never CoT.
 
-        await _log_intent_comparison(session_id, _reasoning, execution_plan.intent)
+        if not is_operational_task(execution_plan.intent):
+            await _log_intent_comparison(session_id, _reasoning, execution_plan.intent)
 
         # ---- WAVE B: MODEL INTENT PROMOTION (Single-Owner Authority) ------
         # AUDIT_REPORT §7 Wave B: When reasoning yields a canonical intent,
@@ -8014,8 +8017,20 @@ async def execute(
         ):
             if (_preliminary or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _preliminary[_k]
+            if ((_preliminary or {}).get("literals") or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
+                execution_plan.extracted_entities[_k] = _preliminary["literals"][_k]
             if _ai_prefill.get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _ai_prefill[_k]
+
+        if not execution_plan.extracted_entities.get("date_of_joining"):
+            _d = (
+                execution_plan.extracted_entities.get("transaction_date")
+                or execution_plan.extracted_entities.get("date")
+                or ((_preliminary or {}).get("literals") or {}).get("transaction_date")
+            )
+            if _d:
+                execution_plan.extracted_entities["date_of_joining"] = _d
+
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
         if execution_plan.missing_fields:
             _resolved_fields = set()
@@ -8023,13 +8038,22 @@ async def execute(
                 _resolved_fields.add("supplier_name")
             if execution_plan.extracted_entities.get("customer_name"):
                 _resolved_fields.add("customer_name")
+            if execution_plan.extracted_entities.get("employee_name"):
+                _resolved_fields.add("employee_name")
+            if execution_plan.extracted_entities.get("date_of_joining"):
+                _resolved_fields.add("date_of_joining")
             if execution_plan.extracted_entities.get("amount") and float(execution_plan.extracted_entities.get("amount") or 0) > 0:
                 _resolved_fields.add("amount")
             if _resolved_fields:
                 execution_plan.missing_fields = [f for f in execution_plan.missing_fields if f not in _resolved_fields]
+                from app.planner import _questions_for_fields
                 if not execution_plan.missing_fields:
                     execution_plan.requires_clarification = False
                     execution_plan.clarification_questions = []
+                else:
+                    execution_plan.clarification_questions = _questions_for_fields(
+                        execution_plan.intent, execution_plan.missing_fields, execution_plan.extracted_entities
+                    )
 
 
 
@@ -8093,7 +8117,8 @@ async def execute(
 
         await _log_step(session_id, "PLANNING", planning_details)
 
-        await _log_step(session_id, "ECONOMIC_EVENT", {
+        if not is_operational_task(execution_plan.intent) and execution_plan.economic_event and execution_plan.economic_event != "UNKNOWN":
+            await _log_step(session_id, "ECONOMIC_EVENT", {
 
             "event": execution_plan.economic_event,
 
@@ -8347,12 +8372,11 @@ async def execute(
 
         )
 
-        from app.erp_endpoints import is_operational_task
         if is_operational_task(execution_plan.intent):
             from app.classifier import TransactionClassification
             classification = TransactionClassification(
                 transaction_nature="OPERATIONAL",
-                confidence=1.0,
+                confidence="HIGH",
                 source="OPERATIONAL_TASK",
                 requires_clarification=False,
             )
@@ -12703,7 +12727,6 @@ async def execute(
                     required_information=_req_fields,
                     requires_user_input=True,
                 )
-            from app.erp_endpoints import is_operational_task, format_operational_summary
             _is_op_query = is_operational_task(execution_plan.intent) or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
             _succ = [tr for tr in tool_results if tr.success]
             primary_data = getattr(_succ[-1], "data", {}) if _succ else {}
@@ -13638,7 +13661,6 @@ async def execute(
 
         result_summary = _clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Operation completed."
 
-        from app.erp_endpoints import is_operational_task, format_operational_summary
         if is_operational_task(execution_plan.intent) and successful_results:
             primary_data = getattr(successful_results[-1], "data", {}) or {}
             if isinstance(primary_data, dict):
@@ -14448,7 +14470,6 @@ async def resume_with_clarification(
             )
 
         if not still_missing:
-            from app.erp_endpoints import is_operational_task, format_operational_summary
 
             single_hop_call: Optional[ToolCall] = None
 
