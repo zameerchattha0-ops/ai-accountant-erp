@@ -2291,3 +2291,152 @@ _ASSET_LIFECYCLE_INTENTS = {
 # Intents that need an existing bank account (configuration, never invented).
 _BANK_INTENTS = {"record_receipt", "record_payment", "record_bank_transfer",
                  "record_expense_payment"}
+
+
+
+# ===================================================================
+# Pre-Flight Dependency Resolver (Swiss Cheese Layer 2)
+# ===================================================================
+
+_SUPPLIER_DEPENDENT_TOOLS = frozenset({
+    "create_purchase_bill",
+    "record_credit_purchase",
+    "create_purchase_order",
+    "record_supplier_payment",
+    "create_purchase_return",
+})
+
+_CUSTOMER_DEPENDENT_TOOLS = frozenset({
+    "create_invoice",
+    "record_credit_sale",
+    "create_quotation",
+    "record_customer_receipt",
+    "create_credit_note",
+})
+
+_ITEM_DEPENDENT_TOOLS = frozenset({
+    "create_purchase_bill",
+    "create_purchase_order",
+    "create_invoice",
+    "create_quotation",
+})
+
+
+async def resolve_preflight_entity_dependencies(
+    organization_id: uuid.UUID,
+    *,
+    planned_tool_calls: List[Any],
+    extracted_entities: Optional[Dict[str, Any]] = None,
+    intent: Optional[str] = None,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Pre-flight Dependency Resolver (Swiss Cheese Layer 2).
+
+    Inspects planned tool calls and extracted entities for required master records
+    (suppliers, customers, products). If an entity is required by a planned mutation
+    but does NOT yet exist in the organization's database:
+    1. Checks if the entity was explicitly named by the user / extracted.
+    2. Constructs the prerequisite creation tool call (create_supplier, create_customer, create_product).
+    3. Prepends the prerequisite creation calls BEFORE the dependent mutation in the execution plan.
+
+    Returns (new_planned_tool_calls, injected_prerequisites_info).
+    """
+    from app.models.schemas import ToolCall
+
+    calls = list(planned_tool_calls or [])
+    extracted = dict(extracted_entities or {})
+    injected: List[Dict[str, Any]] = []
+    prereq_calls: List[Any] = []
+    existing_tools = {getattr(c, "tool_name", "") for c in calls}
+
+    # 1. Supplier Pre-flight Resolution
+    for call in calls:
+        tool_name = getattr(call, "tool_name", "")
+        if tool_name in _SUPPLIER_DEPENDENT_TOOLS:
+            args = dict(call.arguments or {})
+            supp_name = (
+                args.get("supplier_name")
+                or args.get("party_name")
+                or args.get("vendor_name")
+                or extracted.get("supplier_name")
+                or extracted.get("party_name")
+                or extracted.get("vendor")
+            )
+            if supp_name and not args.get("supplier_id") and "create_supplier" not in existing_tools:
+                try:
+                    from app.services import supplier_service
+                    found = await supplier_service.search(organization_id, query=str(supp_name).strip(), limit=5)
+                    exact = [s for s in (found or []) if str(s.get("name") or "").strip().lower() == str(supp_name).strip().lower()]
+                    if not exact:
+                        prereq_tc = ToolCall(tool_name="create_supplier", arguments={"name": str(supp_name).strip()})
+                        prereq_calls.append(prereq_tc)
+                        existing_tools.add("create_supplier")
+                        injected.append({"entity": "supplier", "name": str(supp_name).strip(), "tool": "create_supplier"})
+                except Exception as exc:
+                    log.warning("reasoning.preflight_supplier_check_failed", error=str(exc))
+
+    # 2. Customer Pre-flight Resolution
+    for call in calls:
+        tool_name = getattr(call, "tool_name", "")
+        if tool_name in _CUSTOMER_DEPENDENT_TOOLS:
+            args = dict(call.arguments or {})
+            cust_name = (
+                args.get("customer_name")
+                or args.get("party_name")
+                or args.get("client_name")
+                or extracted.get("customer_name")
+                or extracted.get("party_name")
+                or extracted.get("client")
+            )
+            if cust_name and not args.get("customer_id") and "create_customer" not in existing_tools:
+                try:
+                    from app.services import customer_service
+                    found = await customer_service.search(organization_id, query=str(cust_name).strip(), limit=5)
+                    exact = [c for c in (found or []) if str(c.get("name") or "").strip().lower() == str(cust_name).strip().lower()]
+                    if not exact:
+                        prereq_tc = ToolCall(tool_name="create_customer", arguments={"name": str(cust_name).strip()})
+                        prereq_calls.append(prereq_tc)
+                        existing_tools.add("create_customer")
+                        injected.append({"entity": "customer", "name": str(cust_name).strip(), "tool": "create_customer"})
+                except Exception as exc:
+                    log.warning("reasoning.preflight_customer_check_failed", error=str(exc))
+
+    # 3. Product / Catalogue Pre-flight Resolution
+    for call in calls:
+        tool_name = getattr(call, "tool_name", "")
+        if tool_name in _ITEM_DEPENDENT_TOOLS:
+            args = dict(call.arguments or {})
+            items = args.get("items") or args.get("line_items") or []
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_name = item.get("product_name") or item.get("item_name") or item.get("name")
+                    if not item.get("product_id") and not item.get("service_id") and item_name:
+                        try:
+                            from app.services import product_service, service_service
+                            found_p = await product_service.search(organization_id, query=str(item_name).strip(), limit=5)
+                            exact_p = [p for p in (found_p or []) if str(p.get("name") or "").strip().lower() == str(item_name).strip().lower()]
+                            found_s = await service_service.search(organization_id, query=str(item_name).strip(), limit=5)
+                            exact_s = [s for s in (found_s or []) if str(s.get("name") or "").strip().lower() == str(item_name).strip().lower()]
+                            if not exact_p and not exact_s:
+                                price = float(item.get("unit_price") or item.get("price") or item.get("cost_price") or 0.0)
+                                if not any(
+                                    getattr(c, "tool_name", "") == "create_product"
+                                    and (c.arguments or {}).get("name") == str(item_name).strip()
+                                    for c in (prereq_calls + calls)
+                                ):
+                                    prereq_tc = ToolCall(
+                                        tool_name="create_product",
+                                        arguments={
+                                            "name": str(item_name).strip(),
+                                            "cost_price": price,
+                                            "unit_price": price,
+                                            "is_inventory": True,
+                                        },
+                                    )
+                                    prereq_calls.append(prereq_tc)
+                                    injected.append({"entity": "product", "name": str(item_name).strip(), "tool": "create_product"})
+                        except Exception as exc:
+                            log.warning("reasoning.preflight_product_check_failed", error=str(exc))
+
+    return prereq_calls + calls, injected

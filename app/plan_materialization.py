@@ -91,6 +91,11 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
             "supplier_id", "supplier", ("supplier_name", "party_name")
         ),
     },
+    "create_purchase_order": {
+        "supplier_id": ReferenceSpec(
+            "supplier_id", "supplier", ("supplier_name", "party_name")
+        ),
+    },
     "record_customer_receipt": {
         "customer_id": ReferenceSpec(
             "customer_id", "customer", ("customer_name", "party_name")
@@ -155,6 +160,7 @@ DECLARED_REFERENCES: Dict[str, Dict[str, ReferenceSpec]] = {
 LINE_REFERENCE_TOOLS: Dict[str, Tuple[str, ...]] = {
     "create_invoice": ("product_name", "item_name"),
     "create_purchase_bill": ("product_name", "item_name"),
+    "create_purchase_order": ("product_name", "item_name"),
 }
 
 # The container key itself, when the approved plan uses the model's vocabulary
@@ -162,6 +168,7 @@ LINE_REFERENCE_TOOLS: Dict[str, Tuple[str, ...]] = {
 DOCUMENT_LINE_ALIASES: Dict[str, Tuple[str, ...]] = {
     "create_invoice": ("line_items",),
     "create_purchase_bill": ("line_items",),
+    "create_purchase_order": ("line_items",),
 }
 
 # Which tool CREATES each role.  Used ONLY to recognise a creation step the user

@@ -506,6 +506,126 @@ async def record_bank_transfer(
     )
 
 
+async def record_compound_journal(
+    *,
+    organization_id: uuid.UUID,
+    transaction_date: str,
+    description: str,
+    lines: List[Dict[str, Any]],
+    entry_type: str = "MANUAL",
+    currency_code: str = "PKR",
+    user_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Record and post an arbitrary compound multi-line journal entry directly into the GL.
+
+    Validates:
+    - At least 2 lines.
+    - Double-entry balance invariant: sum(debit) == sum(credit) > 0.
+    - Each line must resolve to a valid, active, non-grouping GL account.
+    - Line amounts must be non-negative and mutually exclusive (debit > 0 xor credit > 0).
+    """
+    if not lines or not isinstance(lines, list) or len(lines) < 2:
+        raise ValueError("A compound journal entry requires at least 2 lines.")
+
+    group_ids = await _grouping_account_ids(organization_id)
+    validated_lines: List[Dict[str, Any]] = []
+
+    for idx, line in enumerate(lines, start=1):
+        if not isinstance(line, dict):
+            raise ValueError(f"Line #{idx} must be an object with account and debit/credit details.")
+
+        try:
+            debit = round(float(line.get("debit", 0) or 0), 2)
+            credit = round(float(line.get("credit", 0) or 0), 2)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Line #{idx} contains invalid numeric amount: {exc}")
+
+        if debit < 0 or credit < 0:
+            raise ValueError(f"Line #{idx} amounts cannot be negative: debit={debit}, credit={credit}")
+        if debit > 0 and credit > 0:
+            raise ValueError(f"Line #{idx} cannot have both debit ({debit}) and credit ({credit})")
+        if debit == 0 and credit == 0:
+            raise ValueError(f"Line #{idx} must have either debit > 0 or credit > 0")
+
+        acc: Optional[Dict[str, Any]] = None
+        raw_acc_id = line.get("account_id")
+        code = str(line.get("account_code") or line.get("code") or "").strip()
+        name = str(line.get("account_name") or line.get("name") or "").strip()
+
+        if raw_acc_id:
+            try:
+                acc_uuid = uuid.UUID(str(raw_acc_id))
+                acc = await a_repo.get_account(organization_id, account_id=acc_uuid)
+            except Exception:
+                acc = None
+
+        if not acc and code:
+            acc = await a_repo.get_account_by_code(organization_id, code=code)
+
+        if not acc and name:
+            acc = await accounting_service.resolve_account(organization_id, account_name=name)
+
+        if not acc:
+            identifier = raw_acc_id or code or name or f"line #{idx}"
+            raise ValueError(f"Account '{identifier}' could not be resolved in chart of accounts.")
+
+        if acc.get("is_active") is False:
+            raise ValueError(f"Account '{acc.get('name')}' ({acc.get('code')}) is inactive and cannot be posted to.")
+
+        if acc.get("id") in group_ids:
+            raise ValueError(f"Account '{acc.get('name')}' ({acc.get('code')}) is a grouping heading, not a postable account.")
+
+        line_desc = str(line.get("description") or description).strip()
+        cust_id = line.get("customer_id") or line.get("party_id")
+        supp_id = line.get("supplier_id")
+        proj_id = line.get("project_id")
+
+        validated_lines.append({
+            "account_id": str(acc["id"]),
+            "description": line_desc,
+            "debit": debit,
+            "credit": credit,
+            "customer_id": str(cust_id) if cust_id else None,
+            "supplier_id": str(supp_id) if supp_id else None,
+            "project_id": str(proj_id) if proj_id else None,
+        })
+
+    total_debit = round(sum(l["debit"] for l in validated_lines), 2)
+    total_credit = round(sum(l["credit"] for l in validated_lines), 2)
+
+    if abs(total_debit - total_credit) > 0.01:
+        raise ValueError(
+            f"Compound journal is unbalanced: total debit ({total_debit}) != total credit ({total_credit}). Double-entry balance invariant violated."
+        )
+    if total_debit <= 0:
+        raise ValueError("Total journal entry amount must be strictly greater than 0.")
+
+    prepared = await accounting_service.prepare_journal(
+        organization_id=organization_id,
+        transaction_date=transaction_date,
+        description=description,
+        lines=validated_lines,
+        source_type=entry_type or "MANUAL",
+        currency_code=currency_code or "PKR",
+    )
+    entry_row = prepared.get("entry") or prepared.get("journal_entry") or {}
+    entry_id = uuid.UUID(str(entry_row["id"]))
+    await accounting_service.validate_journal(entry_id=entry_id)
+    posted = await accounting_service.post_journal(entry_id=entry_id)
+
+    return {
+        "success": True,
+        "journal_entry_id": str(entry_id),
+        "entry_number": entry_row.get("journal_number") or posted.get("entry_number") or entry_row.get("entry_number"),
+        "transaction_date": transaction_date,
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+        "lines_count": len(validated_lines),
+        "status": "POSTED",
+        "description": description,
+    }
+
+
 # ===================================================================
 # Verification
 # ===================================================================

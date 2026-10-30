@@ -88,6 +88,8 @@ from app.accounting_engine import (
 
     ensure_cash_account,
 
+    record_compound_journal,
+
     prepare_cogs_for_items,
 
     record_cash_purchase,
@@ -165,7 +167,10 @@ def register(
 
 
 _TOOL_ALIASES: Dict[str, str] = {
-    # Inventory / Stock status lookups
+    # Journal compound
+    "record_compound_journal": "create_compound_journal",
+    "compound_journal": "create_compound_journal",
+        # Inventory / Stock status lookups
     "get_inventory": "get_inventory_status",
     "check_stock": "get_inventory_status",
     "view_inventory": "get_inventory_status",
@@ -3337,6 +3342,22 @@ async def _reverse_journal(organization_id: uuid.UUID, **kw) -> ToolResult:
     return ToolResult(tool_name="reverse_journal", success=True, data=data)
 
 
+async def _create_compound_journal(organization_id: uuid.UUID, **kw) -> ToolResult:
+    try:
+        data = await record_compound_journal(
+            organization_id=organization_id,
+            transaction_date=kw.get("transaction_date"),
+            description=kw.get("description", "Compound journal entry"),
+            lines=kw.get("lines", []),
+            entry_type=kw.get("entry_type", "MANUAL"),
+            currency_code=kw.get("currency_code", "PKR"),
+            user_id=kw.get("user_id"),
+        )
+        return ToolResult(tool_name="create_compound_journal", success=True, data=data)
+    except Exception as exc:
+        return ToolResult(tool_name="create_compound_journal", success=False, error=str(exc))
+
+
 
 # ===================================================================
 
@@ -4457,6 +4478,13 @@ register("validate_journal", handler=_validate_journal, read_only=False, contrac
 register("post_journal", handler=_post_journal, read_only=False, contract=contract_from_callable(accounting_service.post_journal), description="Post a validated journal entry")
 
 register("reverse_journal", handler=_reverse_journal, read_only=False, description="Reverse a posted journal entry")
+register(
+    "create_compound_journal",
+    handler=_create_compound_journal,
+    read_only=False,
+    contract=contract_from_callable(record_compound_journal),
+    description="Create and post a compound multi-line journal entry directly. Lines must be balanced (total debits == total credits > 0). Each line must provide account_id, account_code, or account_name, and either debit or credit.",
+)
 
 
 

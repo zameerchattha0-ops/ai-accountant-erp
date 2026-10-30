@@ -54,6 +54,8 @@ FINANCIAL_MUTATION_TOOLS = frozenset({
     "record_bank_transfer",
     "prepare_journal",
     "post_journal",
+    "create_compound_journal",
+    "record_compound_journal",
     "register_fixed_asset",
     "dispose_fixed_asset",
     "record_asset_depreciation",

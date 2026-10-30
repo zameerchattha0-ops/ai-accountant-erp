@@ -120,6 +120,8 @@ _DEFAULT_TOOL_CAPABILITIES: Dict[str, Set[str]] = {
     "validate_journal": {"journal_management"},
     "post_journal": {"journal_management"},
     "reverse_journal": {"journal_management"},
+    "create_compound_journal": {"journal_management"},
+    "record_compound_journal": {"journal_management"},
     # Assets & Depreciation
     "run_asset_depreciation": {"assets", "journal_management"},
     "post_asset_disposal": {"assets", "journal_management"},

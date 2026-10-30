@@ -10674,6 +10674,27 @@ async def execute(
 
                         )
 
+
+            # ---- PRE-FLIGHT ENTITY DEPENDENCY RESOLVER (Swiss Cheese Layer 2) ----
+            # When planned mutations depend on missing master records (suppliers,
+            # customers, products), chain prerequisite creation calls inline.
+            if planned_tool_calls:
+                from app.reasoning import resolve_preflight_entity_dependencies
+                planned_tool_calls, _injected_pre = await resolve_preflight_entity_dependencies(
+                    organization_id=organization_id,
+                    planned_tool_calls=planned_tool_calls,
+                    extracted_entities=getattr(execution_plan, "extracted_entities", None) or {},
+                    intent=getattr(execution_plan, "intent", None),
+                )
+                if _injected_pre:
+                    await _log_step(
+                        session_id, "PREFLIGHT_DEPENDENCIES_RESOLVED", {
+                            "injected_count": len(_injected_pre),
+                            "prerequisites": _injected_pre,
+                            "tools_planned": [tc.tool_name for tc in planned_tool_calls],
+                        }
+                    )
+
             # Gate ORDER is contractual: a confirmation-pending plan must
 
             # reach PHASE 5 first (reconcile/approval tests pin it).  The ask
@@ -11702,6 +11723,8 @@ async def execute(
 
         _cancel_state = {"cancelled": False}
 
+        _tool_failure_counts: Dict[str, int] = {}
+
 
 
         async def _executor(tool_name: str, args: dict) -> dict:
@@ -12096,6 +12119,46 @@ async def execute(
                     }
 
                 return {"success": result.success, "data": result.data}
+
+            # ---- P1: SELF-CORRECTION & ENDPOINT CONTRACT GROUNDING (Layer 1) ----
+            if not result.success:
+                _tool_failure_counts[tool_name] = _tool_failure_counts.get(tool_name, 0) + 1
+                fail_count = _tool_failure_counts[tool_name]
+                raw_err = result.error or "tool invocation failed"
+
+                from app.tools import tool_contracts
+                contract = tool_contracts().get(tool_name)
+
+                if fail_count == 1:
+                    augmented_err = (
+                        f"Tool '{tool_name}' failed with error: {raw_err}. "
+                        "Please self-correct the parameters and retry the call."
+                    )
+                else:
+                    if contract:
+                        grounding = (
+                            f"\n[ENDPOINT CONTRACT GROUNDING for '{tool_name}']\n"
+                            f"- Required arguments: {list(contract.get('required', ()))} \n"
+                            f"- Accepted arguments: {list(contract.get('accepted', ()))} \n"
+                            f"- UUID arguments: {list(contract.get('uuid_params', ()))} \n"
+                            f"- Extra arguments allowed: {contract.get('accepts_extra', False)}\n"
+                            "You MUST strictly provide only the accepted and required parameters."
+                        )
+                        augmented_err = f"Tool '{tool_name}' failed again ({raw_err}). {grounding}"
+                    else:
+                        augmented_err = f"Tool '{tool_name}' failed again: {raw_err}. Please verify argument names and types."
+
+                await _log_step(session_id, "SELF_CORRECTION", {
+                    "tool": tool_name,
+                    "attempt": fail_count,
+                    "contract_grounded": fail_count >= 2,
+                    "error": raw_err[:400],
+                })
+                return {
+                    "success": False,
+                    "error": augmented_err,
+                    "error_category": getattr(result, "error_category", None) or "EXECUTION_FAILURE",
+                }
 
             return {"success": result.success, "error": result.error}
 
@@ -13079,7 +13142,54 @@ async def execute(
 
                     return _rescue
 
-                await _update_status(session_id, ExecutionStatus.FAILED)
+                # ---- P1 SELF-CORRECTION REMEDIATION TURN (Swiss Cheese Layer 1) ----
+                # When a planned mutation fails execution, re-prompt the LLM
+                # grounded with the endpoint contract before marking FAILED.
+                if failed_results:
+                    failed_tr = failed_results[0]
+                    from app.tools import tool_contracts
+                    c = tool_contracts().get(failed_tr.tool_name)
+                    c_info = (
+                        f"\n[ENDPOINT CONTRACT GROUNDING for '{failed_tr.tool_name}']:\n"
+                        f"- Required arguments: {list(c.get('required', ()) if c else [])}\n"
+                        f"- Accepted arguments: {list(c.get('accepted', ()) if c else [])}\n"
+                        f"- Parameter rules: {list(c.get('uuid_params', ()) if c else [])}\n"
+                    ) if c else ""
+
+                    remediation_prompt = (
+                        f"The execution of tool '{failed_tr.tool_name}' failed with error:\n"
+                        f"{failed_tr.error}\n{c_info}\n"
+                        f"User request: {user_message}\n"
+                        "Please analyze the failure, correct the parameters to strictly match the contract, and execute the correct tool call."
+                    )
+                    try:
+                        rem_client = get_client()
+                        await _log_step(session_id, "SELF_CORRECTION_TRIGGERED", {
+                            "failed_tool": failed_tr.tool_name,
+                            "error": str(failed_tr.error)[:300],
+                        })
+                        rem_out = await rem_client.generate_with_tools(
+                            user_message=remediation_prompt,
+                            context=context,
+                            executor=_executor,
+                            max_tool_iterations=3,
+                            thinking_off=True,
+                        )
+                        rem_trs = rem_out.get("tool_results", [])
+                        if any(r.success for r in rem_trs):
+                            tool_calls = rem_out.get("tool_calls", tool_calls)
+                            tool_results = rem_trs
+                            successful_results = [r for r in tool_results if r.success]
+                            failed_results = [r for r in tool_results if not r.success]
+                            llm_text = rem_out.get("text", "") or "Operation successfully completed after parameter correction."
+                            await _log_step(session_id, "SELF_CORRECTION_SUCCEEDED", {
+                                "tools": [r.tool_name for r in rem_trs if r.success],
+                            })
+                    except Exception as rem_exc:
+                        log.warning("agent.remediation_turn_failed", error=str(rem_exc)[:200])
+
+                if not successful_results:
+                    await _update_status(session_id, ExecutionStatus.FAILED)
 
                 await create_execution_result(
 
