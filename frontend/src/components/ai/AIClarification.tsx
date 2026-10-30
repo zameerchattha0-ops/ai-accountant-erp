@@ -92,9 +92,15 @@ function optionsForSubQuestion(
   if (embedded && embedded.length > 0) {
     return embedded;
   }
+
+  // Extract the specific question prompt line (line ending with '?' or the trailing line),
+  // preventing informational summaries, employee records, or historical transaction logs above from hijacking options.
+  const lines = q.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const questionLine = lines.filter((l) => /\?\s*$/m.test(l)).pop() || lines[lines.length - 1] || q;
+
   if (
     /how was .*paid|how was .*settled|payment (?:mode|method|type)|how did you pay|cash or (?:credit|bank)|settlement/i.test(
-      q
+      questionLine
     )
   ) {
     return [
@@ -103,29 +109,33 @@ function optionsForSubQuestion(
       { value: "CREDIT", label: "On credit" },
     ];
   }
-  if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(q)) {
+  if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(questionLine)) {
     return [
       { value: "CASH", label: "Cash" },
       { value: "BANK", label: "Bank transfer" },
     ];
   }
-  if (/paid.*(?:now|or).*outstanding|payable/i.test(q)) {
+  if (/paid.*(?:now|or).*outstanding|payable/i.test(questionLine)) {
     return [
       { value: "PAID_NOW", label: "Paid now" },
       { value: "OUTSTANDING", label: "Payable (pay later)" },
       { value: "PREPAID", label: "Prepaid / advance" },
     ];
   }
-  if (/cash or on credit/i.test(q)) {
+  if (/cash or on credit/i.test(questionLine)) {
     return [
       { value: "CASH", label: "Cash" },
       { value: "BANK", label: "Bank" },
       { value: "CREDIT", label: "On credit" },
     ];
   }
+  // Date options: ONLY offer Today / Yesterday when the question is genuinely asking the user for a transaction date,
+  // NEVER when displaying factual date metadata (e.g. "Date of joining: ...", "transaction date 27 Oct").
+  const isFactualDate = /(?:date\s*(?:of|:|\()|\bposted\s+\d|\bjoined\s+on|\brecorded\b)\b/i.test(questionLine) && !/\?\s*$/m.test(questionLine);
   if (
-    /(?:what|which) date|date was .*paid|date of|transaction date|expense date|invoice date|payment date|when was .*paid|receive the goods/i.test(
-      q
+    !isFactualDate &&
+    /(?:(?:what|which)\s+(?:is\s+the\s+)?(?:transaction\s+|invoice\s+|payment\s+|expense\s+|bill\s+)?date\b|\bwhen\s+was\s+(?:this|it)\s+(?:paid|received|incurred)\b|\bwhat\s+date\s+did\s+this\s+occur\b)/i.test(
+      questionLine
     )
   ) {
     return [
@@ -133,7 +143,7 @@ function optionsForSubQuestion(
       { value: "YESTERDAY", label: "Yesterday" },
     ];
   }
-  if (/what type of account|account type|type of .*in the chart of accounts/i.test(q)) {
+  if (/what type of account|account type|type of .*in the chart of accounts/i.test(questionLine)) {
     return [
       { value: "Expense", label: "Expense" },
       { value: "Asset", label: "Asset" },
@@ -142,7 +152,7 @@ function optionsForSubQuestion(
       { value: "Equity", label: "Equity" },
     ];
   }
-  const hardcoded = quickOptions(q);
+  const hardcoded = quickOptions(questionLine);
   if (hardcoded) {
     return hardcoded.map((opt) => ({ value: opt, label: opt }));
   }

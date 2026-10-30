@@ -233,3 +233,22 @@ async def test_p1_self_correction_and_contract_grounding_in_executor():
     c = contracts["create_customer"]
     assert "name" in c["required"]
     assert "accepted" in c
+
+
+def test_conversational_offers_not_treated_as_clarification():
+    """Verify polite sign-offs (e.g. 'Would you like me to help with anything else?') are not questions."""
+    from app.agent import _looks_like_question
+
+    informational_text = (
+        "I found the employee record you're referring to:\n"
+        "Name: Gulfam\n"
+        "Code: EMP-000003\n"
+        "Basic salary: PKR 37,000 per month\n"
+        "Date of joining: 2026-10-01\n"
+        "However, the system does not provide a delete-employee operation.\n"
+        "Would you like me to help with anything else regarding this record, such as updating allowances or checking payroll status?"
+    )
+    assert _looks_like_question(informational_text) is False
+
+    operational_question = "What is the employee's basic monthly salary?"
+    assert _looks_like_question(operational_question) is True

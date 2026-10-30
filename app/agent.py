@@ -3223,13 +3223,26 @@ def _looks_like_question(text: str) -> bool:
         if "?" not in t and not re.search(r"\b(?:please provide|confirm whether|tell me which|specify)\b", low):
             return False
 
-    if "?" in t:
+    # Conversational offer guard:
+    # Polite closing offers of further assistance (e.g. "Would you like me to help with anything else?",
+    # "Can I assist you with anything else?") are courtesy sign-offs, NOT operational clarifications.
+    conversational_offer_patterns = (
+        r"(?i)\b(?:would you like me to (?:help|assist|check|look into|do anything else)|"
+        r"can i (?:help|assist) you with anything else|"
+        r"is there anything else (?:i can help|you would like|i can assist)|"
+        r"how else can i (?:help|assist) you|"
+        r"do you (?:have any other questions|need any other assistance)|"
+        r"let me know if you (?:need|would like|want) (?:anything else|further assistance))\b"
+    )
+    t_clean = re.sub(conversational_offer_patterns + r"[^?.]*[?]", "", t).strip()
+
+    if "?" in t_clean:
         return True
-    if re.search(r"\b(?:missing|tell me|confirm|provide|specify|what is|how should|please answer|let me know)\b", t, re.I):
-        if re.search(r"(?:^|\n)\s*(?:1[.)]|[-*•])\s+", t):
+    if re.search(r"\b(?:missing|tell me|confirm|provide|specify|what is|how should|please answer|let me know)\b", t_clean, re.I):
+        if re.search(r"(?:^|\n)\s*(?:1[.)]|[-*•])\s+", t_clean):
             return True
     from app.questionnaire import parse_model_question_text
-    parsed = parse_model_question_text(t)
+    parsed = parse_model_question_text(t_clean)
     return bool(parsed and not parsed.is_empty())
 
 
