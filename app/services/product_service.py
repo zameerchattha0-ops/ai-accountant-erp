@@ -41,13 +41,16 @@ async def create(
     description: Optional[str] = None,
     unit: Optional[str] = None,
     is_stock_tracked: bool = False,
+    is_inventory: bool = False,
     unit_price: float = 0.0,
     cost_price: Optional[float] = None,
     revenue_account_id: Optional[uuid.UUID] = None,
     tax_rate_id: Optional[uuid.UUID] = None,
     category_id: Optional[uuid.UUID] = None,
+    **extra: Any,
 ) -> Dict[str, Any]:
     """Create a catalog product after verifying it doesn't already exist."""
+    is_stock_tracked = bool(is_stock_tracked or is_inventory)
     if not name or not name.strip():
         raise ValueError("Product name is required.")
     if unit_price is None or float(unit_price) < 0:
@@ -229,4 +232,9 @@ async def delete(organization_id: uuid.UUID, *, product_id: uuid.UUID) -> None:
     if not removed:
         raise ValueError("Product not found in this organization.")
     log.info("product.deleted", product_id=str(product_id), name=current.get("name"))
+
+
+# Aliases for repository / tool parity
+search_products = search
+create_product = create
 
