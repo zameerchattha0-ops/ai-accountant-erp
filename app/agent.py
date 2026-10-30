@@ -2805,10 +2805,27 @@ async def _deterministic_mutation_calls(
     if execution_plan.intent == "create_employee":
         emp_name = entities.get("employee_name") or entities.get("name") or entities.get("full_name")
         if emp_name:
+            dt = (
+                entities.get("date_of_joining")
+                or entities.get("joining_date")
+                or entities.get("transaction_date")
+                or entities.get("date")
+                or date.today().isoformat()
+            )
+            sal = entities.get("basic_salary") or entities.get("salary") or entities.get("amount") or 0.0
             args = {
                 "full_name": str(emp_name).strip(),
-                "basic_salary": float(entities.get("salary") or entities.get("amount") or 0.0),
+                "date_of_joining": str(dt).strip(),
+                "basic_salary": float(sal) if sal is not None else 0.0,
             }
+            if entities.get("designation"):
+                args["designation"] = str(entities["designation"]).strip()
+            if entities.get("department"):
+                args["department"] = str(entities["department"]).strip()
+            if entities.get("email"):
+                args["email"] = str(entities["email"]).strip()
+            if entities.get("phone") or entities.get("phone_number"):
+                args["phone"] = str(entities.get("phone") or entities.get("phone_number")).strip()
             return [ToolCall(tool_name="create_employee", arguments=args)]
 
     if execution_plan.intent == "create_project":
@@ -13966,7 +13983,9 @@ def _session_is_pending(session: Dict[str, Any]) -> bool:
 
     """The session is still parked on a user decision."""
 
-    return str(session.get("status") or "") == "WAITING_FOR_USER"
+    st = str(session.get("status") or "")
+
+    return st in ("WAITING_FOR_USER", "AWAITING_CLARIFICATION", "AWAITING_CONFIRMATION")
 
 
 
@@ -14152,6 +14171,14 @@ async def resume_with_clarification(
 
             summary="Session not found.",
 
+        )
+
+    if auth is None:
+        role = session.get("role") or "OWNER"
+        auth = AuthContext(
+            user_id=user_id,
+            organization_id=organization_id,
+            role_code=str(role),
         )
 
     answer = str(user_answer or "").strip()
@@ -14412,11 +14439,41 @@ async def resume_with_clarification(
                     else:
                         merged_entities["account_type"] = ans_up
                 else:
-                    unfulfilled = [f for f in missing_fields if merged_entities.get(f) in (None, "", []) and f not in ("transaction_date", "expense_date", "payment_type", "payment_method", "account_type")]
-                    if unfulfilled:
-                        merged_entities[unfulfilled[0]] = part.strip()
-                    elif len(missing_fields) == 1:
-                        merged_entities[missing_fields[0]] = part.strip()
+                    m_num = re.search(r"^\s*(?:(?:rs|pkr|usd|\$)\.?\s*)?(\d+(?:,\d+)*(?:\.\d+)?)\s*$", part, re.IGNORECASE)
+                    if m_num and any(f in missing_fields for f in ("basic_salary", "salary", "amount", "subtotal", "total", "sales_price", "unit_price")):
+                        clean_n = float(m_num.group(1).replace(",", ""))
+                        if "basic_salary" in missing_fields:
+                            merged_entities["basic_salary"] = clean_n
+                        elif "salary" in missing_fields:
+                            merged_entities["salary"] = clean_n
+                        elif "sales_price" in missing_fields:
+                            merged_entities["sales_price"] = clean_n
+                        elif "unit_price" in missing_fields:
+                            merged_entities["unit_price"] = clean_n
+                        elif "amount" in missing_fields:
+                            merged_entities["amount"] = clean_n
+                        elif "subtotal" in missing_fields:
+                            merged_entities["subtotal"] = clean_n
+                        elif "total" in missing_fields:
+                            merged_entities["total"] = clean_n
+                    else:
+                        unfulfilled = [f for f in missing_fields if merged_entities.get(f) in (None, "", []) and f not in ("transaction_date", "expense_date", "date_of_joining", "payment_type", "payment_method", "account_type")]
+                        if unfulfilled:
+                            merged_entities[unfulfilled[0]] = part.strip()
+                        elif len(missing_fields) == 1:
+                            merged_entities[missing_fields[0]] = part.strip()
+
+        # Fallback / sync date_of_joining if missing
+        if not merged_entities.get("date_of_joining"):
+            _d = (
+                merged_entities.get("transaction_date")
+                or merged_entities.get("date")
+                or (snapshot.get("extracted_entities") or {}).get("date_of_joining")
+                or (snapshot.get("extracted_entities") or {}).get("transaction_date")
+                or (snapshot.get("extracted_entities") or {}).get("date")
+            )
+            if _d:
+                merged_entities["date_of_joining"] = str(_d).strip()
 
         if intent in ("record_expense", "expense", "create_expense"):
             desc_known = merged_entities.get("description") or merged_entities.get("item_description") or merged_entities.get("transaction_purpose")
@@ -14533,11 +14590,54 @@ async def resume_with_clarification(
                     })
 
             elif intent == "create_employee":
-                e_name = merged_entities.get("employee_name") or merged_entities.get("name")
+                e_name = (
+                    merged_entities.get("employee_name")
+                    or merged_entities.get("name")
+                    or merged_entities.get("full_name")
+                )
+                dt = (
+                    merged_entities.get("date_of_joining")
+                    or merged_entities.get("joining_date")
+                    or merged_entities.get("transaction_date")
+                    or merged_entities.get("date")
+                    or date.today().isoformat()
+                )
+                sal = (
+                    merged_entities.get("basic_salary")
+                    or merged_entities.get("salary")
+                    or merged_entities.get("amount")
+                )
+                if not merged_entities.get("designation"):
+                    req = (session or {}).get("user_request") or ""
+                    m_desig = re.search(
+                        r"\b(?:as|role|position|designation|title)\s+([a-zA-Z0-9\s&/-]+?)(?:\s+(?:from|on|at|with|salary|for)|\s*$|[.,;])",
+                        req,
+                        re.IGNORECASE,
+                    )
+                    if m_desig:
+                        merged_entities["designation"] = m_desig.group(1).strip()
+
                 if e_name:
-                    single_hop_call = ToolCall(tool_name="create_employee", arguments={
+                    emp_args: Dict[str, Any] = {
                         "full_name": str(e_name).strip(),
-                    })
+                        "date_of_joining": str(dt).strip(),
+                    }
+                    if sal is not None:
+                        try:
+                            clean_sal = str(sal).replace(",", "").strip()
+                            clean_sal = re.sub(r"[^0-9.]", "", clean_sal)
+                            emp_args["basic_salary"] = float(clean_sal) if clean_sal else float(sal)
+                        except (ValueError, TypeError):
+                            emp_args["basic_salary"] = sal
+                    if merged_entities.get("designation"):
+                        emp_args["designation"] = str(merged_entities["designation"]).strip()
+                    if merged_entities.get("department"):
+                        emp_args["department"] = str(merged_entities["department"]).strip()
+                    if merged_entities.get("email"):
+                        emp_args["email"] = str(merged_entities["email"]).strip()
+                    if merged_entities.get("phone") or merged_entities.get("phone_number"):
+                        emp_args["phone"] = str(merged_entities.get("phone") or merged_entities.get("phone_number")).strip()
+                    single_hop_call = ToolCall(tool_name="create_employee", arguments=emp_args)
 
             elif intent == "create_project":
                 proj_name = merged_entities.get("project_name") or merged_entities.get("name")

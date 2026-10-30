@@ -985,7 +985,19 @@ def format_operational_summary(task_id: str, data: Dict[str, Any]) -> str:
 
         name = data.get("full_name") or "Employee"
 
-        return f"Successfully registered employee '{name}' in the personnel roster under {mod_name} (`{mod_path}`)."
+        code = data.get("employee_code")
+
+        code_str = f" ({code})" if code else ""
+
+        desig = data.get("designation")
+
+        desig_str = f" as {desig}" if desig else ""
+
+        sal = data.get("basic_salary")
+
+        sal_str = f" with monthly salary Rs. {float(sal):,.2f}" if sal else ""
+
+        return f"Successfully registered employee '{name}'{code_str}{desig_str}{sal_str} in the personnel roster under {mod_name} (`{mod_path}`)."
 
 
 

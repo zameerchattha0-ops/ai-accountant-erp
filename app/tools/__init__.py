@@ -4184,6 +4184,10 @@ async def _create_employee(organization_id: uuid.UUID, **kw) -> ToolResult:
             kw["basic_salary"] = kw.pop("salary")
         if "joining_date" in kw and "date_of_joining" not in kw:
             kw["date_of_joining"] = kw.pop("joining_date")
+        if "transaction_date" in kw and "date_of_joining" not in kw:
+            kw["date_of_joining"] = kw.pop("transaction_date")
+        if "date" in kw and "date_of_joining" not in kw:
+            kw["date_of_joining"] = kw.pop("date")
         if "date_of_joining" in kw and str(kw["date_of_joining"]).strip().upper() == "TODAY":
             from datetime import date
             kw["date_of_joining"] = date.today().isoformat()

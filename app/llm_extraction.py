@@ -431,7 +431,7 @@ async def enrich_preliminary(
     for key in (
         "supplier_name", "customer_name", "account_name", "account_type",
         "account_code", "parent_account_name", "product_name", "service_name",
-        "sales_price", "bank_name", "employee_name", "project_name", "template_name",
+        "sales_price", "bank_name", "employee_name", "date_of_joining", "basic_salary", "designation", "department", "project_name", "template_name",
     ):
         if key in clean and clean[key]:
             prior = literals.get(key)
