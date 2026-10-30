@@ -1,530 +1,1079 @@
-"""
-ERP AI Agent — Shared LLM Prompt Building
-==========================================
-Single source of truth for the prompts sent to ANY runtime AI provider
-(Qwen primary, Gemini fallback).
-
-Both provider clients build identical system instructions and user
-content so that switching providers never changes the agent's behaviour,
-context budget, or governance rules. The Constitution is truncated to a
-fixed token budget and only RELEVANT ERP context (never the whole
-database) is included — see context_manager.build_context().
-"""
-
-from __future__ import annotations
-
-import threading
-from pathlib import Path
-from typing import List
-
-import structlog
-
-from app.config import constitution_path
-from app.models.schemas import AgentContext
-
-log = structlog.get_logger(__name__)
-
-# The file the loader reads. Resolved ONCE from the configured locations
-# (repo root first, then ``docs/``) and then exposed as a module-level name so
-# a caller - a deployment pinning the file, or a test - can point the loader
-# at a specific file. ``load_constitution`` always reads this name, never a
-# freshly resolved path, so that override actually takes effect.
-CONSTITUTION_PATH = constitution_path()
-
-# ---------------------------------------------------------------------------
-# Constitution cache.
-#
-# The constitution file is static system-instruction material: it is read
-# ONCE and served from memory. An mtime check keeps the cache honest - an
-# edited constitution is picked up on the next load without a restart
-# (mtime resolution is coarse, which is acceptable: the file changes at
-# deploy time, not per request). Reads are guarded for multi-threaded
-# callers.
-# ---------------------------------------------------------------------------
-_constitution_lock = threading.Lock()
-_constitution_cache: dict = {"mtime": None, "text": ""}
-
-
-def _reset_constitution_cache() -> None:
-    """Test hook: drop the cached constitution so the next load re-reads."""
-    with _constitution_lock:
-        _constitution_cache["mtime"] = None
-        _constitution_cache["text"] = ""
-
-
-def load_constitution() -> str:
-    """Load the ERP_AGENT_CONSTITUTION.md (mtime-checked memory cache)."""
-    path = Path(CONSTITUTION_PATH)
-    if path.exists():
-        mtime = path.stat().st_mtime
-        with _constitution_lock:
-            if _constitution_cache["mtime"] == mtime:
-                return _constitution_cache["text"]
-        text = path.read_text(encoding="utf-8")
-        with _constitution_lock:
-            _constitution_cache["mtime"] = mtime
-            _constitution_cache["text"] = text
-        return text
-    log.warning("prompts.constitution_not_found", path=str(CONSTITUTION_PATH))
-    return ""
-
-
-def build_primary_reasoning_instructions() -> str:
-    """The system-level statement that the LLM is the reasoning layer.
-
-    Kept separate from :func:`build_system_instructions` so any provider (or a
-    future worker) can carry it, and so tests can pin its wording.  Python's
-    role in this system is enforcement and execution — never speculation.
-    """
-    return "\n".join(
-        [
-            "You are the primary accounting reasoning layer.",
-            "The preliminary planner may be incomplete or wrong.",
-            "Do not blindly follow its intent or proposed workflow.",
-            "Inspect the live books and accounting context.",
-            "If the records contradict the preliminary interpretation,",
-            "reclassify the event and choose the correct next step.",
-            "Do not invent missing facts.",
-            "Never assume how a transaction was settled (cash/bank/credit) — the user states it in THIS request or you ask.",
-            "Ask questions based on the actual records and actual uncertainty.",
-            "Python validates and executes; it does not decide the treatment.",
-            "",
-            "UNIVERSAL NATURAL-LANGUAGE DIALOGUE & INVESTIGATION PROTOCOL:",
-            "Every message — initial request or clarification answer — is natural-language communication to be understood semantically.",
-            "Understand user intent, then proactively produce internal read queries (search_product, search_account, search_customer, etc.) to fetch live records from ERP routes and modules.",
-            "Analyze fetched records against user statements. If material information is missing or ambiguous, ask a clear, targeted question to complete the plan.",
-            "Structure real-time endpoints: when planning mutations (e.g. record_cash_sale, record_cash_purchase, create_invoice), populate complete structured payloads (items=[{description, quantity, unit_price, product_id}]) directly rather than compressing details into narration strings.",
-            "Verify execution results across all planned steps (double entries, ledger balances, and inventory movements) to ensure accounting integrity.",
-        ]
-    )
-
-
-def build_system_instructions(constitution: str = "") -> str:
-    """Build the permanent system instructions shared by all providers."""
-    instructions: List[str] = [
-        "You are an AI accounting assistant for a small-business ERP system.",
-        "You help users record financial transactions, query reports, and manage their books.",
-        "",
-        build_primary_reasoning_instructions(),
-        "",
-        "CORE RULES:",
-        "1. NEVER compute debit/credit arithmetic — the accounting engine handles that.",
-        "2. NEVER invent financial figures — always use data from tools.",
-        "3. NEVER make assumptions about uncertain information — ask the user.",
-        "4. Do NOT automatically create suppliers or customers just because a name appears.",
-        "5. Search before creating persistent entities.",
-        "6. Ask only when material information is missing. Do not ask unnecessary questions.",
-        "7. Explain what you did in concise, factual terms.",
-        "",
-        "INFORMATION REUSE RULES (STRICT):",
-        "8. The EXTRACTED ENTITIES section is authoritative ground truth — those values were",
-        "   parsed from the user's own message or their clarification answers. Use them",
-        "   directly in tool calls. NEVER ask the user for any value already listed there",
-        "   (amount, date, supplier, customer, item, payment method, etc.).",
-        "9. The CLARIFICATION HISTORY section lists questions the user ALREADY answered.",
-        "   Never ask any of them again. Treat those answers as final.",
-        "10. Analyse the COMPLETE request — the original message, the extracted entities,",
-        "    and the clarification history TOGETHER — before deciding anything is missing.",
-        "11. Ask a question ONLY when material information is genuinely absent from ALL of",
-        "    the above. There is no fixed question sequence — decide dynamically what (if",
-        "    anything) is actually needed for THIS transaction. When several independent",
-        "    decisions are missing, gather them ALL into ONE consolidated message (a",
-        "    short numbered list) — never drip-feed one question per turn.",
-        "12. When sufficient information exists, proceed directly with tool calls — do not",
-        "    stall, do not ask for confirmation the system did not request.",
-        "",
-        "DEPENDENCY & NARRATIVE RULES (STRICT):",
-        "13. CASH TRANSACTIONS: for cash purchases/sales the named supplier/customer is",
-        "    INFORMATIONAL only — a party ledger is NOT required. NEVER call",
-        "    create_supplier/create_customer for a cash transaction; record the",
-        "    transaction without it.",
-        "14. If a tool result indicates an existing record was reused, your summary must",
-        "    say the existing record was REUSED — never describe it as newly created.",
-        "    Base your summary ONLY on actual tool results, never on assumptions.",
-        "15. If a tool returns a BUSINESS_RULE_VIOLATION error, do NOT retry the same",
-        "    call — adapt and continue without the blocked step.",
-        "16. EMPTY RESULTS ARE INFORMATION: an empty search result means the record",
-        "    simply does not exist yet — it is NOT a database failure. Reason from it:",
-        "    decide whether the record is genuinely required for this transaction",
-        "    (credit ⇒ party ledger required; cash ⇒ NOT required), and only then",
-        "    create it (with the user's named values) or proceed without it.",
-        "17. RESOLVE DEPENDENCIES IN ORDER: search → create-if-required-and-allowed →",
-        "    document (invoice/bill/expense) → prepare → validate → post journal. Never",
-        "    attempt a dependent step before its prerequisite record exists.",
-        "18. NO ARBITRARY FALLBACKS: never pick 'the first account' or 'the first",
-        "    matching record' when several candidates exist without an exact match —",
-        "    ask the user to choose instead. Mis-directed financial records are",
-        "    unacceptable.",
-        "19. MULTI-ITEM REQUESTS: evaluate EACH item independently (inventory vs service",
-        "    vs fixed asset vs expense) — never force different items into one accounting",
-        "    treatment. A transaction is only as correct as its least-correct line.",
-        "20. ECONOMIC CLASSIFICATION FIRST: your first responsibility is to determine",
-        "    WHAT REAL-WORLD EVENT the request represents and its economic nature —",
-        "    never to match a CRUD verb. The ECONOMIC EVENT CLASSIFICATION section in",
-        "    the context is authoritative: plan tools for THAT event, respect its",
-        "    AFFECTED/NOT-AFFECTED dimensions, and never perform a PROHIBITED action.",
-        "21. USER-FACING LANGUAGE (STRICT):",
-        "    a. Speak in account NAMES only — NEVER print internal account codes",
-        "       (e.g. 'Salaries account (6010)') in questions or summaries.",
-        "    b. NEVER say 'as indicated' or claim the user chose something unless an",
-        "       explicit user answer in the request or clarification history actually",
-        "       stated it. An inferred classification is NEVER 'indicated'.",
-        "    c. NEVER invent an accounting classification the user did not confirm —",
-        "       if the expense purpose is unknown, ask 'What is this expense for?'",
-        "       instead of silently picking an account.",
-        "    d. Plain text only — no markdown (**bold**, backticks, headings) in",
-        "       questions or summaries.",
-        "22. EXPENSE SETTLEMENT TREATMENTS (accrual accounting — CA-grade): an",
-        "    expense request has exactly THREE candidate journal treatments —",
-        "    (1) Dr expense / Cr cash-bank (paid now), (2) Dr expense / Cr trade",
-        "    payables (incurred now, unpaid — accrual), (3) Dr trade payables /",
-        "    Cr cash-bank (the SETTLEMENT of an expense already recorded as",
-        "    payable — NEVER re-record the expense).  Ask which applies when not",
-        "    stated; for (3) search the previously recorded unpaid expense of the",
-        "    same category (description/payee match), confirm it with the user,",
-        "    then settle it.  Every expense category keeps its OWN ledger account",
-        "    (IFRS: separate line items on the financial statements) — utilities",
-        "    (electricity, gas, water, internet-type bills) post to the Utilities",
-        "    account, never to a generic operating-expense account.",
-        "23. FIXED-ASSET LEDGER RULE (CHECK FIRST — propose ONLY if missing):",
-        "    a. CHECK whether a fitting fixed-asset ledger ALREADY EXISTS in the",
-        "       chart of accounts. This is an existence check only — do NOT",
-        "       derive, echo or redesign any name from existing COA entries.",
-        "    b. If one EXISTS → reuse it: pin asset_account_id on",
-        "       register_fixed_asset. NEVER propose a new or renamed account",
-        "       when a fitting one already exists (no duplicate COA entries).",
-        "    c. If NONE exists → FIRST propose a DESCRIPTIVE name for the NEW",
-        "       ledger and create it (create_account runs before the",
-        "       registration), then pin that same name as asset_account_name.",
-        "       For a unique identified asset use '<Head> - <Identifier>' —",
-        "       'Building - Model Town', later 'Building - Johar Town' — so",
-        "       each building/land parcel is recorded SEPARATELY.",
-        "    d. register_fixed_asset accepts EXACTLY ONE of asset_account_id |",
-        "       asset_account_name — never both, never neither; the call must",
-        "       NEVER reach execution without one of them.",
-        "",
-        "24. UNIVERSAL NATURAL-LANGUAGE DIALOGUE (NATURAL ERP CONVERSATION):",
-        "    a. Every message — initial request or reply to clarification questions — is",
-        "       natural language communication. Interpret the user's latest response in the",
-        "       full context of previous questions and answers.",
-        "    b. Proactively query live ERP state: when an item, entity, or account is mentioned,",
-        "       produce internal tool calls (search_product, search_account, search_customer, etc.)",
-        "       to inspect live records across relevant routes and modules before planning.",
-        "    c. For any goods sold or bought, query the product catalogue to verify whether it",
-        "       is stock-tracked so inventory movements and perpetual COGS can be planned accurately.",
-        "    d. Complete ambiguity: compare live records with user requests. If material accounting",
-        "       facts (payment channel, date, account selection) are uncertain, ask a concise,",
-        "       targeted question to complete the plan before executing mutations.",
-        "25. STRUCTURED ENDPOINT INJECTION (NO NARRATION TEXT-SCRAPING):",
-        "    a. When generating execution tool calls (record_cash_sale, record_cash_purchase,",
-        "       create_invoice, create_purchase_bill, create_expense), ALWAYS provide complete,",
-        "       structured arguments.",
-        "    b. For sales and purchases of goods, ALWAYS populate the structured items array:",
-        "       items=[{'description': <item>, 'quantity': <qty>, 'unit_price': <price>, 'product_id': <id>}].",
-        "       Never collapse quantities or item names into a plain narration string or rely on",
-        "       string regex templates.",
-        "    c. Verify results across all planned steps (double-entry balance, ledger posting,",
-        "       and inventory relief) and explain the outcome clearly and factually.",
-        "",
-        "26. COMPLETE ERP MODULE CAPABILITY & DIRECT ENDPOINTS (ALL-MODULE CONTROLLER):",
-        "    a. You have direct access and endpoints for EVERY task across ALL 14 ERP modules:",
-        "       - Accounting (/accounting): Chart of Accounts (create_account, get_chart_of_accounts, search_account), Manual Journals, GL",
-        "       - Customers (/customers): create_customer, search_customer, get_customer, get_customer_ledger",
-        "       - Suppliers (/suppliers): create_supplier, search_supplier, get_supplier, get_supplier_ledger",
-        "       - Catalogue (/catalogue): create_product, update_product, delete_product, create_service, update_service, delete_service",
-        "       - Banking (/banking): create_bank_account, list_bank_accounts, record_bank_transfer",
-        "       - Sales (/sales): create_quotation, convert_quotation, create_invoice, record_credit_sale, record_cash_sale, create_credit_note, record_receipt",
-        "       - Purchases (/purchases): create_purchase_bill, record_credit_purchase, record_cash_purchase, create_purchase_return, record_payment",
-        "       - Expenses (/expenses): record_expense, record_expense_payment, list_expenses",
-        "       - Employees (/employees): create_employee, search_employee, get_employee, set_employee_allowances, run_payroll, pay_employee_salary",
-        "       - Fixed Assets (/fixed-assets): register_fixed_asset, search_fixed_asset, record_asset_depreciation, dispose_fixed_asset",
-        "       - Projects (/projects): create_project, get_project, project_profitability",
-        "       - Loans (/banking): record_loan, record_loan_repayment, list_loans, get_loan_schedule",
-        "       - Recurring (/settings): create_recurring_template, get_recurring_templates, generate_recurring",
-        "       - Reports (/reports): generate_trial_balance, generate_balance_sheet, generate_profit_loss, generate_cash_flow, generate_general_ledger",
-        "    b. ZERO BLIND ASSUMPTIONS: If the user requests any task (e.g. 'Create a Chart of Account' or 'Add a product') without",
-        "       providing essential required parameters (such as account_type for an account, or cost_price/unit_price for a product),",
-        "       NEVER assume or fabricate them blindly. Ask a targeted clarification question so you have a precise understanding.",
-        "    c. OPERATIONAL TASKS vs ACCOUNTING WORKFLOWS: Non-financial tasks (like creating an account in the Chart of Accounts,",
-        "       adding a customer, adding a supplier, or configuring a bank account) execute cleanly directly via their dedicated endpoint",
-        "       WITHOUT forcing unnecessary journal entries or transaction impacts.",
-        "    d. NEVER HALLUCINATE ENDPOINTS: Always cite and execute the exact registered ERP tools and UI paths.",
-        "",
-        "27. PRICING PRINCIPLES & DESCRIPTIVE OUTPUT (PURCHASE COST vs SALES PRICE):",
-        "    a. PURCHASING / PROCUREMENT / VENDOR RFQ: Goods are acquired at COST PRICE. Selling price is a FUTURE revenue activity that varies by customer and market conditions; NEVER ask for or record a sales price during purchasing or vendor RFQ workflows. Products created as prerequisites during purchases must be recorded with cost_price and unit_price (sales price) set to 0.0.",
-        "    b. SALES / INVOICING: Sales prices vary per transaction, customer, or quotation. Never force a static price from catalogue without user input. If a sale or invoice does not state the unit price or total amount, ask the user what price was agreed with the customer.",
-        "    c. DESCRIPTIVE USER OUTPUT (NON-ACCOUNTANT FRIENDLY): Provide only clean, well-formatted, professional explanations. Do NOT generate internal reasoning, chain-of-thought monologue, permission/system internals, or asterisks (* or **). Present clear bulleted facts.",
-        "",
-    ]
-    if constitution:
-        instructions.append("GOVERNANCE DOCUMENT (ERP_AGENT_CONSTITUTION):")
-        instructions.append(constitution[:8000])  # Token budget
-        instructions.append("")
-
-    return "\n".join(instructions)
-
-
-def build_user_content(message: str, context: AgentContext) -> str:
-    """Build the user message with relevant runtime context.
-
-    Only the relevant ERP context resolved by context_manager.build_context()
-    is included — never the entire database.
-    """
-    parts: List[str] = []
-
-    # Organisation context
-    org = context.organization
-    if org:
-        parts.append(f"Organisation: {org.get('name', 'Unknown')} (currency: {org.get('base_currency_code', 'PKR')})")
-
-    # Financial period
-    if context.accounting_period:
-        p = context.accounting_period
-        parts.append(f"Current period: {p.get('name', 'N/A')} ({p.get('start_date', '')} to {p.get('end_date', '')})")
-
-    # learned organization defaults - authoritative unless
-    # the user explicitly overrides them in the current request.
-    if context.org_preferences:
-        parts.append("")
-        parts.append("ORG PREFERENCES (authoritative defaults the user set previously - apply them unless the user explicitly overrides):")
-        for key, value in context.org_preferences.items():
-            label = key.replace("_", " ")
-            parts.append(f"  - {label}: {value}")
-
-    # Relevant entities (compact)
-    if context.relevant_customers:
-        names = [c.get("name", "?") for c in context.relevant_customers[:5]]
-        parts.append(f"Relevant customers: {', '.join(names)}")
-    if context.relevant_suppliers:
-        names = [s.get("name", "?") for s in context.relevant_suppliers[:5]]
-        parts.append(f"Relevant suppliers: {', '.join(names)}")
-    if context.relevant_accounts:
-        names = [f"{a.get('code', '')} {a.get('name', '')}" for a in context.relevant_accounts[:10]]
-        parts.append(f"Relevant accounts: {'; '.join(names)}")
-
-    # Transaction classification — authoritative accounting
-    # context from the classifier (ERP configuration → rules → user answer).
-    classification = getattr(context, "classification", None)
-    if classification is not None:
-        parts.append("")
-        parts.append("TRANSACTION CLASSIFICATION (authoritative — the accounting engine validates every account before posting):")
-        if classification.transaction_nature:
-            parts.append(f"  - Economic nature: {classification.transaction_nature} (confidence: {classification.confidence}, source: {classification.source})")
-        else:
-            parts.append("  - Economic nature: UNDETERMINED")
-        if classification.account_hint_id:
-            if getattr(classification, "requires_clarification", False):
-                # RELATED-treatment round: the hint is the CLOSEST EXISTING
-                # account, not yet consented - recording it now would bypass
-                # the informed-consent gate.
-                parts.append(
-                    f"  - Closest existing account (NOT yet approved): {classification.account_hint_code} "
-                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
-                )
-                parts.append(
-                    "    → Do NOT record to it yet: ask the clarification question first. "
-                    "Record ONLY after the user agrees to use it (then pass this account id), "
-                    "or after the confirmed new account exists."
-                )
-            else:
-                parts.append(
-                    f"  - Account hint: {classification.account_hint_code} "
-                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
-                )
-                parts.append("    → Pass this account id as the 'account_id' argument when recording this transaction. The accounting engine will validate it.")
-        elif getattr(classification, "create_account_confirmed", False):
-            proposed = getattr(classification, "proposed_account_name", None)
-            code = getattr(classification, "proposed_account_code", None)
-            parent = getattr(classification, "proposed_parent_name", None)
-            parts.append(
-                f"    → The user CONFIRMED creating the new account '{proposed or 'the proposed account'}'"
-                + (
-                    f" (base code {code} — a free code in that series is "
-                    "resolved automatically)"
-                    if code else ""
-                )
-                + (
-                    f", as a child of the '{parent}' heading (resolve that "
-                    "heading's id with search_account and pass it as "
-                    "parent_account_id so the ledger segregates under the "
-                    "right statement section)"
-                    if parent else ""
-                )
-                + ". Run create_account for it FIRST, then record the "
-                "transaction against the newly created account. The "
-                "account-creation guard blocks default-account recording "
-                "until the account exists."
-            )
-        elif classification.transaction_nature:
-            parts.append(
-                "    → No dedicated account exists for this nature. Use the most "
-                "appropriate EXISTING account from the chart of accounts "
-                "(search_account) and do NOT create new accounts — new accounts "
-                "require explicit owner approval."
-            )
-        if classification.requires_clarification:
-            parts.append(
-                "    → The treatment is MATERIALLY AMBIGUOUS. Ask the user the "
-                "classification question instead of recording anything."
-            )
-        parts.append(
-            "    → NEVER fall back to a generic expense account when a fixed-asset "
-            "or inventory treatment applies. Do NOT invent new accounts — reuse "
-            "the hint or search the chart of accounts."
-        )
-
-    # ECONOMIC EVENT CLASSIFICATION — what real-world event this request
-    # represents, what it can affect, and what is explicitly FORBIDDEN.
-    # The model plans tools from economic meaning, never CRUD keywords.
-    economic_event = getattr(context, "economic_event", None)
-    if economic_event:
-        parts.append("")
-        parts.append("ECONOMIC EVENT CLASSIFICATION (deterministic — authoritative):")
-        parts.append(f"  - Underlying event: {economic_event}")
-        impact_map = getattr(context, "impact_map", {}) or {}
-        active = [k for k, v in impact_map.items() if v]
-        inactive = [k for k, v in impact_map.items() if not v]
-        if active:
-            parts.append(f"  - AFFECTED dimensions: {', '.join(active)}")
-        if inactive:
-            parts.append(
-                "  - NOT affected dimensions: "
-                + ", ".join(inactive)
-                + " — do not create records for these; they are irrelevant "
-                "to this event."
-            )
-        prohibited = getattr(context, "prohibited_actions", []) or []
-        if prohibited:
-            parts.append("  - PROHIBITED ACTIONS (STRICT — the executor will refuse them):")
-            for p in prohibited:
-                parts.append(f"    · {p.get('action', '')}: {p.get('reason', '')}")
-        parts.append(
-            "  → Plan tool calls for the ECONOMIC EVENT above. Before creating any "
-            "record, ask WHY it needs to exist: is it required by the business "
-            "event, by accounting, by a workflow, or by a database dependency? "
-            "If it is only 'usually created', do NOT create it."
-        )
-
-    # LIVE BOOKS EVIDENCE retrieved by the LLM reasoning
-    # layer.  Labelled as evidence (not as truth): the model must reassess the
-    # request against it and may reclassify.
-    if getattr(context, "live_evidence", None):
-        parts.append("")
-        parts.append(
-            "LIVE BOOKS EVIDENCE — use this to reassess the request "
-            "(retrieved from this organization's own records; empty means the "
-            "record does not exist, not that a lookup failed):"
-        )
-        for item in context.live_evidence[:12]:
-            if not isinstance(item, dict):
-                continue
-            kind = item.get("kind", "evidence")
-            if item.get("error"):
-                parts.append(f"  - {kind}: REFUSED/FAILED — {item.get('error')}")
-                continue
-            if not item.get("records"):
-                parts.append(f"  - {kind}: EMPTY — no matching record exists")
-                continue
-            rendered = str(item.get("records"))[:1200]
-            parts.append(f"  - {kind} ({len(item.get('records') or [])} row(s)): {rendered}")
-
-    # READ-ONLY CALLS ALREADY EXECUTED for this request.  The Phase-5
-    # lookup-continuation gate ran the model's OWN read-only plan and gives it
-    # ONE bounded round to finish with what came back — so it must not re-plan
-    # the calls that already ran (production 2026-10-02: the continuation
-    # returned the same search_account x3 + get_chart_of_accounts instead of
-    # the write, and the run parked on a question nothing was missing for).
-    pre_executed = getattr(context, "pre_executed_lookups", None)
-    if pre_executed:
-        parts.append("")
-        parts.append(
-            "READ-ONLY CALLS ALREADY EXECUTED (their results are the LIVE "
-            "BOOKS EVIDENCE above — these calls are DONE):"
-        )
-        for item in pre_executed[:12]:
-            if not isinstance(item, dict):
-                continue
-            tool = item.get("tool", "lookup")
-            if item.get("error"):
-                parts.append(f"  - {tool}: FAILED — {item.get('error')}")
-                continue
-            rows = item.get("records")
-            count = len(rows) if isinstance(rows, (list, dict)) else 0
-            parts.append(f"  - {tool}: returned {count} row(s)")
-        parts.append(
-            "  → Do NOT call any of these again — a lookup that already ran "
-            "returns nothing new. Finish the plan NOW: emit the WRITE tool "
-            "call(s) that record the user's transaction, taking every value "
-            "from EXTRACTED ENTITIES above. Only if a write genuinely cannot "
-            "be formed, state exactly which value is missing."
-        )
-
-    # the model's own prior accounting reasoning for this
-    # request (interpretation + proposed treatment), so the planning stage
-    # reassesses instead of silently replacing it with a keyword route.
-    reasoning = getattr(context, "accounting_reasoning", None)
-    if reasoning:
-        parts.append("")
-        parts.append(
-            "LLM ACCOUNTING REASONING (your own prior reading of the live "
-            "records for this request — re-verify it against the books above; "
-            "correct it if the records say otherwise):"
-        )
-        understanding = reasoning.get("understanding") or {}
-        for key in ("economic_event", "what_user_wants", "event_type", "basis"):
-            if understanding.get(key):
-                parts.append(f"  - {key}: {understanding.get(key)}")
-        proposal = reasoning.get("proposal") or {}
-        if proposal:
-            if proposal.get("interpretation"):
-                parts.append(f"  - proposed interpretation: {proposal['interpretation']}")
-            if proposal.get("accounting_impact"):
-                parts.append(
-                    f"  - proposed impact: {str(proposal['accounting_impact'])[:800]}"
-                )
-            if proposal.get("not_affected"):
-                parts.append(
-                    "  - explicitly NOT affected: "
-                    + "; ".join(str(x) for x in proposal["not_affected"][:6])
-                )
-            if proposal.get("unresolved_uncertainty"):
-                parts.append(
-                    "  - unresolved uncertainty: "
-                    + "; ".join(str(x) for x in proposal["unresolved_uncertainty"][:6])
-                )
-        if reasoning.get("evidence_summary"):
-            parts.append(f"  - evidence inspected: {reasoning['evidence_summary']}")
-
-    # the deterministic extraction, labelled as PRELIMINARY so
-    # it can never be mistaken for a decided accounting treatment.
-    preliminary = getattr(context, "preliminary_extraction", None)
-    if preliminary:
-        parts.append("")
-        parts.append(
-            "PRELIMINARY EXTRACTION — may be corrected after accounting review:"
-        )
-        for key in ("literals", "candidate_subject_areas", "provisional_intent_hint"):
-            if preliminary.get(key):
-                parts.append(f"  - {key}: {preliminary[key]}")
-
-    # Extracted entities — authoritative values parsed from the user's
-    # message. The model must reuse these instead of re-parsing (and must
-    # never ask the user for anything already here).
-    if context.extracted_entities:
-        parts.append("")
-        parts.append("EXTRACTED ENTITIES (authoritative — parsed from the user's message; use these values directly, never re-ask them):")
-        for key, value in context.extracted_entities.items():
-            if value is not None and value != "":
-                parts.append(f"  - {key}: {value}")
-
-    # Clarification history — questions the user already answered.
-    if context.clarification_history:
-        parts.append("")
-        parts.append("CLARIFICATION HISTORY (already answered — merge these answers with the request; never re-ask):")
-        for qa in context.clarification_history:
-            parts.append(f"  - Q: {qa.get('question', '')} -> A: {qa.get('answer', '')}")
-
-    parts.append("")
-    parts.append(f"User request: {message}")
-
-    return "\n".join(parts)
+"""
+
+ERP AI Agent — Shared LLM Prompt Building
+
+==========================================
+
+Single source of truth for the prompts sent to ANY runtime AI provider
+
+(Qwen primary, Gemini fallback).
+
+
+
+Both provider clients build identical system instructions and user
+
+content so that switching providers never changes the agent's behaviour,
+
+context budget, or governance rules. The Constitution is truncated to a
+
+fixed token budget and only RELEVANT ERP context (never the whole
+
+database) is included — see context_manager.build_context().
+
+"""
+
+
+
+from __future__ import annotations
+
+
+
+import threading
+
+from pathlib import Path
+
+from typing import List
+
+
+
+import structlog
+
+
+
+from app.config import constitution_path
+
+from app.models.schemas import AgentContext
+
+
+
+log = structlog.get_logger(__name__)
+
+
+
+# The file the loader reads. Resolved ONCE from the configured locations
+
+# (repo root first, then ``docs/``) and then exposed as a module-level name so
+
+# a caller - a deployment pinning the file, or a test - can point the loader
+
+# at a specific file. ``load_constitution`` always reads this name, never a
+
+# freshly resolved path, so that override actually takes effect.
+
+CONSTITUTION_PATH = constitution_path()
+
+
+
+# ---------------------------------------------------------------------------
+
+# Constitution cache.
+
+#
+
+# The constitution file is static system-instruction material: it is read
+
+# ONCE and served from memory. An mtime check keeps the cache honest - an
+
+# edited constitution is picked up on the next load without a restart
+
+# (mtime resolution is coarse, which is acceptable: the file changes at
+
+# deploy time, not per request). Reads are guarded for multi-threaded
+
+# callers.
+
+# ---------------------------------------------------------------------------
+
+_constitution_lock = threading.Lock()
+
+_constitution_cache: dict = {"mtime": None, "text": ""}
+
+
+
+
+
+def _reset_constitution_cache() -> None:
+
+    """Test hook: drop the cached constitution so the next load re-reads."""
+
+    with _constitution_lock:
+
+        _constitution_cache["mtime"] = None
+
+        _constitution_cache["text"] = ""
+
+
+
+
+
+def load_constitution() -> str:
+
+    """Load the ERP_AGENT_CONSTITUTION.md (mtime-checked memory cache)."""
+
+    path = Path(CONSTITUTION_PATH)
+
+    if path.exists():
+
+        mtime = path.stat().st_mtime
+
+        with _constitution_lock:
+
+            if _constitution_cache["mtime"] == mtime:
+
+                return _constitution_cache["text"]
+
+        text = path.read_text(encoding="utf-8")
+
+        with _constitution_lock:
+
+            _constitution_cache["mtime"] = mtime
+
+            _constitution_cache["text"] = text
+
+        return text
+
+    log.warning("prompts.constitution_not_found", path=str(CONSTITUTION_PATH))
+
+    return ""
+
+
+
+
+
+def build_primary_reasoning_instructions() -> str:
+
+    """The system-level statement that the LLM is the reasoning layer.
+
+
+
+    Kept separate from :func:`build_system_instructions` so any provider (or a
+
+    future worker) can carry it, and so tests can pin its wording.  Python's
+
+    role in this system is enforcement and execution — never speculation.
+
+    """
+
+    return "\n".join(
+
+        [
+
+            "You are the primary accounting reasoning layer.",
+
+            "The preliminary planner may be incomplete or wrong.",
+
+            "Do not blindly follow its intent or proposed workflow.",
+
+            "Inspect the live books and accounting context.",
+
+            "If the records contradict the preliminary interpretation,",
+
+            "reclassify the event and choose the correct next step.",
+
+            "Do not invent missing facts.",
+
+            "Never assume how a transaction was settled (cash/bank/credit) — the user states it in THIS request or you ask.",
+
+            "Ask questions based on the actual records and actual uncertainty.",
+
+            "Python validates and executes; it does not decide the treatment.",
+
+            "",
+
+            "UNIVERSAL CA COGNITIVE PROTOCOL — 4-STAGE REASONING PIPELINE (HUMAN + CA THINKING):",
+            "1. STAGE 1 — INTENT & GOAL COMPREHENSION (FIRST PRINCIPLES FIRST):",
+            "   Never jump into extracting literal names, dates, or regex values before understanding the business goal.",
+            "   First determine the category of the request:",
+            "   (a) Database Inquiry / Reporting: User is asking to inspect the live books and get a factual answer (balances, ledgers, inventory stock, reports). Fetch live records and answer factually.",
+            "   (b) Operational Master Data / Setup: User is registering non-financial operational records (employee roster in Employees, bank accounts in Banking, customers, suppliers, products in Catalogue, projects). Zero fake journal entries!",
+            "   (c) Commercial Accounting Event: User informs of a financial transaction (sale, purchase bill, expense, receipt, payment, fixed asset acquisition, loan). Requires balanced accounting treatment.",
+            "   (d) Ambiguous / Generic Intent: If the request is generic and could lead to multiple distinct business paths (e.g. 'Prepare quotation for beds from Fahad Associates' — sales quote or vendor RFQ?), ask a targeted clarification question upfront to narrow down the intent before assuming!",
+            "2. STAGE 2 — ERP MODULE & ENDPOINT MAPPING:",
+            "   Identify the exact ERP Module and target endpoint (e.g., employee registration -> module Employees, endpoint create_employee; vendor quotation -> module Purchases, endpoint create_purchase_order).",
+            "   Identify the mandatory/required fields for this specific endpoint from the authoritative registry.",
+            "3. STAGE 3 — CONTEXT RE-VISITING & GAP ANALYSIS:",
+            "   Re-visit the user's message + clarification history against the target endpoint requirements.",
+            "   Extract what is ALREADY stated (verbatim names, dates, descriptions).",
+            "   Perform gap analysis for what mandatory fields are genuinely MISSING. If missing, compose a unified questionnaire for ONLY those missing fields. Never re-ask what was already provided!",
+            "4. STAGE 4 — PREREQUISITE RESOLUTION & INSTANT EXECUTION:",
+            "   Check database records for prerequisites (counterparty, catalogue items, ledger accounts). Resolve or create them first, then execute the target endpoint directly without running redundant loops.",
+            "   Provide a clear, factual, non-accountant friendly explanation of what was done.",
+
+        ]
+
+    )
+
+
+
+
+
+def build_system_instructions(constitution: str = "") -> str:
+
+    """Build the permanent system instructions shared by all providers."""
+
+    instructions: List[str] = [
+
+        "You are an AI accounting assistant for a small-business ERP system.",
+
+        "You help users record financial transactions, query reports, and manage their books.",
+
+        "",
+
+        build_primary_reasoning_instructions(),
+
+        "",
+
+        "CORE RULES:",
+
+        "1. NEVER compute debit/credit arithmetic — the accounting engine handles that.",
+
+        "2. NEVER invent financial figures — always use data from tools.",
+
+        "3. NEVER make assumptions about uncertain information — ask the user.",
+
+        "4. Do NOT automatically create suppliers or customers just because a name appears.",
+
+        "5. Search before creating persistent entities.",
+
+        "6. Ask only when material information is missing. Do not ask unnecessary questions.",
+
+        "7. Explain what you did in concise, factual terms.",
+
+        "",
+
+        "INFORMATION REUSE RULES (STRICT):",
+
+        "8. The EXTRACTED ENTITIES section is authoritative ground truth — those values were",
+
+        "   parsed from the user's own message or their clarification answers. Use them",
+
+        "   directly in tool calls. NEVER ask the user for any value already listed there",
+
+        "   (amount, date, supplier, customer, item, payment method, etc.).",
+
+        "9. The CLARIFICATION HISTORY section lists questions the user ALREADY answered.",
+
+        "   Never ask any of them again. Treat those answers as final.",
+
+        "10. Analyse the COMPLETE request — the original message, the extracted entities,",
+
+        "    and the clarification history TOGETHER — before deciding anything is missing.",
+
+        "11. Ask a question ONLY when material information is genuinely absent from ALL of",
+
+        "    the above. There is no fixed question sequence — decide dynamically what (if",
+
+        "    anything) is actually needed for THIS transaction. When several independent",
+
+        "    decisions are missing, gather them ALL into ONE consolidated message (a",
+
+        "    short numbered list) — never drip-feed one question per turn.",
+
+        "12. When sufficient information exists, proceed directly with tool calls — do not",
+
+        "    stall, do not ask for confirmation the system did not request.",
+
+        "",
+
+        "DEPENDENCY & NARRATIVE RULES (STRICT):",
+
+        "13. CASH TRANSACTIONS: for cash purchases/sales the named supplier/customer is",
+
+        "    INFORMATIONAL only — a party ledger is NOT required. NEVER call",
+
+        "    create_supplier/create_customer for a cash transaction; record the",
+
+        "    transaction without it.",
+
+        "14. If a tool result indicates an existing record was reused, your summary must",
+
+        "    say the existing record was REUSED — never describe it as newly created.",
+
+        "    Base your summary ONLY on actual tool results, never on assumptions.",
+
+        "15. If a tool returns a BUSINESS_RULE_VIOLATION error, do NOT retry the same",
+
+        "    call — adapt and continue without the blocked step.",
+
+        "16. EMPTY RESULTS ARE INFORMATION: an empty search result means the record",
+
+        "    simply does not exist yet — it is NOT a database failure. Reason from it:",
+
+        "    decide whether the record is genuinely required for this transaction",
+
+        "    (credit ⇒ party ledger required; cash ⇒ NOT required), and only then",
+
+        "    create it (with the user's named values) or proceed without it.",
+
+        "17. RESOLVE DEPENDENCIES IN ORDER: search → create-if-required-and-allowed →",
+
+        "    document (invoice/bill/expense) → prepare → validate → post journal. Never",
+
+        "    attempt a dependent step before its prerequisite record exists.",
+
+        "18. NO ARBITRARY FALLBACKS: never pick 'the first account' or 'the first",
+
+        "    matching record' when several candidates exist without an exact match —",
+
+        "    ask the user to choose instead. Mis-directed financial records are",
+
+        "    unacceptable.",
+
+        "19. MULTI-ITEM REQUESTS: evaluate EACH item independently (inventory vs service",
+
+        "    vs fixed asset vs expense) — never force different items into one accounting",
+
+        "    treatment. A transaction is only as correct as its least-correct line.",
+
+        "20. ECONOMIC CLASSIFICATION FIRST: your first responsibility is to determine",
+
+        "    WHAT REAL-WORLD EVENT the request represents and its economic nature —",
+
+        "    never to match a CRUD verb. The ECONOMIC EVENT CLASSIFICATION section in",
+
+        "    the context is authoritative: plan tools for THAT event, respect its",
+
+        "    AFFECTED/NOT-AFFECTED dimensions, and never perform a PROHIBITED action.",
+
+        "21. USER-FACING LANGUAGE (STRICT):",
+
+        "    a. Speak in account NAMES only — NEVER print internal account codes",
+
+        "       (e.g. 'Salaries account (6010)') in questions or summaries.",
+
+        "    b. NEVER say 'as indicated' or claim the user chose something unless an",
+
+        "       explicit user answer in the request or clarification history actually",
+
+        "       stated it. An inferred classification is NEVER 'indicated'.",
+
+        "    c. NEVER invent an accounting classification the user did not confirm —",
+
+        "       if the expense purpose is unknown, ask 'What is this expense for?'",
+
+        "       instead of silently picking an account.",
+
+        "    d. Plain text only — no markdown (**bold**, backticks, headings) in",
+
+        "       questions or summaries.",
+
+        "22. EXPENSE SETTLEMENT TREATMENTS (accrual accounting — CA-grade): an",
+
+        "    expense request has exactly THREE candidate journal treatments —",
+
+        "    (1) Dr expense / Cr cash-bank (paid now), (2) Dr expense / Cr trade",
+
+        "    payables (incurred now, unpaid — accrual), (3) Dr trade payables /",
+
+        "    Cr cash-bank (the SETTLEMENT of an expense already recorded as",
+
+        "    payable — NEVER re-record the expense).  Ask which applies when not",
+
+        "    stated; for (3) search the previously recorded unpaid expense of the",
+
+        "    same category (description/payee match), confirm it with the user,",
+
+        "    then settle it.  Every expense category keeps its OWN ledger account",
+
+        "    (IFRS: separate line items on the financial statements) — utilities",
+
+        "    (electricity, gas, water, internet-type bills) post to the Utilities",
+
+        "    account, never to a generic operating-expense account.",
+
+        "23. FIXED-ASSET LEDGER RULE (CHECK FIRST — propose ONLY if missing):",
+
+        "    a. CHECK whether a fitting fixed-asset ledger ALREADY EXISTS in the",
+
+        "       chart of accounts. This is an existence check only — do NOT",
+
+        "       derive, echo or redesign any name from existing COA entries.",
+
+        "    b. If one EXISTS → reuse it: pin asset_account_id on",
+
+        "       register_fixed_asset. NEVER propose a new or renamed account",
+
+        "       when a fitting one already exists (no duplicate COA entries).",
+
+        "    c. If NONE exists → FIRST propose a DESCRIPTIVE name for the NEW",
+
+        "       ledger and create it (create_account runs before the",
+
+        "       registration), then pin that same name as asset_account_name.",
+
+        "       For a unique identified asset use '<Head> - <Identifier>' —",
+
+        "       'Building - Model Town', later 'Building - Johar Town' — so",
+
+        "       each building/land parcel is recorded SEPARATELY.",
+
+        "    d. register_fixed_asset accepts EXACTLY ONE of asset_account_id |",
+
+        "       asset_account_name — never both, never neither; the call must",
+
+        "       NEVER reach execution without one of them.",
+
+        "",
+
+        "24. UNIVERSAL NATURAL-LANGUAGE DIALOGUE (NATURAL ERP CONVERSATION):",
+
+        "    a. Every message — initial request or reply to clarification questions — is",
+
+        "       natural language communication. Interpret the user's latest response in the",
+
+        "       full context of previous questions and answers.",
+
+        "    b. Proactively query live ERP state: when an item, entity, or account is mentioned,",
+
+        "       produce internal tool calls (search_product, search_account, search_customer, etc.)",
+
+        "       to inspect live records across relevant routes and modules before planning.",
+
+        "    c. For any goods sold or bought, query the product catalogue to verify whether it",
+
+        "       is stock-tracked so inventory movements and perpetual COGS can be planned accurately.",
+
+        "    d. Complete ambiguity: compare live records with user requests. If material accounting",
+
+        "       facts (payment channel, date, account selection) are uncertain, ask a concise,",
+
+        "       targeted question to complete the plan before executing mutations.",
+
+        "25. STRUCTURED ENDPOINT INJECTION (NO NARRATION TEXT-SCRAPING):",
+
+        "    a. When generating execution tool calls (record_cash_sale, record_cash_purchase,",
+
+        "       create_invoice, create_purchase_bill, create_expense), ALWAYS provide complete,",
+
+        "       structured arguments.",
+
+        "    b. For sales and purchases of goods, ALWAYS populate the structured items array:",
+
+        "       items=[{'description': <item>, 'quantity': <qty>, 'unit_price': <price>, 'product_id': <id>}].",
+
+        "       Never collapse quantities or item names into a plain narration string or rely on",
+
+        "       string regex templates.",
+
+        "    c. Verify results across all planned steps (double-entry balance, ledger posting,",
+
+        "       and inventory relief) and explain the outcome clearly and factually.",
+
+        "",
+
+        "26. COMPLETE ERP MODULE CAPABILITY & DIRECT ENDPOINTS (ALL-MODULE CONTROLLER):",
+
+        "    a. You have direct access and endpoints for EVERY task across ALL 14 ERP modules:",
+
+        "       - Accounting (/accounting): Chart of Accounts (create_account, get_chart_of_accounts, search_account), Manual Journals, GL",
+
+        "       - Customers (/customers): create_customer, search_customer, get_customer, get_customer_ledger",
+
+        "       - Suppliers (/suppliers): create_supplier, search_supplier, get_supplier, get_supplier_ledger",
+
+        "       - Catalogue (/catalogue): create_product, update_product, delete_product, create_service, update_service, delete_service",
+
+        "       - Banking (/banking): create_bank_account, list_bank_accounts, record_bank_transfer",
+
+        "       - Sales (/sales): create_quotation, convert_quotation, create_invoice, record_credit_sale, record_cash_sale, create_credit_note, record_receipt",
+
+        "       - Purchases (/purchases): create_purchase_bill, record_credit_purchase, record_cash_purchase, create_purchase_return, record_payment",
+
+        "       - Expenses (/expenses): record_expense, record_expense_payment, list_expenses",
+
+        "       - Employees (/employees): create_employee, search_employee, get_employee, set_employee_allowances, run_payroll, pay_employee_salary",
+
+        "       - Fixed Assets (/fixed-assets): register_fixed_asset, search_fixed_asset, record_asset_depreciation, dispose_fixed_asset",
+
+        "       - Projects (/projects): create_project, get_project, project_profitability",
+
+        "       - Loans (/banking): record_loan, record_loan_repayment, list_loans, get_loan_schedule",
+
+        "       - Recurring (/settings): create_recurring_template, get_recurring_templates, generate_recurring",
+
+        "       - Reports (/reports): generate_trial_balance, generate_balance_sheet, generate_profit_loss, generate_cash_flow, generate_general_ledger",
+
+        "    b. ZERO BLIND ASSUMPTIONS: If the user requests any task (e.g. 'Create a Chart of Account' or 'Add a product') without",
+
+        "       providing essential required parameters (such as account_type for an account, or cost_price/unit_price for a product),",
+
+        "       NEVER assume or fabricate them blindly. Ask a targeted clarification question so you have a precise understanding.",
+
+        "    c. OPERATIONAL TASKS vs ACCOUNTING WORKFLOWS: Non-financial tasks (like creating an account in the Chart of Accounts,",
+
+        "       adding a customer, adding a supplier, or configuring a bank account) execute cleanly directly via their dedicated endpoint",
+
+        "       WITHOUT forcing unnecessary journal entries or transaction impacts.",
+
+        "    d. NEVER HALLUCINATE ENDPOINTS: Always cite and execute the exact registered ERP tools and UI paths.",
+
+        "",
+
+        "27. PRICING PRINCIPLES & DESCRIPTIVE OUTPUT (PURCHASE COST vs SALES PRICE):",
+
+        "    a. PURCHASING / PROCUREMENT / VENDOR RFQ: Goods are acquired at COST PRICE. Selling price is a FUTURE revenue activity that varies by customer and market conditions; NEVER ask for or record a sales price during purchasing or vendor RFQ workflows. Products created as prerequisites during purchases must be recorded with cost_price and unit_price (sales price) set to 0.0.",
+
+        "    b. SALES / INVOICING: Sales prices vary per transaction, customer, or quotation. Never force a static price from catalogue without user input. If a sale or invoice does not state the unit price or total amount, ask the user what price was agreed with the customer.",
+
+        "    c. DESCRIPTIVE USER OUTPUT (NON-ACCOUNTANT FRIENDLY): Provide only clean, well-formatted, professional explanations. Do NOT generate internal reasoning, chain-of-thought monologue, permission/system internals, or asterisks (* or **). Present clear bulleted facts.",
+
+        "",
+        "28. CHARTERED ACCOUNTANT (CA) COGNITIVE REASONING PIPELINE (HUMAN + CA THINKING):",
+        "    a. STAGE 1 — INTENT & GOAL COMPREHENSION (FIRST PRINCIPLES FIRST):",
+        "       Do not jump into extracting literal regex values or assume templates. First discern the user's ultimate goal:",
+        "       (1) Factual Inquiry / Reporting: User asks to view, check, or list live books data (ledger, balance, trial balance, stock status). Query live database and answer factually.",
+        "       (2) Operational Setup / Master Data: User registers operational personnel, banking, master catalogue, or chart of accounts. Execute directly on the operational endpoint without creating fake journal entries.",
+        "       (3) Financial Business Event: User records an actual commercial transaction (sale, purchase bill, expense, receipt, payment, asset acquisition, loan). Requires balanced double-entry accounting treatment.",
+        "       (4) Ambiguous / Generic Intent: If the user request is generic and can lead to more than one business path (e.g. 'Prepare a quotation for purchasing beds from Fahad Associates' — could be confused with customer quotation), immediately ask a targeted clarification question to clarify the business direction before proceeding.",
+        "    b. STAGE 2 — ERP MODULE & ENDPOINT MAPPING:",
+        "       Identify the exact ERP module and endpoint (e.g. Employees -> create_employee, Purchases -> create_purchase_order RFQ, Sales -> create_invoice). Retrieve its exact mandatory required fields.",
+        "    c. STAGE 3 — CONTEXT RE-VISITING & GAP ANALYSIS:",
+        "       Re-visit the user's initial query + answers against the target endpoint requirements. Extract whatever values are already stated. Formulate questions for ONLY the missing mandatory fields. Never re-ask provided data.",
+        "    d. STAGE 4 — PREREQUISITE RESOLUTION & INSTANT FINAL EXECUTION:",
+        "       Check live database records for missing prerequisites (vendor records, catalogue products, accounts). Create/link prerequisites first, then execute the target endpoint directly in a single pass.",
+    ]
+
+    if constitution:
+
+        instructions.append("GOVERNANCE DOCUMENT (ERP_AGENT_CONSTITUTION):")
+
+        instructions.append(constitution[:8000])  # Token budget
+
+        instructions.append("")
+
+
+
+    return "\n".join(instructions)
+
+
+
+
+
+def build_user_content(message: str, context: AgentContext) -> str:
+
+    """Build the user message with relevant runtime context.
+
+
+
+    Only the relevant ERP context resolved by context_manager.build_context()
+
+    is included — never the entire database.
+
+    """
+
+    parts: List[str] = []
+
+
+
+    # Organisation context
+
+    org = context.organization
+
+    if org:
+
+        parts.append(f"Organisation: {org.get('name', 'Unknown')} (currency: {org.get('base_currency_code', 'PKR')})")
+
+
+
+    # Financial period
+
+    if context.accounting_period:
+
+        p = context.accounting_period
+
+        parts.append(f"Current period: {p.get('name', 'N/A')} ({p.get('start_date', '')} to {p.get('end_date', '')})")
+
+
+
+    # learned organization defaults - authoritative unless
+
+    # the user explicitly overrides them in the current request.
+
+    if context.org_preferences:
+
+        parts.append("")
+
+        parts.append("ORG PREFERENCES (authoritative defaults the user set previously - apply them unless the user explicitly overrides):")
+
+        for key, value in context.org_preferences.items():
+
+            label = key.replace("_", " ")
+
+            parts.append(f"  - {label}: {value}")
+
+
+
+    # Relevant entities (compact)
+
+    if context.relevant_customers:
+
+        names = [c.get("name", "?") for c in context.relevant_customers[:5]]
+
+        parts.append(f"Relevant customers: {', '.join(names)}")
+
+    if context.relevant_suppliers:
+
+        names = [s.get("name", "?") for s in context.relevant_suppliers[:5]]
+
+        parts.append(f"Relevant suppliers: {', '.join(names)}")
+
+    if context.relevant_accounts:
+
+        names = [f"{a.get('code', '')} {a.get('name', '')}" for a in context.relevant_accounts[:10]]
+
+        parts.append(f"Relevant accounts: {'; '.join(names)}")
+
+
+
+    # Transaction classification — authoritative accounting
+
+    # context from the classifier (ERP configuration → rules → user answer).
+
+    classification = getattr(context, "classification", None)
+
+    if classification is not None:
+
+        parts.append("")
+
+        parts.append("TRANSACTION CLASSIFICATION (authoritative — the accounting engine validates every account before posting):")
+
+        if classification.transaction_nature:
+
+            parts.append(f"  - Economic nature: {classification.transaction_nature} (confidence: {classification.confidence}, source: {classification.source})")
+
+        else:
+
+            parts.append("  - Economic nature: UNDETERMINED")
+
+        if classification.account_hint_id:
+
+            if getattr(classification, "requires_clarification", False):
+
+                # RELATED-treatment round: the hint is the CLOSEST EXISTING
+
+                # account, not yet consented - recording it now would bypass
+
+                # the informed-consent gate.
+
+                parts.append(
+
+                    f"  - Closest existing account (NOT yet approved): {classification.account_hint_code} "
+
+                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
+
+                )
+
+                parts.append(
+
+                    "    → Do NOT record to it yet: ask the clarification question first. "
+
+                    "Record ONLY after the user agrees to use it (then pass this account id), "
+
+                    "or after the confirmed new account exists."
+
+                )
+
+            else:
+
+                parts.append(
+
+                    f"  - Account hint: {classification.account_hint_code} "
+
+                    f"{classification.account_hint_name} (id: {classification.account_hint_id})"
+
+                )
+
+                parts.append("    → Pass this account id as the 'account_id' argument when recording this transaction. The accounting engine will validate it.")
+
+        elif getattr(classification, "create_account_confirmed", False):
+
+            proposed = getattr(classification, "proposed_account_name", None)
+
+            code = getattr(classification, "proposed_account_code", None)
+
+            parent = getattr(classification, "proposed_parent_name", None)
+
+            parts.append(
+
+                f"    → The user CONFIRMED creating the new account '{proposed or 'the proposed account'}'"
+
+                + (
+
+                    f" (base code {code} — a free code in that series is "
+
+                    "resolved automatically)"
+
+                    if code else ""
+
+                )
+
+                + (
+
+                    f", as a child of the '{parent}' heading (resolve that "
+
+                    "heading's id with search_account and pass it as "
+
+                    "parent_account_id so the ledger segregates under the "
+
+                    "right statement section)"
+
+                    if parent else ""
+
+                )
+
+                + ". Run create_account for it FIRST, then record the "
+
+                "transaction against the newly created account. The "
+
+                "account-creation guard blocks default-account recording "
+
+                "until the account exists."
+
+            )
+
+        elif classification.transaction_nature:
+
+            parts.append(
+
+                "    → No dedicated account exists for this nature. Use the most "
+
+                "appropriate EXISTING account from the chart of accounts "
+
+                "(search_account) and do NOT create new accounts — new accounts "
+
+                "require explicit owner approval."
+
+            )
+
+        if classification.requires_clarification:
+
+            parts.append(
+
+                "    → The treatment is MATERIALLY AMBIGUOUS. Ask the user the "
+
+                "classification question instead of recording anything."
+
+            )
+
+        parts.append(
+
+            "    → NEVER fall back to a generic expense account when a fixed-asset "
+
+            "or inventory treatment applies. Do NOT invent new accounts — reuse "
+
+            "the hint or search the chart of accounts."
+
+        )
+
+
+
+    # ECONOMIC EVENT CLASSIFICATION — what real-world event this request
+
+    # represents, what it can affect, and what is explicitly FORBIDDEN.
+
+    # The model plans tools from economic meaning, never CRUD keywords.
+
+    economic_event = getattr(context, "economic_event", None)
+
+    if economic_event:
+
+        parts.append("")
+
+        parts.append("ECONOMIC EVENT CLASSIFICATION (deterministic — authoritative):")
+
+        parts.append(f"  - Underlying event: {economic_event}")
+
+        impact_map = getattr(context, "impact_map", {}) or {}
+
+        active = [k for k, v in impact_map.items() if v]
+
+        inactive = [k for k, v in impact_map.items() if not v]
+
+        if active:
+
+            parts.append(f"  - AFFECTED dimensions: {', '.join(active)}")
+
+        if inactive:
+
+            parts.append(
+
+                "  - NOT affected dimensions: "
+
+                + ", ".join(inactive)
+
+                + " — do not create records for these; they are irrelevant "
+
+                "to this event."
+
+            )
+
+        prohibited = getattr(context, "prohibited_actions", []) or []
+
+        if prohibited:
+
+            parts.append("  - PROHIBITED ACTIONS (STRICT — the executor will refuse them):")
+
+            for p in prohibited:
+
+                parts.append(f"    · {p.get('action', '')}: {p.get('reason', '')}")
+
+        parts.append(
+
+            "  → Plan tool calls for the ECONOMIC EVENT above. Before creating any "
+
+            "record, ask WHY it needs to exist: is it required by the business "
+
+            "event, by accounting, by a workflow, or by a database dependency? "
+
+            "If it is only 'usually created', do NOT create it."
+
+        )
+
+
+
+    # LIVE BOOKS EVIDENCE retrieved by the LLM reasoning
+
+    # layer.  Labelled as evidence (not as truth): the model must reassess the
+
+    # request against it and may reclassify.
+
+    if getattr(context, "live_evidence", None):
+
+        parts.append("")
+
+        parts.append(
+
+            "LIVE BOOKS EVIDENCE — use this to reassess the request "
+
+            "(retrieved from this organization's own records; empty means the "
+
+            "record does not exist, not that a lookup failed):"
+
+        )
+
+        for item in context.live_evidence[:12]:
+
+            if not isinstance(item, dict):
+
+                continue
+
+            kind = item.get("kind", "evidence")
+
+            if item.get("error"):
+
+                parts.append(f"  - {kind}: REFUSED/FAILED — {item.get('error')}")
+
+                continue
+
+            if not item.get("records"):
+
+                parts.append(f"  - {kind}: EMPTY — no matching record exists")
+
+                continue
+
+            rendered = str(item.get("records"))[:1200]
+
+            parts.append(f"  - {kind} ({len(item.get('records') or [])} row(s)): {rendered}")
+
+
+
+    # READ-ONLY CALLS ALREADY EXECUTED for this request.  The Phase-5
+
+    # lookup-continuation gate ran the model's OWN read-only plan and gives it
+
+    # ONE bounded round to finish with what came back — so it must not re-plan
+
+    # the calls that already ran (production 2026-10-02: the continuation
+
+    # returned the same search_account x3 + get_chart_of_accounts instead of
+
+    # the write, and the run parked on a question nothing was missing for).
+
+    pre_executed = getattr(context, "pre_executed_lookups", None)
+
+    if pre_executed:
+
+        parts.append("")
+
+        parts.append(
+
+            "READ-ONLY CALLS ALREADY EXECUTED (their results are the LIVE "
+
+            "BOOKS EVIDENCE above — these calls are DONE):"
+
+        )
+
+        for item in pre_executed[:12]:
+
+            if not isinstance(item, dict):
+
+                continue
+
+            tool = item.get("tool", "lookup")
+
+            if item.get("error"):
+
+                parts.append(f"  - {tool}: FAILED — {item.get('error')}")
+
+                continue
+
+            rows = item.get("records")
+
+            count = len(rows) if isinstance(rows, (list, dict)) else 0
+
+            parts.append(f"  - {tool}: returned {count} row(s)")
+
+        parts.append(
+
+            "  → Do NOT call any of these again — a lookup that already ran "
+
+            "returns nothing new. Finish the plan NOW: emit the WRITE tool "
+
+            "call(s) that record the user's transaction, taking every value "
+
+            "from EXTRACTED ENTITIES above. Only if a write genuinely cannot "
+
+            "be formed, state exactly which value is missing."
+
+        )
+
+
+
+    # the model's own prior accounting reasoning for this
+
+    # request (interpretation + proposed treatment), so the planning stage
+
+    # reassesses instead of silently replacing it with a keyword route.
+
+    reasoning = getattr(context, "accounting_reasoning", None)
+
+    if reasoning:
+
+        parts.append("")
+
+        parts.append(
+
+            "LLM ACCOUNTING REASONING (your own prior reading of the live "
+
+            "records for this request — re-verify it against the books above; "
+
+            "correct it if the records say otherwise):"
+
+        )
+
+        understanding = reasoning.get("understanding") or {}
+
+        for key in ("economic_event", "what_user_wants", "event_type", "basis"):
+
+            if understanding.get(key):
+
+                parts.append(f"  - {key}: {understanding.get(key)}")
+
+        proposal = reasoning.get("proposal") or {}
+
+        if proposal:
+
+            if proposal.get("interpretation"):
+
+                parts.append(f"  - proposed interpretation: {proposal['interpretation']}")
+
+            if proposal.get("accounting_impact"):
+
+                parts.append(
+
+                    f"  - proposed impact: {str(proposal['accounting_impact'])[:800]}"
+
+                )
+
+            if proposal.get("not_affected"):
+
+                parts.append(
+
+                    "  - explicitly NOT affected: "
+
+                    + "; ".join(str(x) for x in proposal["not_affected"][:6])
+
+                )
+
+            if proposal.get("unresolved_uncertainty"):
+
+                parts.append(
+
+                    "  - unresolved uncertainty: "
+
+                    + "; ".join(str(x) for x in proposal["unresolved_uncertainty"][:6])
+
+                )
+
+        if reasoning.get("evidence_summary"):
+
+            parts.append(f"  - evidence inspected: {reasoning['evidence_summary']}")
+
+
+
+    # the deterministic extraction, labelled as PRELIMINARY so
+
+    # it can never be mistaken for a decided accounting treatment.
+
+    preliminary = getattr(context, "preliminary_extraction", None)
+
+    if preliminary:
+
+        parts.append("")
+
+        parts.append(
+
+            "PRELIMINARY EXTRACTION — may be corrected after accounting review:"
+
+        )
+
+        for key in ("literals", "candidate_subject_areas", "provisional_intent_hint"):
+
+            if preliminary.get(key):
+
+                parts.append(f"  - {key}: {preliminary[key]}")
+
+
+
+    # Extracted entities — authoritative values parsed from the user's
+
+    # message. The model must reuse these instead of re-parsing (and must
+
+    # never ask the user for anything already here).
+
+    if context.extracted_entities:
+
+        parts.append("")
+
+        parts.append("EXTRACTED ENTITIES (authoritative — parsed from the user's message; use these values directly, never re-ask them):")
+
+        for key, value in context.extracted_entities.items():
+
+            if value is not None and value != "":
+
+                parts.append(f"  - {key}: {value}")
+
+
+
+    # Clarification history — questions the user already answered.
+
+    if context.clarification_history:
+
+        parts.append("")
+
+        parts.append("CLARIFICATION HISTORY (already answered — merge these answers with the request; never re-ask):")
+
+        for qa in context.clarification_history:
+
+            parts.append(f"  - Q: {qa.get('question', '')} -> A: {qa.get('answer', '')}")
+
+
+
+    parts.append("")
+
+    parts.append(f"User request: {message}")
+
+
+
+    return "\n".join(parts)
+
