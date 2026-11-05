@@ -672,7 +672,7 @@ async def classify_transaction(
         or entities.get("entity_name")
     )
     entity_name = (
-        entities.get("entity_name") or item or entities.get("supplier_name")
+        entities.get("entity_name") or item
     )
 
     # Payment intents: no item to classify — never pause for classification.
@@ -684,7 +684,24 @@ async def classify_transaction(
         "record_bank_transfer", "record_supplier_payment", "record_customer_receipt",
         "record_loan", "record_loan_repayment",
     )
-    if intent in _PAYMENT_INTENTS:
+    # Payment intents or document references (bill/invoice settlements) never ask 4-way item classification
+    if (
+        intent in _PAYMENT_INTENTS
+        or entities.get("bill_id")
+        or entities.get("bill_number")
+        or entities.get("invoice_id")
+        or entities.get("invoice_number")
+    ):
+        return TransactionClassification(
+            transaction_nature=None,
+            confidence="LOW",
+            source="INFERENCE",
+            entity=item or entity_name,
+            requires_clarification=False,
+        )
+
+    # If intent is unknown and there is no concrete purchased item, do NOT trigger item classification
+    if intent in ("unknown", None, "") and not (entities.get("item_description") or entities.get("description")):
         return TransactionClassification(
             transaction_nature=None,
             confidence="LOW",

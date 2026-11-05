@@ -45,6 +45,12 @@ _CAPITALIZATION_RE = re.compile(r"ordinary expense or capitalized", re.I)
 KEY_PAYMENT_METHOD = "payment_method"
 KEY_TRANSACTION_NATURE = "transaction_nature"
 KEY_TAX_CATEGORY = "tax_category"
+KEY_DEFAULT_TAX_PRICING = "default_tax_pricing"
+KEY_TAX_AUTHORITY = "tax_authority"
+KEY_IS_SALES_TAX_REGISTERED = "is_sales_tax_registered"
+KEY_MONTHLY_ALLOWED_LEAVES = "payroll.monthly_allowed_leaves"
+KEY_ANNUAL_ALLOWED_LEAVES = "payroll.annual_allowed_leaves"
+KEY_STANDARD_WORKING_DAYS = "payroll.standard_working_days"
 # Prefixed key namespace: capitalization:<PURPOSE_VALUE>.
 CAPITALIZATION_KEY_PREFIX = "capitalization:"
 
@@ -102,6 +108,16 @@ def capture_preference_from_answer(
         return None
 
     if _TAX_RE.search(question or ""):
+        if "inclusive" in low or low in ("b", "2"):
+            return {"key": KEY_DEFAULT_TAX_PRICING, "value": "INCLUSIVE"}
+        if "exclusive" in low or low in ("a", "1"):
+            return {"key": KEY_DEFAULT_TAX_PRICING, "value": "EXCLUSIVE"}
+        if "exempt" in low or low in ("c", "3"):
+            return {"key": KEY_DEFAULT_TAX_PRICING, "value": "EXEMPT"}
+        if "pra" in low or "punjab" in low:
+            return {"key": KEY_TAX_AUTHORITY, "value": "PRA"}
+        if "srb" in low or "sindh" in low:
+            return {"key": KEY_TAX_AUTHORITY, "value": "SRB"}
         return {"key": KEY_TAX_CATEGORY, "value": text}
 
     return None

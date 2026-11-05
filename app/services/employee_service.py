@@ -118,12 +118,32 @@ def _clean_component_kind(value: Any) -> str:
     return token
 
 
+
+def _attach_tax_profile(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Auto-calculate and attach Section 149 statutory tax profile to employee record."""
+    if not row or not isinstance(row, dict):
+        return row
+    salary = float(row.get("basic_salary") or 0.0)
+    if salary > 0:
+        from app.services.tax_service import calculate_salary_tax_withholding
+        tax_info = calculate_salary_tax_withholding(salary)
+        row["monthly_tax"] = tax_info["monthly_tax"]
+        row["annual_tax"] = tax_info["annual_tax"]
+        row["tax_slab"] = tax_info["slab"]
+    else:
+        row["monthly_tax"] = 0.0
+        row["annual_tax"] = 0.0
+        row["tax_slab"] = 1
+    return row
+
+
 async def search(
     organization_id: uuid.UUID, *, query: str, limit: int = 25
 ) -> List[Dict[str, Any]]:
-    return await repo.search_employees(
+    rows = await repo.search_employees(
         organization_id, query=query, limit=max(1, min(int(limit or 25), 50))
     )
+    return [_attach_tax_profile(dict(r)) for r in rows]
 
 
 async def _resolve_employee(
@@ -143,19 +163,19 @@ async def _resolve_employee(
     try:
         return_row = await repo.get_employee(organization_id, employee_id=uuid.UUID(text))
         if return_row:
-            return return_row
+            return _attach_tax_profile(dict(return_row))
     except (ValueError, AttributeError):
         pass
     code_row = await repo.get_employee_by_code(organization_id, code=text)
     if code_row:
-        return code_row
+        return _attach_tax_profile(dict(code_row))
     matches = await search(organization_id, query=text, limit=10)
     exact = [
         row for row in matches
         if str(row.get("full_name") or "").strip().lower() == text.lower()
     ]
     if len(exact) == 1:
-        return exact[0]
+        return _attach_tax_profile(dict(exact[0]))
     if len(exact) > 1:
         codes = ", ".join(str(r.get("employee_code") or r.get("id")) for r in exact)
         raise EmployeeInputError(
@@ -267,6 +287,7 @@ async def create(
         basic_salary=salary,
         **clean_optional,
     )
+    data = _attach_tax_profile(dict(data))
     log.info("employee_service.created", code=data.get("employee_code"))
     return data
 

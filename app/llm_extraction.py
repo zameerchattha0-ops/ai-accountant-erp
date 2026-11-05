@@ -156,13 +156,20 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
 
     _num("amount")
     _num("quantity")
-    date = payload.get("transaction_date")
-    if date is not None:
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)):
-            clean["transaction_date"] = str(date)
+    raw_date = payload.get("transaction_date")
+    if raw_date is not None:
+        str_d = str(raw_date).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str_d):
+            clean["transaction_date"] = str_d
+        elif str_d.upper() == "TODAY":
+            from datetime import date as dt_date
+            clean["transaction_date"] = dt_date.today().isoformat()
+        elif str_d.upper() == "YESTERDAY":
+            from datetime import date as dt_date, timedelta
+            clean["transaction_date"] = (dt_date.today() - timedelta(days=1)).isoformat()
         else:
-            failures.append(f"transaction_date: not ISO ({date!r})")
-            log.warning("authority_split.intercepted", field="transaction_date", reason="untraceable_date", raw_value=str(date)[:40])
+            failures.append(f"transaction_date: not ISO ({raw_date!r})")
+            log.warning("authority_split.intercepted", field="transaction_date", reason="untraceable_date", raw_value=str_d[:40])
     desc = payload.get("item_description")
     if desc is not None and str(desc).strip():
         clean["item_description"] = str(desc).strip()[:120]

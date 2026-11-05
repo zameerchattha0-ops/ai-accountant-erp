@@ -91,6 +91,25 @@ class QuestionSpec:
 # LLM may rephrase them, and this bank is always the fallback.
 # ---------------------------------------------------------------------------
 QUESTION_BANK: Dict[str, QuestionSpec] = {
+    "transaction_intent": QuestionSpec(
+        field="transaction_intent",
+        kind=KIND_CHOICE,
+        question=(
+            "Could you please clarify what action you would like to take? "
+            "(a) Pay a Supplier Bill, (b) Receive Customer Payment against an Invoice, "
+            "(c) Record an Expense, (d) Direct Sale, or (e) Direct Purchase? "
+            "Please reply with a, b, c, d, or e."
+        ),
+        options=(
+            ("record_payment", "Pay a Supplier Bill"),
+            ("record_receipt", "Receive Customer Payment"),
+            ("record_expense", "Record an Expense"),
+            ("record_sale", "Record a Sale"),
+            ("record_purchase", "Record a Purchase"),
+        ),
+        answer_hint="a, b, c, d or e",
+        why="Clarifies the transaction goal so the correct accounting workflow executes.",
+    ),
     "transaction_nature": QuestionSpec(
         field="transaction_nature",
         kind=KIND_CHOICE,
@@ -251,6 +270,74 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         options=(("NONE", "Generate one for me"),),
         answer_hint="A short code, or NONE",
         why="The project ledger is keyed by its code.",
+    ),
+    # --- Taxes & Statutory Withholding -----------------------------------
+    "tax_pricing_mode": QuestionSpec(
+        field="tax_pricing_mode", kind=KIND_CHOICE,
+        question=(
+            "Is this amount: (a) GST EXCLUSIVE (add 18% FBR sales tax on top), "
+            "(b) GST INCLUSIVE (price already includes sales tax), "
+            "(c) TAX EXEMPT (0% GST / non-taxable), "
+            "(d) PUNJAB SERVICES (16% PRA), or (e) SINDH SERVICES (15% SRB)? "
+            "Please choose a, b, c, d, or e."
+        ),
+        options=(
+            ("EXCLUSIVE", "Exclusive (+18% FBR)"),
+            ("INCLUSIVE", "Inclusive (Back-calculate GST)"),
+            ("EXEMPT", "Tax Exempt (0% GST)"),
+            ("PRA_16", "Punjab Services (+16% PRA)"),
+            ("SRB_15", "Sindh Services (+15% SRB)"),
+        ),
+        answer_hint="exclusive, inclusive, exempt, pra, or srb",
+        why="Determines how sales tax is separated in double-entry journals per FBR/provincial rules.",
+    ),
+    "withholding_tax_rate": QuestionSpec(
+        field="withholding_tax_rate", kind=KIND_CHOICE,
+        question=(
+            "Does Withholding Tax u/s 153 apply to this supplier payment? "
+            "(a) NONE / EXEMPT (0%), (b) GOODS - Corporate (5.5%), "
+            "(c) GOODS - Non-Corporate (6%), (d) SERVICES - Corporate (9%), "
+            "or (e) SERVICES - Non-Corporate (11%)?"
+        ),
+        options=(
+            ("NONE", "No WHT (0%)"),
+            ("GOODS_CORP", "Goods - Corporate (5.5%)"),
+            ("GOODS_NON_CORP", "Goods - Non-Corporate (6%)"),
+            ("SERVICES_CORP", "Services - Corporate (9%)"),
+            ("SERVICES_NON_CORP", "Services - Non-Corporate (11%)"),
+        ),
+        answer_hint="none, goods 5.5%, goods 6%, services 9%, services 11%",
+        why="Pakistan Income Tax Ordinance u/s 153 requires tax withholding at payment settlement.",
+    ),
+    # --- Attendance & Leave Policy ---------------------------------------
+    "days_absent": QuestionSpec(
+        field="days_absent", kind=KIND_CHOICE,
+        question=(
+            "Did the employee take leaves or absences this month exceeding the organization's allowed quota "
+            "(standard policy allows 2 days per month / 27 per year)? "
+            "(a) FULL MONTH (0 to 2 days leave - full salary paid), "
+            "(b) EXCESS ABSENCES (specify days absent beyond allowed quota for pro-rated deduction)."
+        ),
+        options=(
+            ("FULL_MONTH", "Within Allowed Quota (Full Month Paid)"),
+            ("EXCESS_ABSENCES", "Deduct Excess Absent Days (Pro-rated salary)"),
+        ),
+        answer_hint="full month, or specify number of absent days",
+        why="Leaves up to the monthly allowed quota are fully paid per company policy; excess days are deducted at 1/30th per day.",
+    ),
+    "payroll_attendance": QuestionSpec(
+        field="payroll_attendance", kind=KIND_CHOICE,
+        question=(
+            "Were all employees present or within the allowed monthly leave policy (e.g. 2 leaves/month allowed)? "
+            "(a) ALL PRESENT / WITHIN ALLOWED QUOTA (Calculate full month salary for all), "
+            "(b) SOME EMPLOYEES EXCEEDED LEAVES (Specify absent days for pro-rated deduction)."
+        ),
+        options=(
+            ("ALL_PRESENT", "All Present / Within Allowed Quota (Full Salary)"),
+            ("SOME_EXCEEDED", "Some Employees Exceeded Allowed Leaves"),
+        ),
+        answer_hint="all present, or specify absent employees",
+        why="Company policy allows monthly paid leaves; deductions only apply to days exceeding the allowed quota.",
     ),
 }
 

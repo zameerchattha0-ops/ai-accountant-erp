@@ -61,15 +61,23 @@ def get_service_client() -> Client:
 # Gemini API key (from Vault)
 # ---------------------------------------------------------------------------
 def get_gemini_api_key() -> str:
-    """Retrieve the Gemini API key from Supabase Vault.
+    """Retrieve the Gemini API key from environment first, then Supabase Vault."""
+    import os
+    env_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    try:
+        from app.config import get_settings
+        cfg_key = (get_settings().gemini_api_key or "").strip()
+        if cfg_key:
+            return cfg_key
+    except Exception:
+        pass
 
-    Calls ``public.get_gemini_api_key()`` which is a SECURITY DEFINER
-    function granting access only to the service_role.
-    """
     client = get_service_client()
     result = client.rpc("get_gemini_api_key").execute()
     if not result.data:
-        raise RuntimeError("Gemini API key not found in Supabase Vault")
+        raise RuntimeError("Gemini API key not found in environment or Supabase Vault")
     key = result.data
     if isinstance(key, list):
         key = key[0] if key else None

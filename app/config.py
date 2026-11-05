@@ -84,7 +84,8 @@ class Settings(BaseSettings):
     # ---- Gemini (FALLBACK provider — model config only, key in Vault) ----
     # gemini-2.5-flash was retired by Google for new API users; the API
     # directs new integrations to gemini-3.6-flash.
-    gemini_model: str = Field(default="gemini-3.6-flash")
+    gemini_api_key: str = Field(default="", description="Gemini API key")
+    gemini_model: str = Field(default="gemini-flash-lite-latest")
     gemini_temperature: float = Field(default=0.1)
     gemini_max_output_tokens: int = Field(
         default=2048,

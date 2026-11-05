@@ -109,8 +109,19 @@ def stream_label(item_description: Optional[str]) -> Optional[str]:
 
 
 def suggest_ledger_name(label: str) -> str:
-    """Name proposed for a NEW dedicated ledger: 'Chairs' -> 'Chairs Sales'."""
-    return f"{label.strip()}{_LEDGER_SUFFIX}"
+    """Name proposed for a NEW dedicated ledger:
+    Services: 'IT Consulting services' -> 'IT Consulting services Revenue'
+    Goods:    'Chairs' -> 'Chairs Sales'
+    """
+    clean = label.strip()
+    low = clean.lower()
+    if any(k in low for k in ("service", "consulting", "maintenance", "development", "support", "subscription", "design", "repair", "fee", "advisory")):
+        if low.endswith("revenue") or low.endswith("income"):
+            return clean
+        if low.endswith("sales"):
+            return clean
+        return f"{clean} Revenue"
+    return f"{clean}{_LEDGER_SUFFIX}"
 
 
 def _norm(value: Any) -> str:
@@ -408,38 +419,45 @@ async def apply_decision(
     ``USE_EXISTING`` -> the account the user NAMED (exact, case-insensitive
                         match inside this organisation) when they named one;
                         otherwise the general revenue account.
-    anything else    -> (None, False): the caller must keep asking, never guess.
-
-    An invalid or ambiguous named account NEVER falls back silently to another
-    account — the caller receives (None, False) and re-asks with a targeted
-    error.
+    anything else    -> matches live revenue accounts in chart or falls back safely.
     """
     choice = str(decision or "").strip().upper()
-    if choice == "CREATE" and label:
+    if choice in ("CREATE", "YES", "CREATE IT") and label:
         return await create_stream_ledger(organization_id, label)
-    if choice in ("USE_EXISTING", "SKIP", "EXISTING"):
-        rows = await list_revenue_accounts(organization_id)
-        named = extract_account_name(named_account)
-        if named:
+
+    rows = await list_revenue_accounts(organization_id)
+    general = await find_general_revenue(organization_id)
+
+    named = extract_account_name(named_account or decision)
+    if named and named.upper() not in ("CREATE", "YES", "CREATE IT"):
+        norm_named = _norm(named)
+        matches = [
+            r for r in rows if _norm(r.get("name")) == norm_named
+        ]
+        if not matches:
             matches = [
-                r for r in rows if _norm(r.get("name")) == _norm(named)
+                r for r in rows if norm_named in _norm(r.get("name")) or _norm(r.get("name")) in norm_named
             ]
-            if len(matches) == 1:
+        if len(matches) == 1:
+            log.info(
+                "ledger_account_resolved",
+                organization_id=str(organization_id),
+                account_id=str(matches[0].get("id")),
+                source="named_existing",
+            )
+            return matches[0], False
+
+        if len(matches) > 1 and general is not None:
+            if any(str(r.get("id")) == str(general.get("id")) for r in matches):
                 log.info(
                     "ledger_account_resolved",
                     organization_id=str(organization_id),
-                    account_id=str(matches[0].get("id")),
-                    source="named_existing",
+                    account_id=str(general.get("id")),
+                    source="general_revenue_preferred_over_ambiguous",
                 )
-                return matches[0], False
-            log.warning(
-                "ledger_decision_invalid",
-                organization_id=str(organization_id),
-                reason="ambiguous" if len(matches) > 1 else "unknown_account",
-                requested=named[:80],
-            )
-            return None, False
-        general = await find_general_revenue(organization_id)
+                return general, False
+
+    if choice in ("USE_EXISTING", "SKIP", "EXISTING", "DEFAULT") or (named and _norm(named) in ("service", "services", "consulting", "it consulting")):
         if general is not None:
             log.info(
                 "ledger_account_resolved",
@@ -448,16 +466,16 @@ async def apply_decision(
                 source="general_revenue",
             )
             return general, False
-        if len(rows) == 1:
-            # A single-revenue-account chart is unambiguous — crediting the
-            # only revenue account cannot misstate the books.
-            log.info(
-                "ledger_account_resolved",
-                organization_id=str(organization_id),
-                account_id=str(rows[0].get("id")),
-                source="only_revenue_account",
-            )
-            return rows[0], False
+
+    if len(rows) == 1:
+        log.info(
+            "ledger_account_resolved",
+            organization_id=str(organization_id),
+            account_id=str(rows[0].get("id")),
+            source="only_revenue_account",
+        )
+        return rows[0], False
+
     log.warning(
         "ledger_decision_invalid",
         organization_id=str(organization_id),
@@ -465,7 +483,6 @@ async def apply_decision(
         decision=str(choice)[:40],
     )
     return None, False
-
 
 async def needs_review(
     organization_id: uuid.UUID,
@@ -487,6 +504,92 @@ async def needs_review(
     if await find_stream_ledger(organization_id, label) is not None:
         return False
     return len(await list_revenue_accounts(organization_id)) > 1
+
+
+
+async def propose_revenue_structure_with_llm(
+    organization_id: uuid.UUID,
+    item_description: Optional[str],
+    *,
+    orchestrator=None,
+) -> Dict[str, Any]:
+    """Reason about the business's Chart of Accounts using LLM with CA mindset.
+
+    Proposes:
+      1. Closely related existing account (e.g., 'Services Revenue') so user can
+         choose it rather than creating a new sub-category for every service.
+      2. Tailored dedicated sub-category name (e.g., 'IT Consulting Revenue' under 'Services Revenue').
+      3. Professional CA rationale for the decision.
+    """
+    import json
+    rows = await list_revenue_accounts(organization_id)
+    general = await find_general_revenue(organization_id)
+    label = stream_label(item_description) or str(item_description or "Services").strip()
+    is_service = any(k in label.lower() for k in ("service", "consulting", "maintenance", "development", "support", "subscription", "design", "repair", "fee", "advisory"))
+
+    fallback_dedicated = suggest_ledger_name(label)
+    fallback_parent = (general or {}).get("name") or ("Services Revenue" if is_service else "Revenue")
+
+    fallback_related = None
+    if is_service:
+        for r in rows:
+            r_name = str(r.get("name") or "")
+            if "services revenue" in r_name.lower():
+                fallback_related = r_name
+                break
+        if not fallback_related:
+            for r in rows:
+                r_name = str(r.get("name") or "")
+                if "service" in r_name.lower():
+                    fallback_related = r_name
+                    break
+    if not fallback_related:
+        fallback_related = (general or {}).get("name") or (rows[0].get("name") if rows else "Services Revenue")
+
+    result = {
+        "dedicated_name": fallback_dedicated,
+        "parent_name": fallback_parent,
+        "related_existing_name": fallback_related,
+        "is_service": is_service,
+        "reasoning": f"Business provides services; tracking '{label}' can be aggregated under existing '{fallback_related}' or separated into a new dedicated sub-category '{fallback_dedicated}'."
+    }
+
+    if orchestrator and rows:
+        accounts_summary = ", ".join(f"'{r.get('name')}'" for r in rows[:15])
+        prompt = (
+            f"You are a Chartered Accountant advising an ERP business owner.\n"
+            f"The business is invoicing for: '{item_description}'.\n"
+            f"Existing active revenue accounts in their Chart of Accounts: {accounts_summary}\n\n"
+            f"Analyze this service/item:\n"
+            f"1. Closely related existing account: Which existing account from the list is the closest match to record under if the user does NOT want a new sub-category? (e.g. 'Services Revenue')\n"
+            f"2. Dedicated sub-category name: If the user DOES want separate reporting for this revenue stream, what professional sub-category name should be created? (e.g. 'IT Consulting Revenue', NOT '<Item> Sales' for services)\n"
+            f"3. Parent account: Which existing account should that sub-category be parented under?\n\n"
+            f"Return ONLY a JSON object with keys: 'related_existing_name', 'dedicated_name', 'parent_name', 'reasoning'."
+        )
+        try:
+            resp = await orchestrator.generate_text(
+                prompt=prompt,
+                system_instruction="You are an expert Chartered Accountant. Return valid JSON only.",
+                temperature=0.0,
+                max_output_tokens=300,
+            )
+            text = (resp or "").strip()
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if m:
+                parsed = json.loads(m.group(0))
+                rel = parsed.get("related_existing_name")
+                if rel and any(_norm(r.get("name")) == _norm(rel) for r in rows):
+                    result["related_existing_name"] = rel
+                if parsed.get("dedicated_name"):
+                    result["dedicated_name"] = parsed["dedicated_name"]
+                if parsed.get("parent_name"):
+                    result["parent_name"] = parsed["parent_name"]
+                if parsed.get("reasoning"):
+                    result["reasoning"] = parsed["reasoning"]
+        except Exception as exc:
+            log.warning("propose_revenue_structure_llm_failed", error=str(exc)[:150])
+
+    return result
 
 
 __all__ = [

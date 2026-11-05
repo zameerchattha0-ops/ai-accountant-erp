@@ -59,6 +59,60 @@ class PayrollInputError(ValueError):
 #: journal, the reviewer and the confirmation card all stay reviewable).
 _MAX_EMPLOYEES_PER_RUN = 200
 
+
+async def get_organization_leave_policy(organization_id: uuid.UUID) -> Dict[str, Any]:
+    """Retrieve organization's leave and payroll calculation policy.
+
+    Default Policy:
+    - monthly_allowed_leaves: 2 days (absences <= 2 in a month receive full salary)
+    - annual_allowed_leaves: 27 days
+    - standard_working_days: 30 days (excess absences deducted at 1/30th per day)
+    """
+    from app.services import preference_service as prefs
+
+    try:
+        all_prefs = await prefs.get_all_preferences(organization_id)
+        monthly_allowed = int(all_prefs.get(prefs.KEY_MONTHLY_ALLOWED_LEAVES, 2))
+        annual_allowed = int(all_prefs.get(prefs.KEY_ANNUAL_ALLOWED_LEAVES, 27))
+        standard_days = int(all_prefs.get(prefs.KEY_STANDARD_WORKING_DAYS, 30))
+    except BaseException:
+        monthly_allowed = 2
+        annual_allowed = 27
+        standard_days = 30
+
+    return {
+        "organization_id": str(organization_id),
+        "monthly_allowed_leaves": monthly_allowed,
+        "annual_allowed_leaves": annual_allowed,
+        "standard_working_days": standard_days,
+        "policy_summary": (
+            f"{monthly_allowed} paid leaves allowed per month ({annual_allowed} per year). "
+            f"Absences up to {monthly_allowed} days receive 100% full month salary. "
+            f"Absences exceeding {monthly_allowed} days are deducted at 1/{standard_days}th per excess day."
+        ),
+    }
+
+
+async def set_organization_leave_policy(
+    organization_id: uuid.UUID,
+    *,
+    monthly_allowed_leaves: Optional[int] = None,
+    annual_allowed_leaves: Optional[int] = None,
+    standard_working_days: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Configure organization's leave policy for payroll calculations."""
+    from app.services import preference_service as prefs
+
+    if monthly_allowed_leaves is not None:
+        await prefs.set_preference(organization_id, prefs.KEY_MONTHLY_ALLOWED_LEAVES, int(monthly_allowed_leaves))
+    if annual_allowed_leaves is not None:
+        await prefs.set_preference(organization_id, prefs.KEY_ANNUAL_ALLOWED_LEAVES, int(annual_allowed_leaves))
+    if standard_working_days is not None:
+        await prefs.set_preference(organization_id, prefs.KEY_STANDARD_WORKING_DAYS, int(standard_working_days))
+
+    return await get_organization_leave_policy(organization_id)
+
+
 #: employees in these states are never paid by a run.
 _TERMINAL_STATUSES = frozenset({"RESIGNED", "TERMINATED"})
 
@@ -177,20 +231,26 @@ def _compute_pay(
     employee: Dict[str, Any],
     components: List[Dict[str, Any]],
     as_of: str,
+    *,
+    apply_income_tax: Optional[bool] = None,
+    days_absent: Optional[int] = 0,
+    monthly_allowed_leaves: int = 2,
+    standard_working_days: int = 30,
 ) -> Dict[str, Any]:
     """Deterministic per-employee entitlement for *as_of*.
 
     gross = basic salary + MONTHLY allowance components in force
-    net   = gross − MONTHLY deductions in force
-
-    ONE-TIME / ANNUAL components are collected into ``deferred`` and returned
-    to the caller for disclosure — a recurring run must never pay them twice.
+    net   = gross - MONTHLY deductions in force (including Section 149 income tax & leave deductions)
     """
+    from app.services.tax_service import calculate_salary_tax_withholding
+
     basic = round(float(employee.get("basic_salary") or 0), 2)
     allowances_total = 0.0
     deductions_total = 0.0
     applied: List[Dict[str, Any]] = []
     deferred: List[Dict[str, Any]] = []
+    has_explicit_tax_deduction = False
+
     for component in components or []:
         if not _in_force(component, as_of):
             continue
@@ -212,13 +272,79 @@ def _compute_pay(
             continue
         if kind == "DEDUCTION":
             deductions_total = round(deductions_total + amount, 2)
+            desc_low = str(component.get("description") or "").lower()
+            if "tax" in desc_low or "149" in desc_low or "wht" in desc_low:
+                has_explicit_tax_deduction = True
         else:
             allowances_total = round(allowances_total + amount, 2)
         applied.append(row)
 
     gross = round(basic + allowances_total, 2)
+
+    # -------------------------------------------------------------------
+    # Attendance & Leave Policy Calculation (Actual Days Worked)
+    # -------------------------------------------------------------------
+    absent_days_count = max(0, int(days_absent or 0))
+    allowed_leaves = max(0, int(monthly_allowed_leaves or 0))
+    working_days = max(1, int(standard_working_days or 30))
+    excess_absent_days = 0
+    leave_deduction = 0.0
+    daily_rate = 0.0
+
+    if absent_days_count > allowed_leaves and gross > 0:
+        excess_absent_days = absent_days_count - allowed_leaves
+        daily_rate = round(gross / working_days, 2)
+        leave_deduction = min(gross, round(excess_absent_days * daily_rate, 2))
+        if leave_deduction > 0:
+            applied.append({
+                "description": f"Unpaid Leave Deduction ({excess_absent_days} days exceeding {allowed_leaves} allowed leaves @ PKR {daily_rate:,.2f}/day)",
+                "component_kind": "DEDUCTION",
+                "frequency": "MONTHLY",
+                "amount": leave_deduction,
+                "statutory": False,
+                "excess_days": excess_absent_days,
+                "allowed_leaves": allowed_leaves,
+                "daily_rate": daily_rate,
+            })
+            deductions_total = round(deductions_total + leave_deduction, 2)
+
+    taxable_gross = max(0.0, round(gross - leave_deduction, 2))
+    tax_withheld = 0.0
+    tax_slab = None
+    annual_tax = 0.0
+
+    # Check for precomputed monthly tax on employee record
+    precomputed_tax = employee.get("monthly_tax") or employee.get("monthly_income_tax") or employee.get("tax_withheld")
+
+    should_apply_tax = False
+    if apply_income_tax is True:
+        should_apply_tax = True
+    elif apply_income_tax is None:
+        should_apply_tax = (precomputed_tax is not None)
+
+    if should_apply_tax and not has_explicit_tax_deduction and taxable_gross > 0:
+        if precomputed_tax is not None and excess_absent_days == 0:
+            tax_withheld = round(float(precomputed_tax), 2)
+            tax_slab = employee.get("tax_slab")
+            annual_tax = employee.get("annual_tax") or round(tax_withheld * 12, 2)
+        else:
+            tax_info = calculate_salary_tax_withholding(taxable_gross)
+            tax_withheld = tax_info["monthly_tax"]
+            tax_slab = tax_info["slab"]
+            annual_tax = tax_info["annual_tax"]
+
+        if tax_withheld > 0:
+            applied.append({
+                "description": f"Income Tax u/s 149 (Slab {tax_slab or 'Auto'})",
+                "component_kind": "DEDUCTION",
+                "frequency": "MONTHLY",
+                "amount": tax_withheld,
+                "statutory": True,
+            })
+            deductions_total = round(deductions_total + tax_withheld, 2)
+
     net = round(gross - deductions_total, 2)
-    return {
+    res = {
         "employee_id": str(employee.get("id")),
         "employee_code": employee.get("employee_code"),
         "full_name": employee.get("full_name"),
@@ -226,11 +352,21 @@ def _compute_pay(
         "allowances_total": allowances_total,
         "deductions_total": deductions_total,
         "gross_pay": gross,
+        "taxable_gross": taxable_gross,
         "net_pay": net,
+        "days_absent": absent_days_count,
+        "monthly_allowed_leaves": allowed_leaves,
+        "excess_absent_days": excess_absent_days,
+        "leave_deduction": leave_deduction,
+        "daily_rate": daily_rate,
+        "tax_withheld": tax_withheld,
+        "tax_slab": tax_slab,
+        "annual_tax": annual_tax,
         "components": applied,
         "deferred": deferred,
         "status": str(employee.get("status") or "ACTIVE").upper(),
     }
+    return res
 
 
 def _clean_uuid(value: Any, *, label: str) -> Optional[uuid.UUID]:
@@ -384,6 +520,10 @@ async def run_payroll(
     payment_account_id: Any = None,
     salary_expense_account_id: Any = None,
     accrued_salaries_account_id: Any = None,
+    wht_payable_account_id: Any = None,
+    apply_income_tax: Optional[bool] = None,
+    days_absent: Optional[int] = 0,
+    employee_absences: Optional[Dict[str, int]] = None,
     description: Any = None,
     **_: Any,
 ) -> Dict[str, Any]:
@@ -444,10 +584,33 @@ async def run_payroll(
     for component in components or []:
         by_employee.setdefault(str(component.get("employee_id")), []).append(component)
 
+    policy = await get_organization_leave_policy(organization_id)
+    monthly_allowed_leaves = int(policy.get("monthly_allowed_leaves", 2))
+    standard_working_days = int(policy.get("standard_working_days", 30))
+
     pays: List[Dict[str, Any]] = []
     for employee in eligible:
+        emp_code = str(employee.get("employee_code") or "")
+        emp_id = str(employee.get("id") or "")
+        emp_absent = 0
+        if employee_absences:
+            emp_absent = (
+                employee_absences.get(emp_code)
+                or employee_absences.get(emp_id)
+                or days_absent
+                or 0
+            )
+        else:
+            emp_absent = days_absent or 0
+
         pay = _compute_pay(
-            employee, by_employee.get(str(employee.get("id")), []), pay_date
+            employee,
+            by_employee.get(str(employee.get("id")), []),
+            pay_date,
+            apply_income_tax=apply_income_tax,
+            days_absent=emp_absent,
+            monthly_allowed_leaves=monthly_allowed_leaves,
+            standard_working_days=standard_working_days,
         )
         if pay["net_pay"] <= 0:
             raise PayrollInputError(
@@ -495,24 +658,83 @@ async def run_payroll(
             )
         credit_label = "Salaries payable"
 
+    total_tax = round(sum(row.get("tax_withheld", 0.0) for row in pays), 2)
     entry_description = (
         str(description or "").strip()[:200]
         or f"Salaries — {period} ({len(pays)} employees)"
     )
-    lines = [
-        {
-            "account_id": str(expense_account["id"]),
-            "description": f"Salaries — {period}",
-            "debit": net_total,
-            "credit": 0,
-        },
-        {
+
+    if total_tax > 0 or (apply_income_tax and gross_total > net_total):
+        from app import accounting_engine as engine
+        # Gross-to-Net Accounting u/s 149 & IAS 19:
+        # Debit: Gross Salary Expense (6010)
+        # Credit: Withholding Tax Payable u/s 149 (2121)
+        # Credit: Accrued Salaries Payable / Bank for Net Pay
+        wht_account = None
+        if wht_payable_account_id:
+            wht_account = {"id": str(wht_payable_account_id)}
+        else:
+            try:
+                wht_acc_row = await engine.ensure_wht_payable_account(organization_id, section="149")
+                if wht_acc_row:
+                    wht_account = wht_acc_row
+            except BaseException:
+                wht_account = None
+            if not wht_account:
+                try:
+                    wht_account = await _resolve_gl_account(
+                        organization_id,
+                        account_type="LIABILITY",
+                        keywords=("withholding", "wht", "149", "tax payable"),
+                        explicit_id=None,
+                    )
+                except BaseException:
+                    wht_account = None
+
+        lines = [
+            {
+                "account_id": str(expense_account["id"]),
+                "description": f"Salaries Gross Expense — {period}",
+                "debit": gross_total,
+                "credit": 0,
+            },
+        ]
+        if total_tax > 0 and wht_account:
+            lines.append({
+                "account_id": str(wht_account["id"]),
+                "description": f"WHT Payable u/s 149 — {period}",
+                "debit": 0,
+                "credit": total_tax,
+            })
+        other_deductions = round(gross_total - net_total - total_tax, 2)
+        if other_deductions > 0:
+            lines.append({
+                "account_id": str(credit_account["id"]),
+                "description": f"Payroll Deductions / {credit_label} — {period}",
+                "debit": 0,
+                "credit": other_deductions,
+            })
+        lines.append({
             "account_id": str(credit_account["id"]),
             "description": f"{credit_label} — {period}",
             "debit": 0,
             "credit": net_total,
-        },
-    ]
+        })
+    else:
+        lines = [
+            {
+                "account_id": str(expense_account["id"]),
+                "description": f"Salaries — {period}",
+                "debit": net_total,
+                "credit": 0,
+            },
+            {
+                "account_id": str(credit_account["id"]),
+                "description": f"{credit_label} — {period}",
+                "debit": 0,
+                "credit": net_total,
+            },
+        ]
     posting = await _post_or_report(
         organization_id=organization_id,
         transaction_date=pay_date,
@@ -528,7 +750,7 @@ async def run_payroll(
         employees=len(pays),
         net_total=net_total,
         settlement=settlement,
-        posted=posting["posted"],
+        posted=posting.get("posted", False),
     )
     return {
         "period": period,
@@ -541,10 +763,10 @@ async def run_payroll(
         "net_total": net_total,
         "skipped_employees": skipped,
         "deferred_components": deferred,
-        "journal_posted": posting["posted"],
-        "journal_entry": posting["entry"],
-        "journal_lines": posting["lines"],
-        "journal_error": posting["error"],
+        "journal_posted": posting.get("posted", False),
+        "journal_entry": posting.get("entry"),
+        "journal_lines": posting.get("lines"),
+        "journal_error": posting.get("error"),
         "expense_account": _account_ref(expense_account),
         "credit_account": _account_ref(credit_account),
     }
@@ -559,6 +781,8 @@ async def pay_employee_salary(
     payment_account_id: Any = None,
     accrued_salaries_account_id: Any = None,
     salary_expense_account_id: Any = None,
+    apply_income_tax: Optional[bool] = None,
+    days_absent: Optional[int] = 0,
     description: Any = None,
     **_: Any,
 ) -> Dict[str, Any]:
@@ -591,7 +815,19 @@ async def pay_employee_salary(
     components = await repo.list_allowances(
         organization_id, employee_id=employee_id
     )
-    pay = _compute_pay(target, components, pay_date)
+    policy = await get_organization_leave_policy(organization_id)
+    monthly_allowed_leaves = int(policy.get("monthly_allowed_leaves", 2))
+    standard_working_days = int(policy.get("standard_working_days", 30))
+
+    pay = _compute_pay(
+        target,
+        components,
+        pay_date,
+        apply_income_tax=apply_income_tax,
+        days_absent=days_absent or 0,
+        monthly_allowed_leaves=monthly_allowed_leaves,
+        standard_working_days=standard_working_days,
+    )
     overridden = amount is not None and str(amount).strip() != ""
     if overridden:
         # The user stated the figure — it wins over the computed entitlement.
@@ -659,7 +895,7 @@ async def pay_employee_salary(
         organization=str(organization_id),
         employee=str(employee_id),
         amount=net,
-        posted=posting["posted"],
+        posted=posting.get("posted", False),
     )
     return {
         "employee": {
@@ -677,10 +913,10 @@ async def pay_employee_salary(
         "gross_pay": pay["gross_pay"],
         "components": pay["components"],
         "deferred_components": pay["deferred"],
-        "journal_posted": posting["posted"],
-        "journal_entry": posting["entry"],
-        "journal_lines": posting["lines"],
-        "journal_error": posting["error"],
+        "journal_posted": posting.get("posted", False),
+        "journal_entry": posting.get("entry"),
+        "journal_lines": posting.get("lines"),
+        "journal_error": posting.get("error"),
         "debit_account": _account_ref(debit_account),
         "credit_account": _account_ref(credit_account),
     }

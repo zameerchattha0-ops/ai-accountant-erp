@@ -76,6 +76,8 @@ from app.services import (
 
     loan_service,
 
+    tax_service,
+
 )
 
 from datetime import date
@@ -1303,6 +1305,12 @@ async def _record_cash_sale(organization_id: uuid.UUID, **kw) -> ToolResult:
 
         items=items,
 
+        tax_pricing_mode=kw.get("tax_pricing_mode"),
+
+        tax_rate_percent=kw.get("tax_rate_percent"),
+
+        tax_amount=kw.get("tax_amount"),
+
     )
 
     # Auto-validate + auto-post — same convention as the other trusted
@@ -1894,9 +1902,10 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
             created = await customer_service.create(organization_id, name=cname)
             kw["customer_id"] = uuid.UUID(str(created["id"]))
 
-    if not kw.get("items") and (kw.get("total") or kw.get("amount")):
-        tot = float(kw.get("total") or kw.get("amount") or 0.0)
-        desc = kw.get("description") or "Sales"
+    desc = kw.pop("description", None) or kw.pop("item_description", None) or "Sales"
+    amount = kw.pop("amount", None)
+    if not kw.get("items") and (kw.get("total") or amount):
+        tot = float(kw.get("total") or amount or 0.0)
         kw["items"] = [{"description": desc, "quantity": 1.0, "unit_price": tot, "total": tot}]
         kw["total"] = tot
         kw["subtotal"] = tot
@@ -1921,7 +1930,24 @@ async def _create_invoice(organization_id: uuid.UUID, **kw) -> ToolResult:
 
                         error=str(exc)[:200])
 
-    data = await invoice_service.create_invoice(organization_id=organization_id, **kw)
+    tax_pricing_mode = kw.pop("tax_pricing_mode", None)
+    tax_rate_percent = kw.pop("tax_rate_percent", None)
+    tax_amount = kw.pop("tax_amount", None)
+
+    valid_inv_keys = {
+        "customer_id", "invoice_date", "due_date", "currency_code",
+        "subtotal", "tax_total", "discount_total", "total",
+        "payment_terms_days", "project_id", "quotation_id", "notes",
+        "terms", "items", "created_by",
+    }
+    service_kw = {k: v for k, v in kw.items() if k in valid_inv_keys}
+    data = await invoice_service.create_invoice(organization_id=organization_id, **service_kw)
+    if tax_pricing_mode is not None:
+        data["tax_pricing_mode"] = tax_pricing_mode
+    if tax_rate_percent is not None:
+        data["tax_rate_percent"] = tax_rate_percent
+    if tax_amount is not None:
+        data["tax_amount"] = tax_amount
 
     # C3+C4: Atomic document + journal creation
 
@@ -2613,7 +2639,17 @@ async def _create_purchase_bill(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 
-    data = await purchase_service.create_purchase_bill(organization_id=organization_id, **kw)
+    bill_ref = kw.pop("bill_number", None)
+    if bill_ref and not kw.get("supplier_invoice_ref"):
+        kw["supplier_invoice_ref"] = bill_ref
+    valid_bill_keys = {
+        "supplier_id", "bill_date", "due_date", "currency_code",
+        "subtotal", "tax_total", "discount_total", "total",
+        "payment_terms_days", "supplier_invoice_ref", "notes",
+        "items", "created_by",
+    }
+    bill_kw = {k: v for k, v in kw.items() if k in valid_bill_keys}
+    data = await purchase_service.create_purchase_bill(organization_id=organization_id, **bill_kw)
 
     # C3+C4: Atomic document + journal creation
 
@@ -3172,13 +3208,24 @@ async def _classify_expense(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 async def _record_customer_receipt(organization_id: uuid.UUID, **kw) -> ToolResult:
-
-    # Wire invoice_id / bill_id through if present
-
+    # Resolve invoice by invoice_id or invoice_number
     invoice_id = kw.pop("invoice_id", None)
+    invoice_number = kw.pop("invoice_number", None)
+    if not invoice_id and invoice_number:
+        from app.database import fetch_many
+        invoices = await fetch_many("invoices", filters={"organization_id": str(organization_id)}, limit=50)
+        inv_str = str(invoice_number).strip().lstrip("0")
+        for inv in (invoices or []):
+            num = str(inv.get("invoice_number") or "")
+            if invoice_number in num or (inv_str and inv_str in num.lstrip("0")):
+                invoice_id = inv["id"]
+                if "customer_id" not in kw and inv.get("customer_id"):
+                    kw["customer_id"] = uuid.UUID(str(inv["customer_id"]))
+                if float(kw.get("amount") or 0.0) <= 0:
+                    kw["amount"] = max(0.0, float(inv.get("total") or 0.0) - float(inv.get("amount_paid") or 0.0))
+                break
 
     if invoice_id:
-
         kw["invoice_id"] = uuid.UUID(str(invoice_id))
 
     if "customer_id" in kw and isinstance(kw["customer_id"], str):
@@ -3191,21 +3238,48 @@ async def _record_customer_receipt(organization_id: uuid.UUID, **kw) -> ToolResu
         else:
             created = await customer_service.create(organization_id, name=cname)
             kw["customer_id"] = uuid.UUID(str(created["id"]))
+    if "wht_rate" in kw and "wht_rate_percent" not in kw:
+        kw["wht_rate_percent"] = kw.pop("wht_rate")
+    if "withholding_tax_rate" in kw and "wht_rate_percent" not in kw:
+        kw["wht_rate_percent"] = kw.pop("withholding_tax_rate")
     if "payment_mode" in kw and "payment_method" not in kw:
         kw["payment_method"] = kw.pop("payment_mode")
+    if kw.get("payment_method"):
+        _pm = str(kw["payment_method"]).strip().upper()
+        if _pm in ("BANK", "BANK_TRANSFER", "TRANSFER", "BANK TRANSFER", "WIRE"):
+            kw["payment_method"] = "BANK_TRANSFER"
+        elif _pm in ("CASH",):
+            kw["payment_method"] = "CASH"
 
     data = await payment_service.record_customer_receipt(organization_id=organization_id, **kw)
-
     return ToolResult(tool_name="record_customer_receipt", success=True, data=data)
 
 
-
 async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResult:
-
+    # Resolve bill by bill_id or bill_number
     bill_id = kw.pop("bill_id", None)
+    bill_number = kw.pop("bill_number", None)
+    if not bill_id and bill_number:
+        from app.database import fetch_many
+        bills = await fetch_many("purchase_bills", filters={"organization_id": str(organization_id)}, limit=50)
+        bill_str = str(bill_number).strip().lstrip("0")
+        for b in (bills or []):
+            num = str(b.get("bill_number") or "")
+            ref = str(b.get("supplier_invoice_ref") or "")
+            if (
+                bill_number.lower() in num.lower()
+                or (bill_str and bill_str in num.lstrip("0"))
+                or (ref and bill_number.lower() in ref.lower())
+                or (bill_str and bill_str in ref.lstrip("0"))
+            ):
+                bill_id = b["id"]
+                if "supplier_id" not in kw and b.get("supplier_id"):
+                    kw["supplier_id"] = uuid.UUID(str(b["supplier_id"]))
+                if float(kw.get("amount") or 0.0) <= 0:
+                    kw["amount"] = max(0.0, float(b.get("total") or 0.0) - float(b.get("amount_paid") or 0.0))
+                break
 
     if bill_id:
-
         kw["bill_id"] = uuid.UUID(str(bill_id))
 
     if "supplier_id" in kw and isinstance(kw["supplier_id"], str):
@@ -3220,9 +3294,14 @@ async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResu
             kw["supplier_id"] = uuid.UUID(str(created["id"]))
     if "payment_mode" in kw and "payment_method" not in kw:
         kw["payment_method"] = kw.pop("payment_mode")
+    if kw.get("payment_method"):
+        _pm = str(kw["payment_method"]).strip().upper()
+        if _pm in ("BANK", "BANK_TRANSFER", "TRANSFER", "BANK TRANSFER", "WIRE"):
+            kw["payment_method"] = "BANK_TRANSFER"
+        elif _pm in ("CASH",):
+            kw["payment_method"] = "CASH"
 
     data = await payment_service.record_supplier_payment(organization_id=organization_id, **kw)
-
     return ToolResult(tool_name="record_supplier_payment", success=True, data=data)
 
 
@@ -4277,6 +4356,11 @@ async def _set_employee_allowances(organization_id: uuid.UUID, **kw) -> ToolResu
 
 async def _run_payroll(organization_id: uuid.UUID, **kw) -> ToolResult:
 
+    if "withholding_tax" in kw and "apply_income_tax" not in kw:
+        kw["apply_income_tax"] = bool(kw.pop("withholding_tax"))
+    if "deduct_tax" in kw and "apply_income_tax" not in kw:
+        kw["apply_income_tax"] = bool(kw.pop("deduct_tax"))
+
     try:
 
         data = await payroll_service.run_payroll(organization_id, **kw)
@@ -4314,6 +4398,11 @@ async def _run_payroll(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 async def _pay_employee_salary(organization_id: uuid.UUID, **kw) -> ToolResult:
+
+    if "withholding_tax" in kw and "apply_income_tax" not in kw:
+        kw["apply_income_tax"] = bool(kw.pop("withholding_tax"))
+    if "deduct_tax" in kw and "apply_income_tax" not in kw:
+        kw["apply_income_tax"] = bool(kw.pop("deduct_tax"))
 
     try:
 
@@ -4393,9 +4482,9 @@ register("set_employee_allowances", handler=_set_employee_allowances, read_only=
 
 # service computes every amount from the employee records and posts the journal.
 
-register("run_payroll", handler=_run_payroll, read_only=False, contract=contract_from_callable(payroll_service.run_payroll), description="Run payroll for every active employee: computes each one's salary (basic + monthly allowances − deductions recorded on the employee) and posts ONE journal — Dr Salaries / Cr Accrued Salaries, or Cr bank when payment_method=PAID. Pass payment_method=PAID when the user says the salaries are/were actually paid, ACCRUED when they are owed/accrued (default). One-time/annual components are excluded and reported back")
+register("run_payroll", handler=_run_payroll, read_only=False, contract=contract_from_callable(payroll_service.run_payroll, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "employee_absences", "absences")), description="Run payroll for every active employee: computes gross salary, actual days worked based on organization leave policy (absences <= allowed leaves receive full salary; excess days deducted at 1/30th), Section 149 salary tax deductions (auto-applied), and posts ONE journal — Dr Gross Salaries / Cr WHT Payable u/s 149 / Cr Accrued Salaries (or Cr Bank when payment_method=PAID). Pass payment_method=PAID when paid immediately, ACCRUED when owed (default)")
 
-register("pay_employee_salary", handler=_pay_employee_salary, read_only=False, contract=contract_from_callable(payroll_service.pay_employee_salary), description="Pay ONE employee's salary (settles the accrual): resolves the employee by code/name, debits Accrued Salaries (or the Salaries expense account when no accrual ledger exists) and credits bank/cash. Pass the amount only when the user stated a figure — otherwise it is computed from the employee's records")
+register("pay_employee_salary", handler=_pay_employee_salary, read_only=False, contract=contract_from_callable(payroll_service.pay_employee_salary, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "absences")), description="Pay ONE employee's salary (settles the accrual): resolves employee by code/name, calculates salary based on organization leave policy and days_absent, debits Accrued Salaries (or Salaries expense) and credits bank/cash. Automatically applies Section 149 salary income tax into WHT Payable u/s 149")
 
 
 
@@ -4423,7 +4512,7 @@ register("create_account", handler=_create_account, read_only=False, description
 
 # Invoice
 
-register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice), description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] — lines are validated and their totals computed by the service (never invent amounts)")
+register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice, extra_arguments=("tax_pricing_mode", "tax_rate_percent", "tax_amount", "customer_name", "amount", "description")), description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] or total/amount. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent (e.g. 18.0 for FBR, 16.0 for PRA, 15.0 for SRB/KPRA), and tax_amount")
 
 register("get_invoice", handler=_get_invoice, read_only=True, description="Get invoice details — pass invoice_id (uuid) OR invoice_number (the human number, e.g. INV-000011; exact match against this organization's books)")
 
@@ -4455,7 +4544,7 @@ register("classify_expense", handler=_classify_expense, read_only=True, descript
 
 register("record_customer_receipt", handler=_record_customer_receipt, read_only=False, contract=contract_from_callable(payment_service.record_customer_receipt), description="Record customer receipt with journal and allocation")
 
-register("record_supplier_payment", handler=_record_supplier_payment, read_only=False, contract=contract_from_callable(payment_service.record_supplier_payment), description="Record supplier payment with journal and allocation")
+register("record_supplier_payment", handler=_record_supplier_payment, read_only=False, contract=contract_from_callable(payment_service.record_supplier_payment, extra_arguments=("supplier_name", "payment_mode", "wht_rate", "withholding_tax_rate")), description="Record supplier payment with journal and allocation. Supports Section 153 Withholding Tax (WHT) deduction: pass wht_rate_percent (or wht_rate/withholding_tax_rate) and optionally wht_amount. Debits AP, credits Bank net, and credits WHT Payable u/s 153")
 
 
 
@@ -4512,7 +4601,7 @@ register(
 
 register("record_cash_sale", handler=_record_cash_sale, read_only=False,
 
-         description="Record an immediate cash sale: resolves the Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine. For sales of stock-tracked goods pass items=[{product_id, quantity}] so the accounting engine also posts the Cost-of-Sales entry (Dr Cost of Sales / Cr Inventory) and relieves the stock ledger at weighted-average cost")
+         description="Record an immediate cash sale: resolves Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent, and tax_amount to split gross vs net revenue and credit Sales Tax Output Payable (Account 2110). For sales of stock-tracked goods pass items=[{product_id, quantity}] to post Cost of Sales")
 
 
 
@@ -5285,4 +5374,67 @@ register(
     handler=_update_document_status,
     read_only=False,
     description="Update status of single or bulk documents across all modules (purchase_bill, purchase_order, invoice, quotation, product) with verification audit table.",
+)
+# ===================================================================
+# TAX PROFILE TOOLS
+# ===================================================================
+async def _get_organization_tax_profile(organization_id: uuid.UUID, **kw) -> ToolResult:
+    profile = await tax_service.get_organization_tax_profile(organization_id)
+    return ToolResult(tool_name="get_organization_tax_profile", success=True, data=profile)
+
+async def _set_organization_tax_profile(organization_id: uuid.UUID, **kw) -> ToolResult:
+    profile = await tax_service.set_organization_tax_profile(
+        organization_id=organization_id,
+        is_sales_tax_registered=kw.get("is_sales_tax_registered"),
+        tax_authority=kw.get("tax_authority"),
+        default_tax_pricing=kw.get("default_tax_pricing"),
+        sales_tax_rate=kw.get("sales_tax_rate"),
+    )
+    return ToolResult(tool_name="set_organization_tax_profile", success=True, data=profile)
+
+register(
+    "get_organization_tax_profile",
+    handler=_get_organization_tax_profile,
+    read_only=True,
+    description="Get the organization's tax profile: whether registered for sales tax, tax authority (FBR, PRA, SRB, KPRA, BRA), default tax pricing mode (exclusive, inclusive, exempt), and configured sales tax rate.",
+)
+
+register(
+    "set_organization_tax_profile",
+    handler=_set_organization_tax_profile,
+    read_only=False,
+    contract=contract_from_callable(tax_service.set_organization_tax_profile),
+    description="Configure organization's tax profile: set is_sales_tax_registered (bool), tax_authority ('FBR', 'PRA', 'SRB', 'KPRA', 'BRA'), default_tax_pricing ('exclusive', 'inclusive', 'exempt'), and sales_tax_rate (e.g. 18.0).",
+)
+
+
+# ===================================================================
+# LEAVE & ATTENDANCE POLICY TOOLS
+# ===================================================================
+async def _get_organization_leave_policy(organization_id: uuid.UUID, **kw) -> ToolResult:
+    policy = await payroll_service.get_organization_leave_policy(organization_id)
+    return ToolResult(tool_name="get_organization_leave_policy", success=True, data=policy)
+
+async def _set_organization_leave_policy(organization_id: uuid.UUID, **kw) -> ToolResult:
+    policy = await payroll_service.set_organization_leave_policy(
+        organization_id=organization_id,
+        monthly_allowed_leaves=kw.get("monthly_allowed_leaves"),
+        annual_allowed_leaves=kw.get("annual_allowed_leaves"),
+        standard_working_days=kw.get("standard_working_days"),
+    )
+    return ToolResult(tool_name="set_organization_leave_policy", success=True, data=policy)
+
+register(
+    "get_organization_leave_policy",
+    handler=_get_organization_leave_policy,
+    read_only=True,
+    description="Get the organization's leave and payroll calculation policy: monthly allowed leaves (e.g. 2 days), annual allowed leaves (e.g. 27 days), and standard working days per month (e.g. 30 days).",
+)
+
+register(
+    "set_organization_leave_policy",
+    handler=_set_organization_leave_policy,
+    read_only=False,
+    contract=contract_from_callable(payroll_service.set_organization_leave_policy),
+    description="Configure organization's leave policy for payroll: set monthly_allowed_leaves (int), annual_allowed_leaves (int), and standard_working_days (int). Employees with absences <= monthly_allowed_leaves receive full salary; excess days are deducted at 1/standard_working_days.",
 )

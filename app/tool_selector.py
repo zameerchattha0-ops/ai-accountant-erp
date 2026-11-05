@@ -29,6 +29,8 @@ _PRODUCT_LOOKUPS = {"search_product", "search_service", "get_inventory_status"}
 _ASSET_LOOKUPS = {"search_fixed_asset", "get_fixed_asset"}
 _BANK_LOOKUPS = {"list_bank_accounts"}
 _EMPLOYEE_LOOKUPS = {"search_employee", "get_employee"}
+_TAX_LOOKUPS = {"get_organization_tax_profile"}
+_LEAVE_LOOKUPS = {"get_organization_leave_policy"}
 
 # Per-intent mutation/creation toolsets (the trusted core actions).
 _INTENT_TOOLS: dict[str, set[str]] = {
@@ -132,6 +134,18 @@ _INTENT_TOOLS: dict[str, set[str]] = {
         "record_loan_repayment", "list_loans", "get_loan_schedule",
         "prepare_journal", "post_journal",
     },
+    "configure_tax_profile": {
+        "set_organization_tax_profile", "get_organization_tax_profile",
+    },
+    "get_organization_tax_profile": {
+        "get_organization_tax_profile",
+    },
+    "configure_leave_policy": {
+        "set_organization_leave_policy", "get_organization_leave_policy",
+    },
+    "configure_payroll_policy": {
+        "set_organization_leave_policy", "get_organization_leave_policy",
+    },
 }
 
 
@@ -159,13 +173,15 @@ def _lookups_for_intent(intent: str) -> Set[str]:
     if any(w in intent for w in (
         "sale", "invoice", "quotation", "receipt", "customer", "credit_note",
     )):
-        lookups |= _CUSTOMER_LOOKUPS | _PRODUCT_LOOKUPS
+        lookups |= _CUSTOMER_LOOKUPS | _PRODUCT_LOOKUPS | _TAX_LOOKUPS
+    if "tax" in intent:
+        lookups |= _TAX_LOOKUPS
     if "asset" in intent:
         lookups |= _ASSET_LOOKUPS | _ACCOUNT_LOOKUPS
     if "payroll" in intent or "salary" in intent:
-        # The roster (who is paid), the settlement account and the salary /
-        # accrued-salaries ledgers are all needed to carry a run out.
-        lookups |= _EMPLOYEE_LOOKUPS | _BANK_LOOKUPS | _ACCOUNT_LOOKUPS
+        # The roster (who is paid), the settlement account, leave policy, and
+        # the salary / accrued-salaries ledgers are all needed to carry a run out.
+        lookups |= _EMPLOYEE_LOOKUPS | _BANK_LOOKUPS | _ACCOUNT_LOOKUPS | _LEAVE_LOOKUPS
     if "bank" in intent or "transfer" in intent or "receipt" in intent:
         lookups |= _BANK_LOOKUPS
     if "loan" in intent:

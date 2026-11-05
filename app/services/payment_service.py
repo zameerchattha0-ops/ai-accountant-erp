@@ -280,8 +280,8 @@ async def _update_invoice_paid(
     inv = await inv_repo.get_invoice(organization_id, invoice_id=invoice_id)
     if not inv:
         return
-    new_paid = float(inv.get("amount_paid", 0)) + amount
     total = float(inv.get("total", 0))
+    new_paid = min(float(inv.get("amount_paid", 0)) + amount, total)
     if new_paid >= total:
         status = "PAID"
     elif new_paid > 0:
@@ -300,8 +300,8 @@ async def _update_bill_paid(
     bill = await pur_repo.get_purchase_bill(organization_id, bill_id=bill_id)
     if not bill:
         return
-    new_paid = float(bill.get("amount_paid", 0)) + amount
     total = float(bill.get("total", 0))
+    new_paid = min(float(bill.get("amount_paid", 0)) + amount, total)
     if new_paid >= total:
         status = "PAID"
     elif new_paid > 0:
@@ -316,6 +316,21 @@ async def _update_bill_paid(
 # ---------------------------------------------------------------------------
 # Customer Receipts
 # ---------------------------------------------------------------------------
+
+def _normalize_payment_method(method: Optional[str]) -> str:
+    m = str(method or "").strip().upper()
+    if m in ("BANK", "BANK_TRANSFER", "TRANSFER", "BANK TRANSFER", "WIRE"):
+        return "BANK_TRANSFER"
+    if m in ("CASH",):
+        return "CASH"
+    if m in ("CHEQUE", "CHECK"):
+        return "CHEQUE"
+    if m in ("CARD", "CREDIT_CARD", "DEBIT_CARD"):
+        return "CARD"
+    if m in ("ONLINE",):
+        return "ONLINE"
+    return "BANK_TRANSFER" if "BANK" in m else (m or "BANK_TRANSFER")
+
 
 async def record_customer_receipt(
     *,
@@ -344,6 +359,7 @@ async def record_customer_receipt(
     mis-post silently).
     """
     r_date = receipt_date or date.today().isoformat()
+    payment_method = _normalize_payment_method(payment_method)
 
     # ATOMIC POSTING (migration 078): the receipt, its journal entry and its
     # lines commit in ONE database transaction — a receipt can never exist
@@ -447,6 +463,9 @@ async def record_supplier_payment(
     bill_id: Optional[uuid.UUID] = None,
     transaction_nature: Optional[str] = None,
     created_by: Optional[uuid.UUID] = None,
+    wht_rate_percent: Optional[float] = None,
+    wht_amount: Optional[float] = None,
+    wht_account_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """Record a supplier payment with auto-journal and optional bill allocation.
 
@@ -457,6 +476,7 @@ async def record_supplier_payment(
     asset, a loan repayment debits the loan liability (fallbacks warn).
     """
     p_date = payment_date or date.today().isoformat()
+    payment_method = _normalize_payment_method(payment_method)
 
     # ATOMIC POSTING (migration 077): the payment, its journal entry and its
     # lines commit in ONE database transaction — a payment can never exist
@@ -474,7 +494,50 @@ async def record_supplier_payment(
         organization_id, supplier_id, transaction_nature
     )
 
+    # Calculate Section 153 Withholding Tax if applicable
+    gross_settled = round(float(amount or 0.0), 2)
+    calculated_wht = 0.0
+    if wht_amount is not None:
+        calculated_wht = round(float(wht_amount), 2)
+    elif wht_rate_percent is not None and float(wht_rate_percent) > 0:
+        calculated_wht = round(gross_settled * (float(wht_rate_percent) / 100.0), 2)
+
+    net_paid = round(gross_settled - calculated_wht, 2)
     entry_desc = f"Payment to supplier — {reference or 'supplier payment'}"
+
+    # Build balanced journal lines (Gross AP debit = Net cash credit + WHT credit)
+    journal_lines = [
+        {
+            "account_id": str(debit_gl),
+            "description": f"Payable settled — {entry_desc}",
+            "debit": gross_settled,
+            "credit": 0,
+            "supplier_id": str(supplier_id),
+        },
+        {
+            "account_id": str(money_gl),
+            "description": f"Payment — {entry_desc}",
+            "debit": 0,
+            "credit": net_paid,
+        },
+    ]
+
+    if calculated_wht > 0:
+        wht_gl = wht_account_id
+        if not wht_gl:
+            wht_acc = await engine.ensure_wht_payable_account(organization_id, section="153")
+            if wht_acc:
+                wht_gl = uuid.UUID(str(wht_acc["id"]))
+        if not wht_gl:
+            raise ValueError("WHT u/s 153 applies but Withholding Tax Payable account could not be resolved")
+        journal_lines.append({
+            "account_id": str(wht_gl),
+            "description": f"WHT u/s 153 deducted — {entry_desc}",
+            "debit": 0,
+            "credit": calculated_wht,
+            "supplier_id": str(supplier_id),
+        })
+
     outcome = await call_rpc(
         "create_payment_atomic",
         params={
@@ -487,7 +550,7 @@ async def record_supplier_payment(
                 "currency_code": currency_code,
                 "bank_account_id": str(bank_account_id) if bank_account_id else None,
                 "cash_account_id": str(cash_account_id) if cash_account_id else None,
-                "amount": amount,
+                "amount": net_paid,
                 "reference": reference,
                 "notes": notes,
                 "created_by": str(created_by) if created_by else None,
@@ -497,21 +560,7 @@ async def record_supplier_payment(
                 "description": entry_desc,
                 "reference": reference,
                 "currency_code": currency_code,
-                "lines": [
-                    {
-                        "account_id": str(debit_gl),
-                        "description": f"Payable settled — {entry_desc}",
-                        "debit": amount,
-                        "credit": 0,
-                        "supplier_id": str(supplier_id),
-                    },
-                    {
-                        "account_id": str(money_gl),
-                        "description": f"Payment — {entry_desc}",
-                        "debit": 0,
-                        "credit": amount,
-                    },
-                ],
+                "lines": journal_lines,
             },
         },
     ) or {}
@@ -528,15 +577,19 @@ async def record_supplier_payment(
         # R4.3: a nature-driven fallback is DISCLOSED, never silent.
         payment["journal_warning"] = debit_warning
 
-    # Allocate against bill if provided
+    if calculated_wht > 0:
+        payment["wht_amount"] = calculated_wht
+        payment["gross_amount"] = gross_settled
+
+    # Allocate against bill if provided (allocated for full bill amount settled)
     if bill_id:
         await repo.create_payment_allocation(
             organization_id=organization_id,
             payment_id=payment_id,
             bill_id=bill_id,
-            amount_allocated=amount,
+            amount_allocated=gross_settled,
         )
-        await _update_bill_paid(organization_id, bill_id, amount)
+        await _update_bill_paid(organization_id, bill_id, gross_settled)
 
     log.info("payment.supplier_payment_recorded", payment_id=str(payment_id), amount=amount)
     return payment

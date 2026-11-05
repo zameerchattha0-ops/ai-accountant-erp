@@ -79,7 +79,9 @@ def _provider_error_from_sdk(exc: Exception) -> Exception:
             f"Gemini rate limit: {text[:200]}",
             status=code_int or 429,
         )
-    return exc
+    if isinstance(exc, ProviderError):
+        return exc
+    return ProviderError(f"Gemini API error: {text[:250]}")
 
 
 class GeminiClient:
@@ -270,7 +272,7 @@ class GeminiClient:
                         raise _provider_error_from_sdk(exc) from exc
                     continue  # Process the next response
 
-                if not has_function_call:
+                if not has_function_call or not executor:
                     break  # Final text-only response — done
             else:
                 break

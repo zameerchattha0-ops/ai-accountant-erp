@@ -209,7 +209,7 @@ _NATURE_MATRIX: Dict[str, Dict[str, Any]] = {
         ),
         "keywords": (
             (r"fixed\s*asset|capitalis|capitaliz|long.term", "FIXED_ASSET"),
-            (r"inventory|stock|resale", "INVENTORY"),
+            (r"inventory|stock|resale|drives?|ssd|hdd|parts?|goods|hardware|accessories|merchandise|items?|units?|supplies", "INVENTORY"),
             (r"consumable|expense|expensed", "OPERATING_EXPENSE"),
             (r"service", "SERVICE"),
         ),
@@ -267,7 +267,7 @@ _NATURE_MATRIX: Dict[str, Dict[str, Any]] = {
         "marker": "business operation is this for",
         "values": ("ALLOCATION", "ADVANCE", "LOAN_OR_SETTLEMENT"),
         "keywords": (
-            (r"invoice|bill|against|allocation", "ALLOCATION"),
+            (r"invoice|bill|against|allocation|partial|installment|balance|settle|cleared|paid\s+to|received\s+from|payment\s+from|payment\s+to", "ALLOCATION"),
             (r"advance", "ADVANCE"),
             (r"loan|drawing|settlement|other", "LOAN_OR_SETTLEMENT"),
         ),
@@ -628,6 +628,11 @@ _PURPOSE_OPTIONS: List[PurposeOption] = [
     PurposeOption(
         "LEGAL_PROFESSIONAL", "Legal & professional fees",
         r"legal|lawyer|advocate|audit|professional fee|consult",
+        "OPERATING_EXPENSE", "EXPENSE",
+    ),
+    PurposeOption(
+        "OFFICE_SUPPLIES", "Office supplies & stationery",
+        r"suppl|stationery|printing|paper|toner|ink|cartridge|pen|notebook|office expense",
         "OPERATING_EXPENSE", "EXPENSE",
     ),
     PurposeOption(
@@ -1022,6 +1027,14 @@ def options_for_question(question: str) -> Optional[List[Dict[str, str]]]:
     renders these as chips (label shown, value sent); its hardcoded
     field-name switch remains the offline fallback."""
     q = (question or "").lower()
+    if "what action you would like to take" in q or "transaction intent" in q or "clarify what action" in q:
+        return [
+            {"value": "a", "label": "Pay a Supplier Bill"},
+            {"value": "b", "label": "Receive Customer Payment"},
+            {"value": "c", "label": "Record an Expense"},
+            {"value": "d", "label": "Record a Sale"},
+            {"value": "e", "label": "Record a Purchase"},
+        ]
     if "chart of accounts" in q and ("type of account" in q or "account type" in q):
         return [
             {"value": "EXPENSE", "label": "Expense"},

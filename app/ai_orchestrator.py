@@ -210,13 +210,11 @@ class AIOrchestrator:
         )
 
     def _get_gemini(self) -> Any:
-        """REMOVED PATH — Gemini is never dispatched (operator direction
-        2026-10-17); the live Gemini hop failed with an uncontrolled
-        cloudflare-HTML-400 (production session 19b2c1c4)."""
-        raise RuntimeError(
-            "Gemini is removed from dispatch (2026-10-17): every request "
-            "goes to Token Harbor."
-        )
+        """Return lazily initialised Gemini client as secondary fallback."""
+        if self._gemini is None:
+            from app.gemini_client import GeminiClient
+            self._gemini = GeminiClient()
+        return self._gemini
 
     # -------------------------------------------------------------------
     # Chain construction (capability-aware)
@@ -262,6 +260,18 @@ class AIOrchestrator:
         else:
             for model in settings.th_text_chain_list:
                 self._offer(candidates, self._harbor_candidate(model))
+
+        # Secondary fallback: Google Gemini (runs ONLY if Token Harbor fails/stalls)
+        gemini_model = settings.gemini_model or "gemini-flash-lite-latest"
+        self._offer(
+            candidates,
+            {
+                "provider": "gemini",
+                "model": gemini_model,
+                "capability": "vision" if requires_vision else "text_tools",
+                "factory": self._get_gemini,
+            },
+        )
         return candidates
 
     # -------------------------------------------------------------------

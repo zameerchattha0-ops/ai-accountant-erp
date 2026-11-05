@@ -171,12 +171,34 @@ ECONOMIC SUBSTANCE & COMPLETE ERP MODULE INTENT MAPPING:
 - create_quotation: Outbound sales estimates / price quotes issued TO customers (status 'DRAFT'). Counterparty is a customer.
 - create_purchase_bill: Purchases of goods or services on vendor credit (settlement is ON_CREDIT). Supplier name is REQUIRED.
 - register_fixed_asset: Acquisition of capital equipment, machinery, computers, and vehicles exceeding the capitalization threshold (e.g. >= 50,000 PKR or >= $500 USD) with useful life > 1 year. Consumables and minor items are NEVER fixed assets.
-- create_invoice: Sales of goods/services to customers on credit terms (ON_CREDIT). Customer name is REQUIRED.
-- record_cash_sale: Immediate point-of-sale customer receipts (PAID_NOW). Customer ledger is optional.
+- create_invoice: Sales of goods/services to customers on credit terms (ON_CREDIT). Customer name is REQUIRED. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent (e.g. 18.0 for FBR, 16.0 for PRA, 15.0 for SRB/KPRA), and tax_amount. Splits gross vs net revenue and credits Sales Tax Output Payable (Account 2110).
+- record_cash_sale: Immediate point-of-sale customer receipts (PAID_NOW). Customer ledger is optional. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent, and tax_amount to credit Sales Tax Output Payable (Account 2110).
 - record_payment: Disbursing cash/bank funds to settle an existing vendor bill (SETTLE_EXISTING_PAYABLE).
+- record_supplier_payment: Disbursing cash/bank funds to settle an existing vendor bill (SETTLE_EXISTING_PAYABLE). Supports Section 153 Withholding Tax (WHT) deduction: pass wht_rate_percent (e.g. 5.0 for services, 4.0/5.5 for goods) or wht_amount. Debits Accounts Payable gross, credits Bank net, and credits Withholding Tax Payable u/s 153 (Account 2120).
 - record_receipt: Receiving cash/bank funds settling an existing customer invoice (SETTLE_EXISTING_RECEIVABLE).
 - record_bank_transfer: Moving liquidity between two company-owned cash/bank accounts. Zero revenue or expense impact.
-- reporting / queries: get_general_ledger, get_trial_balance, get_profit_loss, get_customer_ledger, get_supplier_ledger, get_inventory_status. Fetch data from live books directly.
+- run_payroll: Compute gross-to-net payroll across active employees under Section 149 & IAS 19. Set apply_income_tax=True (or withholding_tax=True) to deduct progressive income tax. Posts Dr Gross Salaries Expense (5000/5010) / Cr WHT Payable u/s 149 (2121) / Cr Accrued Salaries (2130) (or Cr Bank if payment_method=PAID).
+- pay_employee_salary: Pay one employee's salary settling their accrual: Dr Accrued Salaries (2130) / Cr Bank (1010). If paying direct salary, pass apply_income_tax=True to deduct Section 149 salary tax.
+- set_organization_tax_profile / get_organization_tax_profile: Configure or retrieve company tax registration status, jurisdiction (FBR, PRA, SRB, KPRA, BRA), default tax pricing mode ('exclusive', 'inclusive', 'exempt'), and standard sales tax rate.
+- set_organization_leave_policy / get_organization_leave_policy: Configure or retrieve company leave policy for payroll: monthly allowed leaves (e.g. 2 days/month), annual allowed leaves (e.g. 27 days/year), and standard working days (e.g. 30 days).
+- reporting / queries: get_general_ledger, get_trial_balance, get_profit_loss, get_customer_ledger, get_supplier_ledger,
+
+STATUTORY TAX & COMPLIANCE RULES (PAKISTAN ITO 2001 & SALES TAX ACT 1990):
+1. Sales Tax Splitting (Sales Tax Act 1990 & Provincial Sales Tax Acts):
+   - When an organization is registered for sales tax, sales amounts must be separated into Net Revenue and Sales Tax Output Payable (2110).
+   - If user does not specify whether price is inclusive or exclusive of GST, look up the organization tax profile (get_organization_tax_profile) or clarify with the user. Never blindly guess.
+2. Withholding Tax Deduction u/s 153 (ITO 2001):
+   - When settling supplier bills, if withholding tax applies, pass wht_rate_percent or wht_amount on record_supplier_payment. The engine debits Accounts Payable gross, credits Bank net, and credits WHT Payable u/s 153 (2120).
+3. Payroll Gross-to-Net Accounting u/s 149 & IAS 19 & Leave Policy:
+   - For salaried employees, income tax is automatically precomputed and applied on every payroll expense run under Section 149 annual progressive tax slabs (1% to 35% across 8 slabs).
+   - Actual Days Worked & Organization Leave Policy:
+     * Check the organization's leave policy via get_organization_leave_policy (standard policy: 2 paid leaves allowed per month, 27 per year; standard 30 working days per month).
+     * Inquire or inspect employee attendance for the month:
+       - If employee absences <= monthly allowed leaves (e.g. 1 or 2 days absent with 2 allowed): 100% full month salary is paid (absence is fully covered under the paid leave quota).
+       - If employee absences > monthly allowed leaves (e.g. 5 days absent with 2 allowed): deduct ONLY the excess absent days (5 - 2 = 3 excess days) pro-rated at (Monthly Gross / 30) per excess day.
+       - Taxable gross is pro-rated for unpaid leaves before applying Section 149 tax slabs.
+4. Section 73 Crossed Banking Instrument Compliance Guard:
+   - Any cash payment or transaction exceeding PKR 50,000 for business supplies or expenses violates Section 73 of the Income Tax Ordinance 2001 (disallowance of tax deduction and forfeiture of input tax). Whenever a transaction exceeds PKR 50,000 in cash, proactively warn the user and recommend settlement via crossed cheque or online bank transfer. get_inventory_status. Fetch data from live books directly.
 
 CREDIT / DEBIT NOTES:
 A credit note reverses revenue and shrinks the customer receivable; a
@@ -1908,18 +1930,30 @@ def preliminary_extraction(
         # never guesses a canonical form.  Strict form required (the
         # no./number/# qualifier) so "invoice for 50000" is never a reference.
         loose = re.search(
-            r"\binvoice\s+(?:no\.?|number|#)\s*[-#:]?\s*(\d{1,6})\b",
+            r"\binvoice\s+(?:(?:no\.?|number|#)\s*[-#:]?\s*|#\s*)(\d{1,6})\b",
             message,
             re.I,
         )
+        if not loose:
+            loose = re.search(
+                r"\binvoice\s+(\d{1,6})\b",
+                message,
+                re.I,
+            )
         if loose:
             reference = loose.group(1)
             invoice_number = reference
         loose_bill = re.search(
-            r"\b(?:bill|purchase\s*bill|po|pur)\s+(?:no\.?|number|#)\s*[-#:]?\s*([A-Za-z0-9_-]+)\b",
+            r"\b(?:bill|purchase\s*bill|po|pur)\s+(?:(?:no\.?|number|#)\s*[-#:]?\s*|#\s*)([A-Za-z0-9_-]+)\b",
             message,
             re.I,
         )
+        if not loose_bill:
+            loose_bill = re.search(
+                r"\b(?:bill|purchase\s*bill|po|pur)\s+(\d{1,6})\b",
+                message,
+                re.I,
+            )
         if loose_bill:
             reference = loose_bill.group(1)
             literals["bill_number"] = reference

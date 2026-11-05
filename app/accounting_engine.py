@@ -173,29 +173,93 @@ async def record_credit_sale(
     description: str,
     source_id: Optional[uuid.UUID] = None,
     project_id: Optional[uuid.UUID] = None,
+    tax_amount: Optional[float] = None,
+    tax_account_id: Optional[uuid.UUID] = None,
+    tax_pricing_mode: Optional[str] = None,
+    tax_rate_percent: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Record a credit sale journal.
+    """Record a credit sale journal with net/gross separation and sales tax.
 
-    Debit:  Accounts Receivable (customer)
-    Credit: Revenue account
+    Debit:  Accounts Receivable (customer) for Gross total
+    Credit: Revenue account for Net amount
+    Credit: Sales Tax Output Payable (2110) for Tax amount (if applicable)
     """
-    lines = [
-        {
-            "account_id": str(receivable_account_id),
-            "description": f"Receivable — {description}",
-            "debit": amount,
-            "credit": 0,
-            "customer_id": str(customer_id),
-        },
-        {
-            "account_id": str(revenue_account_id),
-            "description": description,
-            "debit": 0,
-            "credit": amount,
-            "customer_id": str(customer_id),
-            "project_id": str(project_id) if project_id else None,
-        },
-    ]
+    from app.services.tax_service import calculate_tax_split
+
+    amt = round(float(amount or 0.0), 2)
+    t_amt = round(float(tax_amount), 2) if tax_amount is not None else None
+    mode = str(tax_pricing_mode or "").strip().upper()
+
+    if t_amt is not None and t_amt > 0:
+        if mode == "INCLUSIVE":
+            net_amt = round(amt - t_amt, 2)
+            gross_amt = amt
+        else:
+            net_amt = amt
+            gross_amt = round(amt + t_amt, 2)
+        applied_tax = t_amt
+    elif mode in ("EXCLUSIVE", "INCLUSIVE") and (tax_rate_percent or 0.0) > 0:
+        split = calculate_tax_split(amt, rate_percent=tax_rate_percent, pricing_mode=mode)
+        net_amt = split["net_amount"]
+        applied_tax = split["tax_amount"]
+        gross_amt = split["gross_amount"]
+    else:
+        net_amt = amt
+        applied_tax = 0.0
+        gross_amt = amt
+
+    if applied_tax > 0:
+        tax_gl = tax_account_id
+        if not tax_gl:
+            tax_acc = await ensure_tax_payable_account(organization_id)
+            if tax_acc:
+                tax_gl = uuid.UUID(str(tax_acc["id"]))
+        if not tax_gl:
+            raise ValueError("Sales tax applies but Sales Tax Output Payable account could not be resolved")
+
+        lines = [
+            {
+                "account_id": str(receivable_account_id),
+                "description": f"Receivable — {description}",
+                "debit": gross_amt,
+                "credit": 0,
+                "customer_id": str(customer_id),
+            },
+            {
+                "account_id": str(revenue_account_id),
+                "description": description,
+                "debit": 0,
+                "credit": net_amt,
+                "customer_id": str(customer_id),
+                "project_id": str(project_id) if project_id else None,
+            },
+            {
+                "account_id": str(tax_gl),
+                "description": f"Sales Tax Output Payable — {description}",
+                "debit": 0,
+                "credit": applied_tax,
+                "customer_id": str(customer_id),
+            },
+        ]
+    else:
+        lines = [
+            {
+                "account_id": str(receivable_account_id),
+                "description": f"Receivable — {description}",
+                "debit": amt,
+                "credit": 0,
+                "customer_id": str(customer_id),
+            },
+            {
+                "account_id": str(revenue_account_id),
+                "description": description,
+                "debit": 0,
+                "credit": amt,
+                "customer_id": str(customer_id),
+                "project_id": str(project_id) if project_id else None,
+            },
+        ]
+
     return await accounting_service.prepare_journal(
         organization_id=organization_id,
         transaction_date=transaction_date,
@@ -217,33 +281,90 @@ async def record_cash_sale(
     source_id: Optional[uuid.UUID] = None,
     customer_id: Optional[uuid.UUID] = None,
     items: Optional[List[Dict[str, Any]]] = None,
+    tax_amount: Optional[float] = None,
+    tax_account_id: Optional[uuid.UUID] = None,
+    tax_pricing_mode: Optional[str] = None,
+    tax_rate_percent: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Record a cash sale journal.
+    """Record a cash sale journal with net/gross separation and sales tax.
 
-    Debit:  Cash / Bank account
-    Credit: Revenue account
-
-    ``items`` is carried so the caller can trigger cost recognition for
-    stock-tracked lines — see ``prepare_cogs_for_items``.  It never changes
-    the journal itself: the entry stays exactly the two lines above, because
-    the sale of goods is a single revenue event.
+    Debit:  Cash / Bank account for Gross total
+    Credit: Revenue account for Net amount
+    Credit: Sales Tax Output Payable (2110) for Tax amount (if applicable)
     """
-    lines = [
-        {
-            "account_id": str(cash_account_id),
-            "description": f"Cash received — {description}",
-            "debit": amount,
-            "credit": 0,
-            "customer_id": str(customer_id) if customer_id else None,
-        },
-        {
-            "account_id": str(revenue_account_id),
-            "description": description,
-            "debit": 0,
-            "credit": amount,
-            "customer_id": str(customer_id) if customer_id else None,
-        },
-    ]
+    from app.services.tax_service import calculate_tax_split
+
+    amt = round(float(amount or 0.0), 2)
+    t_amt = round(float(tax_amount), 2) if tax_amount is not None else None
+    mode = str(tax_pricing_mode or "").strip().upper()
+
+    if t_amt is not None and t_amt > 0:
+        if mode == "INCLUSIVE":
+            net_amt = round(amt - t_amt, 2)
+            gross_amt = amt
+        else:
+            net_amt = amt
+            gross_amt = round(amt + t_amt, 2)
+        applied_tax = t_amt
+    elif mode in ("EXCLUSIVE", "INCLUSIVE") and (tax_rate_percent or 0.0) > 0:
+        split = calculate_tax_split(amt, rate_percent=tax_rate_percent, pricing_mode=mode)
+        net_amt = split["net_amount"]
+        applied_tax = split["tax_amount"]
+        gross_amt = split["gross_amount"]
+    else:
+        net_amt = amt
+        applied_tax = 0.0
+        gross_amt = amt
+
+    if applied_tax > 0:
+        tax_gl = tax_account_id
+        if not tax_gl:
+            tax_acc = await ensure_tax_payable_account(organization_id)
+            if tax_acc:
+                tax_gl = uuid.UUID(str(tax_acc["id"]))
+        if not tax_gl:
+            raise ValueError("Sales tax applies but Sales Tax Output Payable account could not be resolved")
+
+        lines = [
+            {
+                "account_id": str(cash_account_id),
+                "description": f"Cash received — {description}",
+                "debit": gross_amt,
+                "credit": 0,
+                "customer_id": str(customer_id) if customer_id else None,
+            },
+            {
+                "account_id": str(revenue_account_id),
+                "description": description,
+                "debit": 0,
+                "credit": net_amt,
+                "customer_id": str(customer_id) if customer_id else None,
+            },
+            {
+                "account_id": str(tax_gl),
+                "description": f"Sales Tax Output Payable — {description}",
+                "debit": 0,
+                "credit": applied_tax,
+                "customer_id": str(customer_id) if customer_id else None,
+            },
+        ]
+    else:
+        lines = [
+            {
+                "account_id": str(cash_account_id),
+                "description": f"Cash received — {description}",
+                "debit": amt,
+                "credit": 0,
+                "customer_id": str(customer_id) if customer_id else None,
+            },
+            {
+                "account_id": str(revenue_account_id),
+                "description": description,
+                "debit": 0,
+                "credit": amt,
+                "customer_id": str(customer_id) if customer_id else None,
+            },
+        ]
     prepared = await accounting_service.prepare_journal(
         organization_id=organization_id,
         transaction_date=transaction_date,
@@ -1029,6 +1150,148 @@ async def _resolve_named_postable_account(
 
 
 
+
+
+async def ensure_tax_payable_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """Resolve or create the Sales Tax Output Payable LIABILITY ledger (code 2110)."""
+    from app.services import accounting_service
+    acc = await a_repo.get_account_by_code(organization_id, code="2110")
+    if acc and acc.get("is_active") is not False:
+        return acc
+    row = await accounting_service.resolve_account(
+        organization_id,
+        account_name="Sales Tax Output Payable",
+        account_type="LIABILITY",
+        fallback_type="CURRENT_LIABILITY",
+    )
+    if row and row.get("is_active") is not False:
+        return row
+    rows = await a_repo.list_accounts(organization_id, account_type="LIABILITY", is_active=True)
+    for r in rows or []:
+        if re.search(r"sales\s*tax|output\s*tax|gst\s*payable", r.get("name", ""), re.I):
+            return r
+    try:
+        code = await a_repo.next_available_code(organization_id, "2110")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Sales Tax Output Payable",
+            account_type="LIABILITY",
+            normal_balance="CREDIT",
+            parent_account_id=None,
+            description="Sales Tax (GST/PRA/SRB) collected on sales and payable to tax authorities.",
+        )
+        created["tax_account_created"] = True
+        return created
+    except Exception as exc:
+        log.warning("accounting_engine.tax_payable_account_create_failed", error=str(exc))
+        return None
+
+
+async def ensure_tax_receivable_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """Resolve or create the Sales Tax Input Claimable ASSET ledger (code 1310)."""
+    from app.services import accounting_service
+    acc = await a_repo.get_account_by_code(organization_id, code="1310")
+    if acc and acc.get("is_active") is not False:
+        return acc
+    row = await accounting_service.resolve_account(
+        organization_id,
+        account_name="Sales Tax Input Claimable",
+        account_type="ASSET",
+        fallback_type="CURRENT_ASSET",
+    )
+    if row and row.get("is_active") is not False:
+        return row
+    rows = await a_repo.list_accounts(organization_id, account_type="ASSET", is_active=True)
+    for r in rows or []:
+        if re.search(r"sales\s*tax|input\s*tax|gst\s*receivable|tax\s*claimable", r.get("name", ""), re.I):
+            return r
+    try:
+        code = await a_repo.next_available_code(organization_id, "1310")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Sales Tax Input Claimable",
+            account_type="ASSET",
+            normal_balance="DEBIT",
+            parent_account_id=None,
+            description="Sales Tax (GST) paid on purchases and claimable against output tax.",
+        )
+        created["tax_account_created"] = True
+        return created
+    except Exception as exc:
+        log.warning("accounting_engine.tax_receivable_account_create_failed", error=str(exc))
+        return None
+
+
+async def ensure_wht_payable_account(
+    organization_id: uuid.UUID,
+    section: str = "153",
+) -> Optional[Dict[str, Any]]:
+    """Resolve or create the Withholding Tax Payable LIABILITY ledger (code 2120 u/s 153, 2121 u/s 149)."""
+    code_target = "2121" if str(section) == "149" else "2120"
+    name_target = f"Withholding Tax Payable u/s {section}"
+    acc = await a_repo.get_account_by_code(organization_id, code=code_target)
+    if acc and acc.get("is_active") is not False:
+        return acc
+    rows = await a_repo.list_accounts(organization_id, account_type="LIABILITY", is_active=True)
+    for r in rows or []:
+        if re.search(rf"wht.*{section}|withholding.*{section}", r.get("name", ""), re.I):
+            return r
+    for r in rows or []:
+        if re.search(r"withholding\s*tax|wht\s*payable", r.get("name", ""), re.I):
+            return r
+    try:
+        code = await a_repo.next_available_code(organization_id, code_target)
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name=name_target,
+            account_type="LIABILITY",
+            normal_balance="CREDIT",
+            parent_account_id=None,
+            description=f"Tax withheld under Section {section} to be deposited with the tax authorities.",
+        )
+        created["wht_account_created"] = True
+        return created
+    except Exception as exc:
+        log.warning("accounting_engine.wht_account_create_failed", section=section, error=str(exc))
+        return None
+
+
+async def ensure_accrued_salaries_account(
+    organization_id: uuid.UUID,
+) -> Optional[Dict[str, Any]]:
+    """Resolve or create the Accrued Salaries Payable LIABILITY ledger (code 2130)."""
+    acc = await a_repo.get_account_by_code(organization_id, code="2130")
+    if acc and acc.get("is_active") is not False:
+        return acc
+    rows = await a_repo.list_accounts(organization_id, account_type="LIABILITY", is_active=True)
+    for r in rows or []:
+        if re.search(r"accrued\s*salar|salaries\s*payable|salary\s*payable|payroll\s*payable", r.get("name", ""), re.I):
+            return r
+    try:
+        code = await a_repo.next_available_code(organization_id, "2130")
+        created = await a_repo.create_account(
+            organization_id=organization_id,
+            code=code,
+            name="Accrued Salaries Payable",
+            account_type="LIABILITY",
+            normal_balance="CREDIT",
+            parent_account_id=None,
+            description="Net salaries earned and accrued at month-end, payable on salary disbursement date.",
+        )
+        created["accrued_salaries_account_created"] = True
+        return created
+    except Exception as exc:
+        log.warning("accounting_engine.accrued_salaries_create_failed", error=str(exc))
+        return None
+
+
 async def prepare_cogs_for_items(
     organization_id: uuid.UUID,
     *,
@@ -1271,6 +1534,9 @@ async def auto_journal(
                 description=description,
                 source_id=source_id,
                 project_id=project_id,
+                tax_amount=document.get("tax_amount"),
+                tax_pricing_mode=document.get("tax_pricing_mode"),
+                tax_rate_percent=document.get("tax_rate_percent"),
             )
             result: Dict[str, Any] = {"journal_entry": entry}
             # PERPETUAL INVENTORY: the SALE triggers cost recognition —

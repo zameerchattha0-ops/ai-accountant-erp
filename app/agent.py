@@ -2667,6 +2667,11 @@ async def _deterministic_mutation_calls(
 
                 entities["account_id"] = str(_exact["id"])
 
+        # COA Selection: When account_id is not already resolved, retire the rigid consumable bypass
+        # so LLM inspects live Chart of Accounts context and selects the best account.
+        if not entities.get("account_id"):
+            return None
+
         return _expense_fast_path_call(entities, classification)
 
     if execution_plan.intent == "record_receipt":
@@ -3851,11 +3856,25 @@ async def _revenue_ledger_review_gate(
 
 
 
-    proposed = rls.suggest_ledger_name(label) if label else "a new ledger"
+    # LLM-guided CA proposal: checks chart for closely related existing account
 
-    general = await rls.find_general_revenue(organization_id)
+    # vs. creating a dedicated sub-category for separate stream reporting
 
-    parent_name = (general or {}).get("name") or rls.REVENUE_PARENT_NAME
+    proposal = await rls.propose_revenue_structure_with_llm(
+
+        organization_id, item, orchestrator=get_client()
+
+    )
+
+    proposed = proposal.get("dedicated_name") or (rls.suggest_ledger_name(label) if label else "a new ledger")
+
+    parent_name = proposal.get("parent_name") or rls.REVENUE_PARENT_NAME
+
+    related_name = proposal.get("related_existing_name") or parent_name
+
+    reasoning_text = proposal.get("reasoning", "")
+
+
 
     return {
 
@@ -3863,11 +3882,13 @@ async def _revenue_ledger_review_gate(
 
             f"Revenue ledger check: nothing is recorded against '{label}' yet. "
 
-            f"Create a dedicated ledger '{proposed}' under '{parent_name}' so "
+            f"{reasoning_text} "
+
+            f"Create a dedicated sub-category '{proposed}' under '{parent_name}' so "
 
             f"this revenue is reported separately? Reply YES to create it, or "
 
-            f"reply with the name of an existing revenue account to use instead."
+            f"use the existing '{related_name}' account."
 
         ),
 
@@ -5715,6 +5736,54 @@ async def _resolve_open_document_reference(
                     entities["amount"] = bal if bal > 0 else tot
         except Exception as exc:
             log.warning("agent.resolve_bill_reference_failed", error=str(exc)[:200])
+
+    # --- Live Multi-Record Disambiguation Harness ---
+    try:
+        from app.conversation_harness import (
+            probe_live_records,
+            evaluate_disambiguation_need,
+            build_detailed_disambiguation_card,
+            resolve_user_selection,
+        )
+
+        user_reply = entities.get("selected_document_id")
+        if not user_reply:
+            for qa in (entities.get("prior_qa") or []):
+                q_text = str(qa.get("question") or "").lower()
+                if ("disambiguation" in q_text or "matching records" in q_text) and qa.get("answer"):
+                    user_reply = str(qa["answer"]).strip()
+                    break
+
+        ctx = await probe_live_records(organization_id, msg_str, entities)
+        all_candidates = [*ctx.matching_bills, *ctx.matching_invoices]
+
+        if user_reply and all_candidates:
+            selected = resolve_user_selection(user_reply, all_candidates)
+            if selected:
+                if selected.doc_type == "bill":
+                    entities["bill_id"] = str(selected.id)
+                    entities["bill_number"] = selected.number
+                    entities["supplier_id"] = str(selected.party_id)
+                    entities["supplier_name"] = selected.party_name
+                    entities["amount"] = selected.balance_due
+                else:
+                    entities["invoice_id"] = str(selected.id)
+                    entities["invoice_number"] = selected.number
+                    entities["customer_id"] = str(selected.party_id)
+                    entities["customer_name"] = selected.party_name
+                    entities["amount"] = selected.balance_due
+                entities["requires_disambiguation"] = False
+                return
+
+        if not (entities.get("bill_id") or entities.get("invoice_id")):
+            is_amb, reason, candidates = evaluate_disambiguation_need(ctx, msg_str)
+            if is_amb and candidates:
+                card_text, options = build_detailed_disambiguation_card(candidates, ctx.extracted_party)
+                entities["requires_disambiguation"] = True
+                entities["disambiguation_question"] = card_text
+                entities["disambiguation_options"] = options
+    except Exception as harness_exc:
+        log.warning("agent.harness_probe_failed", error=str(harness_exc)[:200])
 
 
 
@@ -7928,6 +7997,26 @@ async def execute(
         await _resolve_open_document_reference(organization_id, _ai_prefill)
         if (_preliminary or {}).get("provisional_intent_hint") and not _ai_prefill.get("semantic_intent"):
             _ai_prefill["semantic_intent"] = _preliminary["provisional_intent_hint"]
+        if _reasoning is not None and not _reasoning.provider_failed:
+            _rf = _prefill_from_reasoning(_reasoning, _preliminary)
+            for _k, _v in _rf.items():
+                if _v not in (None, "") and not _ai_prefill.get(_k):
+                    _ai_prefill[_k] = _v
+        if _preliminary:
+            _lits = _preliminary.get("literals") or {}
+            for _k, _v in _lits.items():
+                if _v not in (None, "") and not _ai_prefill.get(_k):
+                    _ai_prefill[_k] = _v
+            for _k, _v in _preliminary.items():
+                if _v not in (None, "") and _k not in ("literals", "original_request") and not _ai_prefill.get(_k):
+                    _ai_prefill[_k] = _v
+            if _preliminary.get("service_name") and not _ai_prefill.get("item_description"):
+                _ai_prefill["item_description"] = _preliminary["service_name"]
+            if _preliminary.get("product_name") and not _ai_prefill.get("item_description"):
+                _ai_prefill["item_description"] = _preliminary["product_name"]
+        if _ai_prefill.get("item_description") and not _ai_prefill.get("quantity"):
+            if str(_ai_prefill.get("transaction_nature") or "").upper() == "SERVICE" or "service" in str(_ai_prefill.get("item_description") or "").lower() or _ai_prefill.get("amount"):
+                _ai_prefill["quantity"] = 1.0
 
 
 
@@ -8034,7 +8123,10 @@ async def execute(
 
         for _k in (
             "product_name", "account_name", "bank_name", "employee_name",
-            "supplier_name", "customer_name", "project_name", "invoice_id", "invoice_number", "bill_id", "bill_number"
+            "supplier_name", "customer_name", "project_name", "invoice_id", "invoice_number",
+            "bill_id", "bill_number", "item_description", "description", "service_name",
+            "line_items", "quantity", "payment_method", "payment_channel", "payment_type",
+            "transaction_date", "transaction_purpose", "transaction_nature", "wht_rate_percent", "wht_rate"
         ):
             if (_preliminary or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _preliminary[_k]
@@ -8052,7 +8144,30 @@ async def execute(
             if _d:
                 execution_plan.extracted_entities["date_of_joining"] = _d
 
+        execution_plan.extracted_entities["prior_qa"] = prior_qa
+        # Service description and quantity defaulting
+        if not execution_plan.extracted_entities.get("item_description") and execution_plan.extracted_entities.get("service_name"):
+            execution_plan.extracted_entities["item_description"] = execution_plan.extracted_entities["service_name"]
+        if execution_plan.extracted_entities.get("item_description") and execution_plan.extracted_entities.get("quantity") is None:
+            if (
+                str(execution_plan.transaction_nature).upper() == "SERVICE"
+                or "service" in str(execution_plan.extracted_entities.get("item_description") or "").lower()
+                or execution_plan.extracted_entities.get("amount") is not None
+            ):
+                execution_plan.extracted_entities["quantity"] = 1
+
+        if not execution_plan.extracted_entities.get("payment_method") and execution_plan.extracted_entities.get("payment_channel"):
+            execution_plan.extracted_entities["payment_method"] = execution_plan.extracted_entities["payment_channel"]
+
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
+        if execution_plan.extracted_entities.get("requires_disambiguation"):
+            execution_plan.requires_clarification = True
+            execution_plan.clarification_questions = [
+                execution_plan.extracted_entities["disambiguation_question"]
+            ]
+            execution_plan.extracted_entities["question_options"] = [
+                execution_plan.extracted_entities.get("disambiguation_options") or []
+            ]
         if execution_plan.missing_fields:
             _resolved_fields = set()
             if execution_plan.extracted_entities.get("supplier_name"):
@@ -8065,6 +8180,16 @@ async def execute(
                 _resolved_fields.add("date_of_joining")
             if execution_plan.extracted_entities.get("amount") and float(execution_plan.extracted_entities.get("amount") or 0) > 0:
                 _resolved_fields.add("amount")
+            if execution_plan.extracted_entities.get("item_description"):
+                _resolved_fields.add("item_description")
+            if execution_plan.extracted_entities.get("quantity") is not None:
+                _resolved_fields.add("quantity")
+            if execution_plan.extracted_entities.get("transaction_purpose"):
+                _resolved_fields.add("transaction_purpose")
+            if execution_plan.extracted_entities.get("payment_method"):
+                _resolved_fields.add("payment_method")
+            if execution_plan.extracted_entities.get("transaction_date"):
+                _resolved_fields.add("transaction_date")
             if _resolved_fields:
                 execution_plan.missing_fields = [f for f in execution_plan.missing_fields if f not in _resolved_fields]
                 from app.planner import _questions_for_fields
@@ -8075,6 +8200,27 @@ async def execute(
                     execution_plan.clarification_questions = _questions_for_fields(
                         execution_plan.intent, execution_plan.missing_fields, execution_plan.extracted_entities
                     )
+
+        # Section 73 Cash Limitation Guard (> PKR 50,000 cash payment)
+        if (
+            execution_plan.intent in ("record_payment", "record_supplier_payment", "record_expense", "create_expense", "record_cash_purchase")
+            and (str(execution_plan.extracted_entities.get("payment_method") or "").upper() == "CASH" or "cash" in user_message.lower())
+            and float(execution_plan.extracted_entities.get("amount") or 0.0) > 50000.0
+        ):
+            from app.conversation_harness import validate_compliance_prerequisites
+            _guard = validate_compliance_prerequisites(
+                action_type=execution_plan.intent,
+                amount=float(execution_plan.extracted_entities.get("amount") or 0.0),
+                payment_method="CASH",
+            )
+            if _guard:
+                execution_plan.requires_clarification = True
+                execution_plan.clarification_questions = [
+                    f"⚠️ {_guard[0]}\n\nPlease confirm how you would like to proceed:"
+                ]
+                execution_plan.extracted_entities["question_options"] = [
+                    ["Pay via Bank Transfer (Recommended)", "Pay via Crossed Cheque", "Proceed with Cash (disallowance risk)"]
+                ]
 
 
 
@@ -9300,6 +9446,35 @@ async def execute(
 
         ):
 
+            if execution_plan.extracted_entities.get("requires_disambiguation"):
+                question = execution_plan.extracted_entities["disambiguation_question"]
+                options_list = execution_plan.extracted_entities.get("disambiguation_options") or []
+                opt_labels = [o["label"] for o in options_list] if options_list else []
+                await _log_step(
+                    session_id,
+                    "AWAITING_CLARIFICATION",
+                    _clarification_telemetry(
+                        "classifier_gate",
+                        branch="multi_record_disambiguation",
+                        required_fields=["selected_document_id"],
+                        question=question[:500],
+                    ),
+                )
+                clarification = await create_clarification(
+                    session_id=session_id,
+                    question=question,
+                    required_fields=["selected_document_id"],
+                )
+                return AgentResponse(
+                    status=ExecutionStatus.AWAITING_CLARIFICATION,
+                    execution_id=session_id,
+                    question=clarification.get("question", question),
+                    required_information=["selected_document_id"],
+                    options=opt_labels,
+                    question_options=[options_list] if options_list else None,
+                    requires_user_input=True,
+                )
+
             if classification.transaction_nature:
 
                 # Configuration gap: the nature is decided (user answer /
@@ -9541,12 +9716,18 @@ async def execute(
                     )
 
             else:
-
-                question = _classification_question(classification)
-
-                # R3.4: the 4-way nature decision is tap-to-answer too.
-
-                nature_options = options_for_question(question)
+                if execution_plan.intent in ("unknown", None, "") and not (entities.get("item_description") or entities.get("description")):
+                    from app.questionnaire import QUESTION_BANK
+                    spec = QUESTION_BANK.get("transaction_intent")
+                    question = spec.question if spec else "Could you please clarify what action you would like to take? (a) Pay a Supplier Bill, (b) Receive Customer Payment against an Invoice, (c) Record an Expense, (d) Direct Sale, or (e) Direct Purchase?"
+                    nature_options = ["Pay a Supplier Bill", "Receive Customer Payment", "Record an Expense", "Record a Sale", "Record a Purchase"]
+                    req_fields = ["transaction_intent"]
+                    branch_name = "transaction_intent"
+                else:
+                    question = _classification_question(classification)
+                    nature_options = options_for_question(question)
+                    req_fields = ["transaction_nature"]
+                    branch_name = "nature_4way"
 
                 question = strip_markdown(question) or question
 
@@ -9560,9 +9741,9 @@ async def execute(
 
                         "classifier_gate",
 
-                        branch="nature_4way",
+                        branch=branch_name,
 
-                        required_fields=["transaction_nature"],
+                        required_fields=req_fields,
 
                         question=question[:500],
 
@@ -9576,7 +9757,7 @@ async def execute(
 
                     question=question,
 
-                    required_fields=["transaction_nature"],
+                    required_fields=req_fields,
 
                 )
 
@@ -9901,6 +10082,16 @@ async def execute(
                 required_fields=["revenue_ledger_decision"],
 
                 options=review.get("options"),
+
+                reason=json.dumps({
+
+                    "intent": getattr(execution_plan, "intent", "create_invoice"),
+
+                    "extracted_entities": entities,
+
+                    "missing_fields": ["revenue_ledger_decision"],
+
+                }),
 
             )
 
@@ -14861,22 +15052,28 @@ async def resume_with_clarification(
                     }
                     if merged_entities.get("invoice_id"):
                         _rcpt_args["invoice_id"] = str(merged_entities["invoice_id"])
+                    if merged_entities.get("invoice_number"):
+                        _rcpt_args["invoice_number"] = str(merged_entities["invoice_number"])
                     single_hop_call = ToolCall(tool_name="record_customer_receipt", arguments=_rcpt_args)
 
-            elif intent in ("record_supplier_payment", "payment"):
+            elif intent in ("record_supplier_payment", "record_payment", "payment"):
                 amt = float(merged_entities.get("amount") or 0.0)
                 party = merged_entities.get("supplier_name") or merged_entities.get("name")
                 dt = merged_entities.get("transaction_date") or date.today().isoformat()
                 pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "CASH").upper()
-                if party and amt > 0:
+                if (party or merged_entities.get("bill_number") or merged_entities.get("bill_id")) and (amt > 0 or merged_entities.get("bill_number") or merged_entities.get("bill_id")):
                     _pmt_args = {
-                        "supplier_name": str(party).strip(),
-                        "amount": amt,
                         "payment_date": dt,
                         "payment_mode": pm,
                     }
+                    if party:
+                        _pmt_args["supplier_name"] = str(party).strip()
+                    if amt > 0:
+                        _pmt_args["amount"] = amt
                     if merged_entities.get("bill_id"):
                         _pmt_args["bill_id"] = str(merged_entities["bill_id"])
+                    if merged_entities.get("bill_number"):
+                        _pmt_args["bill_number"] = str(merged_entities["bill_number"])
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             if single_hop_call is not None:
