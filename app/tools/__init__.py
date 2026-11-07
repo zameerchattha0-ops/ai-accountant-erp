@@ -4542,7 +4542,7 @@ register("classify_expense", handler=_classify_expense, read_only=True, descript
 
 # Payment
 
-register("record_customer_receipt", handler=_record_customer_receipt, read_only=False, contract=contract_from_callable(payment_service.record_customer_receipt), description="Record customer receipt with journal and allocation")
+register("record_customer_receipt", handler=_record_customer_receipt, read_only=False, contract=contract_from_callable(payment_service.record_customer_receipt, extra_arguments=("customer_name", "payment_mode", "wht_rate", "withholding_tax_rate")), description="Record customer receipt with journal and allocation")
 
 register("record_supplier_payment", handler=_record_supplier_payment, read_only=False, contract=contract_from_callable(payment_service.record_supplier_payment, extra_arguments=("supplier_name", "payment_mode", "wht_rate", "withholding_tax_rate")), description="Record supplier payment with journal and allocation. Supports Section 153 Withholding Tax (WHT) deduction: pass wht_rate_percent (or wht_rate/withholding_tax_rate) and optionally wht_amount. Debits AP, credits Bank net, and credits WHT Payable u/s 153")
 

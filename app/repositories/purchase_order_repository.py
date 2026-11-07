@@ -167,7 +167,8 @@ async def update_purchase_order_status(
 
     return await update_one(
         "purchase_orders",
+        row_id=order_id,
         data={"status": status_upper},
-        filters={"id": str(order_id), "organization_id": str(organization_id)},
+        organization_id=organization_id,
     )
 

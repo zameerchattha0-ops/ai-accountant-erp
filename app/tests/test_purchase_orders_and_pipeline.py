@@ -158,3 +158,29 @@ async def test_universal_document_status_update_bulk():
         assert "Successfully updated 2 bills to status **PAID**" in res.data["summary"]
         assert "PUR-000014" in res.data["summary"]
         assert "PUR-000015" in res.data["summary"]
+
+
+@pytest.mark.asyncio
+async def test_update_purchase_order_status_repo_calls_update_one_correctly():
+    """Verify repo update_purchase_order_status passes row_id and organization_id to update_one."""
+    from app.repositories import purchase_order_repository as po_repo
+
+    org_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+
+    mock_update_one = AsyncMock(return_value={"id": str(order_id), "status": "ORDERED"})
+
+    with patch("app.repositories.purchase_order_repository.update_one", new=mock_update_one):
+        res = await po_repo.update_purchase_order_status(
+            organization_id=org_id,
+            order_id=order_id,
+            new_status="ORDERED",
+        )
+        assert res["status"] == "ORDERED"
+        mock_update_one.assert_awaited_once_with(
+            "purchase_orders",
+            row_id=order_id,
+            data={"status": "ORDERED"},
+            organization_id=org_id,
+        )
+

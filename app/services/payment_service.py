@@ -35,14 +35,27 @@ log = structlog.get_logger(__name__)
 async def _resolve_bank_gl_account(
     organization_id: uuid.UUID,
     bank_account_id: Optional[uuid.UUID],
+    bank_name_hint: Optional[str] = None,
 ) -> uuid.UUID:
     """Resolve the GL account id for a bank_accounts row."""
     if not bank_account_id:
         # Fall back to default bank account
         default = await bank_repo.get_default_bank_account(organization_id)
-        if not default:
-            raise ValueError("No bank account specified and no default bank account configured")
-        return uuid.UUID(default["gl_account_id"])
+        if default and default.get("gl_account_id"):
+            return uuid.UUID(default["gl_account_id"])
+
+        # Fall back to first active bank account
+        active_banks = await bank_repo.list_bank_accounts(organization_id, is_active=True, limit=5)
+        if active_banks and active_banks[0].get("gl_account_id"):
+            return uuid.UUID(active_banks[0]["gl_account_id"])
+
+        # Prerequisite resolution: Auto-ensure bank account and linked GL account
+        from app.accounting_engine import ensure_bank_account
+        ensured = await ensure_bank_account(organization_id, bank_name=bank_name_hint)
+        if ensured and ensured.get("gl_account_id"):
+            return uuid.UUID(str(ensured["gl_account_id"]))
+
+        raise ValueError("No bank account specified and no default bank account configured")
     ba = await bank_repo.get_bank_account(organization_id, bank_account_id=bank_account_id)
     if not ba:
         raise ValueError(f"Bank account {bank_account_id} not found")
@@ -86,6 +99,7 @@ async def _resolve_settlement_gl(
     payment_method: str,
     bank_account_id: Optional[uuid.UUID] = None,
     cash_account_id: Optional[uuid.UUID] = None,
+    bank_name: Optional[str] = None,
 ) -> uuid.UUID:
     """The MONEY side of a settlement journal.
 
@@ -95,7 +109,7 @@ async def _resolve_settlement_gl(
     """
     if str(payment_method or "").upper() == "CASH":
         return await _resolve_cash_gl_account(organization_id, cash_account_id)
-    return await _resolve_bank_gl_account(organization_id, bank_account_id)
+    return await _resolve_bank_gl_account(organization_id, bank_account_id, bank_name_hint=bank_name)
 
 
 async def _resolve_account_by_keywords(
@@ -342,6 +356,7 @@ async def record_customer_receipt(
     currency_code: str = "PKR",
     bank_account_id: Optional[uuid.UUID] = None,
     cash_account_id: Optional[uuid.UUID] = None,
+    bank_name: Optional[str] = None,
     reference: Optional[str] = None,
     notes: Optional[str] = None,
     invoice_id: Optional[uuid.UUID] = None,
@@ -371,6 +386,7 @@ async def record_customer_receipt(
         payment_method=payment_method,
         bank_account_id=bank_account_id,
         cash_account_id=cash_account_id,
+        bank_name=bank_name,
     )
     credit_gl, credit_warning = await _resolve_receipt_credit_account(
         organization_id, customer_id, transaction_nature
@@ -458,6 +474,7 @@ async def record_supplier_payment(
     currency_code: str = "PKR",
     bank_account_id: Optional[uuid.UUID] = None,
     cash_account_id: Optional[uuid.UUID] = None,
+    bank_name: Optional[str] = None,
     reference: Optional[str] = None,
     notes: Optional[str] = None,
     bill_id: Optional[uuid.UUID] = None,
@@ -489,6 +506,7 @@ async def record_supplier_payment(
         payment_method=payment_method,
         bank_account_id=bank_account_id,
         cash_account_id=cash_account_id,
+        bank_name=bank_name,
     )
     debit_gl, debit_warning = await _resolve_payment_debit_account(
         organization_id, supplier_id, transaction_nature

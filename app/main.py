@@ -2610,6 +2610,9 @@ async def update_purchase_order_status_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        log.exception("transition_order_status_failed", order_id=str(order_id), error=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
     return {"order": order}
 
 

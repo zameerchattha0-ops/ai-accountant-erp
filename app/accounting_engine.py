@@ -1117,6 +1117,97 @@ async def ensure_cash_account(
     return created
 
 
+async def ensure_bank_account(
+    organization_id: uuid.UUID,
+    bank_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """The Bank account and linked ASSET ledger a bank settlement credits/debits —
+    RESOLVING or CREATING it as a prerequisite when the books lack one.
+
+    Prerequisite resolution contract: A bank settlement (payment/receipt) must
+    never fail or crash merely because no bank account was explicitly configured yet.
+    """
+    from app.repositories import bank_repository as bank_repo
+
+    try:
+        # 1. Existing default or active bank account
+        default = await bank_repo.get_default_bank_account(organization_id)
+        if default and default.get("gl_account_id"):
+            return default
+
+        active_banks = await bank_repo.list_bank_accounts(organization_id, is_active=True, limit=5)
+        if active_banks and active_banks[0].get("gl_account_id"):
+            return active_banks[0]
+    except Exception as exc:
+        log.warning("accounting_engine.list_bank_accounts_failed", error=str(exc))
+
+    # 2. Check GL accounts in COA for an ASSET account named Bank or with code 1010
+    gl_row = None
+    for name in ("Bank", "Bank Account", "Cash at Bank", "Operating Bank Account"):
+        gl_row = await _resolve_named_postable_account(organization_id, name)
+        if gl_row is not None:
+            break
+
+    if gl_row is None:
+        try:
+            rows = await a_repo.search_accounts(organization_id, query="bank", limit=10)
+            group_ids = await _grouping_account_ids(organization_id)
+            for r in rows or ():
+                if r.get("account_type") == "ASSET" and r.get("id") not in group_ids and r.get("is_active") is not False:
+                    gl_row = r
+                    break
+        except Exception:
+            gl_row = None
+
+    # 3. If GL account still doesn't exist, create it in Chart of Accounts
+    if gl_row is None:
+        try:
+            code = await a_repo.next_available_code(organization_id, "1010")
+            gl_row = await a_repo.create_account(
+                organization_id=organization_id,
+                code=code,
+                name="Bank",
+                account_type="ASSET",
+                normal_balance="DEBIT",
+                parent_account_id=None,
+                description="Primary bank account ledger — created automatically as a settlement prerequisite.",
+            )
+            log.info("accounting_engine.bank_gl_created", code=code, name="Bank")
+        except Exception as exc:
+            log.warning("accounting_engine.bank_gl_create_failed", error=str(exc))
+            return None
+
+    # 4. Create the bank_accounts entry linked to this GL account
+    b_name = (bank_name or "").strip() or "Primary Bank"
+    acc_name = f"{b_name} - Main"
+    try:
+        bank_account = await bank_repo.create_bank_account(
+            organization_id=organization_id,
+            account_name=acc_name,
+            bank_name=b_name,
+            gl_account_id=uuid.UUID(str(gl_row["id"])),
+            is_default=True,
+            is_active=True,
+        )
+        bank_account["bank_account_created"] = True
+        log.info(
+            "accounting_engine.bank_account_prerequisite_created",
+            bank_account_id=str(bank_account.get("id")),
+            account_name=acc_name,
+            gl_account_id=str(gl_row["id"]),
+        )
+        return bank_account
+    except Exception as b_exc:
+        log.warning("accounting_engine.bank_account_create_failed", error=str(b_exc))
+        return {
+            "id": str(uuid.uuid4()),
+            "gl_account_id": str(gl_row["id"]),
+            "account_name": acc_name,
+            "bank_name": b_name,
+            "bank_account_created": True,
+        }
+
+
 async def _resolve_named_postable_account(
     organization_id: uuid.UUID, name: str, expected_type: str = "ASSET"
 ) -> Optional[Dict[str, Any]]:

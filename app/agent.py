@@ -14750,6 +14750,10 @@ async def resume_with_clarification(
                     pm = "CASH" if "CASH" in ans_up else ("BANK" if ("BANK" in ans_up or "TRANSFER" in ans_up) else ("CREDIT" if any(k in ans_up for k in ("CREDIT", "LATER", "PAYABLE")) else "CASH"))
                     merged_entities["payment_method"] = pm
                     merged_entities["payment_type"] = pm
+                    for b_keyword in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
+                        if b_keyword in ans_up:
+                            merged_entities["bank_name"] = b_keyword.title()
+                            break
                 elif any(k in part.upper() for k in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY")):
                     ans_up = part.upper()
                     for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
@@ -15054,6 +15058,10 @@ async def resume_with_clarification(
                         _rcpt_args["invoice_id"] = str(merged_entities["invoice_id"])
                     if merged_entities.get("invoice_number"):
                         _rcpt_args["invoice_number"] = str(merged_entities["invoice_number"])
+                    if merged_entities.get("bank_name"):
+                        _rcpt_args["bank_name"] = str(merged_entities["bank_name"])
+                    if merged_entities.get("bank_account_id"):
+                        _rcpt_args["bank_account_id"] = str(merged_entities["bank_account_id"])
                     single_hop_call = ToolCall(tool_name="record_customer_receipt", arguments=_rcpt_args)
 
             elif intent in ("record_supplier_payment", "record_payment", "payment"):
@@ -15074,6 +15082,10 @@ async def resume_with_clarification(
                         _pmt_args["bill_id"] = str(merged_entities["bill_id"])
                     if merged_entities.get("bill_number"):
                         _pmt_args["bill_number"] = str(merged_entities["bill_number"])
+                    if merged_entities.get("bank_name"):
+                        _pmt_args["bank_name"] = str(merged_entities["bank_name"])
+                    if merged_entities.get("bank_account_id"):
+                        _pmt_args["bank_account_id"] = str(merged_entities["bank_account_id"])
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             if single_hop_call is not None:
@@ -15123,15 +15135,18 @@ async def resume_with_clarification(
                     )
                 elif intent in ("record_supplier_payment", "payment") and tool_result.success:
                     pay_data = tool_result.data if isinstance(tool_result.data, dict) else {}
-                    amt = float(pay_data.get("amount") or merged_entities.get("amount") or 0.0)
+                    pay_row = pay_data.get("payment") if isinstance(pay_data.get("payment"), dict) else pay_data
+                    amt = float(pay_row.get("amount") or merged_entities.get("amount") or 0.0)
                     sname = merged_entities.get("supplier_name") or "Supplier"
                     pm = merged_entities.get("payment_method") or merged_entities.get("payment_mode") or "CASH"
+                    b_num = merged_entities.get("bill_number")
+                    bill_str = f" for Bill `{b_num}`" if b_num else ""
                     result_summary = (
                         f"### ✅ Supplier Payment Recorded\n\n"
                         f"* **Supplier:** {sname}\n"
-                        f"* **Amount Paid:** **Rs. {amt:,.2f}**\n"
+                        f"* **Amount Paid:** **Rs. {amt:,.2f}**{bill_str}\n"
                         f"* **Payment Mode:** {pm}\n"
-                        f"* **Status:** Posted to General Ledger\n\n"
+                        f"* **Status:** Posted to General Ledger (Settled in Full)\n\n"
                         f"[View Payments in Purchases →](/purchases/payments)"
                     )
                 elif intent in ("record_expense", "expense", "create_expense") and tool_result.success:
