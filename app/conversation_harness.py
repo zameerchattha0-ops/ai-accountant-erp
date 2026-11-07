@@ -275,20 +275,39 @@ def evaluate_disambiguation_need(
     is_payment_shaped = any(w in msg for w in ["pay", "paid", "settle", "bill", "pur", "supplier", "clear"])
     is_receipt_shaped = any(w in msg for w in ["receiv", "receipt", "collect", "invoice", "inv", "customer"])
 
+    # Ambiguity case 0a: Bill explicitly matched but ALREADY FULLY SETTLED
+    open_bills = [b for b in ctx.matching_bills if b.balance_due > 0.01 and str(b.status).upper() not in ("PAID", "SETTLED")]
+    open_invs = [i for i in ctx.matching_invoices if i.balance_due > 0.01 and str(i.status).upper() not in ("PAID", "SETTLED")]
+
+    if is_payment_shaped and ctx.matching_bills and not open_bills:
+        settled_bill = ctx.matching_bills[0]
+        if settled_bill.balance_due <= 0.01 or str(settled_bill.status).upper() in ("PAID", "SETTLED"):
+            return True, "bill_already_paid", [settled_bill]
+
+    # Ambiguity case 0b: Invoice explicitly matched but ALREADY FULLY COLLECTED
+    if is_receipt_shaped and ctx.matching_invoices and not open_invs:
+        settled_inv = ctx.matching_invoices[0]
+        if settled_inv.balance_due <= 0.01 or str(settled_inv.status).upper() in ("PAID", "SETTLED"):
+            return True, "invoice_already_paid", [settled_inv]
+
     # Ambiguity case 1: Multiple matching bills with open balances
-    open_bills = [b for b in ctx.matching_bills if b.balance_due > 0]
     if len(open_bills) > 1 and not (is_receipt_shaped and not is_payment_shaped):
         # Multiple bills on different dates or same date!
         return True, "multiple_matching_bills", open_bills
 
     # Ambiguity case 2: Multiple matching invoices with open balances
-    open_invs = [i for i in ctx.matching_invoices if i.balance_due > 0]
     if len(open_invs) > 1 and not (is_payment_shaped and not is_receipt_shaped):
         return True, "multiple_matching_invoices", open_invs
 
     # Ambiguity case 3: Cross-domain match (both open bills and invoices for similar names)
     if open_bills and open_invs:
         return True, "cross_document_ambiguity", [*open_bills, *open_invs]
+
+    if is_payment_shaped and len(open_bills) == 1:
+        return False, "single_open_bill", open_bills
+
+    if is_receipt_shaped and len(open_invs) == 1:
+        return False, "single_open_invoice", open_invs
 
     return False, None, []
 
@@ -297,8 +316,62 @@ def build_detailed_disambiguation_card(
     candidates: List[DocumentCandidate],
     party_name: Optional[str] = None,
     context_note: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, str]]]:
     """Build a rich, fully-detailed questionnaire card showing dates, totals, and balances."""
+    if reason == "bill_already_paid" and candidates:
+        c = candidates[0]
+        lines = [
+            f"### ⚠️ Live Books Audit: Bill `{c.number}` is Already Paid in Full",
+            "",
+            f"I reviewed your live purchase ledger and verified the official records for **{c.party_name}**:",
+            f"* **Bill Number:** `{c.number}`",
+            f"* **Supplier:** {c.party_name}",
+            f"* **Bill Date:** {c.doc_date or 'N/A'}",
+            f"* **Total Bill Amount:** Rs. {c.total:,.2f}",
+            f"* **Amount Already Paid:** **Rs. {c.amount_paid:,.2f}** (Status: **{c.status}**)",
+            f"* **Current Balance Due:** **Rs. 0.00**",
+            "",
+            f"Recording another payment against `{c.number}` would result in an overpayment and create an incorrect debit balance in Accounts Payable.",
+            "",
+            "**How would you like to proceed?**",
+            "(a) **Cancel this payment** (Do not record a duplicate)",
+            f"(b) **Record as unallocated supplier advance** to {c.party_name}",
+            "(c) **Apply payment to a different open bill**",
+        ]
+        options = [
+            {"value": "cancel", "label": "(A) Cancel payment (prevent duplicate)"},
+            {"value": "advance", "label": f"(B) Record as advance payment to {c.party_name}"},
+            {"value": "other_bill", "label": "(C) Apply to a different open bill"},
+        ]
+        return "\n".join(lines), options
+
+    if reason == "invoice_already_paid" and candidates:
+        c = candidates[0]
+        lines = [
+            f"### ⚠️ Live Books Audit: Invoice `{c.number}` is Already Collected in Full",
+            "",
+            f"I reviewed your live sales ledger and verified the official records for **{c.party_name}**:",
+            f"* **Invoice Number:** `{c.number}`",
+            f"* **Customer:** {c.party_name}",
+            f"* **Invoice Date:** {c.doc_date or 'N/A'}",
+            f"* **Invoice Total:** Rs. {c.total:,.2f}",
+            f"* **Amount Already Collected:** **Rs. {c.amount_paid:,.2f}** (Status: **{c.status}**)",
+            f"* **Current Balance Due:** **Rs. 0.00**",
+            "",
+            f"Recording another receipt against `{c.number}` would result in a duplicate receipt and produce an incorrect credit balance in Accounts Receivable.",
+            "",
+            "**How would you like to proceed?**",
+            "(a) **Cancel this receipt** (Do not record a duplicate)",
+            f"(b) **Record as unallocated customer advance** from {c.party_name}",
+            "(c) **Apply receipt to a different open invoice**",
+        ]
+        options = [
+            {"value": "cancel", "label": "(A) Cancel receipt (prevent duplicate)"},
+            {"value": "advance", "label": f"(B) Record as customer advance from {c.party_name}"},
+            {"value": "other_invoice", "label": "(C) Apply to a different open invoice"},
+        ]
+        return "\n".join(lines), options
     party = party_name or (candidates[0].party_name if candidates else "this party")
     lines = [
         f"### 📋 Disambiguation: Multiple Matching Records for {party}",

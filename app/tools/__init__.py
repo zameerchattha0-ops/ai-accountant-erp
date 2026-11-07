@@ -3251,8 +3251,11 @@ async def _record_customer_receipt(organization_id: uuid.UUID, **kw) -> ToolResu
         elif _pm in ("CASH",):
             kw["payment_method"] = "CASH"
 
-    data = await payment_service.record_customer_receipt(organization_id=organization_id, **kw)
-    return ToolResult(tool_name="record_customer_receipt", success=True, data=data)
+    try:
+        data = await payment_service.record_customer_receipt(organization_id=organization_id, **kw)
+        return ToolResult(tool_name="record_customer_receipt", success=True, data=data)
+    except ValueError as exc:
+        return ToolResult(tool_name="record_customer_receipt", success=False, error=str(exc))
 
 
 async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResult:
@@ -3301,8 +3304,11 @@ async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResu
         elif _pm in ("CASH",):
             kw["payment_method"] = "CASH"
 
-    data = await payment_service.record_supplier_payment(organization_id=organization_id, **kw)
-    return ToolResult(tool_name="record_supplier_payment", success=True, data=data)
+    try:
+        data = await payment_service.record_supplier_payment(organization_id=organization_id, **kw)
+        return ToolResult(tool_name="record_supplier_payment", success=True, data=data)
+    except ValueError as exc:
+        return ToolResult(tool_name="record_supplier_payment", success=False, error=str(exc))
 
 
 

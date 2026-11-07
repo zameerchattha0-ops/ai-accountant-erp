@@ -5778,10 +5778,31 @@ async def _resolve_open_document_reference(
         if not (entities.get("bill_id") or entities.get("invoice_id")):
             is_amb, reason, candidates = evaluate_disambiguation_need(ctx, msg_str)
             if is_amb and candidates:
-                card_text, options = build_detailed_disambiguation_card(candidates, ctx.extracted_party)
+                card_text, options = build_detailed_disambiguation_card(candidates, ctx.extracted_party, reason=reason)
                 entities["requires_disambiguation"] = True
+                entities["disambiguation_reason"] = reason
                 entities["disambiguation_question"] = card_text
                 entities["disambiguation_options"] = options
+            elif reason == "single_open_bill" and candidates:
+                selected = candidates[0]
+                entities["bill_id"] = str(selected.id)
+                entities["bill_number"] = selected.number
+                entities["supplier_id"] = str(selected.party_id)
+                entities["supplier_name"] = selected.party_name
+                entities["balance_due"] = selected.balance_due
+                entities["bill_total"] = selected.total
+                if not entities.get("amount") or entities.get("in_full"):
+                    entities["amount"] = selected.balance_due
+            elif reason == "single_open_invoice" and candidates:
+                selected = candidates[0]
+                entities["invoice_id"] = str(selected.id)
+                entities["invoice_number"] = selected.number
+                entities["customer_id"] = str(selected.party_id)
+                entities["customer_name"] = selected.party_name
+                entities["balance_due"] = selected.balance_due
+                entities["invoice_total"] = selected.total
+                if not entities.get("amount") or entities.get("in_full"):
+                    entities["amount"] = selected.balance_due
     except Exception as harness_exc:
         log.warning("agent.harness_probe_failed", error=str(harness_exc)[:200])
 
@@ -14762,6 +14783,22 @@ async def resume_with_clarification(
                             break
                     else:
                         merged_entities["account_type"] = ans_up
+                elif any(k in part.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "certificate available", "valid certificate", "zero tax", "no tax", "no wht", "no deduction", "deduct", "withhold", "tax deduction", "no certificate", "without certificate")) or (part.strip().lower() in ("1", "2", "a", "b", "(a)", "(b)", "(1)", "(2)") and "wht_certificate" in missing_fields):
+                    ans_low = part.lower()
+                    if any(k in ans_low for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "certificate available", "valid certificate", "0%", "zero tax", "no tax", "no wht", "no deduction", "pay in full", "pay full")) or ans_low in ("1", "a", "(a)", "(1)"):
+                        merged_entities["wht_status"] = "EXEMPT"
+                        merged_entities["wht_decision"] = "EXEMPT"
+                        merged_entities["wht_exempt"] = True
+                        merged_entities["wht_rate_percent"] = 0.0
+                    else:
+                        merged_entities["wht_status"] = "DEDUCT"
+                        merged_entities["wht_decision"] = "DEDUCT"
+                        merged_entities["wht_exempt"] = False
+                        m_pct = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", ans_low)
+                        if m_pct:
+                            merged_entities["wht_rate_percent"] = float(m_pct.group(1))
+                        elif merged_entities.get("wht_rate_percent") is None:
+                            merged_entities["wht_rate_percent"] = 5.0
                 else:
                     m_num = re.search(r"^\s*(?:(?:rs|pkr|usd|\$)\.?\s*)?(\d+(?:,\d+)*(?:\.\d+)?)\s*$", part, re.IGNORECASE)
                     if m_num and any(f in missing_fields for f in ("basic_salary", "salary", "amount", "subtotal", "total", "sales_price", "unit_price")):
@@ -15086,6 +15123,10 @@ async def resume_with_clarification(
                         _pmt_args["bank_name"] = str(merged_entities["bank_name"])
                     if merged_entities.get("bank_account_id"):
                         _pmt_args["bank_account_id"] = str(merged_entities["bank_account_id"])
+                    if merged_entities.get("wht_rate_percent") is not None:
+                        _pmt_args["wht_rate_percent"] = float(merged_entities["wht_rate_percent"])
+                    if merged_entities.get("wht_amount") is not None:
+                        _pmt_args["wht_amount"] = float(merged_entities["wht_amount"])
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             if single_hop_call is not None:
@@ -15141,11 +15182,23 @@ async def resume_with_clarification(
                     pm = merged_entities.get("payment_method") or merged_entities.get("payment_mode") or "CASH"
                     b_num = merged_entities.get("bill_number")
                     bill_str = f" for Bill `{b_num}`" if b_num else ""
+                    gross_amt = float(pay_row.get("gross_amount") or 0.0)
+                    wht_amt = float(pay_row.get("wht_amount") or 0.0)
+                    wht_line = ""
+                    if wht_amt > 0:
+                        wht_line = (
+                            f"\n* **Gross Payable Settled:** Rs. {gross_amt:,.2f}\n"
+                            f"* **Section 153 WHT Deducted:** **Rs. {wht_amt:,.2f}** (Credited to Account 2120 WHT Payable)\n"
+                            f"* **Net Paid to Vendor:** **Rs. {amt:,.2f}**"
+                        )
+                    elif merged_entities.get("wht_exempt"):
+                        wht_line = "\n* **Tax Compliance:** 0% Withholding Tax (Section 153 Exemption Certificate verified)"
+
                     result_summary = (
                         f"### ✅ Supplier Payment Recorded\n\n"
                         f"* **Supplier:** {sname}\n"
                         f"* **Amount Paid:** **Rs. {amt:,.2f}**{bill_str}\n"
-                        f"* **Payment Mode:** {pm}\n"
+                        f"* **Payment Mode:** {pm}{wht_line}\n"
                         f"* **Status:** Posted to General Ledger (Settled in Full)\n\n"
                         f"[View Payments in Purchases →](/purchases/payments)"
                     )

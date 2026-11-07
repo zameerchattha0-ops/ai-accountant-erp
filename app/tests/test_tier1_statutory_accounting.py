@@ -296,6 +296,10 @@ async def test_record_supplier_payment_with_wht(monkeypatch):
     async def fake_noop(*args, **kwargs):
         pass
 
+    async def fake_get_bill(*args, **kwargs):
+        return {"id": str(bill_id), "total": 100000.0, "amount_paid": 0.0, "status": "OPEN", "bill_number": "PUR-001"}
+
+    monkeypatch.setattr(payment_service.pur_repo, "get_purchase_bill", fake_get_bill)
     monkeypatch.setattr(payment_service, "_resolve_settlement_gl", fake_resolve_settlement_gl)
     monkeypatch.setattr(payment_service, "_resolve_payment_debit_account", fake_resolve_payment_debit_account)
     monkeypatch.setattr(payment_service.engine, "ensure_wht_payable_account", fake_ensure_wht)

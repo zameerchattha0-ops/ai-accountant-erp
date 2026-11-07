@@ -376,6 +376,24 @@ async def record_customer_receipt(
     r_date = receipt_date or date.today().isoformat()
     payment_method = _normalize_payment_method(payment_method)
 
+    if invoice_id:
+        inv = await inv_repo.get_invoice(organization_id, invoice_id=invoice_id)
+        if inv:
+            inv_tot = float(inv.get("total") or 0.0)
+            inv_paid = float(inv.get("amount_paid") or 0.0)
+            inv_due = max(0.0, inv_tot - inv_paid)
+            if inv_due <= 0.01 or str(inv.get("status") or "").upper() == "PAID":
+                raise ValueError(
+                    f"Invoice {inv.get('invoice_number')} is already fully settled "
+                    f"(Total: Rs. {inv_tot:,.2f}, Already Collected: Rs. {inv_paid:,.2f}, Status: PAID). "
+                    f"Duplicate receipt rejected to protect general ledger."
+                )
+            if float(amount or 0.0) > (inv_due + 0.01):
+                raise ValueError(
+                    f"Receipt amount Rs. {float(amount):,.2f} exceeds remaining balance "
+                    f"of Rs. {inv_due:,.2f} on invoice {inv.get('invoice_number')}."
+                )
+
     # ATOMIC POSTING (migration 078): the receipt, its journal entry and its
     # lines commit in ONE database transaction — a receipt can never exist
     # without its journal (the partial state the previous create-then-journal
@@ -494,6 +512,24 @@ async def record_supplier_payment(
     """
     p_date = payment_date or date.today().isoformat()
     payment_method = _normalize_payment_method(payment_method)
+
+    if bill_id:
+        bill = await pur_repo.get_purchase_bill(organization_id, bill_id=bill_id)
+        if bill:
+            b_tot = float(bill.get("total") or 0.0)
+            b_paid = float(bill.get("amount_paid") or 0.0)
+            b_due = max(0.0, b_tot - b_paid)
+            if b_due <= 0.01 or str(bill.get("status") or "").upper() == "PAID":
+                raise ValueError(
+                    f"Purchase bill {bill.get('bill_number')} is already fully settled "
+                    f"(Total: Rs. {b_tot:,.2f}, Already Paid: Rs. {b_paid:,.2f}, Status: PAID). "
+                    f"Duplicate payment rejected to protect general ledger."
+                )
+            if float(amount or 0.0) > (b_due + 0.01):
+                raise ValueError(
+                    f"Payment amount Rs. {float(amount):,.2f} exceeds remaining balance "
+                    f"of Rs. {b_due:,.2f} on bill {bill.get('bill_number')}."
+                )
 
     # ATOMIC POSTING (migration 077): the payment, its journal entry and its
     # lines commit in ONE database transaction — a payment can never exist

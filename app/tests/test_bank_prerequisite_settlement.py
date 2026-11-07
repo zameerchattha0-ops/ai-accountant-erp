@@ -144,3 +144,97 @@ async def test_supplier_payment_with_bank_resolves_prerequisite():
 
         assert res["amount"] == 90000.0
         assert res["payment_method"] == "BANK_TRANSFER"
+
+
+@pytest.mark.asyncio
+async def test_record_supplier_payment_rejects_already_paid_bill():
+    """Verify duplicate payment protection: paying an already-settled bill raises ValueError."""
+    org_id = uuid.uuid4()
+    supplier_id = uuid.uuid4()
+    bill_id = uuid.uuid4()
+
+    mock_paid_bill = {
+        "id": str(bill_id),
+        "organization_id": str(org_id),
+        "supplier_id": str(supplier_id),
+        "bill_number": "PUR-000005",
+        "total": 200000.0,
+        "amount_paid": 200000.0,
+        "status": "PAID",
+    }
+
+    with patch("app.repositories.purchase_repository.get_purchase_bill", new=AsyncMock(return_value=mock_paid_bill)):
+        with pytest.raises(ValueError, match="already fully settled"):
+            await payment_service.record_supplier_payment(
+                organization_id=org_id,
+                supplier_id=supplier_id,
+                bill_id=bill_id,
+                amount=200000.0,
+                payment_method="CASH",
+            )
+
+
+@pytest.mark.asyncio
+async def test_record_customer_receipt_rejects_already_paid_invoice():
+    """Verify duplicate receipt protection: collecting on an already-settled invoice raises ValueError."""
+    org_id = uuid.uuid4()
+    customer_id = uuid.uuid4()
+    invoice_id = uuid.uuid4()
+
+    mock_paid_inv = {
+        "id": str(invoice_id),
+        "organization_id": str(org_id),
+        "customer_id": str(customer_id),
+        "invoice_number": "INV-000006",
+        "total": 450000.0,
+        "amount_paid": 450000.0,
+        "status": "PAID",
+    }
+
+    with patch("app.repositories.invoice_repository.get_invoice", new=AsyncMock(return_value=mock_paid_inv)):
+        with pytest.raises(ValueError, match="already fully settled"):
+            await payment_service.record_customer_receipt(
+                organization_id=org_id,
+                customer_id=customer_id,
+                invoice_id=invoice_id,
+                amount=450000.0,
+                payment_method="CASH",
+            )
+
+
+def test_conversation_harness_flags_already_paid_bill():
+    """Verify that conversation harness detects already-paid bills and prepares an audit warning card."""
+    from app.conversation_harness import (
+        DisambiguationContext,
+        DocumentCandidate,
+        evaluate_disambiguation_need,
+        build_detailed_disambiguation_card,
+    )
+
+    doc = DocumentCandidate(
+        doc_type="bill",
+        id=uuid.uuid4(),
+        number="PUR-000005",
+        doc_date="2026-10-17",
+        due_date=None,
+        party_id=uuid.uuid4(),
+        party_name="Delta Pvt",
+        total=200000.0,
+        amount_paid=200000.0,
+        balance_due=0.0,
+        status="PAID",
+    )
+
+    ctx = DisambiguationContext(matching_bills=[doc], extracted_number="5")
+    is_amb, reason, candidates = evaluate_disambiguation_need(ctx, "Paid in full the bill no. 5 today")
+
+    assert is_amb is True
+    assert reason == "bill_already_paid"
+    assert len(candidates) == 1
+    assert candidates[0].number == "PUR-000005"
+
+    card_text, options = build_detailed_disambiguation_card(candidates, reason=reason)
+    assert "Already Paid in Full" in card_text
+    assert "PUR-000005" in card_text
+    assert any(opt["value"] == "cancel" for opt in options)
+

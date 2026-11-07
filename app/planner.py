@@ -3362,6 +3362,12 @@ _FIELD_QUESTION = {
 
     "project_name": "What is the name of the project to set up?",
 
+    "wht_certificate": (
+        "Has the supplier provided a Section 153 Withholding Tax Exemption Certificate, "
+        "or should withholding tax be deducted from this payment? Reply EXEMPT (0% WHT) if an "
+        "exemption certificate was provided, or DEDUCT WHT (e.g. DEDUCT 5%)."
+    ),
+
 }
 
 def _questions_for_fields(
@@ -3505,6 +3511,16 @@ def _questions_for_fields(
             else:
 
                 questions.append(_FIELD_QUESTION[f])
+
+        elif f == "wht_certificate":
+            sname = ents.get("supplier_name") or ents.get("party_name") or "the supplier"
+            questions.append(
+                f"Has {sname} provided a valid Section 153 Withholding Tax Exemption Certificate, "
+                "or should withholding tax be deducted from this payment?\n"
+                "1. Exemption Certificate provided (0% WHT — Pay full gross amount)\n"
+                "2. Deduct standard WHT (5% for services / 4% for goods)\n"
+                "3. Specify custom tax deduction rate (e.g. 1%, 2%, 10%)"
+            )
 
         elif f == "account_name" and intent == "create_bank_account":
 
@@ -3911,6 +3927,16 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     if intent in ("record_receipt", "record_payment") and not entities.get("payment_method"):
 
         missing.append("payment_type")
+
+    if (
+        intent in ("record_payment", "record_supplier_payment")
+        and not entities.get("wht_status")
+        and not entities.get("wht_decision")
+        and not entities.get("wht_exempt")
+        and entities.get("wht_rate_percent") is None
+        and entities.get("wht_amount") is None
+    ):
+        missing.append("wht_certificate")
 
     if intent == "record_credit_purchase" and not entities.get("supplier_name"):
 
