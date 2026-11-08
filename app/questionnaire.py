@@ -1116,7 +1116,7 @@ Rules (any violation discards that question):
      ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [].
      For payment_type when paid now: offer [{"value": "CASH", "label": "Cash"}, {"value": "BANK", "label": "Bank transfer"}].
      For settlement_position: offer [{"value": "PAID_NOW", "label": "Paid now"}, {"value": "OUTSTANDING", "label": "Payable (pay later)"}, {"value": "PREPAID", "label": "Prepaid / advance"}].
-     For wht_certificate: offer [{"value": "EXEMPTION_PROVIDED", "label": "Exemption Certificate (0% WHT)"}, {"value": "DEDUCT_STANDARD_WHT", "label": "Deduct Standard WHT"}, {"value": "CUSTOM_TAX", "label": "Custom Tax Rate"}].
+     For wht_certificate: offer [{"value": "EXEMPTION_PROVIDED", "label": "Exemption Certificate (0% WHT)"}, {"value": "DEDUCT_IT_SERVICES_4", "label": "IT Services (4% WHT)"}, {"value": "DEDUCT_GOODS_5", "label": "Goods (5% / 5.5% WHT)"}, {"value": "DEDUCT_SERVICES_14", "label": "Other Services (14% WHT)"}, {"value": "DEDUCT_PROFESSIONAL_15", "label": "Professional Services (15% WHT)"}, {"value": "CUSTOM_TAX", "label": "Custom Tax Rate"}].
   3. One sentence per question, plain text — no markdown, no numbering; repeat
      the known facts the question relies on so it needs no outside context;
   4. "field" is what routes the answer into the books — a question whose field

@@ -14876,7 +14876,7 @@ async def resume_with_clarification(
                             break
                     else:
                         merged_entities["account_type"] = ans_up
-                elif any(k in part.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "certificate available", "valid certificate", "zero tax", "no tax", "no wht", "no deduction", "deduct", "withhold", "tax deduction", "no certificate", "without certificate")) or (part.strip().lower() in ("1", "2", "a", "b", "(a)", "(b)", "(1)", "(2)") and "wht_certificate" in missing_fields):
+                elif any(k in part.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "certificate available", "valid certificate", "zero tax", "no tax", "no wht", "no deduction", "deduct", "withhold", "tax deduction", "no certificate", "without certificate")) or (part.strip().lower() in ("1", "2", "3", "4", "a", "b", "c", "d", "(a)", "(b)", "(c)", "(d)", "(1)", "(2)", "(3)", "(4)") and "wht_certificate" in missing_fields):
                     ans_low = part.lower()
                     if any(k in ans_low for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "certificate available", "valid certificate", "0%", "zero tax", "no tax", "no wht", "no deduction", "pay in full", "pay full")) or ans_low in ("1", "a", "(a)", "(1)"):
                         merged_entities["wht_status"] = "EXEMPT"
@@ -14887,11 +14887,16 @@ async def resume_with_clarification(
                         merged_entities["wht_status"] = "DEDUCT"
                         merged_entities["wht_decision"] = "DEDUCT"
                         merged_entities["wht_exempt"] = False
+                        from app.services.tax_service import resolve_section_153_rate
                         m_pct = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", ans_low)
                         if m_pct:
                             merged_entities["wht_rate_percent"] = float(m_pct.group(1))
-                        elif merged_entities.get("wht_rate_percent") is None:
-                            merged_entities["wht_rate_percent"] = 5.0
+                        else:
+                            sname = str(merged_entities.get("supplier_name") or "")
+                            is_corp = any(k in sname.lower() for k in ("pvt", "limited", "ltd", "inc", "corp", "llc", "company", "co."))
+                            context_text = f"{ans_low} {merged_entities.get('item_description') or ''} {merged_entities.get('description') or ''} {merged_entities.get('notes') or ''}"
+                            rate, _ = resolve_section_153_rate(context_text, payee_is_corporate=is_corp)
+                            merged_entities["wht_rate_percent"] = rate
                 else:
                     m_num = re.search(r"^\s*(?:(?:rs|pkr|usd|\$)\.?\s*)?(\d+(?:,\d+)*(?:\.\d+)?)\s*$", part, re.IGNORECASE)
                     if m_num and any(f in missing_fields for f in ("basic_salary", "salary", "amount", "subtotal", "total", "sales_price", "unit_price")):

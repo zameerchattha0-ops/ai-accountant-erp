@@ -3376,9 +3376,9 @@ _FIELD_QUESTION = {
     "project_name": "What is the name of the project to set up?",
 
     "wht_certificate": (
-        "Has the supplier provided a Section 153 Withholding Tax Exemption Certificate, "
-        "or should withholding tax be deducted from this payment? Reply EXEMPT (0% WHT) if an "
-        "exemption certificate was provided, or DEDUCT WHT (e.g. DEDUCT 5%)."
+        "Has the supplier provided a Section 153 Withholding Tax Exemption Certificate (0% WHT), "
+        "or should statutory withholding tax be deducted from this payment (e.g. Goods 5%/5.5%, "
+        "IT services 4%, Professional services 15%, Other services 14%, Contracts 7.5%/8%, Advertising 1.5%)?"
     ),
 
 }
@@ -3526,13 +3526,20 @@ def _questions_for_fields(
                 questions.append(_FIELD_QUESTION[f])
 
         elif f == "wht_certificate":
+            from app.services.tax_service import resolve_section_153_rate, SECTION_153_STATUTORY_RATES
             sname = ents.get("supplier_name") or ents.get("party_name") or "the supplier"
+            raw_text = f"{ents.get('notes') or ''} {ents.get('bill_number') or ''} {ents.get('description') or ''} {ents.get('item_description') or ''}"
+            is_corp = any(k in str(sname).lower() for k in ("pvt", "limited", "ltd", "inc", "corp", "llc", "company", "co."))
+            suggested_rate, cat_code = resolve_section_153_rate(raw_text, payee_is_corporate=is_corp)
+            cat_info = SECTION_153_STATUTORY_RATES.get(cat_code, {})
+            cat_label = cat_info.get("label", f"Section 153 WHT ({suggested_rate}%)")
             questions.append(
                 f"Has {sname} provided a valid Section 153 Withholding Tax Exemption Certificate, "
-                "or should withholding tax be deducted from this payment?\n"
-                "1. Exemption Certificate provided (0% WHT — Pay full gross amount)\n"
-                "2. Deduct standard WHT (5% for services / 4% for goods)\n"
-                "3. Specify custom tax deduction rate (e.g. 1%, 2%, 10%)"
+                f"or should statutory withholding tax be deducted from this payment?\n"
+                f"1. Exemption Certificate provided (0% WHT — Pay full gross amount)\n"
+                f"2. Deduct statutory ATL rate: {cat_label}\n"
+                f"3. Other statutory rates: Goods 5%/5.5%, IT services 4%, Professional 15%, Services 14%, Contracts 7.5%/8%, Advertising 1.5%\n"
+                f"4. Specify custom tax deduction rate (e.g. 1%, 2%, 10%)"
             )
 
         elif f == "item_description" and intent == "create_purchase_order":

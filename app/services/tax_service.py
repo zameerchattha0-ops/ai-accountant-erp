@@ -49,16 +49,177 @@ KNOWN_TAX_RATES: Dict[str, float] = {
     "ZERO": 0.0,
     "0%": 0.0,
     "EXEMPT": 0.0,
-    # Withholding Tax u/s 153 (Supplies & Services)
-    "WHT_153_GOODS_CORP": 5.5,
-    "WHT_153_GOODS_NON_CORP": 6.0,
-    "WHT_153_SERVICES_CORP": 9.0,
-    "WHT_153_SERVICES_NON_CORP": 11.0,
-    "WHT_153_CONTRACTS": 7.5,
-    "WHT_SERVICES": 9.0,
+    # Withholding Tax u/s 153 (Active Taxpayer List / ATL Statutory Rates)
+    "WHT_153_GOODS_CORP": 5.0,
+    "WHT_153_GOODS_INDIVIDUAL": 5.5,
+    "WHT_153_SPECIFIED_SERVICES": 7.0,
+    "WHT_153_IT_SERVICES": 4.0,
+    "WHT_153_PROFESSIONAL_SERVICES": 15.0,
+    "WHT_153_OTHER_SERVICES": 14.0,
+    "WHT_153_CONTRACTS_CORP": 7.5,
+    "WHT_153_CONTRACTS_INDIVIDUAL": 8.0,
+    "WHT_153_ADVERTISING": 1.5,
+    "WHT_SERVICES": 14.0,
     "WHT_IMPORTS": 6.0,
     "CORPORATE": 29.0,
 }
+
+# Section 153 Statutory Rate Schedule & Metadata
+SECTION_153_STATUTORY_RATES: Dict[str, Dict[str, Any]] = {
+    "GOODS_CORP": {
+        "rate": 5.0,
+        "label": "Purchase of goods – companies (5%)",
+        "description": "Supplies/goods purchased from corporate vendors",
+    },
+    "GOODS_INDIVIDUAL": {
+        "rate": 5.5,
+        "label": "Purchase of goods – individuals/AOPs (5.5%)",
+        "description": "Supplies/goods purchased from sole proprietors or AOPs",
+    },
+    "SPECIFIED_SERVICES": {
+        "rate": 7.0,
+        "label": "Specified services (7%)",
+        "description": "Transport, freight, courier, hoteling, security, cargo services",
+    },
+    "IT_SERVICES": {
+        "rate": 4.0,
+        "label": "IT and IT-enabled services (4%)",
+        "description": "Software, web development, cloud hosting, IT consulting, BPO, data services",
+    },
+    "PROFESSIONAL_SERVICES": {
+        "rate": 15.0,
+        "label": "Independent professional services (15%)",
+        "description": "Legal, accounting, auditing, medical, engineering, architecture, consulting",
+    },
+    "OTHER_SERVICES": {
+        "rate": 14.0,
+        "label": "Other services (14%)",
+        "description": "General services provided by companies, individuals, or AOPs",
+    },
+    "CONTRACTS_CORP": {
+        "rate": 7.5,
+        "label": "Contracts – companies (7.5%)",
+        "description": "Execution of contracts by corporate entities",
+    },
+    "CONTRACTS_INDIVIDUAL": {
+        "rate": 8.0,
+        "label": "Contracts – individuals/AOPs (8%)",
+        "description": "Execution of contracts by sole proprietors or AOPs",
+    },
+    "ADVERTISING_MEDIA": {
+        "rate": 1.5,
+        "label": "Advertising through print/electronic media (1.5%)",
+        "description": "Print, electronic, and digital media advertising services",
+    },
+}
+
+
+def resolve_section_153_rate(
+    text_or_nature: str = "",
+    payee_is_corporate: bool = False,
+    has_exemption_cert: bool = False,
+    custom_rate: Optional[float] = None,
+) -> Tuple[float, str]:
+    """Deterministically resolve Section 153 Withholding Tax rate.
+
+    Rules:
+    - If payee holds valid Section 153 Exemption Certificate: 0% WHT.
+    - If custom rate explicitly provided: custom rate wins.
+    - Otherwise, maps payment nature & payee type to official ATL rate:
+      * IT and IT-enabled services: 4%
+      * Purchase of goods – companies: 5%
+      * Purchase of goods – individuals/AOPs: 5.5%
+      * Specified services (freight, courier, hotel, transport): 7%
+      * Contracts – companies: 7.5%
+      * Contracts – individuals/AOPs: 8%
+      * Independent professional services: 15%
+      * Other services: 14%
+      * Advertising (print/electronic media): 1.5%
+    """
+    if has_exemption_cert:
+        return 0.0, "EXEMPT"
+
+    if custom_rate is not None:
+        r = float(custom_rate)
+        return r, "CUSTOM"
+
+    t = (text_or_nature or "").lower()
+
+    # 1. Advertising / Media
+    if any(k in t for k in ("advertis", "print media", "electronic media", "billboard", "tv ad", "newspaper ad")):
+        return 1.5, "ADVERTISING_MEDIA"
+
+    # 2. IT and IT-enabled services (4%)
+    if any(k in t for k in ("it consult", "software", "web develop", "web design", "programming", "cloud", "saas", "hosting", "it enabled", "bpo", "data entry", "computer")):
+        return 4.0, "IT_SERVICES"
+
+    # 3. Independent professional services (15%)
+    if any(k in t for k in ("legal", "lawyer", "advocate", "audit", "chartered account", "accountant", "doctor", "medical", "architect", "engineer", "professional fee", "professional consult")):
+        return 15.0, "PROFESSIONAL_SERVICES"
+
+    # 4. Specified services (7%)
+    if any(k in t for k in ("transport", "freight", "courier", "cargo", "hotel", "security guard", "security service", "tracking", "clearing agent")):
+        return 7.0, "SPECIFIED_SERVICES"
+
+    # 5. Contracts (7.5% corp / 8% ind)
+    if any(k in t for k in ("contract", "construction", "civil work", "fabrication", "turnkey")):
+        return (7.5, "CONTRACTS_CORP") if payee_is_corporate else (8.0, "CONTRACTS_INDIVIDUAL")
+
+    # 6. Goods / Supplies (5% corp / 5.5% ind)
+    if any(k in t for k in ("goods", "product", "supplies", "material", "inventory", "hardware", "furniture", "stationery", "toner", "paper", "equipment", "parts")):
+        return (5.0, "GOODS_CORP") if payee_is_corporate else (5.5, "GOODS_INDIVIDUAL")
+
+    # 7. Other services default (14%)
+    if any(k in t for k in ("service", "consulting", "maintenance", "repair", "cleaning", "cater")):
+        return 14.0, "OTHER_SERVICES"
+
+    # Fallback: Goods vs Corporate default
+    return (5.0, "GOODS_CORP") if payee_is_corporate else (5.5, "GOODS_INDIVIDUAL")
+
+
+def evaluate_input_tax_treatment(
+    subtotal: float,
+    sales_tax_amount: float,
+    supplier_has_strn: bool = False,
+    org_is_registered: bool = True,
+) -> Dict[str, Any]:
+    """Evaluate GST / Sales Tax input treatment under Sales Tax Act 1990.
+
+    Statutory Invariant:
+    - Input tax on purchase of goods is an ASSET (Sales Tax Recoverable / Input Tax),
+      claimable against output sales tax liabilities.
+    - S. 8 & S. 73 Restriction: Input tax can ONLY be recorded/claimed as an asset if
+      purchased from a REGISTERED person (valid Sales Tax Registration Number / STRN).
+    - If purchased from an UNREGISTERED vendor, input tax CANNOT be recorded or claimed
+      as an asset; the full cost must be capitalized into inventory/expense cost.
+    """
+    sub = round(float(subtotal or 0.0), 2)
+    tax = round(float(sales_tax_amount or 0.0), 2)
+
+    if not org_is_registered:
+        return {
+            "can_claim_input_tax": False,
+            "input_tax_asset": 0.0,
+            "inventory_or_expense_cost": round(sub + tax, 2),
+            "reason": "Organization is not registered for Sales Tax with FBR/provincial authority. Input tax cannot be claimed.",
+        }
+
+    if not supplier_has_strn:
+        return {
+            "can_claim_input_tax": False,
+            "input_tax_asset": 0.0,
+            "inventory_or_expense_cost": round(sub + tax, 2),
+            "reason": "Supplier is not registered for Sales Tax (No active STRN). Under Section 8 of Sales Tax Act 1990, input tax cannot be claimed as an asset and is absorbed into cost.",
+        }
+
+    return {
+        "can_claim_input_tax": True,
+        "input_tax_asset": tax,
+        "inventory_or_expense_cost": sub,
+        "asset_account_code": "1060",
+        "asset_account_name": "Input Sales Tax Recoverable",
+        "reason": "Valid registered supplier: Input sales tax is recognized as an Asset / Tax Recoverable to offset against output sales tax.",
+    }
 
 # Authority default rates
 AUTHORITY_DEFAULT_RATES: Dict[str, float] = {
