@@ -279,17 +279,13 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
     # invoice" also matches the generic quotation pattern below.
 
     ("create_purchase_order", [
-
-        r"(?:purchase|vendor|supplier)\s*(?:quotation|quote|rfq|order|po)",
-
+        r"\b(?:prepare|create|make|issue|draft|raise|generate|new|open)\s*(?:a\s+)?(?:purchase\s*order|po|rfq|vendor\s*order)\b",
+        r"\b(?:purchase\s*order|po|rfq)\s+(?:to|for|from|with)\b",
+        r"(?:purchase|vendor|supplier)\s*(?:quotation|quote|rfq|order|po)\b",
         r"(?:quotation|quote|rfq|order|po)\s+(?:for\s+purchasing|for\s+buying|from\s+supplier|from\s+vendor)",
-
-        r"(?:prepare|create|make|issue|draft)\s*(?:a\s+)?(?:quotation|quote|rfq|order)\s+(?:for\s+purchasing|for\s+buying|from)",
-
+        r"(?:prepare|create|make|issue|draft|raise|generate)\s*(?:a\s+)?(?:quotation|quote|rfq|order)\s+(?:for\s+purchasing|for\s+buying|from)",
         r"\bpurchas(?:e|ing)\s+quotation\b",
-
         r"\brfq\b",
-
     ]),
 
     ("convert_quotation", [r"convert.*(?:quotation|quote)", r"(?:quotation|quote).*invoice", r"accept.*(?:quotation|quote).*invoice"]),
@@ -1744,11 +1740,12 @@ def plan(
         entities["transaction_date"] = txn_date
     if re.search(r"\b(in full|paid in full|received in full|full amount|in total|cleared)\b", msg_lower):
         entities["in_full"] = True
+    _STOP_REFS = {"for", "to", "from", "in", "the", "a", "an", "of", "with", "on", "at", "against", "dated", "amounting", "amount", "is", "by", "all", "full", "cash", "bank", "credit"}
     m_bill = re.search(r"\bbill\s+(?:no\.?|#)?\s*([a-zA-Z0-9_-]+)", msg_lower)
-    if m_bill:
+    if m_bill and m_bill.group(1).strip().lower() not in _STOP_REFS:
         entities["bill_number"] = m_bill.group(1).strip()
     m_inv = re.search(r"\binvoice\s+(?:no\.?|#)?\s*([a-zA-Z0-9_-]+)", msg_lower)
-    if m_inv:
+    if m_inv and m_inv.group(1).strip().lower() not in _STOP_REFS:
         entities["invoice_number"] = m_inv.group(1).strip()
 
     # Report/list intents accept a relative period ("this month", "last
@@ -1776,6 +1773,19 @@ def plan(
             entities.setdefault("date_to", rng[1])
 
     item = _extract_item(msg)
+    if item:
+        party_name_val = entities.get("party") or entities.get("supplier_name") or entities.get("customer_name")
+        if party_name_val:
+            p_clean = str(party_name_val).strip().lower()
+            i_clean = str(item).strip().lower()
+            if p_clean == i_clean or i_clean.startswith(p_clean) or i_clean.endswith(p_clean):
+                sub_item = re.sub(re.escape(str(party_name_val)), "", item, flags=re.IGNORECASE).strip()
+                sub_item = re.sub(r"^(?:for|to|from|against|of|with)\s+", "", sub_item, flags=re.IGNORECASE).strip()
+                item = sub_item if sub_item and _is_plausible_item(sub_item) else None
+
+    if intent == "create_purchase_order":
+        if entities.get("party") and not entities.get("supplier_name"):
+            entities["supplier_name"] = str(entities["party"]).strip()
 
     if item:
 
@@ -1786,26 +1796,30 @@ def plan(
         # user had already given.
 
         stated_qty = _extract_item_quantity(msg, item)
+        clean_item, leading_qty = _split_leading_count(item)
+        if stated_qty is None and leading_qty is not None:
+            stated_qty = leading_qty
+
+        # Also extract unit price if phrased as "at 15000 each" or "@ 500"
+        m_price = re.search(r"\b(?:at|@|worth)\s+(?:rs\.?|pkr|₨|\$)?\s*([\d,]+(?:\.\d+)?)\s*(?:each|per\s+unit|a\s+piece)?\b", clean_item or item, re.I)
+        if m_price:
+            try:
+                u_price = float(m_price.group(1).replace(",", ""))
+                entities["unit_price"] = u_price
+                if stated_qty and not entities.get("amount"):
+                    entities["amount"] = stated_qty * u_price
+                clean_item = (clean_item or item)[:m_price.start()].strip()
+            except ValueError:
+                pass
+
+        if clean_item:
+            entities["item_description"] = clean_item
+        else:
+            entities["item_description"] = item
 
         if stated_qty is not None:
-
-            # A WRITTEN count rides inside the item the extractor returned
-
-            # ("two motorbikes"), so it must come OUT of the description — the
-
-            # line is "motorbikes" x2, not "two motorbikes" x2.
-
-            clean_item, _ = _split_leading_count(item)
-
-            entities["item_description"] = clean_item or item
-
             entities.setdefault("item_quantity", stated_qty)
-
             entities.setdefault("quantity", stated_qty)
-
-        else:
-
-            entities["item_description"] = item
 
     # several items stated in ONE
 
@@ -3522,6 +3536,15 @@ def _questions_for_fields(
                 "3. Specify custom tax deduction rate (e.g. 1%, 2%, 10%)"
             )
 
+        elif f == "item_description" and intent == "create_purchase_order":
+            sname = ents.get("supplier_name") or ents.get("party_name") or ents.get("party") or "the supplier"
+            questions.append(
+                f"What item or product are you ordering from {sname}? (description for the PO / RFQ line — e.g. 'Office chairs', 'Dell laptops')"
+            )
+
+        elif f == "supplier_name" and intent == "create_purchase_order":
+            questions.append("Who is the supplier for this Purchase Order / RFQ?")
+
         elif f == "account_name" and intent == "create_bank_account":
 
             questions.append("What is the account title or name for this bank account (e.g. Current Account, Operations)?")
@@ -3982,6 +4005,12 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
                     entities.setdefault("item_quantity", 1.0)
                 else:
                     missing.append("quantity")
+
+    if intent == "create_purchase_order":
+        if not (entities.get("supplier_name") or entities.get("party_name") or entities.get("counterparty") or entities.get("party")):
+            missing.append("supplier_name")
+        if not (entities.get("item_description") or entities.get("product_name") or entities.get("items") or entities.get("line_items") or entities.get("item_name") or entities.get("description")):
+            missing.append("item_description")
 
     # Asset lifecycle: the asset reference is material (which asset?), and
 
@@ -7216,6 +7245,10 @@ def _split_leading_count(text: str) -> Tuple[str, Optional[float]]:
     """
 
     raw = str(text or "").strip()
+    # Check leading numeric digits (e.g. "5 chairs", "10 laptops")
+    m_num = re.match(r"^\s*(?P<qty>\d+(?:\.\d+)?)\s*(?:x\b\s*|pcs\b\s*|units?\b\s*|pieces\b\s*|nos\b\s*)?", raw, re.I)
+    if m_num and float(m_num.group("qty")) > 0:
+        return raw[m_num.end():].strip(), float(m_num.group("qty"))
 
     match = _COUNT_PREFIX_RE.match(raw)
 

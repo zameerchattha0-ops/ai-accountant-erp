@@ -57,6 +57,7 @@ _INSTRUCTION = """You are the PRIMARY intelligence and fact-extraction engine fo
   "supplier_name": "<string>"|null,
   "invoice_number": "<string>"|null,
   "bill_number": "<string>"|null,
+  "po_number": "<string>"|null,
   "document_reference": "<string>"|null,
   "reason": "<string>"|null,
   "line_items": [{"description": "<item or service name>", "quantity": <number|null>, "unit_price": <number|null>, "total_amount": <number|null>}]|null,
@@ -83,6 +84,7 @@ RULES:
    - Personnel & Staff: create_employee (e.g. "record an employee", "add staff", "hire worker", "new employee"), list_employees, run_payroll
    - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation
    - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill
+   - Procurement & Orders: create_purchase_order (e.g. "create PO", "issue PO", "new PO for [supplier]", "RFQ", "purchase order for goods"), update_purchase_order_status (e.g. "issue PO RFQ-000001", "approve PO", "cancel PO")
    - Settlements & Cashflow: record_receipt (customer payments, receipts against invoice, e.g. "record payment receipt against invoice 12"), record_payment (supplier payments, payments against bill, e.g. "record payment against bill 5"), record_expense_payment, record_bank_transfer
    - Expenses: record_expense, list_expenses
    - Returns: create_credit_note (sales return), create_purchase_return (purchase return/debit note)

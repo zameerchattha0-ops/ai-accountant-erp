@@ -184,3 +184,66 @@ async def test_update_purchase_order_status_repo_calls_update_one_correctly():
             organization_id=org_id,
         )
 
+
+@pytest.mark.asyncio
+async def test_create_po_intent_recognition_and_disambiguation_guard():
+    """Verify 'CREATE PO FOR SHABBIR FURNITURE' plans create_purchase_order and never triggers bill settlement."""
+    from app.planner import plan
+    from app.agent import _resolve_open_document_reference, _deterministic_mutation_calls
+
+    msg = "CREATE PO FOR SHABBIR FURNITURE"
+    plan_res = plan(msg)
+
+    assert plan_res.intent == "create_purchase_order"
+    assert plan_res.extracted_entities.get("supplier_name") == "SHABBIR FURNITURE"
+    assert plan_res.extracted_entities.get("item_description") is None
+    assert "item_description" in plan_res.missing_fields
+    assert len(plan_res.clarification_questions) == 1
+    assert "What item or product are you ordering from SHABBIR FURNITURE?" in plan_res.clarification_questions[0]
+
+    # Verify _resolve_open_document_reference does not run bill settlement disambiguation
+    org_id = uuid.uuid4()
+    entities = {
+        "user_message": msg,
+        "original_request": msg,
+        "intent": "create_purchase_order",
+        "supplier_name": "SHABBIR FURNITURE",
+    }
+    await _resolve_open_document_reference(org_id, entities)
+    assert entities.get("requires_disambiguation") is not True
+    assert entities.get("bill_id") is None
+
+
+@pytest.mark.asyncio
+async def test_create_po_with_item_qty_price_fast_path():
+    """Verify 'CREATE PO FOR SHABBIR FURNITURE FOR 5 OFFICE CHAIRS AT 15000 EACH' extracts all fields and executes."""
+    from app.planner import plan
+    from app.agent import _deterministic_mutation_calls
+
+    msg = "CREATE PO FOR SHABBIR FURNITURE FOR 5 OFFICE CHAIRS AT 15000 EACH"
+    plan_res = plan(msg)
+
+    assert plan_res.intent == "create_purchase_order"
+    assert plan_res.extracted_entities.get("supplier_name") == "SHABBIR FURNITURE"
+    assert plan_res.extracted_entities.get("item_description") == "OFFICE CHAIRS"
+    assert plan_res.extracted_entities.get("quantity") == 5.0
+    assert plan_res.extracted_entities.get("unit_price") == 15000.0
+    assert plan_res.extracted_entities.get("amount") == 75000.0
+    assert plan_res.missing_fields == []
+    assert plan_res.requires_clarification is False
+
+    org_id = uuid.uuid4()
+    calls = await _deterministic_mutation_calls(
+        organization_id=org_id,
+        execution_plan=plan_res,
+        classification=None,
+    )
+    assert calls is not None
+    assert len(calls) == 1
+    assert calls[0].tool_name == "create_purchase_order"
+    assert calls[0].arguments["supplier_name"] == "SHABBIR FURNITURE"
+    assert calls[0].arguments["product_name"] == "OFFICE CHAIRS"
+    assert calls[0].arguments["quantity"] == 5.0
+    assert calls[0].arguments["unit_price"] == 15000.0
+
+

@@ -83,8 +83,20 @@ async def probe_live_records(
 ) -> DisambiguationContext:
     """Harvest real records matching party, numbers, and amounts from the books."""
     msg = user_message.lower()
-    entities = preliminary_entities or {}
     ctx = DisambiguationContext()
+
+    # Document creation requests (PO, RFQ, new invoice, quote) must NEVER be treated as settlement disambiguation
+    is_creation = any(
+        re.search(pat, msg)
+        for pat in [
+            r"\b(?:prepare|create|make|issue|draft|raise|generate|new|open)\s*(?:a\s+)?(?:purchase\s*order|po|rfq|vendor\s*order|quotation|quote|invoice|bill)\b",
+            r"\b(?:purchase\s*order|po|rfq)\s+(?:to|for|from|with)\b",
+            r"\b(?:invoice|bill|quotation)\s+(?:to|for)\s+[a-zA-Z]",
+        ]
+    ) and not any(w in msg for w in ["pay", "paid", "settle", "settlement", "clear", "against"])
+    if is_creation:
+        return ctx
+    entities = preliminary_entities or {}
 
     # 1. Extract search hints
     party_hint = (
@@ -104,9 +116,12 @@ async def probe_live_records(
     ctx.extracted_party = party_hint
 
     # Extract number hint (e.g. "bill 5", "invoice 0006", "inv-12")
-    m_num = re.search(r"\b(?:bill|purchase\s*bill|inv|invoice|po|pur)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", user_message, re.I)
+    m_num = re.search(r"\b(?:bill|purchase\s*bill|inv|invoice|pur)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", user_message, re.I)
+    _STOP_WORDS = {"for", "to", "from", "in", "the", "a", "an", "of", "with", "on", "at", "against", "dated", "amounting", "amount", "is", "by", "all", "full", "cash", "bank", "credit"}
     if m_num:
-        ctx.extracted_number = m_num.group(1).strip()
+        cand_num = m_num.group(1).strip()
+        if cand_num.lower() not in _STOP_WORDS and (any(ch.isdigit() for ch in cand_num) or "#" in user_message or "no" in user_message.lower()):
+            ctx.extracted_number = cand_num
 
     # Extract amount hint
     m_amt = re.search(r"\b(?:rs\.?|pkr|₨|\$)?\s*([\d,]+(?:\.\d+)?)\b", user_message, re.I)
@@ -270,6 +285,18 @@ def evaluate_disambiguation_need(
 ) -> Tuple[bool, Optional[str], List[DocumentCandidate]]:
     """Determine whether multiple records create ambiguity requiring user clarification."""
     msg = user_message.lower()
+
+    # Document creation requests (PO, RFQ, new invoice, quote) must NEVER be treated as settlement disambiguation
+    is_creation = any(
+        re.search(pat, msg)
+        for pat in [
+            r"\b(?:prepare|create|make|issue|draft|raise|generate|new|open)\s*(?:a\s+)?(?:purchase\s*order|po|rfq|vendor\s*order|quotation|quote|invoice|bill)\b",
+            r"\b(?:purchase\s*order|po|rfq)\s+(?:to|for|from|with)\b",
+            r"\b(?:invoice|bill|quotation)\s+(?:to|for)\s+[a-zA-Z]",
+        ]
+    ) and not any(w in msg for w in ["pay", "paid", "settle", "settlement", "clear", "against"])
+    if is_creation:
+        return False, None, []
 
     # If user explicitly asked about bills or payments
     is_payment_shaped = any(w in msg for w in ["pay", "paid", "settle", "bill", "pur", "supplier", "clear"])

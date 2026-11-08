@@ -171,6 +171,8 @@ _FAST_PATH_INTENTS = {
 
     "create_purchase_return",   # resolved supplier return -> debit note
 
+    "create_purchase_order",    # resolved purchase order / RFQ fast path
+
     # Master data / Setup and Operational intents across all ERP modules
     "create_account",
     "get_chart_of_accounts",
@@ -2842,7 +2844,7 @@ async def _deterministic_mutation_calls(
             return [ToolCall(tool_name="create_project", arguments=args)]
 
     if execution_plan.intent == "create_purchase_order":
-        supp_name = entities.get("supplier_name") or entities.get("party_name") or entities.get("counterparty")
+        supp_name = entities.get("supplier_name") or entities.get("party_name") or entities.get("counterparty") or entities.get("party")
         p_name = entities.get("product_name") or entities.get("item_name") or entities.get("item_description") or entities.get("description")
         price = entities.get("unit_price") or entities.get("price") or entities.get("amount")
         qty = entities.get("quantity") or 1
@@ -5633,13 +5635,38 @@ async def _resolve_open_document_reference(
     if not isinstance(entities, dict):
         return
 
+    # Document creation / operational setup intents NEVER resolve open bills for settlement
+    msg_str = str(entities.get("user_message") or entities.get("original_request") or "").strip()
+    msg_l = msg_str.lower()
+    intent = str(entities.get("intent") or entities.get("semantic_intent") or entities.get("provisional_intent_hint") or "").lower()
+    if intent in (
+        "create_purchase_order", "update_purchase_order_status", "create_quotation",
+        "create_invoice", "record_sale", "record_credit_sale", "record_purchase",
+        "record_credit_purchase", "create_product", "create_service", "create_customer",
+        "create_supplier", "create_employee", "create_project", "create_bank_account",
+        "create_account", "create_purchase_bill"
+    ):
+        return
+
+    is_creation = any(
+        re.search(pat, msg_l)
+        for pat in [
+            r"\b(?:prepare|create|make|issue|draft|raise|generate|new|open)\s*(?:a\s+)?(?:purchase\s*order|po|rfq|vendor\s*order|quotation|quote|invoice|bill)\b",
+            r"\b(?:purchase\s*order|po|rfq)\s+(?:to|for|from|with)\b",
+            r"\b(?:invoice|bill|quotation)\s+(?:to|for)\s+[a-zA-Z]",
+        ]
+    ) and not any(w in msg_l for w in ["pay", "paid", "settle", "settlement", "clear", "against"])
+    if is_creation:
+        return
+
+    _STOP_WORDS = {"for", "to", "from", "in", "the", "a", "an", "of", "with", "on", "at", "against", "dated", "amounting", "amount", "is", "by", "all", "full", "cash", "bank", "credit"}
+
     # --- Invoice Resolution ---
     inv_ref = entities.get("invoice_number") or entities.get("invoice_id")
     if not inv_ref:
-        msg_str = str(entities.get("user_message") or entities.get("original_request") or "")
         m_inv = re.search(r"\b(?:invoice|inv)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", msg_str, re.I)
-        if m_inv:
-            inv_ref = m_inv.group(1)
+        if m_inv and m_inv.group(1).strip().lower() not in _STOP_WORDS:
+            inv_ref = m_inv.group(1).strip()
             entities["invoice_number"] = inv_ref
     if inv_ref and not (entities.get("invoice_id") and entities.get("customer_name") and entities.get("amount")):
         try:
@@ -5688,9 +5715,9 @@ async def _resolve_open_document_reference(
     bill_ref = entities.get("bill_number") or entities.get("bill_id")
     if not bill_ref:
         msg_str = str(entities.get("user_message") or entities.get("original_request") or "")
-        m_bill = re.search(r"\b(?:bill|purchase\s*bill|po|pur)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", msg_str, re.I)
-        if m_bill:
-            bill_ref = m_bill.group(1)
+        m_bill = re.search(r"\b(?:bill|purchase\s*bill|pur)\s*(?:no\.?|number|#)?\s*([A-Za-z0-9_-]+)\b", msg_str, re.I)
+        if m_bill and m_bill.group(1).strip().lower() not in _STOP_WORDS:
+            bill_ref = m_bill.group(1).strip()
             entities["bill_number"] = bill_ref
 
     if bill_ref and not (entities.get("bill_id") and entities.get("supplier_name") and entities.get("amount")):
