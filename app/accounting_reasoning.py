@@ -1249,6 +1249,9 @@ _PREFETCH_KIND_MAP: Dict[str, str] = {
     "fixed_assets": "fixed_assets",
     "bank": "bank_accounts",
     "cash": "bank_accounts",
+    "purchases": "purchase_orders",
+    "procurement": "purchase_orders",
+    "orders": "purchase_orders",
 }
 _PREFETCH_MAX_KINDS = 3
 

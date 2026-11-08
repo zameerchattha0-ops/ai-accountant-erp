@@ -396,6 +396,25 @@ async def _load_ledgers(
     return out
 
 
+async def _load_purchase_orders(
+    organization_id: uuid.UUID, **args: Any
+) -> List[Dict[str, Any]]:
+    """Purchase orders and vendor RFQs — optionally scoped to supplier or status."""
+    from app.services import purchase_order_service
+
+    party_names = [str(args.get("party_name") or "").strip()] if args.get("party_name") else _terms(args)
+    party_names = [p for p in party_names if p]
+    status = str(args.get("status") or "").strip().upper() or None
+    query = party_names[0] if party_names else None
+
+    orders = await purchase_order_service.list_orders(
+        organization_id,
+        status=status,
+        query=query,
+    )
+    return [_trim({**row, "kind": "purchase_order"}) for row in (orders or [])[:_limit(args)]]
+
+
 async def _load_documents(
     organization_id: uuid.UUID, **args: Any
 ) -> List[Dict[str, Any]]:
@@ -404,6 +423,8 @@ async def _load_documents(
         expense_repository,
         invoice_repository,
         purchase_repository,
+        purchase_order_repository,
+        quotation_repository,
     )
 
     terms = _terms(args)
@@ -420,6 +441,20 @@ async def _load_documents(
         organization_id, limit=_limit(args)
     )
     out.extend(_trim({"kind": "expense", **row}) for row in expenses if _matches(row, terms))
+    try:
+        orders = await purchase_order_repository.list_purchase_orders(
+            organization_id, limit=_limit(args)
+        )
+        out.extend(_trim({"kind": "purchase_order", **row}) for row in orders if _matches(row, terms))
+    except Exception:
+        pass
+    try:
+        quotes = await quotation_repository.list_quotations(
+            organization_id, limit=_limit(args)
+        )
+        out.extend(_trim({"kind": "quotation", **row}) for row in quotes if _matches(row, terms))
+    except Exception:
+        pass
     return out
 
 
@@ -751,7 +786,7 @@ EVIDENCE_KINDS: Dict[str, EvidenceKind] = {
     ),
     "documents": EvidenceKind(
         kind="documents",
-        title="Existing documents (invoices, purchase bills, expenses)",
+        title="Existing documents (invoices, purchase bills, expenses, orders)",
         description=(
             "Full document list with status and amounts. Use it to detect "
             "that an event was already recorded before proposing a new one."
@@ -759,6 +794,18 @@ EVIDENCE_KINDS: Dict[str, EvidenceKind] = {
         args={"terms": "list", "limit": "number"},
         permission_slug="get_invoice",
         loader=_load_documents,
+    ),
+    "purchase_orders": EvidenceKind(
+        kind="purchase_orders",
+        title="Purchase Orders and Vendor RFQs",
+        description=(
+            "Purchase orders, requests for quotation (RFQs), inbound procurement in-flight, "
+            "and line items. Use it to check existing orders before creating a new one, or "
+            "to check lifecycle status (RFQ, ORDERED, RECEIVED, BILLED, CANCELLED)."
+        ),
+        args={"party_name": "string", "terms": "list", "status": "string", "limit": "number"},
+        permission_slug="get_purchase_order",
+        loader=_load_purchase_orders,
     ),
     "journal_entries": EvidenceKind(
         kind="journal_entries",

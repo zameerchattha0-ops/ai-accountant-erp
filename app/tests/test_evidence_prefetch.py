@@ -208,3 +208,20 @@ async def test_proposal_first_round_reaps_unused_prefetch(monkeypatch):
     await asyncio.sleep(0)
     assert calls == [["open_receivables"]]
 
+
+def test_prefetch_requests_maps_procurement_to_purchase_orders():
+    """Verify speculative prefetch correctly maps procurement subject areas to purchase_orders."""
+    facts = SimpleNamespace(
+        preliminary={
+            "candidate_subject_areas": ["purchases", "procurement", "orders"],
+            "named_parties_or_items_candidates": ["Alpha Traders"],
+        }
+    )
+    reqs = _prefetch_requests(facts, evidence_cache={})
+    kinds = [r.kind for r in reqs]
+    assert "purchase_orders" in kinds
+    # Max limit of 3 kinds respected
+    assert len(reqs) <= 3
+
+
+
