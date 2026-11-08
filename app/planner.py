@@ -745,8 +745,7 @@ _SEMANTIC_INTENTS = frozenset({
     "record_adjustment", "record_correction", "reverse_journal",
 
     "update_product", "delete_product", "update_service", "delete_service",
-
-    "create_purchase_order", "create_quotation", "convert_quotation",
+    "create_purchase_order", "update_purchase_order_status", "update_document_status", "create_quotation", "convert_quotation",
 
 })
 

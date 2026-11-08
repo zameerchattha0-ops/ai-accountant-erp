@@ -890,6 +890,23 @@ AUTHORED_FIELDS: frozenset = frozenset(
         "depreciation_amount",
         "period",
         "note",
+        "wht_certificate",
+        "wht_rate_percent",
+        "wht_rate",
+        "service_name",
+        "product_name",
+        "bank_name",
+        "employee_name",
+        "basic_salary",
+        "date_of_joining",
+        "counterparty",
+        "loan_direction",
+        "first_payment_date",
+        "tenure_months",
+        "frequency",
+        "po_number",
+        "order_date",
+        "target_status",
     }
 )
 
@@ -1053,6 +1070,9 @@ _FIELD_GLOSS: Dict[str, str] = {
     "proceeds_amount": "the money received on a disposal",
     "period": "the accounting period the entry belongs to",
     "note": "any further detail the user wants recorded",
+    "wht_certificate": "whether supplier provided a Section 153 Withholding Tax Exemption Certificate (0% WHT), or standard tax should be deducted",
+    "po_number": "the purchase order number or RFQ reference",
+    "target_status": "the target document status",
 }
 
 # CALL 1 (SEMANTIC INTAKE) — question authoring belongs to CALL 1 alone
@@ -1096,6 +1116,7 @@ Rules (any violation discards that question):
      ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [].
      For payment_type when paid now: offer [{"value": "CASH", "label": "Cash"}, {"value": "BANK", "label": "Bank transfer"}].
      For settlement_position: offer [{"value": "PAID_NOW", "label": "Paid now"}, {"value": "OUTSTANDING", "label": "Payable (pay later)"}, {"value": "PREPAID", "label": "Prepaid / advance"}].
+     For wht_certificate: offer [{"value": "EXEMPTION_PROVIDED", "label": "Exemption Certificate (0% WHT)"}, {"value": "DEDUCT_STANDARD_WHT", "label": "Deduct Standard WHT"}, {"value": "CUSTOM_TAX", "label": "Custom Tax Rate"}].
   3. One sentence per question, plain text — no markdown, no numbering; repeat
      the known facts the question relies on so it needs no outside context;
   4. "field" is what routes the answer into the books — a question whose field
