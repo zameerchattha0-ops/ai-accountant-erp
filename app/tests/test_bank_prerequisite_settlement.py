@@ -238,3 +238,96 @@ def test_conversation_harness_flags_already_paid_bill():
     assert "PUR-000005" in card_text
     assert any(opt["value"] == "cancel" for opt in options)
 
+
+@pytest.mark.asyncio
+async def test_record_supplier_payment_tool_auto_links_open_bill_and_rejects_duplicate():
+    """Verify tool _record_supplier_payment auto-links open bills and rejects paying suppliers with only settled bills."""
+    from app.tools import _record_supplier_payment
+
+    org_id = uuid.uuid4()
+    supplier_id = uuid.uuid4()
+    bill_id = uuid.uuid4()
+
+    mock_open_bill = {
+        "id": str(bill_id),
+        "organization_id": str(org_id),
+        "supplier_id": str(supplier_id),
+        "bill_number": "PUR-000012",
+        "total": 90000.0,
+        "amount_paid": 0.0,
+        "status": "OPEN",
+    }
+
+    # Case 1: Open bill exists matching amount -> auto-links
+    with patch("app.services.supplier_service.search", new=AsyncMock(return_value=[{"id": str(supplier_id), "name": "Alpha Traders"}])), \
+         patch("app.database.fetch_many", new=AsyncMock(return_value=[mock_open_bill])), \
+         patch("app.services.payment_service.record_supplier_payment", new=AsyncMock(return_value={"id": "pmt1", "amount": 90000.0})) as mock_rec:
+
+        res = await _record_supplier_payment(
+            organization_id=org_id,
+            supplier_name="Alpha Traders",
+            amount=90000.0,
+            payment_mode="BANK",
+        )
+        assert res.success is True
+        # Verify bill_id was auto-linked in the call
+        called_kw = mock_rec.call_args.kwargs
+        assert called_kw.get("bill_id") == bill_id
+
+    # Case 2: Only paid bill exists -> rejects duplicate payment to protect GL
+    mock_paid_bill = {
+        "id": str(bill_id),
+        "organization_id": str(org_id),
+        "supplier_id": str(supplier_id),
+        "bill_number": "PUR-000005",
+        "total": 200000.0,
+        "amount_paid": 200000.0,
+        "status": "PAID",
+    }
+    with patch("app.services.supplier_service.search", new=AsyncMock(return_value=[{"id": str(supplier_id), "name": "DElta Pvt"}])), \
+         patch("app.database.fetch_many", new=AsyncMock(return_value=[mock_paid_bill])):
+
+        res = await _record_supplier_payment(
+            organization_id=org_id,
+            supplier_name="DElta Pvt",
+            amount=200000.0,
+            payment_mode="CASH",
+        )
+        assert res.success is False
+        assert "no outstanding open bills" in res.error
+        assert "PUR-000005" in res.error
+        assert "already fully settled in your books" in res.error
+
+
+@pytest.mark.asyncio
+async def test_resolve_open_document_reference_catches_already_paid_bill_id():
+    """Verify _resolve_open_document_reference detects already-settled bills even if bill_id was already extracted."""
+    from app.agent import _resolve_open_document_reference
+
+    org_id = uuid.uuid4()
+    bill_id = uuid.uuid4()
+    sup_id = uuid.uuid4()
+
+    mock_paid_bill = {
+        "id": str(bill_id),
+        "organization_id": str(org_id),
+        "supplier_id": str(sup_id),
+        "bill_number": "PUR-000005",
+        "total": 200000.0,
+        "amount_paid": 200000.0,
+        "status": "PAID",
+    }
+
+    entities = {
+        "user_message": "PAID BILL 5 IN FULL",
+        "bill_id": str(bill_id),
+        "supplier_name": "DElta Pvt",
+    }
+
+    with patch("app.repositories.purchase_repository.get_purchase_bill", new=AsyncMock(return_value=mock_paid_bill)):
+        await _resolve_open_document_reference(org_id, entities)
+        assert entities.get("requires_disambiguation") is True
+        assert entities.get("disambiguation_reason") == "bill_already_paid"
+        assert "PUR-000005" in entities.get("disambiguation_question", "")
+
+

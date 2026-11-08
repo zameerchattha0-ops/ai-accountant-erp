@@ -3238,6 +3238,44 @@ async def _record_customer_receipt(organization_id: uuid.UUID, **kw) -> ToolResu
         else:
             created = await customer_service.create(organization_id, name=cname)
             kw["customer_id"] = uuid.UUID(str(created["id"]))
+
+    if not invoice_id and kw.get("customer_id"):
+        from app.database import fetch_many
+        customer_invs = await fetch_many(
+            "invoices",
+            filters={"organization_id": str(organization_id), "customer_id": str(kw["customer_id"])},
+            limit=50,
+        )
+        valid_invs = [inv for inv in (customer_invs or []) if str(inv.get("status") or "").upper() not in ("VOID", "CANCELLED")]
+        open_invs = [
+            inv for inv in valid_invs
+            if (float(inv.get("total") or 0.0) - float(inv.get("amount_paid") or 0.0)) > 0.01
+            and str(inv.get("status") or "").upper() not in ("PAID", "SETTLED")
+        ]
+        amt = float(kw.get("amount") or 0.0)
+        exact_matches = [inv for inv in open_invs if abs((float(inv.get("total") or 0.0) - float(inv.get("amount_paid") or 0.0)) - amt) < 0.01]
+        if len(exact_matches) == 1:
+            invoice_id = exact_matches[0]["id"]
+            kw["invoice_id"] = uuid.UUID(str(invoice_id))
+        elif len(open_invs) == 1 and (amt <= 0 or abs((float(open_invs[0].get("total") or 0.0) - float(open_invs[0].get("amount_paid") or 0.0)) - amt) < 0.01 or amt <= float(open_invs[0].get("total") or 0.0)):
+            invoice_id = open_invs[0]["id"]
+            kw["invoice_id"] = uuid.UUID(str(invoice_id))
+            if amt <= 0:
+                kw["amount"] = max(0.0, float(open_invs[0].get("total") or 0.0) - float(open_invs[0].get("amount_paid") or 0.0))
+        elif not open_invs and valid_invs:
+            paid_invs = [inv for inv in valid_invs if str(inv.get("status") or "").upper() in ("PAID", "SETTLED") or (float(inv.get("total") or 0.0) - float(inv.get("amount_paid") or 0.0)) <= 0.01]
+            if paid_invs and str(kw.get("transaction_nature") or "").upper() not in ("ADVANCE", "DEPOSIT"):
+                pi = paid_invs[0]
+                return ToolResult(
+                    tool_name="record_customer_receipt",
+                    success=False,
+                    error=(
+                        f"Customer has no outstanding open invoices. Previous invoice {pi.get('invoice_number')} "
+                        f"(Rs. {float(pi.get('total') or 0.0):,.2f}) is already fully collected (Status: PAID). "
+                        f"Recording another collection without an open invoice would distort accounts receivable. "
+                        f"If this is an advance customer deposit, please specify 'advance deposit' in your instruction."
+                    ),
+                )
     if "wht_rate" in kw and "wht_rate_percent" not in kw:
         kw["wht_rate_percent"] = kw.pop("wht_rate")
     if "withholding_tax_rate" in kw and "wht_rate_percent" not in kw:
@@ -3295,6 +3333,44 @@ async def _record_supplier_payment(organization_id: uuid.UUID, **kw) -> ToolResu
         else:
             created = await supplier_service.create(organization_id, name=sname)
             kw["supplier_id"] = uuid.UUID(str(created["id"]))
+
+    if not bill_id and kw.get("supplier_id"):
+        from app.database import fetch_many
+        supplier_bills = await fetch_many(
+            "purchase_bills",
+            filters={"organization_id": str(organization_id), "supplier_id": str(kw["supplier_id"])},
+            limit=50,
+        )
+        valid_bills = [b for b in (supplier_bills or []) if str(b.get("status") or "").upper() not in ("VOID", "CANCELLED")]
+        open_bills = [
+            b for b in valid_bills
+            if (float(b.get("total") or 0.0) - float(b.get("amount_paid") or 0.0)) > 0.01
+            and str(b.get("status") or "").upper() not in ("PAID", "SETTLED")
+        ]
+        amt = float(kw.get("amount") or 0.0)
+        exact_matches = [b for b in open_bills if abs((float(b.get("total") or 0.0) - float(b.get("amount_paid") or 0.0)) - amt) < 0.01]
+        if len(exact_matches) == 1:
+            bill_id = exact_matches[0]["id"]
+            kw["bill_id"] = uuid.UUID(str(bill_id))
+        elif len(open_bills) == 1 and (amt <= 0 or abs((float(open_bills[0].get("total") or 0.0) - float(open_bills[0].get("amount_paid") or 0.0)) - amt) < 0.01 or amt <= float(open_bills[0].get("total") or 0.0)):
+            bill_id = open_bills[0]["id"]
+            kw["bill_id"] = uuid.UUID(str(bill_id))
+            if amt <= 0:
+                kw["amount"] = max(0.0, float(open_bills[0].get("total") or 0.0) - float(open_bills[0].get("amount_paid") or 0.0))
+        elif not open_bills and valid_bills:
+            paid_bills = [b for b in valid_bills if str(b.get("status") or "").upper() in ("PAID", "SETTLED") or (float(b.get("total") or 0.0) - float(b.get("amount_paid") or 0.0)) <= 0.01]
+            if paid_bills and str(kw.get("transaction_nature") or "").upper() not in ("ADVANCE", "DEPOSIT"):
+                pb = paid_bills[0]
+                return ToolResult(
+                    tool_name="record_supplier_payment",
+                    success=False,
+                    error=(
+                        f"Supplier has no outstanding open bills. Previous bill {pb.get('bill_number')} "
+                        f"(Rs. {float(pb.get('total') or 0.0):,.2f}) is already fully settled in your books (Status: PAID). "
+                        f"Recording another payment will create an incorrect debit balance in Accounts Payable. "
+                        f"If this is an advance payment, please specify 'advance' in your instruction."
+                    ),
+                )
     if "payment_mode" in kw and "payment_method" not in kw:
         kw["payment_method"] = kw.pop("payment_mode")
     if kw.get("payment_method"):

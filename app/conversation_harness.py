@@ -175,9 +175,9 @@ async def probe_live_records(
         if ctx.supplier and str(b.get("supplier_id")) == str(ctx.supplier.get("id")):
             is_match = True
 
-        # Match by exact amount if unsettled
-        if ctx.extracted_amount and (b_due == ctx.extracted_amount or b_tot == ctx.extracted_amount) and b_due > 0:
-            if "bill" in msg or "supplier" in msg or "pay" in msg:
+        # Match by exact amount (open balance or historical total to detect duplicate settlement)
+        if ctx.extracted_amount and (b_due == ctx.extracted_amount or b_tot == ctx.extracted_amount):
+            if "bill" in msg or "supplier" in msg or "pay" in msg or ctx.supplier:
                 is_match = True
 
         if is_match:
@@ -245,8 +245,9 @@ async def probe_live_records(
         if ctx.customer and str(inv.get("customer_id")) == str(ctx.customer.get("id")):
             is_match = True
 
-        if ctx.extracted_amount and (inv_due == ctx.extracted_amount or inv_tot == ctx.extracted_amount) and inv_due > 0:
-            if "invoice" in msg or "customer" in msg or "receiv" in msg:
+        # Match by exact amount (open balance or historical total to detect duplicate collection)
+        if ctx.extracted_amount and (inv_due == ctx.extracted_amount or inv_tot == ctx.extracted_amount):
+            if "invoice" in msg or "customer" in msg or "receiv" in msg or ctx.customer:
                 is_match = True
 
         if is_match:

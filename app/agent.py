@@ -5773,6 +5773,73 @@ async def _resolve_open_document_reference(
             resolve_user_selection,
         )
 
+        # Skeptical Check: If bill_id or invoice_id is already set, verify whether it is already fully settled
+        from app.repositories import purchase_repository as pur_repo, invoice_repository as inv_repo
+        if entities.get("bill_id"):
+            try:
+                b_row = await pur_repo.get_purchase_bill(organization_id, bill_id=uuid.UUID(str(entities["bill_id"])))
+                if b_row:
+                    b_tot = float(b_row.get("total") or 0.0)
+                    b_paid = float(b_row.get("amount_paid") or 0.0)
+                    b_due = max(0.0, b_tot - b_paid)
+                    if b_due <= 0.01 or str(b_row.get("status") or "").upper() in ("PAID", "SETTLED"):
+                        from app.conversation_harness import DocumentCandidate
+                        c_cand = DocumentCandidate(
+                            doc_type="bill",
+                            id=uuid.UUID(str(b_row["id"])),
+                            number=str(b_row.get("bill_number") or ""),
+                            doc_date=str(b_row.get("bill_date") or ""),
+                            due_date=str(b_row.get("due_date") or "") if b_row.get("due_date") else None,
+                            party_id=uuid.UUID(str(b_row["supplier_id"])) if b_row.get("supplier_id") else uuid.uuid4(),
+                            party_name=str(entities.get("supplier_name") or "Supplier"),
+                            total=b_tot,
+                            amount_paid=b_paid,
+                            balance_due=0.0,
+                            status="PAID",
+                            notes=b_row.get("notes"),
+                            currency_code=str(b_row.get("currency_code") or "PKR"),
+                        )
+                        card_text, options = build_detailed_disambiguation_card([c_cand], c_cand.party_name, reason="bill_already_paid")
+                        entities["requires_disambiguation"] = True
+                        entities["disambiguation_reason"] = "bill_already_paid"
+                        entities["disambiguation_question"] = card_text
+                        entities["disambiguation_options"] = options
+                        return
+            except Exception:
+                pass
+        elif entities.get("invoice_id"):
+            try:
+                inv_row = await inv_repo.get_invoice(organization_id, invoice_id=uuid.UUID(str(entities["invoice_id"])))
+                if inv_row:
+                    i_tot = float(inv_row.get("total") or 0.0)
+                    i_paid = float(inv_row.get("amount_paid") or 0.0)
+                    i_due = max(0.0, i_tot - i_paid)
+                    if i_due <= 0.01 or str(inv_row.get("status") or "").upper() in ("PAID", "SETTLED"):
+                        from app.conversation_harness import DocumentCandidate
+                        c_cand = DocumentCandidate(
+                            doc_type="invoice",
+                            id=uuid.UUID(str(inv_row["id"])),
+                            number=str(inv_row.get("invoice_number") or ""),
+                            doc_date=str(inv_row.get("invoice_date") or ""),
+                            due_date=str(inv_row.get("due_date") or "") if inv_row.get("due_date") else None,
+                            party_id=uuid.UUID(str(inv_row["customer_id"])) if inv_row.get("customer_id") else uuid.uuid4(),
+                            party_name=str(entities.get("customer_name") or "Customer"),
+                            total=i_tot,
+                            amount_paid=i_paid,
+                            balance_due=0.0,
+                            status="PAID",
+                            notes=inv_row.get("notes"),
+                            currency_code=str(inv_row.get("currency_code") or "PKR"),
+                        )
+                        card_text, options = build_detailed_disambiguation_card([c_cand], c_cand.party_name, reason="invoice_already_paid")
+                        entities["requires_disambiguation"] = True
+                        entities["disambiguation_reason"] = "invoice_already_paid"
+                        entities["disambiguation_question"] = card_text
+                        entities["disambiguation_options"] = options
+                        return
+            except Exception:
+                pass
+
         user_reply = entities.get("selected_document_id")
         if not user_reply:
             for qa in (entities.get("prior_qa") or []):
