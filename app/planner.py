@@ -3381,6 +3381,19 @@ _FIELD_QUESTION = {
         "IT services 4%, Professional services 15%, Other services 14%, Contracts 7.5%/8%, Advertising 1.5%)?"
     ),
 
+    "sales_tax_status": (
+        "What is the Sales Tax (GST) registration status of this party on the Active Taxpayers List (ATL)? "
+        "(a) Registered & Active, (b) Registered but Inactive, or (c) Unregistered."
+    ),
+
+    "strn": "What is the party's Sales Tax Registration Number (STRN)? (Reply with the STRN or 'NONE' if unregistered)",
+
+    "tax_pricing_mode": (
+        "What is the applicable sales tax treatment? "
+        "(a) FBR Goods Exclusive (+18%), (b) FBR Goods Inclusive, (c) Punjab Services PRA (+16%), "
+        "(d) Sindh Services SRB (+15%), (e) KP Services KPRA (+15%), or (f) Exempt (0%)?"
+    ),
+
 }
 
 def _questions_for_fields(
@@ -3554,6 +3567,21 @@ def _questions_for_fields(
         elif f == "account_name" and intent == "create_bank_account":
 
             questions.append("What is the account title or name for this bank account (e.g. Current Account, Operations)?")
+
+        elif f == "sales_tax_status":
+            pname = ents.get("supplier_name") or ents.get("customer_name") or ents.get("party_name") or "this party"
+            questions.append(
+                f"What is the Sales Tax (GST) registration status of {pname} on the Active Taxpayers List (ATL)?\n"
+                f"1. Registered & Active (Can issue official tax invoices / claimable input tax)\n"
+                f"2. Registered but Inactive / Suspended (Requires tax compliance review)\n"
+                f"3. Unregistered (Cannot charge GST; no input tax; no 4% further tax on purchases)"
+            )
+
+        elif f == "strn":
+            pname = ents.get("supplier_name") or ents.get("customer_name") or ents.get("party_name") or "the party"
+            questions.append(
+                f"What is the Sales Tax Registration Number (STRN) of {pname}? (Reply with the STRN, or reply 'NONE' if unregistered)"
+            )
 
         else:
 
