@@ -442,13 +442,19 @@ async def enrich_preliminary(
         "account_code", "parent_account_name", "product_name", "service_name",
         "sales_price", "bank_name", "employee_name", "date_of_joining", "basic_salary", "designation", "department", "project_name", "template_name",
     ):
-        if key in clean and clean[key]:
+        if key in clean:
             prior = literals.get(key)
-            literals[key] = clean[key]
-            if prior is None:
-                filled.append(key)
-            elif prior != clean[key]:
-                overridden.append(key)
+            if clean[key]:
+                literals[key] = clean[key]
+                if prior is None:
+                    filled.append(key)
+                elif prior != clean[key]:
+                    overridden.append(key)
+            elif prior is not None and key in ("supplier_name", "customer_name"):
+                # LLM is authoritative: it determined there is NO party named in this message.
+                # Explicitly clear any false regex candidate.
+                literals.pop(key, None)
+                overridden.append(f"cleared_{key}")
 
     if clean.get("named_parties") and not literals.get(
         "named_parties_or_items_candidates"

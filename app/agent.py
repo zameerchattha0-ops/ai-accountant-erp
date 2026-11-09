@@ -7221,29 +7221,18 @@ async def execute(
                 route_message as _route_message,
             )
 
-            from app.planner import _SEMANTIC_INTENTS
-            _prov_intent = (_preliminary or {}).get("provisional_intent_hint") or ""
-            _is_erp_intent = _prov_intent in _SEMANTIC_INTENTS
-            _has_erp_entities = any(
-                k in (_preliminary or {}) or k in ((_preliminary or {}).get("literals") or {})
-                for k in ("account_name", "product_name", "bank_name", "employee_name", "supplier_name", "customer_name", "project_name")
-            )
-            _is_op_task = (
-                _prov_intent in (
-                    "create_account", "get_chart_of_accounts", "create_customer",
-                    "create_supplier", "create_product", "create_service",
-                    "create_bank_account", "create_employee", "create_project",
-                    "create_recurring_template", "get_inventory_status"
-                )
-                or _has_erp_entities
-            )
-            if clarification_history or _is_op_task or _is_erp_intent:
+            # LLM-FIRST ROUTING: Every fresh user message goes directly through
+            # the bounded LLM router (_route_message) to decide "analytics" (read-only
+            # reporting) vs "record" (transaction / operational state mutation) vs "clarify".
+            # The deterministic gate inside _route_message serves as the fallback if the
+            # provider is unreachable or times out, guaranteeing the system never blocks.
+            if clarification_history:
                 _route = "record"
                 _route_audit = {
-                    "source": "clarification_fast_path" if clarification_history else ("llm_erp_authority" if _is_erp_intent else "operational_fast_path"),
+                    "source": "clarification_fast_path",
                     "route": "record",
                     "confidence": 1.0,
-                    "intent": _prov_intent,
+                    "intent": (_preliminary or {}).get("provisional_intent_hint") or "",
                 }
             else:
                 _route, _route_audit = await _route_message(question=user_message)
@@ -13118,9 +13107,18 @@ async def execute(
                 or "bank" in execution_plan.intent
                 or "report" in execution_plan.intent
             )
-            # When read tools retrieved data from the books, the informational inquiry was answered.
-            # Polite suggestions of next steps (e.g. 'Would you like me to pull the GL?') do not park in clarification.
-            if _is_analytical and (any(getattr(tr, "success", False) for tr in tool_results) or "?" not in (llm_text or "")):
+            # When read tools retrieved data from the books or an informational body was rendered,
+            # the informational inquiry was answered. Polite suggestions of next steps do not park in clarification.
+            _has_informational_body = (
+                len(llm_text or "") > 150
+                or "|" in (llm_text or "")
+                or any(getattr(tr, "success", False) for tr in tool_results)
+                or _is_read_only_inquiry(user_message)
+            )
+            if (_is_analytical or _has_informational_body) and (
+                any(getattr(tr, "success", False) for tr in tool_results)
+                or not getattr(execution_plan, "missing_fields", None)
+            ):
                 model_question = None
 
             if model_question and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:

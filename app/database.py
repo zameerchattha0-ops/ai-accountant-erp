@@ -212,7 +212,10 @@ async def fetch_one(
     """Return a single row matching *filters*, or None."""
     q = _table(table_name).select(select)
     for col, val in filters.items():
-        q = q.eq(col, val)
+        if val is None:
+            q = q.is_(col, "null")
+        else:
+            q = q.eq(col, val)
     rows = (await _execute(q.limit(1))).data
     return rows[0] if rows else None
 
@@ -229,7 +232,10 @@ async def fetch_many(
     """Return multiple rows matching *filters*."""
     q = _table(table_name).select(select)
     for col, val in filters.items():
-        q = q.eq(col, val)
+        if val is None:
+            q = q.is_(col, "null")
+        else:
+            q = q.eq(col, val)
     if order:
         # Callers pass PostgREST-style "column.direction" strings. supabase-py's
         # .order() expects a bare column name and appends the direction itself;

@@ -157,7 +157,7 @@ PSEUDO_COLS: Dict[str, set] = {
 
 
 _QUESTION_RE = re.compile(
-    r"^\s*(how\s+much|how\s+many|what\s+is|what'?s\s+my|what\s+are|show\s+me|"
+    r"^\s*(how\s+much|how\s+many|what\s+is|what'?s\s+my|what'?s|what\s+are|show\s+me|show|"
     r"list|report|balance|total|which)\b", re.I,
 )
 _IMPERATIVE_RE = re.compile(
@@ -174,8 +174,8 @@ def _pattern_gate(question: str) -> bool:
     # "how much did I pay X" analyses a PAST payment - allowed; an imperative
     # "pay X" is a mutation and must stay on the normal pipeline.
     body = re.sub(
-        r"^(how\s+much|how\s+many|what\s+is|what'?s\s+my|what\s+are|"
-        r"show\s+me|list|report|balance|total|which)\s+", "",
+        r"^(how\s+much|how\s+many|what\s+is|what'?s\s+my|what'?s|what\s+are|"
+        r"show\s+me|show|list|report|balance|total|which)\s+", "",
         text.strip(), flags=re.I,
     )
     return not _IMPERATIVE_RE.search(body)
@@ -529,9 +529,15 @@ def _apply_noneq(rows: List[Dict[str, Any]],
             # here - the DB can never answer it. Live catch 2026-10-20:
             # without this branch the profit plan's REVENUE/EXPENSE pin
             # was silently IGNORED and every line was counted.
-            out = [r for r in out if str(r.get(col)) == str(val)]
+            if val is None:
+                out = [r for r in out if r.get(col) is None]
+            else:
+                out = [r for r in out if str(r.get(col)) == str(val)]
         elif op == "neq":
-            out = [r for r in out if str(r.get(col)) != str(val)]
+            if val is None:
+                out = [r for r in out if r.get(col) is not None]
+            else:
+                out = [r for r in out if str(r.get(col)) != str(val)]
         elif op == "ilike":
             needle = str(val).strip("%").lower()
             out = [r for r in out
