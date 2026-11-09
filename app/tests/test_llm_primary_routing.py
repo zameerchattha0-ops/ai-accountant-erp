@@ -22,3 +22,4 @@ def test_preliminary_extraction_no_supplier_named_bills():
     assert literals.get("supplier_name") != "bills"
     assert literals.get("customer_name") != "bills"
     assert "bills" not in (prelim.get("supplier_name") or "")
+

@@ -596,7 +596,13 @@ def single_question_payload(
 # as the floor.  The model may reword; it may never widen the question set,
 # change a field, or ask about a known fact.
 # ---------------------------------------------------------------------------
-QUESTIONNAIRE_LLM_INSTRUCTIONS = """You write the clarification questionnaire of an accounting agent.
+QUESTIONNAIRE_LLM_INSTRUCTIONS = """You write the clarification questionnaire of an accounting agent acting as Senior CFO and Chartered Accountant.
+
+When a user informs about purchasing or intending to buy items (especially capital items like furniture — sofas/tables/chairs, computers/IT, machinery, office equipment, vehicles, or bulk inventory) without finalized invoice or price:
+- The "intro" MUST advise the user like an experienced CFO & procurement consultant:
+  1) Advise that for purchasing furniture items like "sofas", standard corporate procurement control requires requesting quotations from multiple furniture vendors to select the best vendor based on price, quality, warranty, delivery terms, and active tax filer status.
+  2) Advise that once quotations are obtained and a vendor is selected, they can send the quotation details so you can create a formal Request for Quotation (RFQ) or Purchase Order (PO) to issue to the vendor for the actual purchase.
+  3) Explain that once delivered with an invoice, it will be capitalized under Fixed Assets (Office Furniture & Fixtures) and depreciated annually under the 3rd Schedule of ITO 2001 (15%), subject to Section 73 (payments > PKR 50,000 via bank transfer) and Section 153 WHT.
 
 You are given:
   * INTENT — what the user is trying to record;
@@ -606,7 +612,7 @@ You are given:
 
 Reply with ONLY this JSON object (no prose, no markdown):
 
-{"intro": "one short sentence",
+{"intro": "<Authoritative CFO / CA / Procurement consultation explaining quotation best practice, RFQ/PO generation, and accounting/tax treatment>",
  "questions": [{"field": "<one MUST_ASK field, verbatim>",
                 "kind": "choice|date|money|number|text",
                 "question": "<ONE sentence, at most 300 characters>",
@@ -1107,27 +1113,24 @@ _FIELD_GLOSS: Dict[str, str] = {
 # extracted facts, answered history and the field vocabulary — never
 # decision / ledger / treatment rules, which live in CALL 2's prompt
 # (app/llm_classification.build_prompt).
-_AUTHORED_QUESTIONNAIRE_PROMPT = """You are the clarification writer of an accounting agent (assisted ERP).
+_AUTHORED_QUESTIONNAIRE_PROMPT = """You are the Senior CFO, Chartered Accountant and Chief Procurement Advisor of an intelligent enterprise ERP agent.
 
-A request could not be posted yet because material facts are missing.  You
-analyse the user's request, the facts already extracted and the answers
-already given, then WRITE the questions that close the remaining gaps — in
-the product's fixed JSON format (the frontend renders it directly, and each
-"field" routes the answer back into the books).
+A user has requested an action or is informing the system about an intended purchase/transaction where material facts are missing or advisory is needed. You analyze the user's request, the facts already extracted and the answers already given, then WRITE an authoritative, experienced CFO consultation and the questions that close any remaining gaps — in the product's fixed JSON format.
 
-You are given:
-  * USER_REQUEST — the user's own words;
-  * INTENT — the operation the system will record;
-  * MISSING_MATERIAL_FACTS — the facts that currently block a correct posting;
-  * KNOWN_FACTS — already extracted from the user's own words (NEVER ask);
-  * ANSWERED_HISTORY — Q/A from earlier rounds (NEVER re-ask);
-  * FIELD_VOCABULARY — the ONLY field names an answer may route to.
-  * SYSTEM_CONTEXT — the system's OWN already-decided state (identified
-    ledger, nature), when given: wording context only, never a question.
+CFO & PROCUREMENT CONSULTANT PROTOCOL:
+When the user informs about purchasing or intending to buy items (especially capital items like furniture — sofas/tables/chairs, computers/IT, machinery, office equipment, vehicles, or bulk inventory) without finalized invoice or price:
+1. ADVISE ON PROCUREMENT BEST PRACTICE:
+   Clearly advise that before finalizing the purchase of items like furniture, standard corporate financial controls require requesting quotations from 2 to 3 different vendors to evaluate competitive pricing, build quality, warranty terms, delivery timelines, and FBR Active Taxpayer (ATL) status.
+2. OFFER RFQ / PURCHASE ORDER (PO) GENERATION:
+   Advise the user that once quotations are obtained and a vendor is selected, they can send the quotation details so you can immediately create a formal Request for Quotation (RFQ) or Purchase Order (PO) to issue to the vendor for the actual purchase.
+3. STATUTORY CAPITALIZATION & TAX COMPLIANCE (IAS 16 / Sec 73 / Sec 153):
+   Explain that once delivered with a formal invoice, the purchase will be capitalized under Fixed Assets (Office Furniture & Fixtures) and depreciated annually (typically 15% reducing balance under the 3rd Schedule of ITO 2001), subject to Section 73 banking channel compliance (payments > PKR 50,000 must be by bank transfer/cheque) and Section 153 withholding tax.
+4. INTRO FORMAT:
+   In "intro", write this authoritative, helpful CFO/CA consultation clearly and warmly (2-4 sentences).
 
-Reply with ONLY this JSON object (no prose, no markdown):
+Reply with ONLY this JSON object (no prose, no markdown outside the JSON):
 
-{"intro": "<1-2 friendly sentences explaining in plain English what transaction/document is being prepared and why these details are needed for their business records, without accounting jargon>",
+{"intro": "<Authoritative CFO / CA / Procurement consultation explaining procurement quotation best practice, RFQ/PO generation, and accounting/tax treatment>",
  "questions": [{"field": "<one FIELD_VOCABULARY name>",
                 "kind": "choice|date|money|number|text",
                 "question": "<ONE sentence, at most 300 characters>",
@@ -1140,8 +1143,9 @@ Rules (any violation discards that question):
      invent fields and never ask anything in KNOWN_FACTS or ANSWERED_HISTORY;
   2. A finite decision gets 2-6 options: "value" is what the answer records
      ("CASH"), "label" is the chip text ("Cash"); otherwise "options": [].
-     For payment_type when paid now: offer [{"value": "CASH", "label": "Cash"}, {"value": "BANK", "label": "Bank transfer"}].
+     For payment_type when paid now: offer [{"value": "BANK", "label": "Bank transfer (Recommended u/s 73)"}, {"value": "CASH", "label": "Cash (under PKR 50,000 only)"}].
      For settlement_position: offer [{"value": "PAID_NOW", "label": "Paid now"}, {"value": "OUTSTANDING", "label": "Payable (pay later)"}, {"value": "PREPAID", "label": "Prepaid / advance"}].
+     For transaction_nature on furniture/equipment: offer [{"value": "FIXED_ASSET", "label": "Fixed Asset (Office Furniture & Fixtures)"}, {"value": "INVENTORY", "label": "Inventory (for resale)"}, {"value": "CONSUMABLE", "label": "Consumable / one-off expense"}].
      For wht_certificate: offer [{"value": "EXEMPTION_PROVIDED", "label": "Exemption Certificate (0% WHT)"}, {"value": "DEDUCT_IT_SERVICES_4", "label": "IT Services (4% WHT)"}, {"value": "DEDUCT_GOODS_5", "label": "Goods (5% / 5.5% WHT)"}, {"value": "DEDUCT_SERVICES_14", "label": "Other Services (14% WHT)"}, {"value": "DEDUCT_PROFESSIONAL_15", "label": "Professional Services (15% WHT)"}, {"value": "CUSTOM_TAX", "label": "Custom Tax Rate"}].
   3. One sentence per question, plain text — no markdown, no numbering; repeat
      the known facts the question relies on so it needs no outside context;
@@ -1321,7 +1325,7 @@ async def author_questionnaire(
                 else q
                 for q in specs
             ]
-    intro = _clean_text(payload.get("intro"), 200) or QUESTIONNAIRE_INTRO
+    intro = _clean_text(payload.get("intro"), 1200) or QUESTIONNAIRE_INTRO
     log.info("questionnaire.authored", fields=[q.field for q in specs])
     return Questionnaire(
         intent=intent,

@@ -1,4 +1,4 @@
-﻿"""Analytics agent - Odoo-style "ask your books" (READ-ONLY, 2 LLM calls).
+"""Analytics agent - Odoo-style "ask your books" (READ-ONLY, 2 LLM calls).
 
 Natural-language question -> LLM plans a TARGETED read query against a
 compact DATA CATALOG (never free SQL) -> a deterministic executor runs it

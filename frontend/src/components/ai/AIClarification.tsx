@@ -250,6 +250,9 @@ export default function AIClarification({
       : (multi ? introText(question) : question)
   );
 
+  const isCfoAdvisory = /procurement|quotation|cfo|chartered accountant|capital procurement|capital acquisition/i.test(headerText);
+  const cardTitle = isCfoAdvisory ? "CFO & Procurement Advisory" : "I need a bit more info";
+
   return (
     <div className="bg-bg-surface rounded-2xl border border-warning-100 shadow-sm p-5 space-y-4">
       <div className="flex items-start gap-3">
@@ -258,12 +261,12 @@ export default function AIClarification({
         </div>
         <div>
           <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="text-sm font-semibold text-text-primary">I need a bit more info</h3>
+            <h3 className="text-sm font-semibold text-text-primary">{cardTitle}</h3>
             <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-warning-50 text-warning-600 border border-warning-100">
-              AWAITING YOUR ANSWER
+              {isCfoAdvisory ? "ADVISORY & NEXT STEPS" : "AWAITING YOUR ANSWER"}
             </span>
           </div>
-          <p className="text-sm text-text-secondary mt-1 whitespace-pre-line">{headerText}</p>
+          <p className="text-sm text-text-secondary mt-1 whitespace-pre-line leading-relaxed">{headerText}</p>
         </div>
       </div>
 
