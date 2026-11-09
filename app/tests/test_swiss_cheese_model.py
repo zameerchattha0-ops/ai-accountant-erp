@@ -250,5 +250,32 @@ def test_conversational_offers_not_treated_as_clarification():
     )
     assert _looks_like_question(informational_text) is False
 
+    cash_report_with_next_steps = (
+        "Cash and Bank Position - Zameer Labs (Pvt) Ltd\n\n"
+        "As at the current books (period July 2026):\n\n"
+        "| Account | Balance (PKR) |\n"
+        "|---|---|\n"
+        "| Cash | (5,194,000) |\n"
+        "| Bank | (11,310,401) |\n\n"
+        "Important observation: both ledgers are showing negative credit balances.\n\n"
+        "Would you like me to:\n"
+        "1 Pull the full general ledger for Cash and Bank so we can trace entries, or\n"
+        "2 Check the trial balance to confirm whether the overall books are in balance?"
+    )
+    assert _looks_like_question(cash_report_with_next_steps) is False
+
     operational_question = "What is the employee's basic monthly salary?"
     assert _looks_like_question(operational_question) is True
+
+
+def test_supplier_bills_not_treated_as_supplier_named_bills():
+    """Verify 'supplier bills' is recognized as document query, never a supplier named 'bills'."""
+    from app.planner import _extract_entities, _identify_intent
+
+    query = "Show me all outstanding supplier bills and upcoming due dates."
+    entities = _extract_entities(query)
+    assert "supplier_name" not in entities
+    assert entities.get("supplier_name") != "bills"
+
+    intent = _identify_intent(query.lower())
+    assert intent == "get_open_payables"

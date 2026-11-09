@@ -361,6 +361,7 @@ export const agentRunStore = {
 
   setError: (msg: string) => set({ error: msg }),
   clearError: () => set({ error: "" }),
+  clearResponse: () => set({ response: null, error: "", notice: "" }),
 
   clearConversation: () => {
     set({

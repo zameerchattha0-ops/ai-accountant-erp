@@ -173,13 +173,16 @@ async def get_supplier_ledger(
 async def get_open_payables(
     organization_id: uuid.UUID,
     *,
-    supplier_id: uuid.UUID,
+    supplier_id: Optional[uuid.UUID] = None,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Fetch open bills for a supplier."""
+    """Fetch open bills for a supplier or all suppliers."""
+    filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+    if supplier_id:
+        filters["supplier_id"] = str(supplier_id)
     return await fetch_many(
         "v_open_payables",
-        filters={
-            "supplier_id": str(supplier_id),
-            "organization_id": str(organization_id),
-        },
+        filters=filters,
+        order="due_date.asc.nullslast",
+        limit=limit,
     )

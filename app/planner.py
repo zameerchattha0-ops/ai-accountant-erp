@@ -230,12 +230,29 @@ _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
 
     ("generate_general_ledger", [r"general\s*ledger"]),
 
+    # Open payables / bills query (must precede supplier_balance so "supplier bills" routes here, not to a single supplier's ledger)
+    ("get_open_payables", [
+        r"(?:show|list|view|get|display|check|what\s+are)\b[^.\n]*\b(?:outstanding|open|unpaid|due)\b[^.\n]*\b(?:bills?|payables?)\b",
+        r"(?:outstanding|open|unpaid|due)\s+(?:supplier\s+)?bills?",
+        r"\bsupplier\s+bills?\b",
+        r"\bopen\s+payables?\b",
+        r"\bunpaid\s+bills?\b",
+        r"\bbills?\s+due\b",
+    ]),
+
+    # Open receivables / invoices query (must precede customer_balance)
+    ("get_open_receivables", [
+        r"(?:show|list|view|get|display|check|what\s+are)\b[^.\n]*\b(?:outstanding|open|unpaid|due)\b[^.\n]*\b(?:invoices?|receivables?)\b",
+        r"(?:outstanding|open|unpaid|due)\s+(?:customer\s+)?invoices?",
+        r"\bcustomer\s+invoices?\b",
+        r"\bopen\s+receivables?\b",
+        r"\bunpaid\s+invoices?\b",
+        r"\binvoices?\s+due\b",
+    ]),
+
     # "owe" with WORD BOUNDARIES (Fix 5): the bare substring `owe` matched
-
     # inside "borrow**owe**d", so every borrowing phrasing was routed to the
-
     # customer-ledger report.  owe/owes/owed/owing still match.
-
     ("customer_balance", [r"\bowe(?:s|d|ing)?\b", r"receivable", r"customer.*ledger", r"how much.*\bowe"]),
 
     ("supplier_balance", [r"supplier.*ledger", r"\bpayables?\b", r"payable.*supplier", r"how much.*\bowe(?:s|d|ing)?\b.*supplier"]),
@@ -873,145 +890,90 @@ _NAME_STOP = (
 )
 
 _SUPPLIER_PATTERNS = [
-
     re.compile(r"\bfrom\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
-    re.compile(r"\bsupplier\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
+    re.compile(r"\bsupplier\s+(?!bills?\b|invoices?\b|ledgers?\b|dues?\b|payables?\b|aging\b|balances?\b|accounts?\b|statements?\b)" + _NAME + _NAME_STOP, re.IGNORECASE),
     # "we returned/sent back/gave back … to <Party>" — the goods went TO
-
     # the supplier (purchase-return phrasing).  Live 2026-10-19: the debit
-
     # note message extracted NO supplier_name at all (the "we" subject
-
     # blocked the customer rule and nothing owned the "to <Party>" side),
-
     # so the DN lane fell to the lossy model path every turn.  Own stop
-
     # set: the sentence's dash ("SHABBIR FURNITURES - create a debit
-
     # note…") is not one of _NAME_STOP's boundaries.
-
     re.compile(
-
         r"\b(?:returned|sent\s+back|gave\s+back)\b[^.]*?\bto\s+"
-
         + _NAME
-
         + r"(?=\s*[-\u2013\u2014]"
-
         + r"|\s+(?:for|of|on|in|to|via|through|by|worth|total|amount|"
-
         r"and|at|with|create|against)\b"
-
         + r"|[,.!?;]|\s*$|\s+\d)",
-
         re.IGNORECASE,
-
     ),
-
 ]
 
-# Action verbs, gerunds and document nouns can never START a party name.
-
+# Action verbs, gerunds and document nouns can never START or FORM a party name.
 # Without this guard, "create an invoice for selling 2 ovens to lkj pvt
-
-# limited" captured "selling" as the customer: _NAME_STOP's `\s+\d`
-
-# lookahead ends the name at the quantity that follows the verb, so the
-
-# regex never reached the real party after "to".
-
+# limited" captured "selling" as the customer, or "supplier bills" captured "bills".
 _NON_PARTY_WORDS = {
-
     "selling", "sold", "sale", "sells", "sell", "buying", "bought", "buy",
-
-    "purchasing", "purchased", "purchase", "procuring", "acquired",
-
-    "invoice", "invoicing", "bill", "billing", "quotation", "quote",
-
-    "creating", "create", "record", "recording", "issue", "issuing",
-
+    "purchasing", "purchased", "purchase", "purchases", "procuring", "acquired",
+    "invoice", "invoices", "invoicing", "bill", "bills", "billing", "quotation", "quotations", "quote", "quotes",
+    "creating", "create", "record", "recording", "records", "issue", "issuing",
     "raise", "raising", "make", "making", "add", "adding", "enter",
-
     "entering", "post", "posting", "be", "is", "are", "was", "were",
-
-    "to", "the", "a", "an", "and", "or",
-
+    "to", "the", "a", "an", "and", "or", "all", "any",
+    "due", "dues", "payable", "payables", "receivable", "receivables",
+    "ledger", "ledgers", "balance", "balances", "statement", "statements",
+    "summary", "summaries", "order", "orders", "po", "pos", "voucher", "vouchers",
+    "payment", "payments", "receipt", "receipts", "expense", "expenses",
+    "tax", "taxes", "return", "returns", "outstanding", "open", "upcoming",
 }
 
 def _is_plausible_party(value: str) -> bool:
-
     """True when a captured string can plausibly be a party name.
 
-    Rejects pronouns / short filler and any capture whose FIRST word is an
-
-    action verb or document noun (``selling``, ``invoice``, ``bought`` ...).
-
-    That is exactly how "create an invoice for selling 2 ovens to lkj pvt
-
-    limited" used to produce the customer name "selling".
-
+    Rejects pronouns / short filler, document nouns, accounting terms,
+    and any capture whose FIRST or ENTIRE word is an action verb or document noun
+    (e.g. 'bills', 'supplier bills', 'selling', 'invoice', 'bought'...).
     """
-
     text = (value or "").strip()
-
     if len(text) < 2:
-
         return False
-
+    low = text.lower().strip(",.")
+    if low in _NON_PARTY_WORDS:
+        return False
     words = text.split()
-
     if not words:
-
         return False
-
-    if text.lower() in (
-
+    if low in (
         "the", "a", "an", "it", "us", "we", "you", "they", "i",
-
         "me", "him", "her", "them", "our", "your", "their",
-
     ):
-
         return False
-
-    return words[0].strip(",.").lower() not in _NON_PARTY_WORDS
+    first_word = words[0].strip(",.").lower()
+    last_word = words[-1].strip(",.").lower()
+    if first_word in _NON_PARTY_WORDS:
+        return False
+    if len(words) <= 2 and (last_word in _NON_PARTY_WORDS or first_word in _NON_PARTY_WORDS):
+        return False
+    return True
 
 _CUSTOMER_PATTERNS = [
-
     # "invoice/quote/bill ... to <party>" — the party is often stated at the
-
     # END, after the goods being invoiced ("create an invoice for selling
-
     # 2 ovens to lkj pvt limited").  MUST precede the
-
     # "invoice ... for <party>" rule below, which would otherwise capture the
-
     # verb ("selling") that follows "for".
-
     re.compile(
-
         r"\b(?:invoice|quotation|quote)\b[^.]*?\bto\s+" + _NAME + _NAME_STOP,
-
         re.IGNORECASE,
-
     ),
-
     re.compile(
-
         r"\bsold\b[^.]*?\bto\s+" + _NAME + _NAME_STOP, re.IGNORECASE
-
     ),
-
-    re.compile(r"\bcustomer\s+" + _NAME + _NAME_STOP, re.IGNORECASE),
-
+    re.compile(r"\bcustomer\s+(?!invoices?\b|bills?\b|ledgers?\b|dues?\b|receivables?\b|aging\b|balances?\b|accounts?\b|statements?\b)" + _NAME + _NAME_STOP, re.IGNORECASE),
     re.compile(
-
         r"\b(?:invoice|bill|quotation|quote)\s+(?:for|to)\s+" + _NAME + _NAME_STOP,
-
         re.IGNORECASE,
-
     ),
 
     # "<Proper Name> owes/ledger/receivable/balance" — every word of the
@@ -8007,8 +7969,9 @@ def _tools_for_intent(intent: str) -> List[str]:
         ],
 
         "customer_balance": ["search_customer", "get_customer", "get_customer_ledger"],
-
         "supplier_balance": ["search_supplier", "get_supplier", "get_supplier_ledger"],
+        "get_open_payables": ["get_open_payables"],
+        "get_open_receivables": ["get_open_receivables"],
 
         "generate_trial_balance": ["get_trial_balance"],
 
@@ -8195,8 +8158,9 @@ def _outcome(intent: str) -> str:
         "list_bank_accounts": "Bank account list retrieved",
 
         "customer_balance": "Customer outstanding balance calculated",
-
         "supplier_balance": "Supplier outstanding balance calculated",
+        "get_open_payables": "Outstanding supplier bills retrieved",
+        "get_open_receivables": "Outstanding customer invoices retrieved",
 
         "generate_trial_balance": "Trial balance report generated",
 

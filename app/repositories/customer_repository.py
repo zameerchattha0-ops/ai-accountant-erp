@@ -178,13 +178,16 @@ async def get_customer_ledger(
 async def get_open_receivables(
     organization_id: uuid.UUID,
     *,
-    customer_id: uuid.UUID,
+    customer_id: Optional[uuid.UUID] = None,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Fetch open invoices for a customer."""
+    """Fetch open invoices for a customer or all customers."""
+    filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+    if customer_id:
+        filters["customer_id"] = str(customer_id)
     return await fetch_many(
         "v_open_receivables",
-        filters={
-            "customer_id": str(customer_id),
-            "organization_id": str(organization_id),
-        },
+        filters=filters,
+        order="due_date.asc.nullslast",
+        limit=limit,
     )

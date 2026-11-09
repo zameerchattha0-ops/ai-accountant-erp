@@ -170,6 +170,7 @@ async def get_ledger(
 async def get_open_payables(
     organization_id: uuid.UUID,
     *,
-    supplier_id: uuid.UUID,
+    supplier_id: Optional[uuid.UUID] = None,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    return await repo.get_open_payables(organization_id, supplier_id=supplier_id)
+    return await repo.get_open_payables(organization_id, supplier_id=supplier_id, limit=limit)

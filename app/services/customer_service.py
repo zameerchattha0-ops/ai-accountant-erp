@@ -173,6 +173,7 @@ async def get_ledger(
 async def get_open_receivables(
     organization_id: uuid.UUID,
     *,
-    customer_id: uuid.UUID,
+    customer_id: Optional[uuid.UUID] = None,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    return await repo.get_open_receivables(organization_id, customer_id=customer_id)
+    return await repo.get_open_receivables(organization_id, customer_id=customer_id, limit=limit)

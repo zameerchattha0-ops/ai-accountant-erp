@@ -199,7 +199,7 @@ _READ_ONLY_LOOKUPS_GATE = frozenset({
     "generate_cash_flow", "project_profitability",
     "list_expenses", "list_bank_accounts", "list_customers",
     "list_suppliers", "list_employees", "get_chart_of_accounts",
-    "get_inventory_status",
+    "get_inventory_status", "get_open_payables", "get_open_receivables",
 })
 
 
@@ -3232,16 +3232,26 @@ def _looks_like_question(text: str) -> bool:
 
     # Conversational offer guard:
     # Polite closing offers of further assistance (e.g. "Would you like me to help with anything else?",
-    # "Can I assist you with anything else?") are courtesy sign-offs, NOT operational clarifications.
-    conversational_offer_patterns = (
-        r"(?i)\b(?:would you like me to (?:help|assist|check|look into|do anything else)|"
-        r"can i (?:help|assist) you with anything else|"
-        r"is there anything else (?:i can help|you would like|i can assist)|"
-        r"how else can i (?:help|assist) you|"
-        r"do you (?:have any other questions|need any other assistance)|"
-        r"let me know if you (?:need|would like|want) (?:anything else|further assistance))\b"
-    )
-    t_clean = re.sub(conversational_offer_patterns + r"[^?.]*[?]", "", t).strip()
+    # "Would you like me to: 1. Pull ledger 2. Check trial balance?") at the end of an informational report
+    # are courtesy sign-offs or suggestions of next steps, NOT operational clarifications blocking completion.
+    has_substantive_body = len(t) > 150 or "|" in t or "\n\n" in t
+    if has_substantive_body:
+        # Strip trailing offers of next steps or courteous sign-offs
+        t_clean = re.sub(
+            r"(?i)(?:\n\s*)?(?:would you like me to|should i|shall i|do you want me to|let me know if you (?:need|would like)|can i (?:help|assist)|is there anything else)[\s\S]*$",
+            "",
+            t,
+        ).strip()
+    else:
+        conversational_offer_patterns = (
+            r"(?i)\b(?:would you like me to (?:help|assist|check|look into|do anything else)|"
+            r"can i (?:help|assist) you with anything else|"
+            r"is there anything else (?:i can help|you would like|i can assist)|"
+            r"how else can i (?:help|assist) you|"
+            r"do you (?:have any other questions|need any other assistance)|"
+            r"let me know if you (?:need|would like|want) (?:anything else|further assistance))\b"
+        )
+        t_clean = re.sub(conversational_offer_patterns + r"[^?.]*[?]", "", t).strip()
 
     if "?" in t_clean:
         return True
@@ -3266,7 +3276,7 @@ def _clean_user_facing_text(text: Optional[str]) -> str:
         return ""
     t = str(text).strip()
     t = re.sub(
-        r"(?i)^(?:I'll look into this|Let me check the live records first|Let me check live records|Checking the live records)[^.\n]*[.\n]*",
+        r"(?i)^(?:I'll look into this|Let me check the live records first|Let me check live records|Checking the live records|I'll pull the live balances(?: for you)?|Let me pull the balances)[^.\n]*[.\n]*",
         "",
         t,
     ).strip()
@@ -13092,19 +13102,25 @@ async def execute(
         if not _mutation_executed(tool_calls):
             model_question = _usable_question(llm_text)
             # Analytical / reporting inquiry guard:
-            # If the intent is reporting/analytical or the user asked for records and the model answered
-            # factually without asking a question mark, it is a completed informational response, NOT a questionnaire.
+            # If the intent is reporting/analytical or the user asked for records/balances and the model answered
+            # factually (or read tools succeeded), it is a completed informational response, NOT a questionnaire.
             _is_analytical = (
                 execution_plan.intent in (
                     "generate_general_ledger", "get_general_ledger", "get_trial_balance",
                     "get_profit_loss", "get_balance_sheet", "get_cash_flow", "generate_report",
                     "get_customer_ledger", "get_supplier_ledger", "get_health", "calculate_health",
                     "list_loans", "get_loan_schedule", "get_inventory_status",
+                    "get_account_balances", "list_accounts", "get_bank_accounts", "get_cash_accounts",
                 )
                 or "ledger" in execution_plan.intent
                 or "entries" in execution_plan.intent
+                or "balance" in execution_plan.intent
+                or "bank" in execution_plan.intent
+                or "report" in execution_plan.intent
             )
-            if _is_analytical and "?" not in (llm_text or ""):
+            # When read tools retrieved data from the books, the informational inquiry was answered.
+            # Polite suggestions of next steps (e.g. 'Would you like me to pull the GL?') do not park in clarification.
+            if _is_analytical and (any(getattr(tr, "success", False) for tr in tool_results) or "?" not in (llm_text or "")):
                 model_question = None
 
             if model_question and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
@@ -13137,7 +13153,46 @@ async def execute(
             _is_op_query = is_operational_task(execution_plan.intent) or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
             _succ = [tr for tr in tool_results if tr.success]
             primary_data = getattr(_succ[-1], "data", {}) if _succ else {}
-            if not (llm_text or "").strip() and _is_op_query and _succ:
+
+            if execution_plan.intent == "get_open_payables" and isinstance(primary_data, list):
+                if not primary_data:
+                    llm_text = "No outstanding supplier bills found in your books. All purchase bills have been settled!"
+                else:
+                    tot_pay = sum(float(b.get("outstanding") or 0.0) for b in primary_data)
+                    lines = [
+                        f"**Outstanding Supplier Bills ({len(primary_data)} total — Rs. {tot_pay:,.2f} total payable):**\n",
+                        "| Bill # | Supplier | Bill Date | Due Date | Total (PKR) | Outstanding (PKR) |",
+                        "|---|---|---|---|---|---|",
+                    ]
+                    for b in primary_data[:25]:
+                        b_num = b.get("bill_number") or b.get("id", "—")
+                        supp = b.get("supplier_name") or "—"
+                        b_date = str(b.get("bill_date") or "—")
+                        d_date = str(b.get("due_date") or "—")
+                        tot = float(b.get("total") or 0.0)
+                        out = float(b.get("outstanding") or 0.0)
+                        lines.append(f"| {b_num} | {supp} | {b_date} | {d_date} | {tot:,.2f} | {out:,.2f} |")
+                    llm_text = "\n".join(lines)
+            elif execution_plan.intent == "get_open_receivables" and isinstance(primary_data, list):
+                if not primary_data:
+                    llm_text = "No outstanding customer invoices found in your books. All sales invoices have been settled!"
+                else:
+                    tot_rec = sum(float(inv.get("outstanding") or 0.0) for inv in primary_data)
+                    lines = [
+                        f"**Outstanding Customer Invoices ({len(primary_data)} total — Rs. {tot_rec:,.2f} total receivable):**\n",
+                        "| Invoice # | Customer | Invoice Date | Due Date | Total (PKR) | Outstanding (PKR) |",
+                        "|---|---|---|---|---|---|",
+                    ]
+                    for inv in primary_data[:25]:
+                        i_num = inv.get("invoice_number") or inv.get("id", "—")
+                        cust = inv.get("customer_name") or "—"
+                        i_date = str(inv.get("invoice_date") or "—")
+                        d_date = str(inv.get("due_date") or "—")
+                        tot = float(inv.get("total") or 0.0)
+                        out = float(inv.get("outstanding") or 0.0)
+                        lines.append(f"| {i_num} | {cust} | {i_date} | {d_date} | {tot:,.2f} | {out:,.2f} |")
+                    llm_text = "\n".join(lines)
+            elif not (llm_text or "").strip() and _is_op_query and _succ:
                 if isinstance(primary_data, dict):
                     llm_text = format_operational_summary(execution_plan.intent, primary_data)
                 elif isinstance(primary_data, list):

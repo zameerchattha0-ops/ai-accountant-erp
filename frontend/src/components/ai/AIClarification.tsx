@@ -269,171 +269,190 @@ export default function AIClarification({
 
       {/* R3.4: structured single-question chips (label shown, value sent) */}
       {singleOpts && singleOpts.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {singleOpts.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              disabled={disabled}
-              onClick={() => onAnswer(opt.value)}
-              className="px-4 py-2 rounded-xl bg-bg-muted text-sm font-medium text-text-primary hover:bg-ai-50 hover:text-ai-700 border border-border-subtle hover:border-ai-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {opt.label}
-            </button>
-          ))}
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            {singleOpts.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                disabled={disabled}
+                onClick={() => onAnswer(opt.value)}
+                className="px-4 py-2 rounded-xl bg-bg-muted hover:bg-ai-50 text-xs font-semibold text-text-primary hover:text-ai-700 border border-border-subtle hover:border-ai-200 transition-all shadow-3xs hover:shadow-2xs active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] text-text-muted">
+            Tap an option above or type your answer in the command bar below.
+          </p>
         </div>
       )}
 
       {/* Quick response buttons (legacy `options` list — anything the
           structured chips above do not already offer) */}
-      {legacyOptions.length > 0 && !multi && (
-        <div className="flex flex-wrap gap-2">
-          {legacyOptions.map((opt) => (
-            <button
-              key={opt}
-              disabled={disabled}
-              onClick={() => onAnswer(opt)}
-              className="px-4 py-2 rounded-xl bg-bg-muted text-sm font-medium text-text-primary hover:bg-ai-50 hover:text-ai-700 border border-border-subtle hover:border-ai-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {opt}
-            </button>
-          ))}
+      {legacyOptions.length > 0 && !multi && !singleOpts?.length && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            {legacyOptions.map((opt) => (
+              <button
+                key={opt}
+                disabled={disabled}
+                onClick={() => onAnswer(opt)}
+                className="px-4 py-2 rounded-xl bg-bg-muted hover:bg-ai-50 text-xs font-semibold text-text-primary hover:text-ai-700 border border-border-subtle hover:border-ai-200 transition-all shadow-3xs hover:shadow-2xs active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] text-text-muted">
+            Tap an option above or type your answer in the command bar below.
+          </p>
         </div>
       )}
 
       {/* ONE ANSWER BOX PER QUESTION - answered separately, sent together */}
       {multi ? (
         <div className="space-y-3">
-          {subQuestions.map((q, i) => (
-            <div key={i} className="space-y-1">
-              <label className="text-xs font-medium text-text-muted flex items-start gap-1.5">
-                <span className="inline-flex items-center justify-center w-5 h-5 mt-px rounded-full bg-ai-50 text-ai-700 text-[10px] font-semibold shrink-0">
-                  {i + 1}
-                </span>
-                <span>{sanitizeMarkdown(q)}</span>
-              </label>
-              {/* R3.4: data-driven chips — backend payload first, the
-                  hardcoded quickOptions switch as fallback. */}
-              {optionsForSubQuestion(q, i, questionOptions, parsed.questions) && (
-                <div className="flex flex-wrap gap-1.5">
-                  {optionsForSubQuestion(q, i, questionOptions, parsed.questions)!.map((opt) => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() =>
-                        setAnswers((prev) =>
-                          prev.map((a, j) => (j === i ? opt.value : a))
-                        )
-                      }
-                      className={cn(
-                        "px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors",
-                        (answers[i] ?? "").toUpperCase() === opt.value.toUpperCase()
-                          ? "bg-ai-50 text-ai-700 border-ai-300"
-                          : "bg-bg-muted text-text-secondary border-border-subtle hover:border-ai-200"
-                      )}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <input
-                type="text"
-                value={answers[i] ?? ""}
-                autoFocus={i === 0 && !optionsForSubQuestion(q, i, questionOptions, parsed.questions)}
-                disabled={disabled}
-                onChange={(e) =>
-                  setAnswers((prev) =>
-                    prev.map((a, j) => (j === i ? e.target.value : a))
-                  )
-                }
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && allAnswered) sendMulti();
-                }}
-                placeholder="Type your answer here..."
-                className="w-full px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-500/30 focus:border-ai-500 transition disabled:bg-bg-muted disabled:text-text-muted disabled:cursor-not-allowed"
-              />
-              {/* the CONDITIONAL party box - only visible
-                  once CREDIT is selected on the payment question (or
-                  "Outstanding" on the R3.3 settlement question). */}
-              {(i === paymentIdx || i === settlementIdx) && creditSelected && (
-                <div className="space-y-2 rounded-xl border border-ai-100 bg-ai-50/40 p-3">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={localVendor}
-                      onChange={(e) => setLocalVendor(e.target.checked)}
-                      className="w-4 h-4 rounded border-border-default text-ai-600 focus:ring-ai-500/30"
-                    />
-                    <span className="text-xs font-medium text-text-secondary">
-                      Purchased from a local vendor (one-off - no party name
-                      needed; a &quot;Local Vendor&quot; account will be used)
-                    </span>
-                  </label>
+          {subQuestions.map((q, i) => {
+            const opts = optionsForSubQuestion(q, i, questionOptions, parsed.questions);
+            const hasSelectedChip = Boolean(answers[i] && opts?.some(o => o.value.toUpperCase() === answers[i]?.toUpperCase()));
+
+            return (
+              <div key={i} className="space-y-1.5 p-3 rounded-xl bg-bg-muted/40 border border-border-subtle">
+                <label className="text-xs font-medium text-text-primary flex items-start gap-1.5">
+                  <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-ai-100 text-ai-700 text-[10px] font-semibold shrink-0">
+                    {i + 1}
+                  </span>
+                  <span>{sanitizeMarkdown(q)}</span>
+                </label>
+
+                {/* Data-driven chips */}
+                {opts && opts.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-0.5">
+                    {opts.map((opt) => {
+                      const isSelected = (answers[i] ?? "").toUpperCase() === opt.value.toUpperCase();
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() =>
+                            setAnswers((prev) =>
+                              prev.map((a, j) => (j === i ? opt.value : a))
+                            )
+                          }
+                          className={cn(
+                            "px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all",
+                            isSelected
+                              ? "bg-ai-500 text-white border-ai-600 shadow-2xs"
+                              : "bg-bg-surface text-text-secondary border-border-default hover:border-ai-200"
+                          )}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Only render text input if no chips exist OR if user wants to type custom value */}
+                {(!opts || opts.length === 0 || !hasSelectedChip) && (
                   <input
                     type="text"
-                    value={creditParty}
-                    disabled={localVendor}
-                    onChange={(e) => setCreditParty(e.target.value)}
+                    value={answers[i] ?? ""}
+                    autoFocus={i === 0 && !opts}
+                    disabled={disabled}
+                    onChange={(e) =>
+                      setAnswers((prev) =>
+                        prev.map((a, j) => (j === i ? e.target.value : a))
+                      )
+                    }
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && allAnswered) sendMulti();
                     }}
-                    placeholder="Party / vendor name for the credit ledger..."
-                    className="w-full px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-500/30 focus:border-ai-500 transition disabled:bg-bg-muted disabled:text-text-muted disabled:cursor-not-allowed"
+                    placeholder={opts ? "Or type a custom answer..." : "Type your answer here..."}
+                    className="w-full px-3 py-1.5 rounded-lg border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
                   />
-                </div>
-              )}
-            </div>
-          ))}
-          <div className="flex justify-end">
+                )}
+
+                {/* Conditional party box for credit ledger */}
+                {(i === paymentIdx || i === settlementIdx) && creditSelected && (
+                  <div className="space-y-2 rounded-xl border border-ai-200 bg-ai-50/50 p-2.5 mt-2">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={localVendor}
+                        onChange={(e) => setLocalVendor(e.target.checked)}
+                        className="w-4 h-4 rounded border-border-default text-ai-600 focus:ring-ai-500/30"
+                      />
+                      <span className="text-[11px] font-medium text-text-secondary">
+                        Purchased from a local vendor (one-off - no party name needed)
+                      </span>
+                    </label>
+                    <input
+                      type="text"
+                      value={creditParty}
+                      disabled={localVendor}
+                      onChange={(e) => setCreditParty(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && allAnswered) sendMulti();
+                      }}
+                      placeholder="Party / vendor name for the credit ledger..."
+                      className="w-full px-3 py-1.5 rounded-lg border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition disabled:bg-bg-muted disabled:text-text-muted"
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          <div className="flex justify-end pt-1">
             <button
               onClick={sendMulti}
               disabled={!allAnswered || disabled}
-              title={allAnswered ? undefined : "Answer every question to send"}
-              className="btn-3d btn-shine px-3 py-2 rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 text-white hover:from-ai-400 hover:to-ai-600 transition flex items-center gap-1.5 text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-3d px-4 py-2 rounded-xl bg-ai-500 text-white hover:bg-ai-600 transition flex items-center gap-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed shadow-2xs"
             >
-              <Send className="w-4 h-4" />
-              Send all answers
+              <Send className="w-3.5 h-3.5" />
+              Submit Answers
             </button>
           </div>
         </div>
       ) : (
-        /* Single question - one free-text answer */
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-text-muted uppercase tracking-wide">
-            Your answer
-          </label>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={custom}
-              autoFocus
-              disabled={disabled}
-              onChange={(e) => setCustom(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && custom.trim() && !disabled) {
-                  onAnswer(custom.trim());
-                  setCustom("");
-                }
-              }}
-              placeholder="Type your answer here..."
-              className="flex-1 px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ai-500/30 focus:border-ai-500 transition disabled:bg-bg-muted disabled:text-text-muted disabled:cursor-not-allowed"
-            />
-            <button
-              onClick={() => {
-                if (custom.trim() && !disabled) {
-                  onAnswer(custom.trim());
-                  setCustom("");
-                }
-              }}
-              disabled={!custom.trim() || disabled}
-              className="btn-3d px-3 py-2 rounded-xl bg-gradient-to-b from-ai-500 to-ai-600 text-white hover:from-ai-400 hover:to-ai-600 transition flex items-center gap-1.5 text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Send className="w-4 h-4" />
-              Send
-            </button>
+        /* Single question without predefined chips */
+        !singleOpts?.length && !legacyOptions.length && (
+          <div className="space-y-1.5">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={custom}
+                autoFocus
+                disabled={disabled}
+                onChange={(e) => setCustom(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && custom.trim() && !disabled) {
+                    onAnswer(custom.trim());
+                    setCustom("");
+                  }
+                }}
+                placeholder="Type your answer here..."
+                className="flex-1 px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
+              />
+              <button
+                onClick={() => {
+                  if (custom.trim() && !disabled) {
+                    onAnswer(custom.trim());
+                    setCustom("");
+                  }
+                }}
+                disabled={!custom.trim() || disabled}
+                className="btn-3d px-3 py-2 rounded-xl bg-ai-500 text-white hover:bg-ai-600 transition flex items-center gap-1.5 text-xs font-semibold disabled:opacity-50"
+              >
+                <Send className="w-3.5 h-3.5" />
+                Submit
+              </button>
+            </div>
           </div>
-        </div>
+        )
       )}
     </div>
   );

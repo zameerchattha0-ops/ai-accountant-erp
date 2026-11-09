@@ -365,10 +365,42 @@ async def _create_supplier(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 async def _get_supplier_ledger(organization_id: uuid.UUID, **kw) -> ToolResult:
-
     data = await supplier_service.get_ledger(organization_id, supplier_id=uuid.UUID(kw["supplier_id"]))
-
     return ToolResult(tool_name="get_supplier_ledger", success=True, data=data)
+
+
+async def _get_open_payables(organization_id: uuid.UUID, **kw) -> ToolResult:
+    supplier_id = kw.get("supplier_id")
+    supplier_name = kw.get("supplier_name")
+    if not supplier_id and supplier_name and str(supplier_name).strip().lower() not in ("all", "any", "bills", "supplier bills"):
+        supp_matches = await supplier_service.search(organization_id, query=str(supplier_name))
+        if supp_matches:
+            supplier_id = supp_matches[0]["id"]
+    sid = None
+    if supplier_id:
+        try:
+            sid = uuid.UUID(str(supplier_id))
+        except (ValueError, TypeError):
+            sid = None
+    data = await supplier_service.get_open_payables(organization_id, supplier_id=sid)
+    return ToolResult(tool_name="get_open_payables", success=True, data=data)
+
+
+async def _get_open_receivables(organization_id: uuid.UUID, **kw) -> ToolResult:
+    customer_id = kw.get("customer_id")
+    customer_name = kw.get("customer_name")
+    if not customer_id and customer_name and str(customer_name).strip().lower() not in ("all", "any", "invoices", "customer invoices"):
+        cust_matches = await customer_service.search(organization_id, query=str(customer_name))
+        if cust_matches:
+            customer_id = cust_matches[0]["id"]
+    cid = None
+    if customer_id:
+        try:
+            cid = uuid.UUID(str(customer_id))
+        except (ValueError, TypeError):
+            cid = None
+    data = await customer_service.get_open_receivables(organization_id, customer_id=cid)
+    return ToolResult(tool_name="get_open_receivables", success=True, data=data)
 
 
 
@@ -4579,6 +4611,8 @@ register("get_supplier", handler=_get_supplier, read_only=True, description="Get
 register("create_supplier", handler=_create_supplier, read_only=False, contract=contract_from_callable(supplier_service.create), description="Create a new supplier")
 
 register("get_supplier_ledger", handler=_get_supplier_ledger, read_only=True, description="Get supplier ledger")
+register("get_open_payables", handler=_get_open_payables, read_only=True, description="Fetch open and unpaid purchase bills with outstanding balances and upcoming due dates across all suppliers (or for one supplier)")
+register("get_open_receivables", handler=_get_open_receivables, read_only=True, description="Fetch open and unpaid sales invoices with outstanding balances and upcoming due dates across all customers (or for one customer)")
 
 
 
