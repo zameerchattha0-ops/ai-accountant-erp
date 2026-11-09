@@ -450,6 +450,7 @@ export interface StreamEvents {
     created_at?: string | null;
     execution_id?: string | null;
   }) => void;
+  onChunk?: (delta: string) => void;
 }
 
 /* P2-⑪: serverless cold start happens BEFORE the server's started_at —
@@ -561,6 +562,15 @@ export async function aiExecuteStream(
         maybeReportTtfb(parsed?.execution_id);
       } catch {
         /* malformed step - ignore */
+      }
+    } else if (event === "chunk") {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed.delta === "string") {
+          events?.onChunk?.(parsed.delta);
+        }
+      } catch {
+        /* malformed chunk - ignore */
       }
     } else if (event === "final") {
       try {

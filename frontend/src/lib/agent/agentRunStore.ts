@@ -40,10 +40,22 @@ export interface AgentLiveStep {
   created_at: string | null;
 }
 
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  streaming?: boolean;
+  steps?: AgentLiveStep[];
+  response?: AgentResponse | null;
+  createdAt: string;
+}
+
 export interface AgentRunState {
   loading: boolean;
   activeRequestId: string | null;
   liveSteps: AgentLiveStep[];
+  streamingText: string;
+  messages: ChatMessage[];
   response: AgentResponse | null;
   error: string;
   /* Informational, non-blocking message (stranded run, run awaiting an
@@ -60,6 +72,8 @@ let state: AgentRunState = {
   loading: false,
   activeRequestId: null,
   liveSteps: [],
+  streamingText: "",
+  messages: [],
   response: null,
   error: "",
   notice: "",
@@ -108,10 +122,23 @@ function isTerminal(res: AgentResponse): boolean {
 
 function applyResponse(res: AgentResponse) {
   const terminal = isTerminal(res);
+  const updatedMessages = [...state.messages];
+  const lastIdx = updatedMessages.length - 1;
+  if (lastIdx >= 0 && updatedMessages[lastIdx].role === "assistant") {
+    updatedMessages[lastIdx] = {
+      ...updatedMessages[lastIdx],
+      streaming: false,
+      response: res,
+      content: res.summary || updatedMessages[lastIdx].content || "Execution completed.",
+    };
+  }
+
   set({
     response: res,
     loading: false,
     liveSteps: [],
+    streamingText: "",
+    messages: updatedMessages,
     ...(terminal ? { activeRequestId: null, reattached: false, stalledJobId: null } : {}),
   });
   if (terminal) notifyDataChanged();
@@ -126,16 +153,42 @@ async function runForeground(request: UserRequest) {
   const res = await aiExecuteStream(request, {
     onStep: (step) => {
       if (!stillMine()) return;
+      const newSteps = [
+        ...state.liveSteps,
+        {
+          step_type: step.step_type,
+          phase: step.phase ?? null,
+          status: step.status ?? null,
+          created_at: step.created_at ?? null,
+        },
+      ];
+      const updatedMessages = [...state.messages];
+      const lastIdx = updatedMessages.length - 1;
+      if (lastIdx >= 0 && updatedMessages[lastIdx].role === "assistant") {
+        updatedMessages[lastIdx] = {
+          ...updatedMessages[lastIdx],
+          steps: newSteps,
+        };
+      }
       set({
-        liveSteps: [
-          ...state.liveSteps,
-          {
-            step_type: step.step_type,
-            phase: step.phase ?? null,
-            status: step.status ?? null,
-            created_at: step.created_at ?? null,
-          },
-        ],
+        liveSteps: newSteps,
+        messages: updatedMessages,
+      });
+    },
+    onChunk: (delta: string) => {
+      if (!stillMine()) return;
+      const nextStream = (state.streamingText || "") + delta;
+      const updatedMessages = [...state.messages];
+      const lastIdx = updatedMessages.length - 1;
+      if (lastIdx >= 0 && updatedMessages[lastIdx].role === "assistant") {
+        updatedMessages[lastIdx] = {
+          ...updatedMessages[lastIdx],
+          content: nextStream,
+        };
+      }
+      set({
+        streamingText: nextStream,
+        messages: updatedMessages,
       });
     },
   });
@@ -309,11 +362,39 @@ export const agentRunStore = {
   setError: (msg: string) => set({ error: msg }),
   clearError: () => set({ error: "" }),
 
+  clearConversation: () => {
+    set({
+      messages: [],
+      response: null,
+      error: "",
+      notice: "",
+      streamingText: "",
+      liveSteps: [],
+      loading: false,
+      activeRequestId: null,
+    });
+  },
+
   /* Start a run. The promise chain lives in THIS module — sidebar
      navigation cannot abort, unmount or orphan it. */
   async startRun(request: UserRequest) {
     if (state.loading) return; // one run at a time
     const rid = requestId();
+    const userMsg: ChatMessage = {
+      id: requestId(),
+      role: "user",
+      content: request.message,
+      createdAt: new Date().toISOString(),
+    };
+    const assistantMsg: ChatMessage = {
+      id: requestId(),
+      role: "assistant",
+      content: "",
+      streaming: true,
+      steps: [],
+      createdAt: new Date().toISOString(),
+    };
+
     set({
       loading: true,
       response: null,
@@ -322,6 +403,8 @@ export const agentRunStore = {
       stalledJobId: null,
       reattached: false,
       liveSteps: [],
+      streamingText: "",
+      messages: [...state.messages, userMsg, assistantMsg],
       cancelling: false,
       activeRequestId: rid,
     });

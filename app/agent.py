@@ -6898,6 +6898,8 @@ async def execute(
         )
 
         session_id = uuid.UUID(session["id"])
+        if conversation_id:
+            _SESSION_TO_CID[str(session_id)] = str(conversation_id)
 
         # P2-⑪: wall-clock start for this session → every step row gets
 
@@ -15993,14 +15995,43 @@ def _swallow_later(task: asyncio.Task) -> None:
 # users re-send instead of answering and left orphaned WAITING_FOR_USER rows.
 
 _DURABLE_STEP_TYPES = {
-
     "AWAITING_CLARIFICATION",
-
     "AWAITING_CONFIRMATION",
-
     "FAILED",
-
 }
+
+# ---------------------------------------------------------------------------
+# IN-MEMORY REAL-TIME EVENT STREAMING (Zero DB Polling)
+# ---------------------------------------------------------------------------
+_LIVE_STREAM_QUEUES: Dict[str, List[asyncio.Queue]] = {}
+_SESSION_TO_CID: Dict[str, str] = {}
+
+def register_stream_queue(key: str, queue: asyncio.Queue) -> None:
+    """Register an in-memory queue to receive real-time steps and chunks directly."""
+    if not key:
+        return
+    _LIVE_STREAM_QUEUES.setdefault(str(key), []).append(queue)
+
+def unregister_stream_queue(key: str, queue: asyncio.Queue) -> None:
+    """Clean up the queue once the SSE response closes."""
+    if not key:
+        return
+    qs = _LIVE_STREAM_QUEUES.get(str(key), [])
+    if queue in qs:
+        qs.remove(queue)
+    if not qs and str(key) in _LIVE_STREAM_QUEUES:
+        _LIVE_STREAM_QUEUES.pop(str(key), None)
+
+def emit_stream_event(keys: Sequence[Optional[str]], event_type: str, payload: Dict[str, Any]) -> None:
+    """Instantly emit an event to all in-memory stream queues."""
+    for k in keys:
+        if not k:
+            continue
+        for q in _LIVE_STREAM_QUEUES.get(str(k), []):
+            try:
+                q.put_nowait({"event": event_type, "data": payload})
+            except Exception:
+                pass
 
 
 
@@ -16027,6 +16058,18 @@ async def _log_step(session_id: uuid.UUID, step_type: str, data: Dict[str, Any])
     """
 
     _sid = str(session_id)
+    _cid = _SESSION_TO_CID.get(_sid)
+    emit_stream_event(
+        [_sid, _cid],
+        "step",
+        {
+            "step_type": step_type,
+            "phase": data.get("description") or step_type,
+            "status": "completed" if step_type in ("COMPLETED", "FAILED") else "active",
+            "created_at": str(time.time()),
+            "execution_id": _sid,
+        },
+    )
 
     # P2-⑮: remember the last parking/terminal marker for the flush policy.
 

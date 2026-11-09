@@ -473,14 +473,16 @@ async def ai_execute_stream(
             )
             + "\n\n"
         )
-        from app.agent import execute  # lazy: heavy agent stack (serverless cold-start)
-        # c1f3faf intent ("provider injection at the API boundary"): this is
-        # the PRIMARY prod path, yet it never passed a questionnaire client —
-        # fresh sends always fell back to deterministic phrasing while the
-        # clarify/execute endpoints injected one.  Inject the same singleton;
-        # build_questionnaire_with_llm swallows provider failures, so a down
-        # provider degrades to the deterministic questionnaire, never a 500.
+        from app.agent import (
+            execute,
+            register_stream_queue,
+            unregister_stream_queue,
+        )
         from app.ai_orchestrator import get_client
+
+        cid = request.conversation_id or str(uuid.uuid4())
+        live_queue: asyncio.Queue = asyncio.Queue()
+        register_stream_queue(cid, live_queue)
 
         run_task = asyncio.create_task(
             execute(
@@ -488,79 +490,37 @@ async def ai_execute_stream(
                 user_id=auth.user_id,
                 organization_id=auth.organization_id,
                 auth=auth,
-                conversation_id=request.conversation_id,
+                conversation_id=cid,
                 attachments=request.attachments,
                 questionnaire_client=get_client(),
             )
         )
-        seen_step_ids: set[str] = set()
-        session_row: Optional[Dict[str, Any]] = None
+
         heartbeat = 0
+        try:
+            while not run_task.done() or not live_queue.empty():
+                try:
+                    event = await asyncio.wait_for(live_queue.get(), timeout=0.1)
+                    etype = event.get("event", "step")
+                    edata = event.get("data", {})
+                    yield f"event: {etype}\ndata: {json.dumps(edata)}\n\n"
+                except asyncio.TimeoutError:
+                    pass
 
-        while not run_task.done():
-            # Resolve the session once via the conversation_id.
-            if session_row is None:
-                session_row = await fetch_one(
-                    "ai_execution_sessions",
-                    filters={"conversation_id": request.conversation_id},
-                )
-            if session_row is not None:
-                steps = await fetch_many(
-                    "ai_execution_steps",
-                    filters={
-                        "execution_session_id": session_row["id"],
-                    },
-                    order="created_at.asc",
-                    limit=200,
-                )
-                for step in steps:
-                    sid = str(step.get("id"))
-                    if sid in seen_step_ids:
-                        continue
-                    seen_step_ids.add(sid)
-                    yield (
-                        "event: step\n"
-                        + "data: "
-                        + json.dumps(
-                            {
-                                "step_type": step.get("step_type"),
-                                # The PHASE - not the coarse enum.  `description`
-                                # holds the real phase name (INTERPRETING,
-                                # PLANNING, CONTEXT_LOADING, EXECUTING, ...),
-                                # which is what the progress UI maps to a label
-                                # and colours.  Sending the enum (REASON/
-                                # RETRIEVE) matched nothing in the UI's
-                                # PHASE_ORDER, so every run displayed the
-                                # fallback string "Agent working" and the
-                                # pipeline stages never lit up.  This now
-                                # matches /api/ai/progress exactly.
-                                "phase": step.get("description") or step.get("step_type"),
-                                "status": step.get("status"),
-                                "created_at": str(step.get("created_at")),
-                                # P2-⑪: lets the client attach its TTFB
-                                # measurement to THIS session's steps.
-                                "execution_id": str(session_row["id"]),
-                            }
-                        )
-                        + "\n\n"
-                    )
-            # Keepalive comment every ~15 polls so proxies never time out.
-            heartbeat += 1
-            if heartbeat % 15 == 0:
-                yield ": keepalive\n\n"
-            # P2-⑬ (forensic report ⑬): 250ms poll — halves the per-run DB
-            # polling load (server-side only; user-perceived step latency
-            # stays well under a quarter second, invisible).
-            await asyncio.sleep(0.25)
+                heartbeat += 1
+                if heartbeat % 50 == 0:
+                    yield ": keepalive\n\n"
 
-        response = await run_task
-        yield (
-            "event: final\n"
-            + "data: "
-            + response.model_dump_json()
-            + "\n\n"
-        )
-        yield "event: done\ndata: {}\n\n"
+            response = await run_task
+            yield (
+                "event: final\n"
+                + "data: "
+                + response.model_dump_json()
+                + "\n\n"
+            )
+            yield "event: done\ndata: {}\n\n"
+        finally:
+            unregister_stream_queue(cid, live_queue)
 
     return StreamingResponse(
         event_stream(),

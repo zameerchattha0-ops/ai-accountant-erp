@@ -1,10 +1,20 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, useSyncExternalStore } from "react";
-import { Send, Paperclip, X, Loader2, Sparkles } from "lucide-react";
+import React, { useState, useRef, useCallback, useEffect, useSyncExternalStore } from "react";
+import {
+  Send,
+  Paperclip,
+  X,
+  Loader2,
+  Sparkles,
+  RotateCcw,
+  Bot,
+  User,
+  Zap,
+  CheckCircle2,
+} from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import type {
-  AgentResponse,
   AttachmentRef,
   UserRequest,
 } from "@/lib/types/api";
@@ -13,99 +23,96 @@ import {
   MAX_UPLOAD_BYTES,
 } from "@/lib/types/api";
 import { ExecutionStatus } from "@/lib/types/enums";
-import { agentRunStore, USE_BACKGROUND_RUNS, type AgentRunState } from "@/lib/agent/agentRunStore";
+import {
+  agentRunStore,
+  USE_BACKGROUND_RUNS,
+  type AgentRunState,
+} from "@/lib/agent/agentRunStore";
 import AIProgress from "./AIProgress";
 import AIActionCard from "./AIActionCard";
 import AIClarification from "./AIClarification";
 import AIConfirmation from "./AIConfirmation";
 
-const PLACEHOLDERS = [
-  "Tell me what happened...",
-  "Create an invoice for ABC Technologies...",
-  "Record an expense of Rs. 25,000...",
-  "Show me this month's profit...",
-  "Upload a receipt and I'll help record it.",
+const QUICK_PROMPTS = [
+  {
+    label: "Cash & Bank Balance",
+    prompt: "What is our current cash and bank balance across all accounts?",
+  },
+  {
+    label: "WHT Rates (Sec 153)",
+    prompt: "What are the latest Section 153 withholding tax rates for goods vs IT services?",
+  },
+  {
+    label: "FBR vs Provincial Tax",
+    prompt: "Explain the difference between Federal GST on goods and Provincial Sales Tax on services (PRA/SRB).",
+  },
+  {
+    label: "Unpaid Bills",
+    prompt: "Show me all outstanding supplier bills and upcoming due dates.",
+  },
 ];
 
 export default function AICommandBox() {
-  // Hydration safety: the FIRST render (server and client) must be
-  // byte-identical.  A module-scope Math.random() placeholder was evaluated
-  // separately on the server and the client, producing different
-  // placeholder attributes and the "Hydration failed because the server
-  // rendered HTML didn't match the client" error.  Use a deterministic
-  // initial placeholder and only randomise AFTER hydration (useEffect).
-  const [placeholderIdx, setPlaceholderIdx] = useState(0);
-  useEffect(() => {
-    setPlaceholderIdx(Math.floor(Math.random() * PLACEHOLDERS.length));
-  }, []);
   const [message, setMessage] = useState("");
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  /* ---- Run state lives in the navigation-proof module store --------
-     Clicking any sidebar tab unmounts this box — the in-flight run,
-     its live steps and its result card survive in agentRunStore and
-     re-render the moment you come back. */
   const run: AgentRunState = useSyncExternalStore(
     agentRunStore.subscribe,
     agentRunStore.getSnapshot,
-    agentRunStore.getSnapshot,
+    agentRunStore.getSnapshot
   );
-  const { loading, response, error, notice, liveSteps, activeRequestId, reattached, stalledJobId } = run;
+  const {
+    loading,
+    response,
+    error,
+    notice,
+    liveSteps,
+    activeRequestId,
+    reattached,
+    stalledJobId,
+    messages,
+  } = run;
 
-  /* Boot the reattach watcher once per session (module-level, idempotent):
-     a page refresh mid-run resumes the live progress view. */
+  // Boot reattach watcher once per session
   useEffect(() => {
     agentRunStore.ensureReattach();
   }, []);
 
-  /* Mirror the store's terminal result onto the LOCAL input: clear the
-     message + attachments once the agent completed (or failed) a run. */
-  const lastTerminalRef = useRef<AgentResponse | null>(null);
+  // Auto-scroll to bottom of conversation
   useEffect(() => {
-    if (!response) return;
-    const terminal =
-      response.status === ExecutionStatus.COMPLETED ||
-      response.status === ExecutionStatus.FAILED;
-    if (terminal && lastTerminalRef.current !== response) {
-      lastTerminalRef.current = response;
-      setMessage("");
-      setAttachments([]);
+    if (messagesEndRef.current && (messages.length > 0 || loading)) {
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
-  }, [response]);
+  }, [messages, loading]);
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
     if (el) {
       el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, 200) + "px";
+      el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
     }
   }, []);
 
   const buildRequest = useCallback(
-    (): UserRequest => ({
-      message: message.trim(),
+    (text?: string): UserRequest => ({
+      message: (text || message).trim(),
       attachments: attachments.length > 0 ? attachments : undefined,
     }),
-    [message, attachments],
+    [message, attachments]
   );
 
-  const handleSend = async () => {
-    if (!message.trim() && attachments.length === 0) return;
-    const req = buildRequest();
+  const handleSend = async (overridePrompt?: string) => {
+    const promptToSend = (overridePrompt || message).trim();
+    if (!promptToSend && attachments.length === 0) return;
+    const req = buildRequest(promptToSend);
     setMessage("");
     setAttachments([]);
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-    // The promise chain lives in agentRunStore — sidebar navigation
-    // during the run is safe and never orphans the work.
     await agentRunStore.startRun(req);
-  };
-
-  // One-click foreground fallback when the queue is not being drained.
-  const runStalledJobInForeground = async () => {
-    await agentRunStore.runStalledInForeground(buildRequest());
   };
 
   const handleClarify = async (answer: string) => {
@@ -116,21 +123,334 @@ export default function AICommandBox() {
     await agentRunStore.confirm(approved, notes);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
     }
   };
 
   return (
-    <div className="w-full max-w-3xl mx-auto space-y-4">
-      {/* Input box */}
-      <div className="glass rounded-2xl p-1 shadow-lg">
-        <div className="flex items-start gap-2 p-2">
-          <div className="p-2 text-ai-500">
-            <Sparkles className="w-5 h-5" />
+    <div className="w-full max-w-4xl mx-auto flex flex-col rounded-3xl bg-bg-surface border border-border-default shadow-xl overflow-hidden transition-all">
+      {/* Copilot Header */}
+      <div className="flex items-center justify-between px-6 py-3.5 border-b border-border-subtle bg-bg-muted/40">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-ai-500 to-ai-600 flex items-center justify-center text-white shadow-2xs">
+            <Sparkles className="w-4 h-4" />
           </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-text-primary tracking-wide">
+                AI Accountant & Tax Copilot
+              </span>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                <Zap className="w-2.5 h-2.5 fill-emerald-500 text-emerald-500" />
+                Gemini 3.8 Flash
+              </span>
+            </div>
+            <p className="text-[11px] text-text-muted">
+              Real-time conversational accounting & statutory FBR/Provincial compliance
+            </p>
+          </div>
+        </div>
+
+        {messages.length > 0 && (
+          <button
+            onClick={() => agentRunStore.clearConversation()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-border-default bg-bg-surface text-text-secondary hover:text-text-primary hover:border-ai-300 text-xs font-medium transition-colors"
+            title="Start a new conversation"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>New Chat</span>
+          </button>
+        )}
+      </div>
+
+      {/* Messages Feed Area */}
+      <div className="p-6 space-y-6 max-h-[560px] overflow-y-auto">
+        {messages.length === 0 ? (
+          <div className="py-8 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-ai-50 text-ai-600 mx-auto flex items-center justify-center shadow-xs">
+              <Bot className="w-6 h-6" />
+            </div>
+            <div className="max-w-md mx-auto space-y-1">
+              <h3 className="text-sm font-semibold text-text-primary">
+                How can I assist your business today?
+              </h3>
+              <p className="text-xs text-text-secondary leading-relaxed">
+                Ask any bookkeeping question, request a CA tax analysis, or instruct me to book invoices, bills, and payments.
+              </p>
+            </div>
+
+            {/* Quick Prompt Suggestions */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-xl mx-auto pt-2 text-left">
+              {QUICK_PROMPTS.map((qp, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => handleSend(qp.prompt)}
+                  className="p-3 rounded-2xl border border-border-subtle bg-bg-primary/60 hover:bg-bg-muted hover:border-ai-200 text-left transition-all group"
+                >
+                  <span className="text-xs font-medium text-text-primary group-hover:text-ai-600 transition-colors">
+                    {qp.label}
+                  </span>
+                  <p className="text-[11px] text-text-muted line-clamp-1 mt-0.5">
+                    {qp.prompt}
+                  </p>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          messages.map((msg, index) => {
+            const isUser = msg.role === "user";
+            const isLastAssistant = !isUser && index === messages.length - 1;
+
+            return (
+              <div
+                key={msg.id}
+                className={cn(
+                  "flex gap-3",
+                  isUser ? "justify-end" : "justify-start"
+                )}
+              >
+                {!isUser && (
+                  <div className="w-8 h-8 rounded-xl bg-ai-50 text-ai-600 shrink-0 flex items-center justify-center mt-1 border border-ai-100">
+                    <Bot className="w-4 h-4" />
+                  </div>
+                )}
+
+                <div
+                  className={cn(
+                    "max-w-[85%] space-y-3",
+                    isUser ? "items-end" : "items-start"
+                  )}
+                >
+                  {/* Message Bubble */}
+                  <div
+                    className={cn(
+                      "px-4 py-3 rounded-2xl text-sm leading-relaxed",
+                      isUser
+                        ? "bg-ai-500 text-white rounded-tr-none shadow-sm font-medium"
+                        : "bg-bg-primary border border-border-subtle text-text-primary rounded-tl-none shadow-2xs"
+                    )}
+                  >
+                    {isUser ? (
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {/* Live Steps while in flight */}
+                        {msg.streaming && msg.steps && msg.steps.length > 0 && (
+                          <div className="pb-2 mb-2 border-b border-border-subtle flex flex-wrap gap-1.5 items-center">
+                            {msg.steps.slice(-3).map((st, i) => (
+                              <span
+                                key={i}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-bg-muted text-text-secondary"
+                              >
+                                <CheckCircle2 className="w-3 h-3 text-emerald-500" />
+                                {st.phase || st.step_type}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Streaming Text Content */}
+                        <div className="whitespace-pre-wrap">
+                          {msg.content || (msg.streaming ? "Thinking and evaluating ledger..." : "")}
+                          {msg.streaming && (
+                            <span className="inline-block w-1.5 h-4 ml-1 bg-ai-500 animate-pulse align-middle" />
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Render Associated Interactive Action Cards on Last Assistant Message */}
+                  {isLastAssistant && (
+                    <div className="w-full space-y-3 pt-1">
+                      {/* Clarification prompt */}
+                      {response?.status === ExecutionStatus.AWAITING_CLARIFICATION && (
+                        <AIClarification
+                          question={response.question || "I need more information."}
+                          options={response.options}
+                          questionOptions={response.question_options}
+                          onAnswer={handleClarify}
+                          disabled={loading}
+                        />
+                      )}
+
+                      {/* Confirmation prompt */}
+                      {response?.status === ExecutionStatus.AWAITING_CONFIRMATION && (
+                        <AIConfirmation
+                          summary={response.summary || ""}
+                          riskLevel={response.risk_level}
+                          accountingImpact={response.accounting_impact}
+                          transactionDate={
+                            typeof response.data?.transaction_date === "string"
+                              ? response.data.transaction_date
+                              : undefined
+                          }
+                          dateDefaulted={Boolean(response.data?.date_defaulted)}
+                          onDecision={handleConfirm}
+                          disabled={loading}
+                        />
+                      )}
+
+                      {/* Completed Action Card (with TaxComplianceCard) */}
+                      {response?.status === ExecutionStatus.COMPLETED && (
+                        <AIActionCard response={response} />
+                      )}
+
+                      {/* Rejected */}
+                      {response?.status === ExecutionStatus.REJECTED && (
+                        <div className="p-3.5 rounded-2xl bg-bg-muted border border-border-subtle text-xs text-text-secondary">
+                          <p className="font-semibold text-text-primary">Action cancelled</p>
+                          <p className="mt-0.5 text-text-muted">
+                            {response.summary || "The action was cancelled and no journal entries were recorded."}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Error State */}
+                      {response?.status === ExecutionStatus.FAILED && (
+                        <div className="p-3.5 rounded-2xl bg-error-50 border border-error-200 text-xs text-error-700">
+                          <p className="font-semibold">Operation failed</p>
+                          <p className="mt-0.5 text-error-600">
+                            {response.summary || "The operation could not be completed."}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {isUser && (
+                  <div className="w-8 h-8 rounded-xl bg-bg-muted text-text-secondary shrink-0 flex items-center justify-center mt-1 border border-border-subtle">
+                    <User className="w-4 h-4" />
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+
+        {/* Global Loading Indicator when starting fresh */}
+        {loading && messages.length === 0 && (
+          <div className="space-y-2">
+            <AIProgress
+              conversationId={activeRequestId}
+              liveSteps={!reattached && !USE_BACKGROUND_RUNS ? liveSteps : undefined}
+            />
+          </div>
+        )}
+
+        {/* Stalled Worker Notice */}
+        {stalledJobId && !loading && (
+          <div className="p-3 rounded-2xl bg-warning-50 border border-warning-200 text-xs text-warning-800 flex items-center justify-between gap-3">
+            <span>Background worker is queued. You can execute directly in foreground.</span>
+            <button
+              onClick={() => agentRunStore.runStalledInForeground(buildRequest())}
+              className="px-3 py-1 rounded-xl bg-warning-600 text-white font-medium text-[11px] shadow-2xs hover:bg-warning-700 transition-colors"
+            >
+              Run in foreground
+            </button>
+          </div>
+        )}
+
+        {/* Error message */}
+        {error && (
+          <div className="p-3 rounded-2xl bg-error-50 border border-error-200 text-xs text-error-700">
+            {error}
+          </div>
+        )}
+
+        {/* Notice banner */}
+        {notice && !loading && (
+          <div className="p-3 rounded-2xl bg-warning-50 border border-warning-200 text-xs text-warning-800 flex items-center justify-between">
+            <span>{notice}</span>
+            <button
+              onClick={() => agentRunStore.dismissNotice()}
+              className="text-text-muted hover:text-text-primary"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input Area */}
+      <div className="p-4 border-t border-border-subtle bg-bg-primary/40">
+        {/* Attachment Previews */}
+        {attachments.length > 0 && (
+          <div className="flex gap-2 pb-2.5 flex-wrap">
+            {attachments.map((att, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 px-2.5 py-1 bg-bg-surface border border-border-default rounded-xl text-xs text-text-secondary shadow-2xs"
+              >
+                <Paperclip className="w-3.5 h-3.5 text-ai-500" />
+                <span className="max-w-32 truncate font-mono text-[11px]">{att.file_name}</span>
+                <button
+                  type="button"
+                  onClick={() => setAttachments((a) => a.filter((_, j) => j !== i))}
+                  className="text-text-muted hover:text-error-600 transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-end gap-2 bg-bg-surface border border-border-default rounded-2xl p-2 focus-within:ring-2 focus-within:ring-ai-100 focus-within:border-ai-400 transition-all shadow-sm">
+          {/* File Upload Button */}
+          <label className="p-2 rounded-xl text-text-muted hover:text-text-primary hover:bg-bg-muted cursor-pointer transition-colors shrink-0">
+            <Paperclip className="w-4 h-4" />
+            <input
+              type="file"
+              className="hidden"
+              multiple
+              accept="image/png,image/jpeg,image/webp"
+              onChange={(e) => {
+                const files = Array.from(e.target.files || []);
+                e.target.value = "";
+                const valid = files.filter((f) => {
+                  if (!ALLOWED_UPLOAD_MIMES.has(f.type)) {
+                    agentRunStore.setError(`${f.name}: only PNG, JPEG or WEBP images are supported.`);
+                    return false;
+                  }
+                  if (f.size > MAX_UPLOAD_BYTES) {
+                    agentRunStore.setError(`${f.name}: file is larger than 8 MB.`);
+                    return false;
+                  }
+                  return true;
+                });
+
+                valid.forEach((f) => {
+                  const reader = new FileReader();
+                  reader.onload = () => {
+                    const dataUrl = String(reader.result || "");
+                    const base64 = dataUrl.split(",")[1] || "";
+                    setAttachments((prev) => [
+                      ...prev,
+                      {
+                        file_name: f.name,
+                        file_url: URL.createObjectURL(f),
+                        mime_type: f.type,
+                        file_size: f.size,
+                        data_base64: base64,
+                      },
+                    ]);
+                  };
+                  reader.readAsDataURL(f);
+                });
+              }}
+            />
+          </label>
+
+          {/* Textarea */}
           <textarea
             ref={textareaRef}
             value={message}
@@ -139,208 +459,28 @@ export default function AICommandBox() {
               autoGrow();
             }}
             onKeyDown={handleKeyDown}
-            placeholder={PLACEHOLDERS[placeholderIdx]}
+            placeholder="Type your instruction (e.g. 'Record cash purchase of Rs 40,000' or 'What is our profit?')..."
             rows={1}
-            className="flex-1 bg-transparent text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none py-2 min-h-[40px] max-h-[200px]"
+            className="flex-1 bg-transparent text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none py-1.5 px-1 min-h-[38px] max-h-[160px]"
           />
-        </div>
 
-        {/* Attachment previews */}
-        {attachments.length > 0 && (
-          <div className="flex gap-2 px-3 pb-2 flex-wrap">
-            {attachments.map((att, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-bg-muted rounded-lg text-xs text-text-secondary"
-              >
-                <Paperclip className="w-3 h-3" />
-                <span className="max-w-24 truncate">{att.file_name}</span>
-                <button
-                  onClick={() => setAttachments((a) => a.filter((_, j) => j !== i))}
-                  className="text-text-muted hover:text-text-primary"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Bottom bar */}
-        <div className="flex items-center justify-between px-2 pb-1">
-          <div className="flex items-center gap-1">
-            <label className="p-2 rounded-lg text-text-muted hover:text-text-secondary hover:bg-bg-muted cursor-pointer transition-colors">
-              <Paperclip className="w-4 h-4" />
-              <input
-                type="file"
-                className="hidden"
-                multiple
-                accept="image/png,image/jpeg,image/webp"
-                onChange={(e) => {
-                  const files = Array.from(e.target.files || []);
-                  e.target.value = ""; // allow re-selecting the same file
-                  const errors: string[] = [];
-                  const valid = files.filter((f) => {
-                    if (!ALLOWED_UPLOAD_MIMES.has(f.type)) {
-                      errors.push(`${f.name}: only PNG, JPEG or WEBP images are supported.`);
-                      return false;
-                    }
-                    if (f.size > MAX_UPLOAD_BYTES) {
-                      errors.push(`${f.name}: file is larger than 8 MB.`);
-                      return false;
-                    }
-                    return true;
-                  });
-                  if (errors.length > 0) agentRunStore.setError(errors.join(" "));
-
-                  // Read each file as base64 so the backend receives the
-                  // ACTUAL document for vision extraction (blob URLs never
-                  // leave the browser).
-                  valid.forEach((f) => {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                      const dataUrl = String(reader.result || "");
-                      const base64 = dataUrl.split(",")[1] || "";
-                      setAttachments((prev) => [
-                        ...prev,
-                        {
-                          file_name: f.name,
-                          file_url: URL.createObjectURL(f),
-                          mime_type: f.type,
-                          file_size: f.size,
-                          data_base64: base64,
-                        },
-                      ]);
-                    };
-                    reader.onerror = () =>
-                      agentRunStore.setError(`${f.name}: could not read the file.`);
-                    reader.readAsDataURL(f);
-                  });
-                }}
-              />
-            </label>
-          </div>
+          {/* Send Button */}
           <button
-            onClick={handleSend}
+            type="button"
+            onClick={() => handleSend()}
             disabled={loading || (!message.trim() && attachments.length === 0)}
             className={cn(
-              "btn-3d btn-shine flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+              "p-2.5 rounded-xl text-white font-medium transition-all shrink-0",
               loading
-                ? "bg-ai-100 text-ai-500 cursor-wait"
-                : "bg-gradient-to-b from-ai-500 to-ai-600 text-white hover:from-ai-400 hover:to-ai-600"
+                ? "bg-ai-200 text-ai-500 cursor-wait"
+                : "bg-ai-500 hover:bg-ai-600 shadow-2xs active:scale-95"
             )}
+            title="Send (Enter)"
           >
             {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-            {loading ? "Processing" : "Send"}
           </button>
         </div>
       </div>
-
-      {/* Error */}
-      {error && (
-        <div className="p-3 rounded-xl bg-error-50 border border-error-100 text-sm text-error-600">
-          {error}
-        </div>
-      )}
-
-      {/* Informational notice - e.g. a previous run was closed because it
-          stopped reporting progress. Never blocks the input: the user can
-          simply send a new request (or dismiss it). */}
-      {notice && !loading && (
-        <div className="p-3 rounded-xl bg-warning-50 border border-warning-100 text-sm text-text-secondary flex items-start justify-between gap-3">
-          <span>{notice}</span>
-          <button
-            type="button"
-            onClick={() => agentRunStore.dismissNotice()}
-            className="shrink-0 text-text-muted hover:text-text-primary transition-colors"
-            aria-label="Dismiss notice"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
-      {/* Loading progress - REAL agent state polled from the backend */}
-      {loading && (
-        <div className="space-y-2">
-          {reattached && (
-            <p className="text-xs text-text-muted">
-              Reattached to a run that was already in progress. The result will
-              be available in AI Activity when it completes.
-            </p>
-          )}
-          <AIProgress
-            conversationId={activeRequestId}
-            liveSteps={
-              !reattached && !USE_BACKGROUND_RUNS ? liveSteps : undefined
-            }
-          />
-        </div>
-      )}
-
-      {/* queued but not picked up by any worker - offer the
-          one-click foreground fallback instead of an endless wait. */}
-      {stalledJobId && !loading && (
-        <div className="p-3 rounded-xl bg-warning-50 border border-warning-100 text-sm text-text-secondary flex items-center justify-between gap-3">
-          <span>
-            No background worker has picked up this run yet. Start one with
-            &quot;python scripts/ai_worker.py&quot; or run it here instead.
-          </span>
-          <button
-            onClick={runStalledJobInForeground}
-            className="btn-3d-soft shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium"
-          >
-            Run in foreground instead
-          </button>
-        </div>
-      )}
-
-      {/* Response rendering */}
-      {response && !loading && (
-        <>
-          {response.status === ExecutionStatus.AWAITING_CLARIFICATION && (
-            <AIClarification
-              question={response.question || "I need more information."}
-              options={response.options}
-              questionOptions={response.question_options}
-              onAnswer={handleClarify}
-              disabled={loading}
-            />
-          )}
-          {response.status === ExecutionStatus.AWAITING_CONFIRMATION && (
-            <AIConfirmation
-              summary={response.summary || ""}
-              riskLevel={response.risk_level}
-              accountingImpact={response.accounting_impact}
-              transactionDate={
-                typeof response.data?.transaction_date === "string"
-                  ? response.data.transaction_date
-                  : undefined
-              }
-              dateDefaulted={Boolean(response.data?.date_defaulted)}
-              onDecision={handleConfirm}
-              disabled={loading}
-            />
-          )}
-          {response.status === ExecutionStatus.COMPLETED && (
-            <AIActionCard response={response} />
-          )}
-          {response.status === ExecutionStatus.REJECTED && (
-            <div className="p-4 rounded-xl bg-bg-muted border border-border-subtle">
-              <p className="text-sm font-medium text-text-secondary">Action cancelled</p>
-              <p className="text-sm text-text-muted mt-1">
-                {response.summary || "The action was rejected and nothing was recorded."}
-              </p>
-            </div>
-          )}
-          {response.status === ExecutionStatus.FAILED && (
-            <div className="p-4 rounded-xl bg-error-50 border border-error-100">
-              <p className="text-sm font-medium text-error-600">Something went wrong</p>
-              <p className="text-sm text-error-500 mt-1">{response.summary || "The operation could not be completed."}</p>
-            </div>
-          )}
-        </>
-      )}
     </div>
   );
 }

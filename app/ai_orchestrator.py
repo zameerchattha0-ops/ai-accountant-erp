@@ -262,7 +262,7 @@ class AIOrchestrator:
                 self._offer(candidates, self._harbor_candidate(model))
 
         # Secondary fallback: Google Gemini (runs ONLY if Token Harbor fails/stalls)
-        gemini_model = settings.gemini_model or "gemini-flash-lite-latest"
+        gemini_model = settings.gemini_model or "gemini-3.8-flash"
         self._offer(
             candidates,
             {
