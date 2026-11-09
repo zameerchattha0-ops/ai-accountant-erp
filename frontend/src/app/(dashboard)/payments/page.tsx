@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Plus, Search } from "lucide-react";
+import { Plus, Search, FileText } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useOrg } from "@/lib/hooks/useOrg";
 import { useServerList } from "@/lib/hooks/useServerList";
@@ -13,6 +13,7 @@ import PageHeader from "@/components/shared/PageHeader";
 import Pagination from "@/components/shared/Pagination";
 import StatusBadge from "@/components/shared/StatusBadge";
 import PartyCombobox from "@/components/shared/PartyCombobox";
+import WithholdingTaxCertificate from "@/components/print/WithholdingTaxCertificate";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Payment, BankAccount, PurchaseBill } from "@/lib/types/entities";
 
@@ -22,7 +23,13 @@ const inputCls =
 const today = () => new Date().toISOString().slice(0, 10);
 
 type PaymentRow = Payment & {
-  supplier?: { name?: string } | null;
+  supplier?: {
+    id?: string;
+    name?: string;
+    tax_number?: string | null;
+    strn?: string | null;
+    sales_tax_status?: string | null;
+  } | null;
   bank_account?: { account_name?: string } | null;
 };
 type BankOption = Pick<BankAccount, "id" | "account_name" | "bank_name" | "is_default">;
@@ -52,6 +59,7 @@ export default function PaymentsPage() {
   const [bankAccounts, setBankAccounts] = useState<BankOption[]>([]);
   const [bills, setBills] = useState<BillOption[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
+  const [selectedPaymentForCert, setSelectedPaymentForCert] = useState<PaymentRow | null>(null);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [form, setForm] = useState<PaymentForm>(EMPTY_FORM);
@@ -83,7 +91,7 @@ export default function PaymentsPage() {
       let query = supabase
         .from("payments")
         .select(
-          "id, payment_number, payment_date, payment_method, amount, currency_code, reference, status, is_transfer, supplier_id, bank_account_id, created_at, supplier:suppliers(name)",
+          "id, payment_number, payment_date, payment_method, amount, currency_code, reference, status, is_transfer, supplier_id, bank_account_id, created_at, supplier:suppliers(id, name, tax_number, strn, sales_tax_status)",
           { count: "exact" }
         )
         .eq("organization_id", org.organization_id)
@@ -287,6 +295,7 @@ export default function PaymentsPage() {
                 <th className="px-4 py-3 font-medium text-right">Amount</th>
                 <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium">Transfer</th>
+                <th className="px-4 py-3 font-medium text-right">Certificate</th>
               </tr>
             </thead>
             <tbody>
@@ -301,6 +310,18 @@ export default function PaymentsPage() {
                   </td>
                   <td className="px-4 py-3"><StatusBadge status={p.status} /></td>
                   <td className="px-4 py-3 text-text-secondary text-xs">{p.is_transfer ? "Yes" : ""}</td>
+                  <td className="px-4 py-3 text-right">
+                    {!p.is_transfer && (
+                      <button
+                        onClick={() => setSelectedPaymentForCert(p)}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-border-default bg-bg-surface px-2.5 py-1 text-xs font-medium text-text-secondary hover:text-ai-600 hover:border-ai-300 transition-colors shadow-2xs"
+                        title="Generate Official Section 164 / Rule 42 WHT Certificate"
+                      >
+                        <FileText className="w-3.5 h-3.5" />
+                        WHT Cert
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -419,6 +440,24 @@ export default function PaymentsPage() {
           </div>
         </div>
       </Modal>
+
+      {/* Official Section 164 / Rule 42 WHT Certificate Modal */}
+      {selectedPaymentForCert && (
+        <WithholdingTaxCertificate
+          paymentNumber={selectedPaymentForCert.payment_number}
+          paymentDate={selectedPaymentForCert.payment_date}
+          agentName={org?.name || "Company"}
+          agentNtn={org?.tax_number}
+          agentStrn={org?.strn}
+          payeeName={selectedPaymentForCert.supplier?.name || "Vendor"}
+          payeeNtn={selectedPaymentForCert.supplier?.tax_number}
+          payeeStrn={selectedPaymentForCert.supplier?.strn}
+          payeeStatus={selectedPaymentForCert.supplier?.sales_tax_status || "Active ATL Taxpayer"}
+          grossAmount={Number(selectedPaymentForCert.amount || 0)}
+          currencyCode={selectedPaymentForCert.currency_code || org?.base_currency_code || "PKR"}
+          onClose={() => setSelectedPaymentForCert(null)}
+        />
+      )}
     </div>
   );
 }

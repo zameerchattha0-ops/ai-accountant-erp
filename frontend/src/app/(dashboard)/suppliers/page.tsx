@@ -12,6 +12,7 @@ import Modal from "@/components/shared/Modal";
 import PageHeader from "@/components/shared/PageHeader";
 import Pagination from "@/components/shared/Pagination";
 import StatusBadge from "@/components/shared/StatusBadge";
+import TaxProfileBadge from "@/components/shared/TaxProfileBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/shared/States";
 import type { Supplier } from "@/lib/types/entities";
 
@@ -23,13 +24,16 @@ interface SupplierForm {
   email: string;
   phone: string;
   tax_number: string;
+  strn: string;
+  sales_tax_status: string;
   payment_terms_days: string;
   credit_limit: string;
   notes: string;
 }
 
 const EMPTY_FORM: SupplierForm = {
-  name: "", email: "", phone: "", tax_number: "",
+  name: "", email: "", phone: "", tax_number: "", strn: "",
+  sales_tax_status: "UNREGISTERED",
   payment_terms_days: "30", credit_limit: "", notes: "",
 };
 
@@ -53,7 +57,7 @@ export default function SuppliersPage() {
       let query = supabase
         .from("suppliers")
         .select(
-          "id, supplier_code, name, email, phone, tax_number, payment_terms_days, credit_limit, currency_code, notes, is_active",
+          "id, supplier_code, name, email, phone, tax_number, strn, sales_tax_status, payment_terms_days, credit_limit, currency_code, notes, is_active",
           { count: "exact" }
         )
         .eq("organization_id", org.organization_id)
@@ -62,7 +66,7 @@ export default function SuppliersPage() {
         .range(page * pageSize, page * pageSize + pageSize - 1)
         .abortSignal(signal);
       const expr = ilikeAny(
-        ["name", "supplier_code", "email", "phone", "tax_number"],
+        ["name", "supplier_code", "email", "phone", "tax_number", "strn"],
         search
       );
       if (expr) query = query.or(expr);
@@ -83,6 +87,8 @@ export default function SuppliersPage() {
       email: form.email.trim() || null,
       phone: form.phone.trim() || null,
       tax_number: form.tax_number.trim() || null,
+      strn: form.strn.trim() || null,
+      sales_tax_status: form.sales_tax_status || "UNREGISTERED",
       payment_terms_days: form.payment_terms_days ? Number(form.payment_terms_days) : null,
       credit_limit: form.credit_limit ? Number(form.credit_limit) : null,
       currency_code: org.base_currency_code,
@@ -108,7 +114,8 @@ export default function SuppliersPage() {
   const [editError, setEditError] = useState<string | null>(null);
 
   const FIELD_LABELS: Record<string, string> = {
-    name: "Name", email: "Email", phone: "Phone", tax_number: "Tax number",
+    name: "Name", email: "Email", phone: "Phone", tax_number: "NTN / Tax Number",
+    strn: "Sales Tax Reg No (STRN)", sales_tax_status: "Sales Tax Status",
     payment_terms_days: "Terms (days)", credit_limit: "Credit limit", notes: "Notes",
   };
   const fmtVal = (v: string) => (v === "" ? "(empty)" : v);
@@ -118,6 +125,8 @@ export default function SuppliersPage() {
     setEditForm({
       name: s.name ?? "", email: s.email ?? "", phone: s.phone ?? "",
       tax_number: s.tax_number ?? "",
+      strn: s.strn ?? "",
+      sales_tax_status: s.sales_tax_status ?? "UNREGISTERED",
       payment_terms_days: s.payment_terms_days != null ? String(s.payment_terms_days) : "",
       credit_limit: s.credit_limit != null ? String(s.credit_limit) : "",
       notes: s.notes ?? "",
@@ -134,6 +143,8 @@ export default function SuppliersPage() {
       email: editForm.email.trim(),
       phone: editForm.phone.trim(),
       tax_number: editForm.tax_number.trim(),
+      strn: editForm.strn.trim(),
+      sales_tax_status: editForm.sales_tax_status,
       payment_terms_days: editForm.payment_terms_days.trim(),
       credit_limit: editForm.credit_limit.trim(),
       notes: editForm.notes.trim(),
@@ -143,6 +154,8 @@ export default function SuppliersPage() {
       email: editing.email ?? "",
       phone: editing.phone ?? "",
       tax_number: editing.tax_number ?? "",
+      strn: editing.strn ?? "",
+      sales_tax_status: editing.sales_tax_status ?? "UNREGISTERED",
       payment_terms_days: editing.payment_terms_days != null ? String(editing.payment_terms_days) : "",
       credit_limit: editing.credit_limit != null ? String(editing.credit_limit) : "",
       notes: editing.notes ?? "",
@@ -226,6 +239,7 @@ export default function SuppliersPage() {
                 <th className="px-4 py-3 font-medium">Name</th>
                 <th className="px-4 py-3 font-medium">Email</th>
                 <th className="px-4 py-3 font-medium">Phone</th>
+                <th className="px-4 py-3 font-medium">Tax Profile</th>
                 <th className="px-4 py-3 font-medium text-right">Credit Limit</th>
                 <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium text-right">Actions</th>
@@ -238,6 +252,14 @@ export default function SuppliersPage() {
                   <td className="px-4 py-3 font-medium text-text-primary">{s.name}</td>
                   <td className="px-4 py-3 text-text-secondary">{s.email ?? "-"}</td>
                   <td className="px-4 py-3 text-text-secondary">{s.phone ?? "-"}</td>
+                  <td className="px-4 py-3">
+                    <TaxProfileBadge
+                      status={s.sales_tax_status}
+                      strn={s.strn}
+                      taxNumber={s.tax_number}
+                      onClick={() => openEdit(s)}
+                    />
+                  </td>
                   <td className="px-4 py-3 text-right text-text-secondary tabular-nums">
                     {s.credit_limit != null ? formatCurrency(s.credit_limit, s.currency_code ?? undefined) : "-"}
                   </td>
@@ -287,12 +309,7 @@ export default function SuppliersPage() {
                 onChange={(e) => setForm({ ...form, phone: e.target.value })} />
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="text-xs font-medium text-text-secondary">Tax number</label>
-              <input className={`${inputCls} mt-1.5`} value={form.tax_number}
-                onChange={(e) => setForm({ ...form, tax_number: e.target.value })} />
-            </div>
+          <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="text-xs font-medium text-text-secondary">Terms (days)</label>
               <input className={`${inputCls} mt-1.5`} type="number" min={0} value={form.payment_terms_days}
@@ -302,6 +319,35 @@ export default function SuppliersPage() {
               <label className="text-xs font-medium text-text-secondary">Credit limit</label>
               <input className={`${inputCls} mt-1.5`} type="number" min={0} value={form.credit_limit}
                 onChange={(e) => setForm({ ...form, credit_limit: e.target.value })} />
+            </div>
+          </div>
+          {/* Tax Profile & FBR ATL Section */}
+          <div className="p-3.5 rounded-xl bg-bg-muted/40 border border-border-subtle space-y-3">
+            <span className="text-[11px] font-semibold text-text-secondary uppercase tracking-wider">
+              Tax & Compliance Profile (FBR / Provincial)
+            </span>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="text-xs font-medium text-text-secondary">NTN / Tax Number</label>
+                <input className={`${inputCls} mt-1 font-mono`} value={form.tax_number}
+                  onChange={(e) => setForm({ ...form, tax_number: e.target.value })}
+                  placeholder="e.g. 1234567-8" />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-text-secondary">STRN (Sales Tax No)</label>
+                <input className={`${inputCls} mt-1 font-mono`} value={form.strn}
+                  onChange={(e) => setForm({ ...form, strn: e.target.value })}
+                  placeholder="e.g. 12-34-5678-901-23" />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-text-secondary">Sales Tax Status</label>
+                <select className={`${inputCls} mt-1 text-xs`} value={form.sales_tax_status}
+                  onChange={(e) => setForm({ ...form, sales_tax_status: e.target.value })}>
+                  <option value="REGISTERED_ACTIVE">Active ATL (Active Taxpayer)</option>
+                  <option value="REGISTERED_INACTIVE">Registered Inactive / Suspended</option>
+                  <option value="UNREGISTERED">Unregistered</option>
+                </select>
+              </div>
             </div>
           </div>
           <div>
@@ -348,12 +394,7 @@ export default function SuppliersPage() {
                   onChange={(e) => setEditForm({ ...editForm, phone: e.target.value })} />
               </div>
             </div>
-            <div className="grid grid-cols-3 gap-4">
-              <div>
-                <label className="text-xs font-medium text-text-secondary">Tax number</label>
-                <input className={`${inputCls} mt-1.5`} value={editForm.tax_number}
-                  onChange={(e) => setEditForm({ ...editForm, tax_number: e.target.value })} />
-              </div>
+            <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="text-xs font-medium text-text-secondary">Terms (days)</label>
                 <input className={`${inputCls} mt-1.5`} type="number" min={0} value={editForm.payment_terms_days}
@@ -363,6 +404,35 @@ export default function SuppliersPage() {
                 <label className="text-xs font-medium text-text-secondary">Credit limit</label>
                 <input className={`${inputCls} mt-1.5`} type="number" min={0} value={editForm.credit_limit}
                   onChange={(e) => setEditForm({ ...editForm, credit_limit: e.target.value })} />
+              </div>
+            </div>
+            {/* Tax Profile & FBR ATL Section */}
+            <div className="p-3.5 rounded-xl bg-bg-muted/40 border border-border-subtle space-y-3">
+              <span className="text-[11px] font-semibold text-text-secondary uppercase tracking-wider">
+                Tax & Compliance Profile (FBR / Provincial)
+              </span>
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="text-xs font-medium text-text-secondary">NTN / Tax Number</label>
+                  <input className={`${inputCls} mt-1 font-mono`} value={editForm.tax_number}
+                    onChange={(e) => setEditForm({ ...editForm, tax_number: e.target.value })}
+                    placeholder="e.g. 1234567-8" />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-text-secondary">STRN (Sales Tax No)</label>
+                  <input className={`${inputCls} mt-1 font-mono`} value={editForm.strn}
+                    onChange={(e) => setEditForm({ ...editForm, strn: e.target.value })}
+                    placeholder="e.g. 12-34-5678-901-23" />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-text-secondary">Sales Tax Status</label>
+                  <select className={`${inputCls} mt-1 text-xs`} value={editForm.sales_tax_status}
+                    onChange={(e) => setEditForm({ ...editForm, sales_tax_status: e.target.value })}>
+                    <option value="REGISTERED_ACTIVE">Active ATL (Active Taxpayer)</option>
+                    <option value="REGISTERED_INACTIVE">Registered Inactive / Suspended</option>
+                    <option value="UNREGISTERED">Unregistered</option>
+                  </select>
+                </div>
               </div>
             </div>
             <div>

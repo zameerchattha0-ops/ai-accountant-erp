@@ -6,6 +6,7 @@ import type { AgentResponse } from "@/lib/types/api";
 import { formatCurrency } from "@/lib/utils/currency";
 import { cn } from "@/lib/utils/cn";
 import { mdToDisplayText } from "@/lib/ai/markdown";
+import TaxComplianceCard from "@/components/ai/TaxComplianceCard";
 
 interface Props {
   response: AgentResponse;
@@ -173,6 +174,20 @@ export default function AIActionCard({ response }: Props) {
       </div>
 
       <div className="p-5 space-y-4">
+        {/* Tax & Statutory Compliance Breakdown Card */}
+        {Boolean(
+          (response.data as Record<string, unknown>)?.tax_breakdown ||
+          (response.data as Record<string, unknown>)?.sales_tax_rate != null ||
+          (response.data as Record<string, unknown>)?.wht_rate_percent != null ||
+          (response.data as Record<string, unknown>)?.wht_amount != null ||
+          (response.summary && /(?:fbr|pra|srb|kpra|gst|sales tax|withholding|section 153|wht|input tax)/i.test(response.summary))
+        ) && (
+          <TaxComplianceCard
+            data={((response.data as Record<string, unknown>)?.tax_breakdown as Record<string, unknown>) ?? (response.data as Record<string, unknown>)}
+            summary={response.summary}
+          />
+        )}
+
         {/* Audit Verification Table for Document Status Updates */}
         {(() => {
           interface AuditDocItem {

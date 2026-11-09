@@ -332,6 +332,8 @@ export interface Organization {
   legal_name?: string;
   business_type: string;
   tax_number?: string;
+  strn?: string | null;
+  sales_tax_status?: "REGISTERED_ACTIVE" | "REGISTERED_INACTIVE" | "UNREGISTERED" | string | null;
   registration_number?: string;
   base_currency_code: string;
   country_code?: string;
@@ -384,5 +386,7 @@ export interface CreateOrganizationRequest {
   fiscal_year_end_month: number;
   legal_name?: string;
   tax_number?: string;
+  strn?: string | null;
+  sales_tax_status?: "REGISTERED_ACTIVE" | "REGISTERED_INACTIVE" | "UNREGISTERED" | string | null;
   registration_number?: string;
 }

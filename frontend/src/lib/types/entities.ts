@@ -10,6 +10,8 @@ export interface Customer {
   name: string;
   legal_name: string | null;
   tax_number: string | null;
+  strn?: string | null;
+  sales_tax_status?: "REGISTERED_ACTIVE" | "REGISTERED_INACTIVE" | "UNREGISTERED" | string | null;
   email: string | null;
   phone: string | null;
   website: string | null;
@@ -30,6 +32,8 @@ export interface Supplier {
   name: string;
   legal_name: string | null;
   tax_number: string | null;
+  strn?: string | null;
+  sales_tax_status?: "REGISTERED_ACTIVE" | "REGISTERED_INACTIVE" | "UNREGISTERED" | string | null;
   email: string | null;
   phone: string | null;
   website: string | null;

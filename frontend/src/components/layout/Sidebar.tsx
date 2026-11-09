@@ -80,6 +80,7 @@ export const navItems: NavItem[] = [
       { label: "Cash Flow", href: "/reports/cash-flow" },
       { label: "Aging", href: "/reports/aging" },
       { label: "Project P&L", href: "/reports/project-profitability" },
+      { label: "Tax Annexures (FBR)", href: "/reports/tax-annexures" },
     ],
   },
   // Employees replaces the empty Expense Entries module: quick-entry

@@ -14,6 +14,8 @@ export interface OrgContext {
   business_type: string;
   legal_name: string | null;
   tax_number: string | null;
+  strn?: string | null;
+  sales_tax_status?: string | null;
   registration_number: string | null;
   logo_url: string | null;
 }
@@ -90,7 +92,7 @@ export async function loadOrgContext(force = false): Promise<OrgSnapshot | null>
            organization:organizations(
              id, name, slug, business_type, base_currency_code, country_code,
              timezone, fiscal_year_end_month, legal_name, tax_number,
-             registration_number, logo_url
+             registration_number, logo_url, strn, sales_tax_status
            ),
            role:organization_roles(code)`
           )
