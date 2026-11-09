@@ -275,21 +275,22 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
     "tax_pricing_mode": QuestionSpec(
         field="tax_pricing_mode", kind=KIND_CHOICE,
         question=(
-            "Is this amount: (a) GST EXCLUSIVE (add 18% FBR sales tax on top), "
-            "(b) GST INCLUSIVE (price already includes sales tax), "
-            "(c) TAX EXEMPT (0% GST / non-taxable), "
-            "(d) PUNJAB SERVICES (16% PRA), or (e) SINDH SERVICES (15% SRB)? "
-            "Please choose a, b, c, d, or e."
+            "What is the applicable sales tax treatment? "
+            "(a) FBR Goods Exclusive (18%), (b) FBR Goods Inclusive, "
+            "(c) Punjab Services PRA (16%), (d) Sindh Services SRB (15%), "
+            "(e) KP Services KPRA (15%), (f) IT Reduced Scheme (3% SRB / 5% PRA), or (g) Exempt (0%)?"
         ),
         options=(
-            ("EXCLUSIVE", "Exclusive (+18% FBR)"),
-            ("INCLUSIVE", "Inclusive (Back-calculate GST)"),
-            ("EXEMPT", "Tax Exempt (0% GST)"),
+            ("EXCLUSIVE", "FBR Goods (+18%)"),
+            ("INCLUSIVE", "Goods Inclusive (Back-calculate 18%)"),
             ("PRA_16", "Punjab Services (+16% PRA)"),
             ("SRB_15", "Sindh Services (+15% SRB)"),
+            ("KPRA_15", "Khyber Pakhtunkhwa (+15% KPRA)"),
+            ("IT_REDUCED", "IT Services Reduced (3% SRB / 5% PRA)"),
+            ("EXEMPT", "Tax Exempt (0%)"),
         ),
-        answer_hint="exclusive, inclusive, exempt, pra, or srb",
-        why="Determines how sales tax is separated in double-entry journals per FBR/provincial rules.",
+        answer_hint="fbr, pra, srb, kpra, it reduced, or exempt",
+        why="Determines sales tax rate, 0% further tax for services, and input tax asset eligibility per provincial statute.",
     ),
     "withholding_tax_rate": QuestionSpec(
         field="withholding_tax_rate", kind=KIND_CHOICE,

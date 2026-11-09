@@ -245,3 +245,187 @@ def test_sales_gst_matrix_s04_and_s05_unregistered_seller():
     assert s5["further_tax_rate"] == 0.0
     assert s5["total_tax_amount"] == 0.0
     assert s5["gross_total"] == 100000.0
+
+
+# =====================================================================
+# Tests: Provincial Services Matrix & Dual Withholding
+# =====================================================================
+
+def test_classify_supply_nature():
+    """Verify goods vs services classification."""
+    from app.services.tax_service import classify_supply_nature, SupplyNature
+    assert classify_supply_nature("Software development and cloud setup") == SupplyNature.SERVICE
+    assert classify_supply_nature("Legal advisory services") == SupplyNature.SERVICE
+    assert classify_supply_nature("Office furniture and desks") == SupplyNature.GOODS
+    assert classify_supply_nature("Computer laptops and toners") == SupplyNature.GOODS
+
+
+def test_classify_service_sector():
+    """Verify sector detection for provincial tariffs."""
+    from app.services.tax_service import classify_service_sector
+    assert classify_service_sector("Custom software programming") == "IT_SERVICES"
+    assert classify_service_sector("Civil building construction") == "CONSTRUCTION"
+    assert classify_service_sector("Restaurant banquet catering") == "RESTAURANT_HOTEL"
+    assert classify_service_sector("Electronic billboard advertising") == "ADVERTISING"
+    assert classify_service_sector("Freight cargo transport") == "TRANSPORT_CARGO"
+    assert classify_service_sector("Cellular bandwidth leased line") == "TELECOM"
+
+
+def test_provincial_services_purchase_standard_rate_pra():
+    """PS-01: Standard rate active parties in Punjab (PRA: 16%, input tax eligible, 0% further tax)."""
+    from app.services.tax_service import evaluate_provincial_services_purchase_matrix
+    res = evaluate_provincial_services_purchase_matrix(
+        buyer_status="REGISTERED_ACTIVE",
+        supplier_status="REGISTERED_ACTIVE",
+        subtotal=100000.0,
+        authority="PRA",
+        sector="GENERAL_SERVICES",
+    )
+    assert res["rule_code"] == "PS-01"
+    assert res["service_tax_rate"] == 16.0
+    assert res["service_tax_amount"] == 16000.0
+    assert res["input_tax_eligible"] is True
+    assert res["input_tax_asset_amount"] == 16000.0
+    assert res["further_tax_rate"] == 0.0
+    assert res["further_tax_amount"] == 0.0
+    assert res["gross_total"] == 116000.0
+
+
+def test_provincial_services_purchase_reduced_rate_it_srb():
+    """PS-01R: Reduced IT scheme in Sindh (SRB: 3%, input tax NOT claimable by statute, 0% further tax)."""
+    from app.services.tax_service import evaluate_provincial_services_purchase_matrix
+    res = evaluate_provincial_services_purchase_matrix(
+        buyer_status="REGISTERED_ACTIVE",
+        supplier_status="REGISTERED_ACTIVE",
+        subtotal=100000.0,
+        authority="SRB",
+        sector="IT_SERVICES",
+        use_reduced_rate=True,
+    )
+    assert res["rule_code"] == "PS-01R"
+    assert res["service_tax_rate"] == 3.0
+    assert res["service_tax_amount"] == 3000.0
+    assert res["input_tax_eligible"] is False
+    assert res["input_tax_asset_amount"] == 0.0
+    assert res["expense_or_cost_amount"] == 103000.0
+    assert res["further_tax_rate"] == 0.0
+    assert res["further_tax_amount"] == 0.0
+    assert res["gross_total"] == 103000.0
+
+
+def test_provincial_services_sales_zero_further_tax_on_unregistered_client():
+    """SS-03: Services to UNREGISTERED client has 0% Further Tax (unlike Goods where 4% applies)."""
+    from app.services.tax_service import evaluate_provincial_services_sales_matrix
+    res = evaluate_provincial_services_sales_matrix(
+        seller_status="REGISTERED_ACTIVE",
+        customer_status="UNREGISTERED",
+        subtotal=100000.0,
+        authority="SRB",
+        sector="GENERAL_SERVICES",
+    )
+    assert res["rule_code"] == "SS-03"
+    assert res["service_tax_rate"] == 15.0
+    assert res["service_tax_amount"] == 15000.0
+    # Statutory Invariant: NO Further Tax on services
+    assert res["further_tax_rate"] == 0.0
+    assert res["further_tax_amount"] == 0.0
+    assert res["total_tax_amount"] == 15000.0
+    assert res["gross_total"] == 115000.0
+
+
+def test_provincial_sales_tax_withholding_unregistered_vendor():
+    """Under PRA/SRB rules, payments to unregistered service providers require 100% withholding."""
+    from app.services.tax_service import evaluate_provincial_sales_tax_withholding
+    res = evaluate_provincial_sales_tax_withholding(
+        authority="PRA",
+        supplier_status="UNREGISTERED",
+        service_tax_amount=16000.0,
+        sector="GENERAL_SERVICES",
+    )
+    assert res["withholding_required"] is True
+    assert res["withholding_percentage"] == 100.0
+    assert res["withheld_tax_amount"] == 16000.0
+    assert res["payable_to_vendor_tax"] == 0.0
+
+
+def test_provincial_sales_tax_withholding_active_vendor_advertising_vs_general():
+    """Active vendor: Advertising has 100% withholding; General has 20% (1/5th) corporate withholding."""
+    from app.services.tax_service import evaluate_provincial_sales_tax_withholding
+    # Advertising
+    res_ad = evaluate_provincial_sales_tax_withholding(
+        authority="PRA",
+        supplier_status="REGISTERED_ACTIVE",
+        service_tax_amount=16000.0,
+        sector="ADVERTISING",
+    )
+    assert res_ad["withholding_percentage"] == 100.0
+    assert res_ad["withheld_tax_amount"] == 16000.0
+    assert res_ad["payable_to_vendor_tax"] == 0.0
+
+    # General Services
+    res_gen = evaluate_provincial_sales_tax_withholding(
+        authority="PRA",
+        supplier_status="REGISTERED_ACTIVE",
+        service_tax_amount=16000.0,
+        sector="GENERAL_SERVICES",
+    )
+    assert res_gen["withholding_percentage"] == 20.0
+    assert res_gen["withheld_tax_amount"] == 3200.0
+    assert res_gen["payable_to_vendor_tax"] == 12800.0
+
+
+def test_dual_withholding_settlement():
+    """Verify dual withholding: Income Tax u/s 153 + Provincial Sales Tax Withholding."""
+    from app.services.tax_service import evaluate_dual_withholding
+    # Subtotal 100,000 IT Services under PRA:
+    # Service Tax (PRA 16%) = 16,000
+    # Sales Tax Withholding (20% of 16,000) = 3,200
+    # Vendor gets 12,800 of sales tax
+    # Income Tax WHT u/s 153 (IT services: 4%) = 4,000
+    # Net cash payment = 100,000 - 4,000 + 12,800 = 108,800
+    # Total deductions = 4,000 (IT) + 3,200 (Wh-ST) = 7,200
+    res = evaluate_dual_withholding(
+        subtotal=100000.0,
+        nature="SERVICE",
+        authority="PRA",
+        payee_is_corporate=True,
+        supplier_status="REGISTERED_ACTIVE",
+        sector="IT_SERVICES",
+    )
+    assert res["income_tax_wht_rate"] == 4.0
+    assert res["income_tax_wht_amount"] == 4000.0
+    assert res["sales_tax_amount"] == 16000.0
+    assert res["sales_tax_withheld_amount"] == 3200.0
+    assert res["net_cash_payment_to_vendor"] == 108800.0
+    assert res["journal_balance_verified"] is True
+
+
+def test_unified_supply_tax_auto_dispatch():
+    """Unified entry point accurately routes goods to 18%+4% Further Tax and services to 0% Further Tax."""
+    from app.services.tax_service import evaluate_unified_supply_tax
+    # Goods to unregistered client -> S.3(1A) 4% Further Tax applied (Total 22%)
+    goods_res = evaluate_unified_supply_tax(
+        subtotal=100000.0,
+        text_or_item="Supply of 10 office chairs and desks",
+        tax_authority="FBR",
+        is_purchase=False,
+        seller_status="REGISTERED_ACTIVE",
+        customer_status="UNREGISTERED",
+    )
+    assert goods_res["further_tax_rate"] == 4.0
+    assert goods_res["further_tax_amount"] == 4000.0
+    assert goods_res["gross_total"] == 122000.0
+
+    # Services to unregistered client -> 0% Further Tax
+    service_res = evaluate_unified_supply_tax(
+        subtotal=100000.0,
+        text_or_item="Software consultancy and cloud migration service",
+        tax_authority="PRA",
+        is_purchase=False,
+        seller_status="REGISTERED_ACTIVE",
+        customer_status="UNREGISTERED",
+    )
+    assert service_res["service_tax_rate"] == 16.0
+    assert service_res["further_tax_rate"] == 0.0
+    assert service_res["further_tax_amount"] == 0.0
+    assert service_res["gross_total"] == 116000.0
