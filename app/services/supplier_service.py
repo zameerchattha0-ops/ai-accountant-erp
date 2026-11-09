@@ -86,6 +86,8 @@ async def create(
     phone: Optional[str] = None,
     legal_name: Optional[str] = None,
     tax_number: Optional[str] = None,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
     currency_code: str = "PKR",
     payment_terms_days: int = 30,
     credit_limit: Optional[float] = None,
@@ -101,6 +103,17 @@ async def create(
                 existing_id=s["id"],
                 name=s["name"],
             )
+            # Update tax profile if newly provided on reuse
+            if strn or sales_tax_status or tax_number:
+                await repo.update_supplier_tax_profile(
+                    organization_id,
+                    supplier_id=uuid.UUID(str(s["id"])),
+                    strn=strn,
+                    sales_tax_status=sales_tax_status,
+                    tax_number=tax_number,
+                )
+                s["strn"] = strn or s.get("strn")
+                s["sales_tax_status"] = sales_tax_status or s.get("sales_tax_status")
             # Explicit reuse marker: the agent's narrative MUST reflect
             # reuse (never "newly created") — the tool result is the
             # authoritative record of what happened.
@@ -115,6 +128,8 @@ async def create(
         phone=phone,
         legal_name=legal_name,
         tax_number=tax_number,
+        strn=strn,
+        sales_tax_status=sales_tax_status,
         currency_code=currency_code,
         payment_terms_days=payment_terms_days,
         credit_limit=credit_limit,
@@ -122,6 +137,23 @@ async def create(
         notes=notes,
     )
     return await _with_party_ledger(organization_id, created)
+
+
+async def update_tax_profile(
+    organization_id: uuid.UUID,
+    *,
+    supplier_id: uuid.UUID,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
+    tax_number: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    return await repo.update_supplier_tax_profile(
+        organization_id,
+        supplier_id=supplier_id,
+        strn=strn,
+        sales_tax_status=sales_tax_status,
+        tax_number=tax_number,
+    )
 
 
 async def get_ledger(

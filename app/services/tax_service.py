@@ -447,13 +447,338 @@ async def get_organization_tax_profile(
         or AUTHORITY_DEFAULT_RATES.get(authority, 18.0)
     )
 
+    org_strn = org.get("strn") or org.get("tax_number")
+    org_gst_status = org.get("sales_tax_status")
+    if not org_gst_status:
+        if is_registered:
+            org_gst_status = "REGISTERED_ACTIVE"
+        else:
+            org_gst_status = "UNREGISTERED"
+
     return {
         "organization_id": str(organization_id),
         "is_sales_tax_registered": is_registered,
+        "strn": org_strn,
+        "sales_tax_status": org_gst_status,
         "tax_authority": authority,
         "default_tax_pricing": default_pricing,
         "sales_tax_rate": default_rate if is_registered else 0.0,
         "tax_number": org.get("tax_number"),
+    }
+
+
+# =====================================================================
+# Sales Tax Act 1990 Scenario Matrices (P-01 to P-07 & S-01 to S-06)
+# =====================================================================
+
+class GSTPartyStatus:
+    REGISTERED_ACTIVE = "REGISTERED_ACTIVE"
+    REGISTERED_INACTIVE = "REGISTERED_INACTIVE"
+    UNREGISTERED = "UNREGISTERED"
+
+
+def normalize_gst_status(status: Optional[str]) -> str:
+    s = str(status or "").strip().upper()
+    if any(k in s for k in ("INACTIVE", "SUSPENDED", "BLACKLISTED", "NON_ACTIVE", "NON-ACTIVE")):
+        return GSTPartyStatus.REGISTERED_INACTIVE
+    if any(k in s for k in ("ACTIVE", "ATL")):
+        return GSTPartyStatus.REGISTERED_ACTIVE
+    return GSTPartyStatus.UNREGISTERED
+
+
+def evaluate_purchase_gst_matrix(
+    buyer_status: str,
+    supplier_status: str,
+    subtotal: float,
+    ordinary_rate: float = 18.0,
+) -> Dict[str, Any]:
+    """Execute complete Purchase-Side GST Matrix (P-01 to P-07) under Sales Tax Act 1990.
+
+    P-01: Active buyer + Active supplier -> Applicable 18% GST, claimable Input Tax (Asset 1060).
+    P-02: Active buyer + Inactive supplier -> Applicable, but Input Tax held under compliance review.
+    P-03: Active buyer + Unregistered supplier -> Supplier cannot charge GST, No Input Tax, NO 4% further tax.
+    P-04: Inactive buyer + Active supplier -> Applicable, but buyer input tax eligibility requires separate review.
+    P-05: Inactive buyer + Inactive supplier -> Verify supplier compliance, input tax held.
+    P-06: Inactive buyer + Unregistered supplier -> No ordinary GST, no input tax claimable.
+    P-07: Unregistered buyer + Active supplier -> Supplier charges 18% GST (and 4% Further Tax under S.3(1A)).
+          Buyer CANNOT claim input tax; total gross amount capitalized into inventory/purchase cost.
+    P-08/P-09: Unregistered buyer + Inactive/Unregistered supplier -> No ordinary input tax claimable.
+    """
+    b_st = normalize_gst_status(buyer_status)
+    s_st = normalize_gst_status(supplier_status)
+    sub = round(float(subtotal or 0.0), 2)
+    rate = float(ordinary_rate or 18.0)
+
+    # P-01: Both registered and active
+    if b_st == GSTPartyStatus.REGISTERED_ACTIVE and s_st == GSTPartyStatus.REGISTERED_ACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        return {
+            "rule_code": "P-01",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "input_tax_eligible": True,
+            "input_tax_asset_amount": gst_amt,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": round(sub + gst_amt, 2),
+            "requires_compliance_review": False,
+            "advisory": (
+                "P-01: Both buyer and supplier are registered and active on FBR ATL. "
+                f"Ordinary {rate}% GST is applicable. Input tax of Rs. {gst_amt:,.2f} is recognized "
+                "as an Asset (Account 1060: Input Sales Tax Recoverable) claimable against output tax, "
+                "subject to Section 73 banking channel verification."
+            ),
+        }
+
+    # P-02: Buyer active, supplier registered but inactive
+    if b_st == GSTPartyStatus.REGISTERED_ACTIVE and s_st == GSTPartyStatus.REGISTERED_INACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        return {
+            "rule_code": "P-02",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": round(sub + gst_amt, 2),
+            "requires_compliance_review": True,
+            "advisory": (
+                "P-02: Supplier is registered but INACTIVE/SUSPENDED on FBR Sales Tax ATL. "
+                "Input tax cannot be automatically approved or claimed. Verify whether supplier was "
+                "active on invoice date and check tax-deposit compliance before approving input adjustment."
+            ),
+        }
+
+    # P-03: Buyer active, supplier unregistered
+    if b_st == GSTPartyStatus.REGISTERED_ACTIVE and s_st == GSTPartyStatus.UNREGISTERED:
+        return {
+            "rule_code": "P-03",
+            "ordinary_gst_rate": 0.0,
+            "ordinary_gst_amount": 0.0,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": sub,
+            "requires_compliance_review": False,
+            "advisory": (
+                "P-03: Supplier is UNREGISTERED. Unregistered suppliers cannot legally issue FBR tax invoices "
+                "or charge GST. Input tax is zero. Do not apply 4% Further Tax to the purchase merely because "
+                "the supplier is unregistered. Total invoice is booked to inventory/expense cost."
+            ),
+        }
+
+    # P-04: Buyer registered but inactive, supplier active
+    if b_st == GSTPartyStatus.REGISTERED_INACTIVE and s_st == GSTPartyStatus.REGISTERED_ACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        return {
+            "rule_code": "P-04",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": round(sub + gst_amt, 2),
+            "requires_compliance_review": True,
+            "advisory": (
+                "P-04: Buyer organization is registered but INACTIVE/SUSPENDED on ATL. Ordinary input adjustment "
+                "rights are restricted. Hold input tax approval pending resolution of company registration status."
+            ),
+        }
+
+    # P-05: Both registered but inactive
+    if b_st == GSTPartyStatus.REGISTERED_INACTIVE and s_st == GSTPartyStatus.REGISTERED_INACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        return {
+            "rule_code": "P-05",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": round(sub + gst_amt, 2),
+            "requires_compliance_review": True,
+            "advisory": "P-05: Both parties are inactive on FBR ATL. Input tax deduction held under compliance review.",
+        }
+
+    # P-06: Buyer inactive, supplier unregistered
+    if b_st == GSTPartyStatus.REGISTERED_INACTIVE and s_st == GSTPartyStatus.UNREGISTERED:
+        return {
+            "rule_code": "P-06",
+            "ordinary_gst_rate": 0.0,
+            "ordinary_gst_amount": 0.0,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": sub,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "gross_total": sub,
+            "requires_compliance_review": False,
+            "advisory": "P-06: Unregistered supplier cannot charge GST. Buyer inactive. Entire amount booked to cost.",
+        }
+
+    # P-07: Buyer unregistered, supplier registered and active
+    if b_st == GSTPartyStatus.UNREGISTERED and s_st == GSTPartyStatus.REGISTERED_ACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        further_rate = 4.0
+        further_amt = round(sub * (further_rate / 100.0), 2)
+        total_tax = round(gst_amt + further_amt, 2)
+        gross = round(sub + total_tax, 2)
+        return {
+            "rule_code": "P-07",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "input_tax_eligible": False,
+            "input_tax_asset_amount": 0.0,
+            "inventory_or_expense_cost": gross,
+            "further_tax_rate": further_rate,
+            "further_tax_amount": further_amt,
+            "gross_total": gross,
+            "requires_compliance_review": False,
+            "advisory": (
+                "P-07: Buyer is UNREGISTERED. Active supplier charges ordinary 18% GST and 4% Further Tax under S.3(1A). "
+                "Buyer CANNOT claim input tax. Total gross amount (including Rs. "
+                f"{total_tax:,.2f} tax) is capitalized into inventory/purchase cost."
+            ),
+        }
+
+    # P-08 / P-09: Buyer unregistered, supplier inactive or unregistered
+    return {
+        "rule_code": "P-09" if s_st == GSTPartyStatus.UNREGISTERED else "P-08",
+        "ordinary_gst_rate": 0.0,
+        "ordinary_gst_amount": 0.0,
+        "input_tax_eligible": False,
+        "input_tax_asset_amount": 0.0,
+        "inventory_or_expense_cost": sub,
+        "further_tax_rate": 0.0,
+        "further_tax_amount": 0.0,
+        "gross_total": sub,
+        "requires_compliance_review": False,
+        "advisory": "P-09: Neither party is registered. No ordinary FBR GST or input tax claim can be created.",
+    }
+
+
+def evaluate_sales_gst_matrix(
+    seller_status: str,
+    customer_status: str,
+    subtotal: float,
+    ordinary_rate: float = 18.0,
+) -> Dict[str, Any]:
+    """Execute complete Sales-Side GST Matrix (S-01 to S-06) under Sales Tax Act 1990.
+
+    S-01: Active seller to Active buyer -> 18% ordinary GST, 0% Further Tax.
+    S-02: Active seller to Inactive buyer -> 18% ordinary GST, 4% Further Tax under S.3(1A).
+    S-03: Active seller to Unregistered buyer -> 18% ordinary GST, 4% Further Tax under S.3(1A).
+    S-04: Inactive seller -> Compliance review required before issuing normal GST invoice.
+    S-05: Unregistered seller -> Cannot charge FBR GST or Further Tax. Total price is commercial revenue.
+    """
+    s_st = normalize_gst_status(seller_status)
+    c_st = normalize_gst_status(customer_status)
+    sub = round(float(subtotal or 0.0), 2)
+    rate = float(ordinary_rate or 18.0)
+
+    # S-05 / S-06: Seller is unregistered
+    if s_st == GSTPartyStatus.UNREGISTERED:
+        return {
+            "rule_code": "S-05" if c_st != GSTPartyStatus.UNREGISTERED else "S-06",
+            "ordinary_gst_rate": 0.0,
+            "ordinary_gst_amount": 0.0,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "total_tax_amount": 0.0,
+            "gross_total": sub,
+            "requires_compliance_review": False,
+            "advisory": (
+                "S-05: Seller company is NOT registered for Sales Tax. The company cannot legally charge FBR GST "
+                "or Further Tax. Total amount is recognized as commercial sales revenue without sales tax."
+            ),
+        }
+
+    # S-04: Seller is registered but inactive / suspended
+    if s_st == GSTPartyStatus.REGISTERED_INACTIVE:
+        return {
+            "rule_code": "S-04",
+            "ordinary_gst_rate": 0.0,
+            "ordinary_gst_amount": 0.0,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "total_tax_amount": 0.0,
+            "gross_total": sub,
+            "requires_compliance_review": True,
+            "advisory": (
+                "S-04: Seller registration is INACTIVE/SUSPENDED on FBR ATL. Cannot issue a normal GST invoice or collect "
+                "sales tax without establishing legal authority. Hold sales invoice pending tax compliance review."
+            ),
+        }
+
+    # Active registered seller:
+    # S-01: Customer is active
+    if c_st == GSTPartyStatus.REGISTERED_ACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        return {
+            "rule_code": "S-01",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "further_tax_rate": 0.0,
+            "further_tax_amount": 0.0,
+            "total_tax_amount": gst_amt,
+            "gross_total": round(sub + gst_amt, 2),
+            "requires_compliance_review": False,
+            "advisory": (
+                f"S-01: Active registered seller to active registered buyer. Applicable {rate}% GST charged (Rs. {gst_amt:,.2f}). "
+                "Further Tax is 0%. Official FBR Sales Tax invoice issued."
+            ),
+        }
+
+    # S-02: Customer is registered but INACTIVE on ATL
+    if c_st == GSTPartyStatus.REGISTERED_INACTIVE:
+        gst_amt = round(sub * (rate / 100.0), 2)
+        further_rate = 4.0
+        further_amt = round(sub * (further_rate / 100.0), 2)
+        tot_tax = round(gst_amt + further_amt, 2)
+        return {
+            "rule_code": "S-02",
+            "ordinary_gst_rate": rate,
+            "ordinary_gst_amount": gst_amt,
+            "further_tax_rate": further_rate,
+            "further_tax_amount": further_amt,
+            "total_tax_amount": tot_tax,
+            "gross_total": round(sub + tot_tax, 2),
+            "requires_compliance_review": False,
+            "advisory": (
+                f"S-02: Customer is registered but INACTIVE on FBR ATL. Ordinary {rate}% GST applies (Rs. {gst_amt:,.2f}), "
+                f"plus 4% Further Tax under Section 3(1A) of Sales Tax Act 1990 (Rs. {further_amt:,.2f}). "
+                "Further tax is recorded separately to Account 2135 Further Tax Payable."
+            ),
+        }
+
+    # S-03: Customer is UNREGISTERED
+    gst_amt = round(sub * (rate / 100.0), 2)
+    further_rate = 4.0
+    further_amt = round(sub * (further_rate / 100.0), 2)
+    tot_tax = round(gst_amt + further_amt, 2)
+    return {
+        "rule_code": "S-03",
+        "ordinary_gst_rate": rate,
+        "ordinary_gst_amount": gst_amt,
+        "further_tax_rate": further_rate,
+        "further_tax_amount": further_amt,
+        "total_tax_amount": tot_tax,
+        "gross_total": round(sub + tot_tax, 2),
+        "requires_compliance_review": False,
+        "advisory": (
+            f"S-03: Supplies to UNREGISTERED buyer. Ordinary {rate}% GST applies (Rs. {gst_amt:,.2f}), "
+            f"plus statutory 4% Further Tax under Section 3(1A) of Sales Tax Act 1990 (Rs. {further_amt:,.2f}). "
+            "Total tax = 22%. Further Tax recorded separately to Account 2135 Further Tax Payable."
+        ),
     }
 
 

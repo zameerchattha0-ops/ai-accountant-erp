@@ -8240,7 +8240,8 @@ async def execute(
             "supplier_name", "customer_name", "project_name", "invoice_id", "invoice_number",
             "bill_id", "bill_number", "item_description", "description", "service_name",
             "line_items", "quantity", "payment_method", "payment_channel", "payment_type",
-            "transaction_date", "transaction_purpose", "transaction_nature", "wht_rate_percent", "wht_rate"
+            "transaction_date", "transaction_purpose", "transaction_nature", "wht_rate_percent", "wht_rate",
+            "sales_tax_status", "strn"
         ):
             if (_preliminary or {}).get(_k) and not execution_plan.extracted_entities.get(_k):
                 execution_plan.extracted_entities[_k] = _preliminary[_k]
@@ -14897,6 +14898,22 @@ async def resume_with_clarification(
                             context_text = f"{ans_low} {merged_entities.get('item_description') or ''} {merged_entities.get('description') or ''} {merged_entities.get('notes') or ''}"
                             rate, _ = resolve_section_153_rate(context_text, payee_is_corporate=is_corp)
                             merged_entities["wht_rate_percent"] = rate
+                elif any(k in part.upper() for k in ("REGISTERED_ACTIVE", "REGISTERED ACTIVE", "ACTIVE ON ATL", "ACTIVE", "ATL", "REGISTERED_INACTIVE", "INACTIVE", "SUSPENDED", "UNREGISTERED", "NON-REGISTERED")) or (part.strip().lower() in ("a", "b", "c", "1", "2", "3", "(a)", "(b)", "(c)") and "sales_tax_status" in missing_fields):
+                    ans_up = part.upper()
+                    ans_clean = part.strip().lower()
+                    if any(k in ans_up for k in ("REGISTERED_ACTIVE", "REGISTERED ACTIVE", "ACTIVE")) or ans_clean in ("a", "1", "(a)", "(1)"):
+                        st_status = "REGISTERED_ACTIVE"
+                    elif any(k in ans_up for k in ("REGISTERED_INACTIVE", "INACTIVE", "SUSPENDED", "NON_ACTIVE")) or ans_clean in ("b", "2", "(b)", "(2)"):
+                        st_status = "REGISTERED_INACTIVE"
+                    else:
+                        st_status = "UNREGISTERED"
+                    merged_entities["sales_tax_status"] = st_status
+                elif "strn" in missing_fields or re.search(r"\b\d{2}[-\s]?\d{2}[-\s]?\d{4}[-\s]?\d{3}[-\s]?\d{2}\b", part):
+                    strn_val = part.strip()
+                    if strn_val.upper() not in ("NONE", "N/A", "NO", "UNREGISTERED"):
+                        merged_entities["strn"] = strn_val
+                    else:
+                        merged_entities["strn"] = None
                 else:
                     m_num = re.search(r"^\s*(?:(?:rs|pkr|usd|\$)\.?\s*)?(\d+(?:,\d+)*(?:\.\d+)?)\s*$", part, re.IGNORECASE)
                     if m_num and any(f in missing_fields for f in ("basic_salary", "salary", "amount", "subtotal", "total", "sales_price", "unit_price")):
@@ -15007,7 +15024,7 @@ async def resume_with_clarification(
                 cust_name = merged_entities.get("customer_name") or merged_entities.get("name")
                 if cust_name:
                     args = {"name": str(cust_name).strip()}
-                    for f in ("email", "phone", "tax_number", "notes"):
+                    for f in ("email", "phone", "tax_number", "strn", "sales_tax_status", "notes"):
                         if merged_entities.get(f):
                             args[f] = merged_entities[f]
                     single_hop_call = ToolCall(tool_name="create_customer", arguments=args)
@@ -15016,7 +15033,7 @@ async def resume_with_clarification(
                 supp_name = merged_entities.get("supplier_name") or merged_entities.get("name")
                 if supp_name:
                     args = {"name": str(supp_name).strip()}
-                    for f in ("email", "phone", "tax_number", "notes"):
+                    for f in ("email", "phone", "tax_number", "strn", "sales_tax_status", "notes"):
                         if merged_entities.get(f):
                             args[f] = merged_entities[f]
                     single_hop_call = ToolCall(tool_name="create_supplier", arguments=args)
@@ -15243,6 +15260,35 @@ async def resume_with_clarification(
                     user_id=user_id,
                     auth=auth,
                 )
+
+                # Persist party tax profile if answered during clarification
+                if merged_entities.get("sales_tax_status") or merged_entities.get("strn"):
+                    _supp_id = merged_entities.get("supplier_id")
+                    _cust_id = merged_entities.get("customer_id")
+                    _st_stat = merged_entities.get("sales_tax_status")
+                    _strn_v = merged_entities.get("strn")
+                    if _supp_id:
+                        from app.services import supplier_service
+                        try:
+                            await supplier_service.update_tax_profile(
+                                organization_id=organization_id,
+                                supplier_id=uuid.UUID(str(_supp_id)),
+                                strn=_strn_v,
+                                sales_tax_status=_st_stat,
+                            )
+                        except Exception as _t_err:
+                            log.warning("agent.supp_tax_profile_update_failed", error=str(_t_err)[:160])
+                    elif _cust_id:
+                        from app.services import customer_service
+                        try:
+                            await customer_service.update_tax_profile(
+                                organization_id=organization_id,
+                                customer_id=uuid.UUID(str(_cust_id)),
+                                strn=_strn_v,
+                                sales_tax_status=_st_stat,
+                            )
+                        except Exception as _t_err:
+                            log.warning("agent.cust_tax_profile_update_failed", error=str(_t_err)[:160])
 
                 if is_operational_task(intent) and tool_result.success and isinstance(tool_result.data, dict):
                     result_summary = format_operational_summary(intent, tool_result.data)

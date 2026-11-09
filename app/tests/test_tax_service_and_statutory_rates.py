@@ -139,3 +139,109 @@ def test_evaluate_input_tax_treatment_unregistered_supplier():
     assert res["input_tax_asset"] == 0.0
     assert res["inventory_or_expense_cost"] == 118000.0  # Absorbed into cost
     assert "Section 8 of Sales Tax Act 1990" in res["reason"]
+
+
+def test_purchase_gst_matrix_p01_both_active():
+    """P-01: Both registered and active -> 18% ordinary GST, claimable Input Tax (Asset 1060)."""
+    from app.services.tax_service import evaluate_purchase_gst_matrix
+    p = evaluate_purchase_gst_matrix("REGISTERED_ACTIVE", "REGISTERED_ACTIVE", subtotal=100000.0)
+    assert p["rule_code"] == "P-01"
+    assert p["ordinary_gst_rate"] == 18.0
+    assert p["ordinary_gst_amount"] == 18000.0
+    assert p["input_tax_eligible"] is True
+    assert p["input_tax_asset_amount"] == 18000.0
+    assert p["inventory_or_expense_cost"] == 100000.0
+    assert p["further_tax_rate"] == 0.0
+    assert p["further_tax_amount"] == 0.0
+    assert p["gross_total"] == 118000.0
+    assert p["requires_compliance_review"] is False
+
+
+def test_purchase_gst_matrix_p02_supplier_inactive():
+    """P-02: Buyer active, supplier inactive -> input tax held under compliance review."""
+    from app.services.tax_service import evaluate_purchase_gst_matrix
+    p = evaluate_purchase_gst_matrix("REGISTERED_ACTIVE", "REGISTERED_INACTIVE", subtotal=100000.0)
+    assert p["rule_code"] == "P-02"
+    assert p["ordinary_gst_amount"] == 18000.0
+    assert p["input_tax_eligible"] is False
+    assert p["input_tax_asset_amount"] == 0.0
+    assert p["requires_compliance_review"] is True
+
+
+def test_purchase_gst_matrix_p03_supplier_unregistered():
+    """P-03: Buyer active, supplier unregistered -> Supplier cannot charge GST, NO 4% Further Tax."""
+    from app.services.tax_service import evaluate_purchase_gst_matrix
+    p = evaluate_purchase_gst_matrix("REGISTERED_ACTIVE", "UNREGISTERED", subtotal=100000.0)
+    assert p["rule_code"] == "P-03"
+    assert p["ordinary_gst_rate"] == 0.0
+    assert p["ordinary_gst_amount"] == 0.0
+    assert p["input_tax_eligible"] is False
+    assert p["input_tax_asset_amount"] == 0.0
+    assert p["further_tax_rate"] == 0.0
+    assert p["further_tax_amount"] == 0.0
+    assert p["gross_total"] == 100000.0
+
+
+def test_purchase_gst_matrix_p07_unregistered_buyer():
+    """P-07: Unregistered buyer + Active supplier -> 18% GST + 4% Further Tax (S.3(1A)), capitalized into cost."""
+    from app.services.tax_service import evaluate_purchase_gst_matrix
+    p = evaluate_purchase_gst_matrix("UNREGISTERED", "REGISTERED_ACTIVE", subtotal=100000.0)
+    assert p["rule_code"] == "P-07"
+    assert p["ordinary_gst_rate"] == 18.0
+    assert p["ordinary_gst_amount"] == 18000.0
+    assert p["further_tax_rate"] == 4.0
+    assert p["further_tax_amount"] == 4000.0
+    assert p["input_tax_eligible"] is False
+    assert p["input_tax_asset_amount"] == 0.0
+    # Total tax Rs. 22,000 capitalized into purchase cost
+    assert p["inventory_or_expense_cost"] == 122000.0
+    assert p["gross_total"] == 122000.0
+
+
+def test_sales_gst_matrix_s01_active_to_active():
+    """S-01: Active registered seller to active registered customer -> 18% GST, 0% Further Tax."""
+    from app.services.tax_service import evaluate_sales_gst_matrix
+    s = evaluate_sales_gst_matrix("REGISTERED_ACTIVE", "REGISTERED_ACTIVE", subtotal=100000.0)
+    assert s["rule_code"] == "S-01"
+    assert s["ordinary_gst_rate"] == 18.0
+    assert s["ordinary_gst_amount"] == 18000.0
+    assert s["further_tax_rate"] == 0.0
+    assert s["further_tax_amount"] == 0.0
+    assert s["total_tax_amount"] == 18000.0
+    assert s["gross_total"] == 118000.0
+
+
+def test_sales_gst_matrix_s02_and_s03_further_tax():
+    """S-02 & S-03: Active registered seller to Inactive or Unregistered customer -> 18% GST + 4% Further Tax."""
+    from app.services.tax_service import evaluate_sales_gst_matrix
+    s2 = evaluate_sales_gst_matrix("REGISTERED_ACTIVE", "REGISTERED_INACTIVE", subtotal=100000.0)
+    assert s2["rule_code"] == "S-02"
+    assert s2["ordinary_gst_rate"] == 18.0
+    assert s2["further_tax_rate"] == 4.0
+    assert s2["further_tax_amount"] == 4000.0
+    assert s2["total_tax_amount"] == 22000.0
+    assert s2["gross_total"] == 122000.0
+
+    s3 = evaluate_sales_gst_matrix("REGISTERED_ACTIVE", "UNREGISTERED", subtotal=100000.0)
+    assert s3["rule_code"] == "S-03"
+    assert s3["ordinary_gst_rate"] == 18.0
+    assert s3["further_tax_rate"] == 4.0
+    assert s3["further_tax_amount"] == 4000.0
+    assert s3["total_tax_amount"] == 22000.0
+    assert s3["gross_total"] == 122000.0
+
+
+def test_sales_gst_matrix_s04_and_s05_unregistered_seller():
+    """S-04 & S-05: Unregistered or Inactive seller cannot legally charge FBR GST or Further Tax."""
+    from app.services.tax_service import evaluate_sales_gst_matrix
+    s4 = evaluate_sales_gst_matrix("REGISTERED_INACTIVE", "REGISTERED_ACTIVE", subtotal=100000.0)
+    assert s4["rule_code"] == "S-04"
+    assert s4["ordinary_gst_amount"] == 0.0
+    assert s4["requires_compliance_review"] is True
+
+    s5 = evaluate_sales_gst_matrix("UNREGISTERED", "REGISTERED_ACTIVE", subtotal=100000.0)
+    assert s5["rule_code"] == "S-05"
+    assert s5["ordinary_gst_rate"] == 0.0
+    assert s5["further_tax_rate"] == 0.0
+    assert s5["total_tax_amount"] == 0.0
+    assert s5["gross_total"] == 100000.0

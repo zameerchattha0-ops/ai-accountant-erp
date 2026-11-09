@@ -30,7 +30,7 @@ async def search_customers(
         column="name",
         value=query,
         organization_id=organization_id,
-        select="id,name,customer_code,email,phone,is_active",
+        select="id,name,customer_code,email,phone,tax_number,strn,sales_tax_status,is_active",
         limit=limit,
     )
     if rows or not str(query or "").strip():
@@ -40,7 +40,7 @@ async def search_customers(
     candidates = await fetch_many(
         "customers",
         filters={"organization_id": str(organization_id)},
-        select="id,name,customer_code,email,phone,is_active",
+        select="id,name,customer_code,email,phone,tax_number,strn,sales_tax_status,is_active",
         order="name.asc",
         limit=500,
     )
@@ -80,6 +80,8 @@ async def create_customer(
     phone: Optional[str] = None,
     legal_name: Optional[str] = None,
     tax_number: Optional[str] = None,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
     currency_code: str = "PKR",
     payment_terms_days: int = 30,
     credit_limit: Optional[float] = None,
@@ -94,6 +96,8 @@ async def create_customer(
         "phone": phone,
         "legal_name": legal_name,
         "tax_number": tax_number,
+        "strn": strn,
+        "sales_tax_status": sales_tax_status,
         "currency_code": currency_code,
         "payment_terms_days": payment_terms_days,
         # credit_limit is NOT NULL in the schema (default 0) — an explicit
@@ -104,6 +108,32 @@ async def create_customer(
         "is_active": True,
     }
     return await insert_one("customers", data=data)
+
+
+async def update_customer_tax_profile(
+    organization_id: uuid.UUID,
+    *,
+    customer_id: uuid.UUID,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
+    tax_number: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update customer STRN, tax number, or Sales Tax registration status."""
+    data: Dict[str, Any] = {}
+    if strn is not None:
+        data["strn"] = strn
+    if sales_tax_status is not None:
+        data["sales_tax_status"] = sales_tax_status
+    if tax_number is not None:
+        data["tax_number"] = tax_number
+    if not data:
+        return await get_customer(organization_id, customer_id=customer_id)
+    return await update_one(
+        "customers",
+        row_id=customer_id,
+        data=data,
+        organization_id=organization_id,
+    )
 
 
 async def set_receivable_account(

@@ -339,6 +339,29 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         answer_hint="all present, or specify absent employees",
         why="Company policy allows monthly paid leaves; deductions only apply to days exceeding the allowed quota.",
     ),
+    "sales_tax_status": QuestionSpec(
+        field="sales_tax_status",
+        kind=KIND_CHOICE,
+        question=(
+            "What is the Sales Tax (GST) registration status of this party on FBR Active Taxpayers List (ATL)? "
+            "(a) Registered & Active, (b) Registered but Inactive/Suspended, or (c) Unregistered."
+        ),
+        options=(
+            ("REGISTERED_ACTIVE", "Registered & Active"),
+            ("REGISTERED_INACTIVE", "Registered but Inactive"),
+            ("UNREGISTERED", "Unregistered"),
+        ),
+        answer_hint="a, b, or c",
+        why="Determines statutory GST charging, 4% Further Tax applicability, and Input Tax asset recovery under Sales Tax Act 1990.",
+    ),
+    "strn": QuestionSpec(
+        field="strn",
+        kind=KIND_TEXT,
+        question="What is the party's Sales Tax Registration Number (STRN)? (Reply 'NONE' if unregistered)",
+        options=(),
+        answer_hint="STRN (e.g. 12-34-5678-901-23) or NONE",
+        why="Required on tax invoices and for validating input tax claims on FBR portal.",
+    ),
 }
 
 
@@ -1071,6 +1094,8 @@ _FIELD_GLOSS: Dict[str, str] = {
     "period": "the accounting period the entry belongs to",
     "note": "any further detail the user wants recorded",
     "wht_certificate": "whether supplier provided a Section 153 Withholding Tax Exemption Certificate (0% WHT), or standard tax should be deducted",
+    "sales_tax_status": "Sales Tax / GST registration status on FBR ATL: REGISTERED_ACTIVE, REGISTERED_INACTIVE, or UNREGISTERED",
+    "strn": "party's Sales Tax Registration Number (STRN) or NONE",
     "po_number": "the purchase order number or RFQ reference",
     "target_status": "the target document status",
 }

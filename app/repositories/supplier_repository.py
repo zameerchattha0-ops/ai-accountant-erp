@@ -27,7 +27,7 @@ async def search_suppliers(
         column="name",
         value=query,
         organization_id=organization_id,
-        select="id,name,supplier_code,email,phone,is_active",
+        select="id,name,supplier_code,email,phone,tax_number,strn,sales_tax_status,is_active",
         limit=limit,
     )
     if rows or not str(query or "").strip():
@@ -37,7 +37,7 @@ async def search_suppliers(
     candidates = await fetch_many(
         "suppliers",
         filters={"organization_id": str(organization_id)},
-        select="id,name,supplier_code,email,phone,is_active",
+        select="id,name,supplier_code,email,phone,tax_number,strn,sales_tax_status,is_active",
         order="name.asc",
         limit=500,
     )
@@ -76,6 +76,8 @@ async def create_supplier(
     phone: Optional[str] = None,
     legal_name: Optional[str] = None,
     tax_number: Optional[str] = None,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
     currency_code: str = "PKR",
     payment_terms_days: int = 30,
     credit_limit: Optional[float] = None,
@@ -90,6 +92,8 @@ async def create_supplier(
         "phone": phone,
         "legal_name": legal_name,
         "tax_number": tax_number,
+        "strn": strn,
+        "sales_tax_status": sales_tax_status,
         "currency_code": currency_code,
         "payment_terms_days": payment_terms_days,
         # credit_limit is NOT NULL in the schema (default 0) — an explicit
@@ -100,6 +104,32 @@ async def create_supplier(
         "is_active": True,
     }
     return await insert_one("suppliers", data=data)
+
+
+async def update_supplier_tax_profile(
+    organization_id: uuid.UUID,
+    *,
+    supplier_id: uuid.UUID,
+    strn: Optional[str] = None,
+    sales_tax_status: Optional[str] = None,
+    tax_number: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update supplier STRN, tax number, or Sales Tax registration status."""
+    data: Dict[str, Any] = {}
+    if strn is not None:
+        data["strn"] = strn
+    if sales_tax_status is not None:
+        data["sales_tax_status"] = sales_tax_status
+    if tax_number is not None:
+        data["tax_number"] = tax_number
+    if not data:
+        return await get_supplier(organization_id, supplier_id=supplier_id)
+    return await update_one(
+        "suppliers",
+        row_id=supplier_id,
+        data=data,
+        organization_id=organization_id,
+    )
 
 
 async def set_payable_account(

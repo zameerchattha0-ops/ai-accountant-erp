@@ -292,6 +292,9 @@ async def _load_parties(
                         "id": row.get("id"),
                         "name": row.get("name"),
                         "code": row.get("customer_code") or row.get("supplier_code"),
+                        "tax_number": row.get("tax_number"),
+                        "strn": row.get("strn"),
+                        "sales_tax_status": row.get("sales_tax_status"),
                         "is_active": row.get("is_active"),
                     }
                 )
@@ -646,6 +649,9 @@ async def _load_policies(
                     "business_type": org.get("business_type") or org.get("business_type_code"),
                     "base_currency": org.get("base_currency_code"),
                     "country": org.get("country_code") or org.get("country"),
+                    "strn": org.get("strn") or org.get("tax_number"),
+                    "sales_tax_status": org.get("sales_tax_status") or ("REGISTERED_ACTIVE" if org.get("is_sales_tax_registered") else "UNREGISTERED"),
+                    "is_sales_tax_registered": bool(org.get("is_sales_tax_registered")),
                 }
             )
         )
