@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import structlog
 from google.genai import types
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.gemini_client import get_client
 from app.tool_selector import _INTENT_TOOLS
@@ -158,6 +158,27 @@ class StructuredTransactionDraft(BaseModel):
     user_intent_type: Literal["informational", "transactional", "advisory"] = "transactional"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_counterparty_string(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("counterparty"), str):
+            name = data["counterparty"].strip()
+            if not name:
+                data = {**data, "counterparty": None}
+            else:
+                intent = str(data.get("intent") or "").lower()
+                if any(k in intent for k in ("invoice", "sale", "customer", "credit_note", "receipt")):
+                    role = "customer"
+                elif any(k in intent for k in ("payroll", "employee", "salary", "advance_salary")):
+                    role = "employee"
+                else:
+                    role = "supplier"
+                data = {
+                    **data,
+                    "counterparty": {"name": name, "role": role, "confidence": 0.8},
+                }
+        return data
+
     @field_validator("counterparty", mode="before")
     @classmethod
     def _drop_empty_counterparty(cls, value: Any) -> Any:
@@ -263,9 +284,15 @@ def _parse_response(response: Any) -> StructuredTransactionDraft:
             return StructuredTransactionDraft.model_validate(response)
         text = response
     if not text:
-        raise ValueError("Empty Gemini structured extraction response")
+        raise ValueError("Empty structured extraction response")
     cleaned = _strip_json_fences(str(text))
-    return StructuredTransactionDraft.model_validate_json(cleaned)
+    try:
+        return StructuredTransactionDraft.model_validate_json(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, re.S)
+        if not match:
+            raise
+        return StructuredTransactionDraft.model_validate_json(match.group(0))
 
 
 async def _call_gemini_structured(client: Any, prompt: str) -> Any:
@@ -323,6 +350,46 @@ _DEFAULT_GET_CLIENT = get_client
 _COOLDOWN_UNTIL: float = 0.0
 _COOLDOWN_SECONDS: float = 60.0
 _EXTRACTION_TIMEOUT_SECONDS: float = 6.5
+_TOKEN_HARBOR_EXTRACTION_TIMEOUT_SECONDS: float = 8.0
+
+_TH_JSON_SUFFIX = (
+    "\n\nRespond ONLY with valid JSON (no markdown) matching:\n"
+    '{"intent": "<canonical_intent_or_null>", '
+    '"counterparty": {"name": "<party_name>", "role": "supplier|customer|employee", "confidence": 0.9}|null, '
+    '"line_items": [{"description": "<item>", "quantity": 1, "unit_price": null, "unit": null}], '
+    '"payment_channel": "cash|bank_transfer|credit|cheque|null", '
+    '"transaction_nature": "<nature_or_null>", '
+    '"transaction_date": "YYYY-MM-DD|null", '
+    '"total_amount": <number_or_null>, '
+    '"currency": "PKR", '
+    '"missing_fields": ["..."], '
+    '"user_intent_type": "informational|transactional|advisory", '
+    '"confidence": 0.9}'
+)
+
+
+async def _call_token_harbor_structured(prompt: str) -> Any:
+    """Invoke primary TokenHarbor orchestrator for structured JSON extraction."""
+    from app.ai_orchestrator import get_client as get_orchestrator_client
+    from app.config import get_settings
+
+    orch = get_orchestrator_client()
+    full_prompt = prompt + _TH_JSON_SUFFIX
+    if hasattr(orch, "generate_text"):
+        settings = get_settings()
+        return await asyncio.wait_for(
+            orch.generate_text(
+                prompt=full_prompt,
+                model_chain=settings.accounting_fast_chain_list,
+                thinking_off=True,
+                max_output_tokens=700,
+            ),
+            timeout=_TOKEN_HARBOR_EXTRACTION_TIMEOUT_SECONDS,
+        )
+    return await asyncio.wait_for(
+        orch.generate_text_light(prompt=full_prompt),
+        timeout=_TOKEN_HARBOR_EXTRACTION_TIMEOUT_SECONDS,
+    )
 
 
 async def extract_structured(
@@ -330,22 +397,45 @@ async def extract_structured(
     conversation_history: Optional[list] = None,
     org_context: Optional[dict] = None,
 ) -> StructuredTransactionDraft:
-    """Extract a ``StructuredTransactionDraft`` via Gemini structured output.
+    """Extract a ``StructuredTransactionDraft`` using primary TokenHarbor or Gemini.
 
-    Calls Gemini (via ``app/gemini_client.py``) with ``response_schema`` set to
-    ``StructuredTransactionDraft``. On provider or validation failure, returns a
-    safe fallback draft with ``confidence=0.0`` so callers can fall through to
-    ``run_planner()``.
+    Routes live extraction through TokenHarbor (the ERP's configured primary
+    provider chain) with Gemini as fallback, while honoring direct Gemini
+    monkeypatches in unit tests. Only returns ``confidence=0.0`` if all
+    available LLM providers fail.
     """
     import time as _time
     import app.gemini_client as _gemini_client_mod
 
     global _COOLDOWN_UNTIL
-    _is_mocked = (
+    _is_gemini_mocked = (
         get_client is not _DEFAULT_GET_CLIENT
         or _gemini_client_mod.get_client is not _DEFAULT_GET_CLIENT
     )
-    if not _is_mocked and _time.monotonic() < _COOLDOWN_UNTIL:
+
+    prompt = build_extraction_prompt(
+        user_message=user_message,
+        conversation_history=conversation_history or [],
+        org_context=org_context or {},
+    )
+
+    # 1. TokenHarbor (primary ERP LLM chain) on unmocked runtime turns
+    if not _is_gemini_mocked:
+        try:
+            raw = await _call_token_harbor_structured(prompt)
+            draft = _parse_response(raw)
+            log.info(
+                "extraction.token_harbor_ok",
+                user_intent_type=draft.user_intent_type,
+                intent=draft.intent,
+                confidence=draft.confidence,
+            )
+            return draft
+        except Exception as exc:  # noqa: BLE001 — fall through to Gemini fallback
+            log.warning("extraction.token_harbor_failed", error=str(exc)[:200])
+
+    # 2. Gemini structured output (explicit unit-test mock OR fallback when TokenHarbor failed)
+    if not _is_gemini_mocked and _time.monotonic() < _COOLDOWN_UNTIL:
         log.info("extraction.skipped_cooldown")
         return StructuredTransactionDraft(
             user_intent_type="transactional",
@@ -353,11 +443,6 @@ async def extract_structured(
             missing_fields=[],
         )
 
-    prompt = build_extraction_prompt(
-        user_message=user_message,
-        conversation_history=conversation_history or [],
-        org_context=org_context or {},
-    )
     try:
         async def _run():
             client = await asyncio.to_thread(get_client)
@@ -375,7 +460,7 @@ async def extract_structured(
             missing_fields=[],
         )
     except asyncio.TimeoutError:
-        if not _is_mocked:
+        if not _is_gemini_mocked:
             _COOLDOWN_UNTIL = _time.monotonic() + _COOLDOWN_SECONDS
         log.warning("extraction.structured_timeout", timeout_s=_EXTRACTION_TIMEOUT_SECONDS)
         return StructuredTransactionDraft(
@@ -385,7 +470,7 @@ async def extract_structured(
         )
     except Exception as exc:  # noqa: BLE001 — degrade gracefully to planner fallback
         msg = str(exc)
-        if not _is_mocked and ("503" in msg or "UNAVAILABLE" in msg or "429" in msg):
+        if not _is_gemini_mocked and ("503" in msg or "UNAVAILABLE" in msg or "429" in msg):
             _COOLDOWN_UNTIL = _time.monotonic() + _COOLDOWN_SECONDS
         log.warning("extraction.structured_failed", error=msg[:200])
         return StructuredTransactionDraft(

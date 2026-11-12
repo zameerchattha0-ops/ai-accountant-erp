@@ -613,3 +613,49 @@ async def test_extract_structured_degrades_gracefully_on_timeout(monkeypatch):
 
     assert isinstance(draft, StructuredTransactionDraft)
     assert draft.confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_extract_structured_uses_token_harbor_primary_and_coerces_string_counterparty(monkeypatch):
+    import app.ai_orchestrator as orch_mod
+
+    class _StubOrch:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_text(self, *, prompt, model_chain=None, thinking_off=False, max_output_tokens=None):
+            self.calls.append({"prompt": prompt, "thinking_off": thinking_off})
+            return json.dumps({
+                "intent": "record_purchase",
+                "counterparty": "Shabbir Furniture",
+                "line_items": [{"description": "sofa", "quantity": 2}],
+                "payment_channel": None,
+                "transaction_nature": "FIXED_ASSET",
+                "currency": "PKR",
+                "missing_fields": ["total_amount", "payment_channel"],
+                "user_intent_type": "advisory",
+                "confidence": 0.91,
+            })
+
+    stub_orch = _StubOrch()
+    monkeypatch.setattr(orch_mod, "get_client", lambda: stub_orch)
+    # Fail loudly if Gemini were called when TokenHarbor succeeds
+    monkeypatch.setattr(
+        extraction_mod,
+        "_call_gemini_structured",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Gemini should not run when TokenHarbor succeeds")),
+    )
+
+    draft = await extract_structured(
+        "I am purchasing 2 sofas from Shabbir Furniture",
+        conversation_history=[],
+        org_context={"currency": "PKR"},
+    )
+
+    assert len(stub_orch.calls) == 1
+    assert stub_orch.calls[0]["thinking_off"] is True
+    assert draft.user_intent_type == "advisory"
+    assert draft.counterparty is not None
+    assert draft.counterparty.name == "Shabbir Furniture"
+    assert draft.counterparty.role == "supplier"
+    assert draft.confidence == pytest.approx(0.91)

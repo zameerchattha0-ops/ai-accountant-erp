@@ -7210,7 +7210,7 @@ async def execute(
                         conversation_history=prior_qa,
                         org_context=_org_profile if isinstance(_org_profile, dict) else {},
                     ),
-                    timeout=7.5,
+                    timeout=10.0,
                 )
                 if _structured_draft is not None and _structured_draft.confidence >= 0.6:
                     _structured_prefill = draft_to_prefill_entities(_structured_draft)
