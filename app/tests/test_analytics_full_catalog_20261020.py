@@ -313,3 +313,77 @@ def test_catalog_and_plan_support_cash_and_bank_balances():
     assert not errors, errors
     assert plan is not None
     assert [op["source"] for op in plan["operations"]] == ["bank_accounts", "cash_accounts"]
+
+
+def test_analytics_status_filter_case_insensitive_and_unpaid_alias():
+    """Bug 1 regression: uppercase DB statuses (OPEN) match lowercase unpaid/open filters."""
+    from app.analytics_agent import _apply_noneq
+
+    rows = [
+        {"bill_number": "PUR-000001", "status": "OPEN", "total": 45000},
+        {"bill_number": "PUR-000002", "status": "DRAFT", "total": 12000},
+        {"bill_number": "PUR-000003", "status": "OPEN", "total": 150000},
+        {"bill_number": "PUR-000004", "status": "PAID", "total": 8000},
+        {"bill_number": "PUR-000005", "status": "VOIDED", "total": 5000},
+    ]
+
+    filtered_in = _apply_noneq(
+        rows,
+        [{"col": "status", "op": "in", "value": ["unpaid", "partial", "partially_paid", "open"]}],
+    )
+    assert [r["bill_number"] for r in filtered_in] == ["PUR-000001", "PUR-000003"]
+
+    filtered_eq = _apply_noneq(rows, [{"col": "status", "op": "eq", "value": "open"}])
+    assert [r["bill_number"] for r in filtered_eq] == ["PUR-000001", "PUR-000003"]
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_analytics_execute_plan_enriches_bank_and_cash_gl_balances(monkeypatch):
+    """Bug 2 regression: bank_accounts/cash_accounts replace stale 0.0 with GL sum(debit-credit)."""
+    from app.analytics_agent import execute_plan
+
+    fake_tables = {
+        "bank_accounts": [
+            {"id": "b1", "bank_name": "Primary Bank - Main", "current_balance": 0.0, "gl_account_id": "gl-bank-1"},
+        ],
+        "cash_accounts": [
+            {"id": "c1", "account_name": "Cash", "current_balance": 0.0, "gl_account_id": "gl-cash-1"},
+        ],
+        "journal_lines": [
+            {"account_id": "gl-bank-1", "debit": 500000.0, "credit": 11810401.0},
+            {"account_id": "gl-cash-1", "debit": 100000.0, "credit": 5294000.0},
+            {"account_id": "gl-other", "debit": 9999.0, "credit": 0.0},
+        ],
+    }
+
+    async def fake_fetch_many(table, filters=None, select="*", order=None, limit=100):
+        return [dict(r) for r in fake_tables.get(table, [])]
+
+    monkeypatch.setattr("app.database.fetch_many", fake_fetch_many)
+
+    plan = {
+        "operations": [
+            {
+                "source": "bank_accounts",
+                "columns": ["bank_name", "current_balance"],
+                "filters": [],
+                "aggregate": None,
+                "order": None,
+                "limit": 20,
+            },
+            {
+                "source": "cash_accounts",
+                "columns": ["account_name", "current_balance"],
+                "filters": [],
+                "aggregate": None,
+                "order": None,
+                "limit": 20,
+            },
+        ]
+    }
+    res = await execute_plan(organization_id="4f20f43c-bb3b-4747-abe1-02d9380884df", plan=plan)
+    assert res[0]["rows"][0]["current_balance"] == -11310401.0
+    assert res[1]["rows"][0]["current_balance"] == -5194000.0

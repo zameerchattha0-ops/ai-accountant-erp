@@ -80,3 +80,83 @@ def test_expense_fast_path_does_not_inject_local_vendor():
     assert len(calls) == 1
     assert calls[0].tool_name == "create_expense"
     assert calls[0].arguments["payee_name"] == ""
+
+
+@pytest.mark.asyncio
+async def test_cash_purchase_does_not_prompt_party_creation(monkeypatch):
+    """Bug 3 regression: cash purchase with supplier name must never prompt to create supplier ledger."""
+    from types import SimpleNamespace
+    from app.agent import _party_resolution_question
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("Should not look up/create party for cash purchase")
+
+    monkeypatch.setattr("app.database.fetch_one", fail_if_called, raising=False)
+
+    plan_cash_intent = SimpleNamespace(
+        intent="record_cash_purchase",
+        extracted_entities={"supplier_name": "Shabbir Furnitures", "payment_method": "CASH"},
+        impact_map={"party_ledger": False},
+    )
+    assert await _party_resolution_question(organization_id="org-1", execution_plan=plan_cash_intent) is None
+
+    plan_purchase_cash = SimpleNamespace(
+        intent="record_purchase",
+        extracted_entities={"supplier_name": "Shabbir Furnitures", "payment_method": "CASH"},
+        impact_map={},
+    )
+    assert await _party_resolution_question(organization_id="org-1", execution_plan=plan_purchase_cash) is None
+
+
+def test_parse_usage_intent_question_emits_asset_vs_inventory_choices():
+    """Bug 4a regression: office-use vs resale single question emits clickable KIND_CHOICE options."""
+    from app.questionnaire import KIND_CHOICE, parse_model_question_text
+
+    q_text = (
+        "Please confirm one thing: Are the two tables for the business's own use "
+        "(office furniture — to be capitalised as a fixed asset), or are they stock held for resale (inventory)?"
+    )
+    parsed = parse_model_question_text(q_text, intent="record_cash_purchase")
+    assert parsed is not None
+    assert len(parsed.questions) == 1
+    assert parsed.questions[0].field == "transaction_nature"
+    assert parsed.questions[0].kind == KIND_CHOICE
+    values = [opt[0] for opt in parsed.questions[0].options]
+    assert values == ["FIXED_ASSET", "INVENTORY"]
+
+
+def test_transactional_clarification_question_not_wiped_after_coa_lookup():
+    """Bug 4b regression: write intent with read-only lookups + >150 char usage question is NOT suppressed."""
+    from types import SimpleNamespace
+    from app.agent import _should_suppress_model_question, _usable_question
+    from app.questionnaire import parse_model_question_text
+
+    llm_question = (
+        "I checked your Chart of Accounts and found Office Furniture and Inventory accounts. "
+        "Please confirm one thing before I record this cash purchase: Are the two tables for the business's "
+        "own use (office furniture — to be capitalised as a fixed asset), or are they stock held for resale (inventory)?"
+    )
+    plan_write = SimpleNamespace(intent="record_cash_purchase", missing_fields=[])
+    read_tool_ok = [SimpleNamespace(success=True, tool_name="get_chart_of_accounts")]
+
+    assert _should_suppress_model_question(
+        "purchased two tables from shabbir furnitures today on cash",
+        plan_write,
+        llm_question,
+        read_tool_ok,
+    ) is False
+
+    q = _usable_question(llm_question)
+    assert q is not None
+    parsed = parse_model_question_text(q, intent="record_cash_purchase")
+    assert parsed is not None
+    assert [opt[0] for opt in parsed.questions[0].options] == ["FIXED_ASSET", "INVENTORY"]
+
+    # Meanwhile an analytical/read-only inquiry that answered with a table still suppresses trailing chat suggestions
+    plan_read = SimpleNamespace(intent="get_cash_accounts", missing_fields=[])
+    assert _should_suppress_model_question(
+        "What is our current cash and bank balance?",
+        plan_read,
+        "Here are your current cash and bank balances:\n| Account | Balance |\n| Cash | 0.00 |\nWould you like a breakdown?",
+        read_tool_ok,
+    ) is True

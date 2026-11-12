@@ -1517,6 +1517,31 @@ def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionn
             )
         else:
             field_name = _infer_field_name(clean, 0)
+            low_clean = clean.lower()
+            _asks_asset_vs_resale = (
+                any(k in low_clean for k in (
+                    "fixed asset", "capitalis", "capitaliz",
+                    "own use", "office use", "office furniture", "business use",
+                ))
+                and any(k in low_clean for k in ("resale", "resell", "inventory", "stock"))
+            )
+            if _asks_asset_vs_resale:
+                return Questionnaire(
+                    intent=intent,
+                    intro=QUESTIONNAIRE_INTRO,
+                    questions=[
+                        QuestionSpec(
+                            field="transaction_nature",
+                            kind=KIND_CHOICE,
+                            question=clean,
+                            options=(
+                                ("FIXED_ASSET", "Fixed asset (office / business use)"),
+                                ("INVENTORY", "Inventory (for resale)"),
+                            ),
+                        )
+                    ],
+                    source="llm_parsed_single",
+                )
             kind = KIND_MONEY if field_name in ("unit_price", "amount") else (
                 KIND_DATE if field_name == "transaction_date" else KIND_TEXT
             )

@@ -487,17 +487,47 @@ async def _party_resolution_question(
         "list_suppliers", "list_employees", "get_chart_of_accounts",
         "get_inventory_status",
     }
+    _CREDIT_OR_PARTY_REQUIRED_INTENTS = {
+        "record_credit_sale", "record_credit_purchase",
+        "record_invoice", "create_invoice", "record_bill", "create_bill",
+        "record_customer_receipt", "record_supplier_payment",
+        "pay_supplier", "receive_customer_payment",
+        "create_quotation", "record_quotation",
+        "record_sales_return", "record_purchase_return",
+        "create_purchase_order", "create_sales_order",
+    }
+    _impact_map = getattr(execution_plan, "impact_map", None) or {}
+    _pm_raw = str(
+        entities.get("payment_method")
+        or entities.get("payment_type")
+        or entities.get("settlement_position")
+        or ""
+    ).strip().upper()
+    _intent_str = str(execution_plan.intent or "")
+    _is_cash_no_party_ledger = (
+        _intent_str in ("record_cash_purchase", "record_cash_sale")
+        or _impact_map.get("party_ledger") is False
+        or (
+            _pm_raw == "CASH"
+            and _intent_str not in _CREDIT_OR_PARTY_REQUIRED_INTENTS
+            and "ledger" not in _intent_str
+            and "credit" not in _intent_str
+            and "payment" not in _intent_str
+            and "receipt" not in _intent_str
+            and "quotation" not in _intent_str
+            and "return" not in _intent_str
+        )
+    )
     if (
         execution_plan.intent not in _PARTY_GATE_INTENTS
         or execution_plan.intent in ("record_expense", "record_bank_transfer")
         or execution_plan.intent in _READ_ONLY_LOOKUPS_GATE
+        or _is_cash_no_party_ledger
     ):
 
-        # No recording workflow (unknown/report intent): a party question
+        # No recording workflow (unknown/report intent), or cash-settled transaction without a party ledger:
 
-        # would be asked with nothing to record behind it — return None so
-
-        # the model path interprets the request instead.
+        # do not ask to create a supplier/customer party ledger.
 
         return None
 
@@ -600,7 +630,52 @@ async def _party_resolution_question(
     }
 
 
+def _should_suppress_model_question(
+    user_message: str,
+    execution_plan: Any,
+    llm_text: str,
+    tool_results: Sequence[Any],
+) -> bool:
+    """Suppress polite trailing follow-up questions ONLY for completed informational/analytical answers.
 
+    Write/transactional intents (record_cash_purchase, create_*, etc.) that executed 0 mutations
+    and asked a clarifying question must keep ``model_question`` so the clarification UI renders.
+    """
+    _intent_str = str(getattr(execution_plan, "intent", "") or "")
+    _is_write_intent = _intent_str.startswith((
+        "record_", "create_", "register_", "post_", "pay_", "receive_", "issue_",
+        "add_", "update_", "delete_", "void_", "reverse_",
+    ))
+    _is_analytical = (
+        not _is_write_intent
+        and (
+            _intent_str in (
+                "generate_general_ledger", "get_general_ledger", "get_trial_balance",
+                "get_profit_loss", "get_balance_sheet", "get_cash_flow", "generate_report",
+                "get_customer_ledger", "get_supplier_ledger", "get_health", "calculate_health",
+                "list_loans", "get_loan_schedule", "get_inventory_status",
+                "get_account_balances", "list_accounts", "get_bank_accounts", "get_cash_accounts",
+            )
+            or "ledger" in _intent_str
+            or "entries" in _intent_str
+            or "balance" in _intent_str
+            or "bank" in _intent_str
+            or "report" in _intent_str
+        )
+    )
+    _is_info_query = _is_read_only_inquiry(user_message, _intent_str)
+    _has_informational_body = _is_info_query and (
+        len(llm_text or "") > 150
+        or "|" in (llm_text or "")
+        or any(getattr(tr, "success", False) for tr in tool_results)
+    )
+    return bool(
+        (_is_analytical or _has_informational_body)
+        and (
+            any(getattr(tr, "success", False) for tr in tool_results)
+            or not getattr(execution_plan, "missing_fields", None)
+        )
+    )
 
 
 def _provider_stall_summary(reason: Optional[str]) -> str:
@@ -13143,35 +13218,7 @@ async def execute(
 
         if not _mutation_executed(tool_calls):
             model_question = _usable_question(llm_text)
-            # Analytical / reporting inquiry guard:
-            # If the intent is reporting/analytical or the user asked for records/balances and the model answered
-            # factually (or read tools succeeded), it is a completed informational response, NOT a questionnaire.
-            _is_analytical = (
-                execution_plan.intent in (
-                    "generate_general_ledger", "get_general_ledger", "get_trial_balance",
-                    "get_profit_loss", "get_balance_sheet", "get_cash_flow", "generate_report",
-                    "get_customer_ledger", "get_supplier_ledger", "get_health", "calculate_health",
-                    "list_loans", "get_loan_schedule", "get_inventory_status",
-                    "get_account_balances", "list_accounts", "get_bank_accounts", "get_cash_accounts",
-                )
-                or "ledger" in execution_plan.intent
-                or "entries" in execution_plan.intent
-                or "balance" in execution_plan.intent
-                or "bank" in execution_plan.intent
-                or "report" in execution_plan.intent
-            )
-            # When read tools retrieved data from the books or an informational body was rendered,
-            # the informational inquiry was answered. Polite suggestions of next steps do not park in clarification.
-            _has_informational_body = (
-                len(llm_text or "") > 150
-                or "|" in (llm_text or "")
-                or any(getattr(tr, "success", False) for tr in tool_results)
-                or _is_read_only_inquiry(user_message)
-            )
-            if (_is_analytical or _has_informational_body) and (
-                any(getattr(tr, "success", False) for tr in tool_results)
-                or not getattr(execution_plan, "missing_fields", None)
-            ):
+            if _should_suppress_model_question(user_message, execution_plan, llm_text, tool_results):
                 model_question = None
 
             if model_question and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:

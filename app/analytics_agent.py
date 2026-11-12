@@ -358,6 +358,10 @@ _PLANNER_RULES = (
     "current_balance, is_active) with answer_shape table; optionally also "
     "accounts with account_type eq ASSET. NEVER use answer_shape computed for "
     "cash or bank balances.\n"
+    "- STATUS VALUES (uppercase in DB): purchase_bills.status is DRAFT, OPEN, "
+    "PARTIALLY_PAID, PAID, VOIDED; invoices.status is DRAFT, ISSUED, PARTIAL, "
+    "PAID, OVERDUE, VOID. For open/outstanding bills filter status in "
+    '["OPEN", "PARTIALLY_PAID"].\n'
     "Use computed ONLY for two-aggregate differences like profit."
 )
 
@@ -440,6 +444,43 @@ async def _enrich_pseudo_cols(*, source: str, rows: List[Dict[str, Any]],
     return rows
 
 
+async def _enrich_bank_cash_gl_balances(
+    *, source: str, rows: List[Dict[str, Any]], organization_id: Any
+) -> List[Dict[str, Any]]:
+    """Replace stale 0.0 metadata current_balance with live GL sum(debit-credit)."""
+    if source not in ("bank_accounts", "cash_accounts") or not rows:
+        return rows
+    gl_ids = {str(r.get("gl_account_id")) for r in rows if r.get("gl_account_id")}
+    if not gl_ids:
+        return rows
+    try:
+        from app.database import fetch_many
+
+        lines = await fetch_many(
+            "journal_lines",
+            filters={"organization_id": str(organization_id)},
+            select="account_id,debit,credit",
+            limit=5000,
+        ) or []
+        net_by_acct: Dict[str, float] = {}
+        seen_accts: set = set()
+        for ln in lines:
+            aid = str(ln.get("account_id") or "")
+            if aid not in gl_ids:
+                continue
+            seen_accts.add(aid)
+            net_by_acct[aid] = net_by_acct.get(aid, 0.0) + (
+                float(ln.get("debit") or 0) - float(ln.get("credit") or 0)
+            )
+        for r in rows:
+            gid = str(r.get("gl_account_id") or "")
+            if gid in seen_accts:
+                r["current_balance"] = round(net_by_acct.get(gid, 0.0), 2)
+    except Exception as exc:  # noqa: BLE001 — keep read resilient
+        log.warning("analytics.gl_balance_enrich_failed", error=str(exc)[:160])
+    return rows
+
+
 async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
     """Run the validated plan org-scoped. Returns one result per op.
 
@@ -458,9 +499,9 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
         pseudo = PSEUDO_COLS.get(op["source"], set())
         noneq = []
         for f in op["filters"]:
-            # Pseudo-cols are NEVER sent to the database - always Python-side
-            # (after the account join below).
-            if f["op"] == "eq" and f["col"] not in pseudo:
+            # Pseudo-cols and status filters run Python-side (status matching
+            # is case-insensitive and expands semantic aliases like unpaid/open).
+            if f["op"] == "eq" and f["col"] not in pseudo and f["col"] != "status":
                 val = f["value"]
                 if str(f["col"]).endswith("_id"):
                     import uuid
@@ -485,6 +526,10 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
             # account_id and every row filters to nothing (live catch
             # 2026-10-20: profit returned 0 rows with a correct plan).
             needed.add("account_id")
+        if op["source"] in ("bank_accounts", "cash_accounts") and (
+            "current_balance" in op["columns"] or "*" in op["columns"]
+        ):
+            needed.add("gl_account_id")
         order_col = op["order"].split()[0].split(".")[0] if op["order"] else ""
         if op["order"] and order_col not in pseudo:
             needed.add(order_col)
@@ -496,6 +541,11 @@ async def execute_plan(*, organization_id, plan: Dict[str, Any]) -> List[Any]:
         ) or []
         if pseudo:
             rows = await _enrich_pseudo_cols(
+                source=op["source"], rows=rows,
+                organization_id=organization_id,
+            )
+        if op["source"] in ("bank_accounts", "cash_accounts"):
+            rows = await _enrich_bank_cash_gl_balances(
                 source=op["source"], rows=rows,
                 organization_id=organization_id,
             )
@@ -540,20 +590,27 @@ def _apply_noneq(rows: List[Dict[str, Any]],
             except (TypeError, ValueError):
                 return None
 
+        def _status_allowed(raw_values: list) -> set:
+            allowed = {str(x).strip().lower() for x in raw_values}
+            if col == "status" and (allowed & {"unpaid", "outstanding"}):
+                allowed.update({"open", "overdue", "partial", "partially_paid", "issued"})
+            return allowed
+
         if op == "eq":
-            # Pseudo-col equality (account_type on journal_lines) lands
-            # here - the DB can never answer it. Live catch 2026-10-20:
-            # without this branch the profit plan's REVENUE/EXPENSE pin
-            # was silently IGNORED and every line was counted.
             if val is None:
                 out = [r for r in out if r.get(col) is None]
+            elif col == "status":
+                allowed = _status_allowed([val])
+                out = [r for r in out if str(r.get(col) or "").strip().lower() in allowed]
             else:
-                out = [r for r in out if str(r.get(col)) == str(val)]
+                target = str(val).strip().lower()
+                out = [r for r in out if r.get(col) is not None and str(r.get(col)).strip().lower() == target]
         elif op == "neq":
             if val is None:
                 out = [r for r in out if r.get(col) is not None]
             else:
-                out = [r for r in out if str(r.get(col)) != str(val)]
+                target = str(val).strip().lower()
+                out = [r for r in out if str(r.get(col) or "").strip().lower() != target]
         elif op == "ilike":
             needle = str(val).strip("%").lower()
             out = [r for r in out
@@ -569,8 +626,9 @@ def _apply_noneq(rows: List[Dict[str, Any]],
                    and _num(r.get(col)) <= nv)
                    or str(r.get(col) or "") <= str(val)]
         elif op == "in":
-            allowed = {str(x) for x in (val if isinstance(val, list) else [val])}
-            out = [r for r in out if str(r.get(col)) in allowed]
+            raw_list = val if isinstance(val, list) else [val]
+            allowed = _status_allowed(raw_list)
+            out = [r for r in out if str(r.get(col) or "").strip().lower() in allowed]
         elif op == "between" and isinstance(val, list) and len(val) == 2:
             out = [r for r in out if str(val[0]) <= str(r.get(col) or "")
                    <= str(val[1])]
