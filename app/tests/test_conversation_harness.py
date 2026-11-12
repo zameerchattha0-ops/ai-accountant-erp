@@ -137,9 +137,42 @@ def test_section_73_compliance_guard():
 
 
 @pytest.mark.asyncio
-@pytest.mark.allows_db
-async def test_probe_live_records_live_db():
+async def test_probe_live_records_live_db(monkeypatch):
+    import app.conversation_harness as ch
+
     org_id = uuid.UUID("00000000-0000-4000-8000-000000000010")
+    sup_id = uuid.uuid4()
+    bill_id = uuid.uuid4()
+
+    async def fake_fetch_many(table, filters=None, select="*", limit=50, **kwargs):
+        if table == "purchase_bills":
+            return [
+                {
+                    "id": str(bill_id),
+                    "bill_number": "PUR-00005",
+                    "bill_date": "2026-10-15",
+                    "due_date": "2026-10-30",
+                    "supplier_id": str(sup_id),
+                    "total": 25000.0,
+                    "amount_paid": 0.0,
+                    "status": "OPEN",
+                    "notes": "Test bill 5",
+                    "currency_code": "PKR",
+                }
+            ]
+        return []
+
+    async def fake_search(*args, **kwargs):
+        return []
+
+    async def fake_get_supplier(*args, **kwargs):
+        return {"id": str(sup_id), "name": "Test Supplier"}
+
+    monkeypatch.setattr(ch, "fetch_many", fake_fetch_many)
+    monkeypatch.setattr(ch.supplier_service, "search", fake_search)
+    monkeypatch.setattr(ch.supplier_service, "get", fake_get_supplier)
+    monkeypatch.setattr(ch.customer_service, "search", fake_search)
+
     # Probe for bill 5
     ctx = await probe_live_records(org_id, "Paid in full the bill no. 5 today")
     assert len(ctx.matching_bills) >= 1
