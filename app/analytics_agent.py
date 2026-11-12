@@ -113,6 +113,16 @@ CATALOG: Dict[str, Dict[str, Any]] = {
                  "bank_account_id", "cash_account_id", "status", "reference",
                  "journal_entry_id", "created_at"],
     },
+    "bank_accounts": {
+        "desc": "BANK accounts and their current balances (module: Banking)",
+        "cols": ["account_name", "bank_name", "currency_code", "current_balance",
+                 "is_default", "is_active", "gl_account_id", "created_at"],
+    },
+    "cash_accounts": {
+        "desc": "CASH accounts / petty cash drawers and balances (module: Banking)",
+        "cols": ["name", "currency_code", "current_balance",
+                 "is_active", "gl_account_id", "created_at"],
+    },
     # ---- JOURNAL module -----------------------------------------------
     "journal_entries": {
         "desc": "JOURNAL entries (one per posting: JV numbers, totals)",
@@ -342,6 +352,12 @@ _PLANNER_RULES = (
     "returns/debit notes = purchase_returns (+purchase_return_items).\n"
     "- INVENTORY on hand: products (is_stock_tracked) + inventory_movements "
     "per product.\n"
+    "- CASH / BANK BALANCES (current cash and bank balance): query "
+    "bank_accounts (account_name, bank_name, currency_code, current_balance, "
+    "is_default, is_active) and cash_accounts (name, currency_code, "
+    "current_balance, is_active) with answer_shape table; optionally also "
+    "accounts with account_type eq ASSET. NEVER use answer_shape computed for "
+    "cash or bank balances.\n"
     "Use computed ONLY for two-aggregate differences like profit."
 )
 

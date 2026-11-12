@@ -290,15 +290,39 @@ async def _call_gemini_structured(client: Any, prompt: str) -> Any:
 
     model_name = getattr(client, "model_name", "gemini-3.8-flash")
     gen_fn = models.generate_content
-    if inspect.iscoroutinefunction(gen_fn):
-        return await gen_fn(model=model_name, contents=prompt, config=config)
-    result = await asyncio.to_thread(
-        gen_fn,
-        model=model_name,
-        contents=prompt,
-        config=config,
-    )
-    return await result if inspect.isawaitable(result) else result
+    try:
+        from google.genai import types as _genai_types
+
+        if hasattr(config, "model_copy") and getattr(config, "http_options", None) is None:
+            config = config.model_copy(
+                update={
+                    "http_options": _genai_types.HttpOptions(
+                        timeout=10_000,
+                        retry_options=_genai_types.HttpRetryOptions(attempts=1),
+                    )
+                }
+            )
+    except Exception:  # noqa: BLE001 — test stubs or older SDKs stay untouched
+        pass
+
+    async def _invoke():
+        if inspect.iscoroutinefunction(gen_fn):
+            return await gen_fn(model=model_name, contents=prompt, config=config)
+        res = await asyncio.to_thread(
+            gen_fn,
+            model=model_name,
+            contents=prompt,
+            config=config,
+        )
+        return await res if inspect.isawaitable(res) else res
+
+    return await asyncio.wait_for(_invoke(), timeout=6.0)
+
+
+_DEFAULT_GET_CLIENT = get_client
+_COOLDOWN_UNTIL: float = 0.0
+_COOLDOWN_SECONDS: float = 60.0
+_EXTRACTION_TIMEOUT_SECONDS: float = 6.5
 
 
 async def extract_structured(
@@ -313,14 +337,33 @@ async def extract_structured(
     safe fallback draft with ``confidence=0.0`` so callers can fall through to
     ``run_planner()``.
     """
+    import time as _time
+    import app.gemini_client as _gemini_client_mod
+
+    global _COOLDOWN_UNTIL
+    _is_mocked = (
+        get_client is not _DEFAULT_GET_CLIENT
+        or _gemini_client_mod.get_client is not _DEFAULT_GET_CLIENT
+    )
+    if not _is_mocked and _time.monotonic() < _COOLDOWN_UNTIL:
+        log.info("extraction.skipped_cooldown")
+        return StructuredTransactionDraft(
+            user_intent_type="transactional",
+            confidence=0.0,
+            missing_fields=[],
+        )
+
     prompt = build_extraction_prompt(
         user_message=user_message,
         conversation_history=conversation_history or [],
         org_context=org_context or {},
     )
     try:
-        client = get_client()
-        response = await _call_gemini_structured(client, prompt)
+        async def _run():
+            client = await asyncio.to_thread(get_client)
+            return await _call_gemini_structured(client, prompt)
+
+        response = await asyncio.wait_for(_run(), timeout=_EXTRACTION_TIMEOUT_SECONDS)
         return _parse_response(response)
     except AssertionError as exc:
         if "REAL_DB_ACCESS" not in str(exc):
@@ -331,8 +374,20 @@ async def extract_structured(
             confidence=0.0,
             missing_fields=[],
         )
+    except asyncio.TimeoutError:
+        if not _is_mocked:
+            _COOLDOWN_UNTIL = _time.monotonic() + _COOLDOWN_SECONDS
+        log.warning("extraction.structured_timeout", timeout_s=_EXTRACTION_TIMEOUT_SECONDS)
+        return StructuredTransactionDraft(
+            user_intent_type="transactional",
+            confidence=0.0,
+            missing_fields=[],
+        )
     except Exception as exc:  # noqa: BLE001 — degrade gracefully to planner fallback
-        log.warning("extraction.structured_failed", error=str(exc)[:200])
+        msg = str(exc)
+        if not _is_mocked and ("503" in msg or "UNAVAILABLE" in msg or "429" in msg):
+            _COOLDOWN_UNTIL = _time.monotonic() + _COOLDOWN_SECONDS
+        log.warning("extraction.structured_failed", error=msg[:200])
         return StructuredTransactionDraft(
             user_intent_type="transactional",
             confidence=0.0,

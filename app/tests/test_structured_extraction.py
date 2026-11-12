@@ -588,3 +588,28 @@ async def test_resume_with_clarification_accepts_typed_field_id_answers(monkeypa
     assert len(executed_calls) == 1
     assert executed_calls[0].tool_name == "create_account"
     assert executed_calls[0].arguments["account_type"] == "EXPENSE"
+
+
+@pytest.mark.asyncio
+async def test_extract_structured_degrades_gracefully_on_timeout(monkeypatch):
+    import asyncio
+
+    async def hanging_generate(*, model, contents, config=None):
+        await asyncio.sleep(5.0)
+        return SimpleNamespace(text="{}")
+
+    stub = SimpleNamespace(
+        model_name="gemini-3.8-flash",
+        _gclient=SimpleNamespace(models=SimpleNamespace(generate_content=hanging_generate)),
+    )
+    monkeypatch.setattr(extraction_mod, "get_client", lambda: stub)
+    monkeypatch.setattr(extraction_mod, "_EXTRACTION_TIMEOUT_SECONDS", 0.05)
+
+    draft = await extract_structured(
+        "Record expense 1000",
+        conversation_history=[],
+        org_context={},
+    )
+
+    assert isinstance(draft, StructuredTransactionDraft)
+    assert draft.confidence == 0.0

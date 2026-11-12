@@ -7204,10 +7204,13 @@ async def execute(
                     if extract_structured is not _ORIG_EXTRACT_STRUCTURED
                     else _extraction_mod.extract_structured
                 )
-                _structured_draft = await _extract_fn(
-                    user_message=user_message,
-                    conversation_history=prior_qa,
-                    org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                _structured_draft = await asyncio.wait_for(
+                    _extract_fn(
+                        user_message=user_message,
+                        conversation_history=prior_qa,
+                        org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                    ),
+                    timeout=7.5,
                 )
                 if _structured_draft is not None and _structured_draft.confidence >= 0.6:
                     _structured_prefill = draft_to_prefill_entities(_structured_draft)

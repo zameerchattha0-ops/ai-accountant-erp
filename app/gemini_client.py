@@ -93,7 +93,13 @@ class GeminiClient:
     def __init__(self) -> None:
         settings = get_settings()
         api_key = get_gemini_api_key()
-        self._gclient = Client(api_key=api_key)
+        self._gclient = Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=25_000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
 
         self.model_name = settings.gemini_model
         self.temperature = settings.gemini_temperature

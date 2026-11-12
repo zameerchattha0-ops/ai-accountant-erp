@@ -286,3 +286,30 @@ def test_answer_pipeline_computed_path_uses_no_synth_call(monkeypatch):
     md = render_markdown(answer)
     assert "**" not in md and "`" not in md and "Data as of" in md
     assert "Revenue: 32,000.00 across 2 entries" in md
+
+
+def test_catalog_and_plan_support_cash_and_bank_balances():
+    assert "bank_accounts" in CATALOG
+    assert "current_balance" in CATALOG["bank_accounts"]["cols"]
+    assert "cash_accounts" in CATALOG
+    assert "current_balance" in CATALOG["cash_accounts"]["cols"]
+    plan, errors = validate_plan({
+        "operations": [
+            {
+                "source": "bank_accounts",
+                "columns": ["account_name", "bank_name", "current_balance", "currency_code"],
+                "filters": [{"col": "is_active", "op": "eq", "value": True}],
+                "limit": 50,
+            },
+            {
+                "source": "cash_accounts",
+                "columns": ["name", "current_balance", "currency_code"],
+                "filters": [{"col": "is_active", "op": "eq", "value": True}],
+                "limit": 50,
+            },
+        ],
+        "answer_shape": "table",
+    })
+    assert not errors, errors
+    assert plan is not None
+    assert [op["source"] for op in plan["operations"]] == ["bank_accounts", "cash_accounts"]
