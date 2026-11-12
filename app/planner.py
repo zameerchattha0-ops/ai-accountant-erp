@@ -913,6 +913,14 @@ _SUPPLIER_PATTERNS = [
 # Action verbs, gerunds and document nouns can never START or FORM a party name.
 # Without this guard, "create an invoice for selling 2 ovens to lkj pvt
 # limited" captured "selling" as the customer, or "supplier bills" captured "bills".
+_NON_PARTY_DOCUMENT_NOUNS = {
+    "due", "dues", "payable", "payables", "receivable", "receivables",
+    "ledger", "ledgers", "balance", "balances", "statement", "statements",
+    "summary", "summaries", "order", "orders", "po", "pos", "voucher", "vouchers",
+    "payment", "payments", "receipt", "receipts", "expense", "expenses",
+    "tax", "taxes", "return", "returns", "outstanding", "open", "upcoming",
+}
+
 _NON_PARTY_WORDS = {
     "selling", "sold", "sale", "sells", "sell", "buying", "bought", "buy",
     "purchasing", "purchased", "purchase", "purchases", "procuring", "acquired",
@@ -921,26 +929,22 @@ _NON_PARTY_WORDS = {
     "raise", "raising", "make", "making", "add", "adding", "enter",
     "entering", "post", "posting", "be", "is", "are", "was", "were",
     "to", "the", "a", "an", "and", "or", "all", "any",
-    "due", "dues", "payable", "payables", "receivable", "receivables",
-    "ledger", "ledgers", "balance", "balances", "statement", "statements",
-    "summary", "summaries", "order", "orders", "po", "pos", "voucher", "vouchers",
-    "payment", "payments", "receipt", "receipts", "expense", "expenses",
-    "tax", "taxes", "return", "returns", "outstanding", "open", "upcoming",
     "of", "for", "on", "in", "at", "by", "with", "from", "as", "into",
-}
+} | _NON_PARTY_DOCUMENT_NOUNS
 
-def _is_plausible_party(value: str) -> bool:
+def _is_plausible_party(value: str, *, _blocked_words: Optional[set] = None) -> bool:
     """True when a captured string can plausibly be a party name.
 
     Rejects pronouns / short filler, document nouns, accounting terms,
     and any capture whose FIRST or ENTIRE word is an action verb or document noun
     (e.g. 'bills', 'supplier bills', 'selling', 'invoice', 'bought'...).
     """
+    blocked = _blocked_words if _blocked_words is not None else _NON_PARTY_WORDS
     text = (value or "").strip()
     if len(text) < 2:
         return False
     low = text.lower().strip(",.")
-    if low in _NON_PARTY_WORDS:
+    if low in blocked or low in _NON_PARTY_WORDS:
         return False
     words = text.split()
     if not words:
@@ -952,9 +956,9 @@ def _is_plausible_party(value: str) -> bool:
         return False
     first_word = words[0].strip(",.").lower()
     last_word = words[-1].strip(",.").lower()
-    if first_word in _NON_PARTY_WORDS:
+    if first_word in blocked:
         return False
-    if len(words) <= 2 and (last_word in _NON_PARTY_WORDS or first_word in _NON_PARTY_WORDS):
+    if len(words) <= 2 and (last_word in blocked or first_word in blocked):
         return False
     return True
 
@@ -1183,7 +1187,7 @@ _ITEM_PATTERNS = [
     # is never lost behind a party name or trailing amount stop lookahead.
     re.compile(
         r"\b(?:for|order\s+(?:of|for)|supply\s+of)\s+"
-        r"(\d+\s+[a-zA-Z][\w\s-]*?(?:\s+(?:at|@|worth)\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?(?:\s*(?:each|per\s+unit|a\s+piece))?)?)"
+        r"(\d{1,4}\s+(?!(?:to|from|for|against|worth|amounting|on|in|at|by|with|of|via|rs|pkr|usd)\b)[a-zA-Z][\w\s-]*?(?:\s+(?:at|@|worth)\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?(?:\s*(?:each|per\s+unit|a\s+piece))?)?)"
         r"(?=\s+(?:on credit|on\b|dated|today|via|to\b|from\b|against)\b|[,.!?;]|\s*$)",
         re.IGNORECASE,
     ),
@@ -7108,7 +7112,10 @@ def _is_plausible_item(value: str) -> bool:
     candidate_check = text or value or ""
     if not any(ch.isalpha() for ch in candidate_check):
         return False
-    return _is_plausible_party(candidate_check)
+    # Allow multi-word domain descriptions like "tax services" or "order fulfillment"
+    # as items even though leading/document nouns cannot name a party.
+    item_blocked = _NON_PARTY_WORDS - _NON_PARTY_DOCUMENT_NOUNS
+    return _is_plausible_party(candidate_check, _blocked_words=item_blocked)
 
 # A legal-entity suffix: "zeta pvt ltd", "Beta Traders Inc".  A product is
 
