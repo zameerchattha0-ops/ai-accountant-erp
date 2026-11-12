@@ -104,6 +104,13 @@ from app.error_normalizer import build_missing_field_question
 
 from app.reasoning import options_for_question, purpose_label, purpose_option, strip_markdown
 from app.erp_endpoints import format_operational_summary, is_operational_task
+import app.gemini_client as _gemini_client_mod
+import app.extraction as _extraction_mod
+from app.extraction import draft_to_prefill_entities, extract_structured
+
+_ORIG_EXTRACT_STRUCTURED = extract_structured
+_ORIG_GEMINI_GET_CLIENT = _gemini_client_mod.get_client
+_ORIG_EXTRACTION_GET_CLIENT = _extraction_mod.get_client
 
 
 
@@ -7177,6 +7184,51 @@ async def execute(
 
         _profile_block = _render_profile(_org_profile)
 
+        # ---- STRUCTURED LLM EXTRACTION (Pydantic schema) -------------------
+        _structured_draft = None
+        _structured_prefill: Dict[str, Any] = {}
+        _should_extract_structured = (
+            approved_tool_calls is None
+            and (
+                bool(getattr(_settings, "llm_preliminary_extraction_enabled", False))
+                or extract_structured is not _ORIG_EXTRACT_STRUCTURED
+                or _extraction_mod.extract_structured is not _ORIG_EXTRACT_STRUCTURED
+                or _gemini_client_mod.get_client is not _ORIG_GEMINI_GET_CLIENT
+                or _extraction_mod.get_client is not _ORIG_EXTRACTION_GET_CLIENT
+            )
+        )
+        if _should_extract_structured:
+            try:
+                _extract_fn = (
+                    extract_structured
+                    if extract_structured is not _ORIG_EXTRACT_STRUCTURED
+                    else _extraction_mod.extract_structured
+                )
+                _structured_draft = await _extract_fn(
+                    user_message=user_message,
+                    conversation_history=prior_qa,
+                    org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                )
+                if _structured_draft is not None and _structured_draft.confidence >= 0.6:
+                    _structured_prefill = draft_to_prefill_entities(_structured_draft)
+                    await _log_step(session_id, "STRUCTURED_EXTRACTION", {
+                        "intent": _structured_draft.intent,
+                        "user_intent_type": _structured_draft.user_intent_type,
+                        "confidence": _structured_draft.confidence,
+                        "missing_fields": list(_structured_draft.missing_fields),
+                        "fields": sorted(_structured_prefill.keys()),
+                    })
+                    if (
+                        _structured_draft.intent
+                        and isinstance(_preliminary, dict)
+                        and not _preliminary.get("provisional_intent_hint")
+                    ):
+                        _preliminary["provisional_intent_hint"] = _structured_draft.intent
+            except Exception as exc:  # noqa: BLE001 — fall through to run_planner()
+                log.warning("agent.structured_extraction_failed", error=str(exc)[:200])
+                _structured_draft = None
+                _structured_prefill = {}
+
         # STAGE-2 LLM EXTRACTION (flag-gated, 2026-10-20 inversion): the model
 
         # is now AUTHORITATIVE for party/item/quantity/reason (it can override
@@ -8118,6 +8170,10 @@ async def execute(
             for _k, _v in _rf.items():
                 if _v not in (None, "") and not _ai_prefill.get(_k):
                     _ai_prefill[_k] = _v
+        if _structured_prefill:
+            for _sk, _sv in _structured_prefill.items():
+                if _sv not in (None, "", []):
+                    _ai_prefill[_sk] = _sv
         if _preliminary:
             _lits = _preliminary.get("literals") or {}
             for _k, _v in _lits.items():
@@ -8192,12 +8248,6 @@ async def execute(
 
         _decision = getattr(_reasoning, "decision", None) or {}
         _model_intent = str(_decision.get("intent") or "").strip().lower()
-
-        # LLM intent is ALWAYS authoritative over legacy planner guessing
-        if not _model_intent and (_preliminary or {}).get("provisional_intent_hint"):
-            _candidate_hint = str((_preliminary or {}).get("provisional_intent_hint") or "").strip().lower()
-            if is_canonical_intent(_candidate_hint):
-                _model_intent = _candidate_hint
 
         if not confirmed_intent and _model_intent and is_canonical_intent(_model_intent):
             execution_plan.intent = _model_intent
@@ -14862,16 +14912,19 @@ async def resume_with_clarification(
     # over a keyword match from the same round.
 
     if structured_answers:
+        from app.clarification_schema import ClarificationAnswer as _TypedClarificationAnswer
 
         for pair in structured_answers[:12]:
-
-            if not isinstance(pair, dict):
-
+            if isinstance(pair, _TypedClarificationAnswer):
+                field_name = pair.field_id.strip()
+                raw_val = pair.value
+                value = str(raw_val).strip() if raw_val is not None else ""
+            elif isinstance(pair, dict):
+                field_name = str(pair.get("field") or pair.get("field_id") or "").strip()
+                raw_val = pair.get("answer") if pair.get("answer") is not None else pair.get("value")
+                value = str(raw_val).strip() if raw_val is not None else ""
+            else:
                 continue
-
-            field_name = str(pair.get("field") or "").strip()
-
-            value = str(pair.get("answer") or "").strip()
 
             if not field_name or not value:
 
@@ -14881,7 +14934,7 @@ async def resume_with_clarification(
 
                 *history,
 
-                {"field": field_name, "question": field_name, "answer": value},
+                {"field": field_name, "field_id": field_name, "question": field_name, "answer": value},
 
             ]
 

@@ -216,7 +216,8 @@ class TestClientTtfb:
 class TestSsePollAndWarmHook:
     def test_sse_poll_is_250ms(self):
         src = MAIN_PY.read_text(encoding="utf-8")
-        assert "asyncio.sleep(0.25)" in src
+        assert "live_queue" in src
+        assert "asyncio.wait_for(live_queue.get(), timeout=0.1)" in src
         assert "asyncio.sleep(0.15)" not in src
         assert "execution_id" in src  # TTFB attach point on step events
 

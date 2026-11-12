@@ -54,6 +54,9 @@ async def create_invoice(
     if not customer:
         raise ValueError(f"Customer {customer_id} not found")
 
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     # PARITY: validate + normalise line items BEFORE any write so an
     # invalid line never leaves a header-only partial state behind.
     normalized_items: List[Dict[str, Any]] = []

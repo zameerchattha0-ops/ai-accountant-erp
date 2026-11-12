@@ -271,6 +271,9 @@ async def create_loan(
             "so owners can identify each facility."
         )
 
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     # ---- GL wiring: headings ensured, per-loan ledger created ------------
     cash = (await a_repo.get_account(organization_id, account_id=cash_account_id)
             if cash_account_id else None) or await _resolve_cash_account(organization_id)
@@ -436,6 +439,9 @@ async def record_installment_payment(
     if not loan_rows:
         raise ValueError("Loan not found in this organization.")
     loan = loan_rows[0]
+
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
 
     inst_rows = await fetch_many(
         "loan_installments",

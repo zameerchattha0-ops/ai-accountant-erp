@@ -494,6 +494,9 @@ async def register_asset(
 
     txn_date = transaction_date or date.today().isoformat()
 
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     # Dependency-first: resolve every account BEFORE mutating anything.
     # Contra accounts (accumulated depreciation) are structural
     # non-candidates for the asset-COST account.
@@ -1101,6 +1104,9 @@ async def dispose_asset(
     gain = round(max(proceeds - carrying, 0.0), 2)
     loss = round(max(carrying - proceeds, 0.0), 2)
     txn_date = transaction_date or date.today().isoformat()
+
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
 
     # Dependency-first: resolve every account BEFORE mutating anything.
     asset_account = await _resolve_gl_account(

@@ -25,9 +25,11 @@ import inspect
 import textwrap
 import uuid
 
-from typing import Any, Callable, Coroutine, Dict, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Type
 
 
+
+from pydantic import BaseModel, Field
 
 import structlog
 
@@ -141,6 +143,8 @@ def register(
 
     live_target: Optional[Callable[..., Any]] = None,
 
+    args_model: Optional[Type[BaseModel]] = None,
+
 ):
 
     """Register a tool handler.
@@ -157,6 +161,10 @@ def register(
 
     """
 
+    if args_model is not None:
+
+        setattr(handler, "_args_model", args_model)
+
     _TOOL_REGISTRY[slug] = {
 
         "handler": handler,
@@ -168,6 +176,8 @@ def register(
         "contract": contract,
 
         "live_target": live_target,
+
+        "args_model": args_model,
 
     }
 
@@ -460,6 +470,836 @@ def derive_live_parameter_schema(slug: str) -> Dict[str, Any]:
 
 
 
+
+
+# ===================================================================
+# PYDANTIC TOOL ARGUMENT MODELS (single source of truth for schemas)
+# ===================================================================
+
+
+class LineItemArgs(BaseModel):
+    description: str = Field(..., description="Line item description or product/service name")
+    quantity: float = Field(1.0, description="Quantity (>0)")
+    unit_price: float = Field(0.0, description="Unit price")
+    unit: Optional[str] = Field(None, description="Unit of measure")
+    discount_amount: Optional[float] = Field(None, description="Line discount amount")
+    tax_rate: Optional[float] = Field(None, description="Line tax rate percentage")
+    line_total: Optional[float] = Field(None, description="Total amount for this line")
+    product_id: Optional[str] = Field(None, description="Optional catalogue product UUID")
+    service_id: Optional[str] = Field(None, description="Optional catalogue service UUID")
+    account_id: Optional[str] = Field(None, description="Optional GL account UUID")
+    is_inventory: Optional[bool] = Field(None, description="Whether this line is resale inventory")
+
+
+class JournalLineArgs(BaseModel):
+    account_id: Optional[str] = Field(None, description="GL account UUID")
+    account_code: Optional[str] = Field(None, description="GL account code")
+    account_name: Optional[str] = Field(None, description="GL account name")
+    debit: float = Field(0.0, description="Debit amount (>= 0)")
+    credit: float = Field(0.0, description="Credit amount (>= 0)")
+    description: Optional[str] = Field(None, description="Line narration")
+
+
+class AllowanceItemArgs(BaseModel):
+    description: str = Field(..., description="Allowance description")
+    amount: float = Field(..., description="Allowance amount")
+    frequency: str = Field("monthly", description="Frequency: monthly, one-time, or annual")
+    allowance_type: Optional[str] = Field(None, description="Allowance type")
+    effective_from: Optional[str] = Field(None, description="Effective date (YYYY-MM-DD)")
+
+
+# --- Customer ---
+class SearchCustomerArgs(BaseModel):
+    query: str = Field("", description="Search query (customer name or code)")
+    limit: int = Field(25, description="Maximum results to return")
+
+
+class GetCustomerArgs(BaseModel):
+    customer_id: str = Field(..., description="Customer UUID")
+
+
+class CreateCustomerArgs(BaseModel):
+    name: str = Field(..., description="Customer name")
+    customer_name: Optional[str] = Field(None, description="Alias for customer name")
+    email: Optional[str] = Field(None, description="Email address")
+    phone: Optional[str] = Field(None, description="Phone number")
+    legal_name: Optional[str] = Field(None, description="Legal business name")
+    tax_number: Optional[str] = Field(None, description="Tax / NTN number")
+    strn: Optional[str] = Field(None, description="Sales Tax Registration Number (STRN)")
+    sales_tax_status: Optional[str] = Field(None, description="Sales tax registration status")
+    currency_code: str = Field("PKR", description="Currency code (default PKR)")
+    payment_terms_days: int = Field(30, description="Payment terms in days")
+    credit_limit: Optional[float] = Field(None, description="Credit limit")
+    receivable_account_id: Optional[str] = Field(None, description="Receivable GL account UUID")
+    notes: Optional[str] = Field(None, description="Additional notes")
+
+
+class GetCustomerLedgerArgs(BaseModel):
+    customer_id: str = Field(..., description="Customer UUID")
+
+
+# --- Employee & Payroll ---
+class SearchEmployeeArgs(BaseModel):
+    query: str = Field("", description="Search query (name, code, department, or designation)")
+    limit: int = Field(25, description="Maximum results to return")
+
+
+class GetEmployeeArgs(BaseModel):
+    employee: Optional[str] = Field(None, description="Employee name or code")
+    employee_id: Optional[str] = Field(None, description="Employee UUID")
+
+
+class CreateEmployeeArgs(BaseModel):
+    full_name: str = Field(..., description="Employee full name")
+    date_of_joining: str = Field(..., description="Date of joining (YYYY-MM-DD, DD/MM/YYYY, or TODAY)")
+    basic_salary: float = Field(..., description="Monthly basic salary")
+    email: Optional[str] = Field(None, description="Employee email")
+    phone: Optional[str] = Field(None, description="Employee phone")
+    department: Optional[str] = Field(None, description="Department name")
+    designation: Optional[str] = Field(None, description="Job title / designation")
+    employee_code: Optional[str] = Field(None, description="Employee code")
+    cnic: Optional[str] = Field(None, description="CNIC / national ID")
+    bank_account: Optional[str] = Field(None, description="Employee bank account")
+    allowances: Optional[List[AllowanceItemArgs]] = Field(None, description="Optional employee allowances")
+
+
+class SetEmployeeAllowancesArgs(BaseModel):
+    employee: str = Field(..., description="Employee name, code, or UUID")
+    allowances: List[AllowanceItemArgs] = Field(..., description="Structured allowances list")
+    raw_text: Optional[str] = Field(None, description="Original natural-language allowance text")
+    effective_from: Optional[str] = Field(None, description="Effective start date (YYYY-MM-DD)")
+
+
+class RunPayrollArgs(BaseModel):
+    transaction_date: Optional[str] = Field(None, description="Payroll date (YYYY-MM-DD)")
+    payment_method: str = Field("ACCRUED", description="PAID (paid immediately) or ACCRUED (default, owed)")
+    department: Optional[str] = Field(None, description="Filter by department")
+    payment_account_id: Optional[str] = Field(None, description="Bank/Cash GL account UUID when PAID")
+    salary_expense_account_id: Optional[str] = Field(None, description="Salaries expense GL account UUID")
+    accrued_salaries_account_id: Optional[str] = Field(None, description="Accrued salaries GL account UUID")
+    wht_payable_account_id: Optional[str] = Field(None, description="WHT payable u/s 149 GL account UUID")
+    apply_income_tax: Optional[bool] = Field(None, description="Whether to apply Section 149 income tax")
+    withholding_tax: Optional[bool] = Field(None, description="Alias for apply_income_tax")
+    deduct_tax: Optional[bool] = Field(None, description="Alias for apply_income_tax")
+    days_absent: Optional[int] = Field(0, description="Number of absent days")
+    absences: Optional[int] = Field(None, description="Alias for days_absent")
+    employee_absences: Optional[Dict[str, int]] = Field(None, description="Map of employee name/id to days absent")
+    description: Optional[str] = Field(None, description="Payroll journal description")
+
+
+class PayEmployeeSalaryArgs(BaseModel):
+    employee: str = Field(..., description="Employee name, code, or UUID")
+    amount: Optional[float] = Field(None, description="Optional explicit amount override")
+    transaction_date: Optional[str] = Field(None, description="Payment date (YYYY-MM-DD)")
+    payment_account_id: Optional[str] = Field(None, description="Bank/Cash GL account UUID")
+    accrued_salaries_account_id: Optional[str] = Field(None, description="Accrued salaries GL account UUID")
+    salary_expense_account_id: Optional[str] = Field(None, description="Salary expense GL account UUID")
+    apply_income_tax: Optional[bool] = Field(None, description="Whether to apply Section 149 income tax")
+    withholding_tax: Optional[bool] = Field(None, description="Alias for apply_income_tax")
+    deduct_tax: Optional[bool] = Field(None, description="Alias for apply_income_tax")
+    days_absent: Optional[int] = Field(0, description="Number of absent days")
+    absences: Optional[int] = Field(None, description="Alias for days_absent")
+    description: Optional[str] = Field(None, description="Payment description")
+
+
+# --- Supplier & Payables/Receivables ---
+class SearchSupplierArgs(BaseModel):
+    query: str = Field("", description="Search query (supplier name or code)")
+    limit: int = Field(25, description="Maximum results to return")
+
+
+class GetSupplierArgs(BaseModel):
+    supplier_id: str = Field(..., description="Supplier UUID")
+
+
+class CreateSupplierArgs(BaseModel):
+    name: str = Field(..., description="Supplier name")
+    supplier_name: Optional[str] = Field(None, description="Alias for supplier name")
+    email: Optional[str] = Field(None, description="Email address")
+    phone: Optional[str] = Field(None, description="Phone number")
+    legal_name: Optional[str] = Field(None, description="Legal business name")
+    tax_number: Optional[str] = Field(None, description="Tax / NTN number")
+    strn: Optional[str] = Field(None, description="Sales Tax Registration Number (STRN)")
+    sales_tax_status: Optional[str] = Field(None, description="Sales tax registration status")
+    currency_code: str = Field("PKR", description="Currency code (default PKR)")
+    payment_terms_days: int = Field(30, description="Payment terms in days")
+    credit_limit: Optional[float] = Field(None, description="Credit limit")
+    payable_account_id: Optional[str] = Field(None, description="Payable GL account UUID")
+    notes: Optional[str] = Field(None, description="Additional notes")
+
+
+class GetSupplierLedgerArgs(BaseModel):
+    supplier_id: str = Field(..., description="Supplier UUID")
+
+
+class GetOpenPayablesArgs(BaseModel):
+    supplier_id: Optional[str] = Field(None, description="Optional supplier UUID filter")
+    supplier_name: Optional[str] = Field(None, description="Optional supplier name filter")
+
+
+class GetOpenReceivablesArgs(BaseModel):
+    customer_id: Optional[str] = Field(None, description="Optional customer UUID filter")
+    customer_name: Optional[str] = Field(None, description="Optional customer name filter")
+
+
+# --- Account ---
+class SearchAccountArgs(BaseModel):
+    query: str = Field("", description="Search query (account name or code)")
+
+
+class GetChartOfAccountsArgs(BaseModel):
+    account_type: Optional[str] = Field(None, description="Filter by ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE")
+
+
+class CreateAccountArgs(BaseModel):
+    name: str = Field(..., description="Account name")
+    account_type: str = Field(..., description="Account type: ASSET, LIABILITY, EQUITY, REVENUE, or EXPENSE")
+    code: Optional[str] = Field(None, description="Account code (or AUTO)")
+    normal_balance: Optional[str] = Field(None, description="DEBIT or CREDIT (derived from account_type if omitted)")
+    parent_account_id: Optional[str] = Field(None, description="Optional parent heading account UUID")
+    parent_account_name: Optional[str] = Field(None, description="Optional parent heading name (reused or created)")
+    is_control_account: bool = Field(False, description="Whether this is a control account")
+    description: Optional[str] = Field(None, description="Account description")
+
+
+# --- Invoice & Cash Sale ---
+class CreateInvoiceArgs(BaseModel):
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    customer_name: Optional[str] = Field(None, description="Customer name (resolved or created if customer_id omitted)")
+    invoice_date: Optional[str] = Field(None, description="Invoice date (YYYY-MM-DD)")
+    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD)")
+    currency_code: str = Field("PKR", description="Currency code")
+    items: Optional[List[LineItemArgs]] = Field(None, description="Invoice line items")
+    subtotal: Optional[float] = Field(None, description="Subtotal before tax/discount")
+    tax_total: float = Field(0.0, description="Total tax amount")
+    discount_total: float = Field(0.0, description="Total discount amount")
+    total: Optional[float] = Field(None, description="Grand total")
+    amount: Optional[float] = Field(None, description="Total amount shorthand when items omitted")
+    description: Optional[str] = Field(None, description="Description shorthand when items omitted")
+    item_description: Optional[str] = Field(None, description="Item description shorthand")
+    payment_terms_days: Optional[int] = Field(None, description="Payment terms in days")
+    project_id: Optional[str] = Field(None, description="Optional project UUID")
+    quotation_id: Optional[str] = Field(None, description="Optional source quotation UUID")
+    notes: Optional[str] = Field(None, description="Notes")
+    terms: Optional[str] = Field(None, description="Terms & conditions")
+    tax_pricing_mode: Optional[str] = Field(None, description="Sales tax pricing mode: exclusive, inclusive, or exempt")
+    tax_rate_percent: Optional[float] = Field(None, description="Sales tax rate percentage (e.g. 18.0)")
+    tax_amount: Optional[float] = Field(None, description="Explicit sales tax amount")
+
+
+class GetInvoiceArgs(BaseModel):
+    invoice_id: Optional[str] = Field(None, description="Invoice UUID")
+    invoice_number: Optional[str] = Field(None, description="Human invoice number, e.g. INV-000011")
+
+
+class RecordCashSaleArgs(BaseModel):
+    amount: float = Field(..., description="Total cash sale amount")
+    transaction_date: Optional[str] = Field(None, description="Sale date (YYYY-MM-DD)")
+    description: Optional[str] = Field(None, description="Sale description")
+    items: Optional[List[LineItemArgs]] = Field(
+        None,
+        description="Stock-tracked goods or services sold: items=[{description, quantity, unit_price, product_id}] so COGS and stock ledger post accurately",
+    )
+    item_description: Optional[str] = Field(None, description="Single item description if items omitted")
+    item: Optional[str] = Field(None, description="Alias for item_description")
+    quantity: Optional[float] = Field(None, description="Quantity if single item")
+    product_id: Optional[str] = Field(None, description="Optional catalogue product UUID")
+    customer_id: Optional[str] = Field(None, description="Optional customer UUID")
+    revenue_account_id: Optional[str] = Field(None, description="Optional revenue account UUID to credit directly")
+    tax_pricing_mode: Optional[str] = Field(None, description="Tax pricing mode: exclusive, inclusive, or exempt")
+    tax_rate_percent: Optional[float] = Field(None, description="Sales tax rate percentage")
+    tax_amount: Optional[float] = Field(None, description="Explicit sales tax amount")
+
+
+# --- Purchase & Cash Purchase ---
+class CreatePurchaseBillArgs(BaseModel):
+    supplier_id: str = Field(..., description="Supplier UUID")
+    bill_date: Optional[str] = Field(None, description="Bill date (YYYY-MM-DD)")
+    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD)")
+    currency_code: str = Field("PKR", description="Currency code")
+    subtotal: float = Field(0.0, description="Subtotal before tax/discount")
+    tax_total: float = Field(0.0, description="Total tax amount")
+    discount_total: float = Field(0.0, description="Total discount amount")
+    total: float = Field(0.0, description="Grand total")
+    payment_terms_days: Optional[int] = Field(None, description="Payment terms in days")
+    supplier_invoice_ref: Optional[str] = Field(None, description="Supplier invoice reference")
+    bill_number: Optional[str] = Field(None, description="Bill reference number")
+    notes: Optional[str] = Field(None, description="Notes")
+    items: Optional[List[LineItemArgs]] = Field(None, description="Purchase line items")
+    account_id: Optional[str] = Field(None, description="Optional debit GL account UUID hint")
+    transaction_nature: Optional[str] = Field(None, description="INVENTORY, FIXED_ASSET, or OPERATING_EXPENSE")
+    payment_method: Optional[str] = Field(None, description="Optional immediate payment method (e.g. CASH)")
+
+
+class GetPurchaseBillArgs(BaseModel):
+    bill_id: str = Field(..., description="Purchase bill UUID or bill number (e.g. PUR-000013)")
+
+
+class RecordCashPurchaseArgs(BaseModel):
+    amount: float = Field(..., description="Total cash amount paid")
+    transaction_date: Optional[str] = Field(None, description="Date of the purchase (YYYY-MM-DD)")
+    description: Optional[str] = Field(None, description="What was purchased")
+    transaction_nature: Optional[str] = Field(None, description="Transaction nature: INVENTORY, FIXED_ASSET, or OPERATING_EXPENSE")
+    items: Optional[List[LineItemArgs]] = Field(
+        None,
+        description="Purchased items. For INVENTORY, pass items=[{description, quantity, unit_price}] so catalogue products are linked/created and stock units are received.",
+    )
+    account_id: Optional[str] = Field(None, description="Optional debit GL account UUID hint")
+    payment_method: Optional[str] = Field("CASH", description="Payment method (CASH, BANK_TRANSFER, CHEQUE, CARD)")
+    payment_type: Optional[str] = Field(None, description="Alias for payment_method")
+    payment_channel: Optional[str] = Field(None, description="Alias for payment_method")
+    bank_name: Optional[str] = Field(None, description="Bank name when settled via bank")
+
+
+# --- Expense ---
+class CreateExpenseArgs(BaseModel):
+    description: str = Field(..., description="Expense description")
+    subtotal: float = Field(..., description="Expense amount before tax")
+    expense_date: Optional[str] = Field(None, description="Expense date (YYYY-MM-DD)")
+    payee_name: Optional[str] = Field(None, description="Payee / vendor name")
+    currency_code: str = Field("PKR", description="Currency code")
+    tax_total: float = Field(0.0, description="Tax amount")
+    total: Optional[float] = Field(None, description="Total amount")
+    supplier_id: Optional[str] = Field(None, description="Optional supplier UUID")
+    category_id: Optional[str] = Field(None, description="Optional expense category UUID")
+    payment_mode: str = Field("CASH", description="Payment mode: CASH, BANK_TRANSFER, CREDIT, etc.")
+    account_id: Optional[str] = Field(None, description="Optional expense GL account UUID hint")
+
+
+class ClassifyExpenseArgs(BaseModel):
+    description: str = Field("", description="Expense description to classify")
+    amount: float = Field(0.0, description="Expense amount")
+
+
+class RecordExpensePaymentArgs(BaseModel):
+    supplier_id: Optional[str] = Field(None, description="Supplier/payee UUID")
+    amount: float = Field(..., description="Payment amount")
+    payment_date: Optional[str] = Field(None, description="Payment date (YYYY-MM-DD)")
+    payment_method: str = Field("BANK_TRANSFER", description="Payment method: BANK_TRANSFER or CASH")
+    currency_code: str = Field("PKR", description="Currency code")
+    bank_account_id: Optional[str] = Field(None, description="Bank account UUID")
+    cash_account_id: Optional[str] = Field(None, description="Cash account UUID")
+    bank_name: Optional[str] = Field(None, description="Bank name")
+    reference: Optional[str] = Field(None, description="Payment reference")
+    notes: Optional[str] = Field(None, description="Notes")
+    bill_id: Optional[str] = Field(None, description="Optional bill UUID")
+    transaction_nature: Optional[str] = Field(None, description="Optional transaction nature")
+    wht_rate_percent: Optional[float] = Field(None, description="Withholding tax rate percentage")
+    wht_amount: Optional[float] = Field(None, description="Withholding tax amount")
+    wht_account_id: Optional[str] = Field(None, description="WHT payable GL account UUID")
+
+
+# --- Payment ---
+class RecordCustomerReceiptArgs(BaseModel):
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    customer_name: Optional[str] = Field(None, description="Customer name")
+    amount: float = Field(..., description="Receipt amount")
+    receipt_date: Optional[str] = Field(None, description="Receipt date (YYYY-MM-DD)")
+    payment_method: str = Field("BANK_TRANSFER", description="BANK_TRANSFER or CASH")
+    payment_mode: Optional[str] = Field(None, description="Alias for payment_method")
+    currency_code: str = Field("PKR", description="Currency code")
+    bank_account_id: Optional[str] = Field(None, description="Bank account UUID")
+    cash_account_id: Optional[str] = Field(None, description="Cash account UUID")
+    bank_name: Optional[str] = Field(None, description="Bank name")
+    reference: Optional[str] = Field(None, description="Receipt reference")
+    notes: Optional[str] = Field(None, description="Notes")
+    invoice_id: Optional[str] = Field(None, description="Target invoice UUID")
+    invoice_number: Optional[str] = Field(None, description="Target invoice number")
+    transaction_nature: Optional[str] = Field(None, description="Optional nature (e.g. ADVANCE)")
+    wht_rate_percent: Optional[float] = Field(None, description="Withholding tax rate percentage")
+    wht_rate: Optional[float] = Field(None, description="Alias for wht_rate_percent")
+    withholding_tax_rate: Optional[float] = Field(None, description="Alias for wht_rate_percent")
+
+
+class RecordSupplierPaymentArgs(BaseModel):
+    supplier_id: Optional[str] = Field(None, description="Supplier UUID")
+    supplier_name: Optional[str] = Field(None, description="Supplier name")
+    amount: float = Field(..., description="Payment amount")
+    payment_date: Optional[str] = Field(None, description="Payment date (YYYY-MM-DD)")
+    payment_method: str = Field("BANK_TRANSFER", description="BANK_TRANSFER or CASH")
+    payment_mode: Optional[str] = Field(None, description="Alias for payment_method")
+    currency_code: str = Field("PKR", description="Currency code")
+    bank_account_id: Optional[str] = Field(None, description="Bank account UUID")
+    cash_account_id: Optional[str] = Field(None, description="Cash account UUID")
+    bank_name: Optional[str] = Field(None, description="Bank name")
+    reference: Optional[str] = Field(None, description="Payment reference")
+    notes: Optional[str] = Field(None, description="Notes")
+    bill_id: Optional[str] = Field(None, description="Target purchase bill UUID")
+    bill_number: Optional[str] = Field(None, description="Target purchase bill number")
+    transaction_nature: Optional[str] = Field(None, description="Optional nature (e.g. ADVANCE)")
+    wht_rate_percent: Optional[float] = Field(None, description="Section 153 WHT rate percentage")
+    wht_rate: Optional[float] = Field(None, description="Alias for wht_rate_percent")
+    withholding_tax_rate: Optional[float] = Field(None, description="Alias for wht_rate_percent")
+    wht_amount: Optional[float] = Field(None, description="Explicit WHT amount")
+    wht_account_id: Optional[str] = Field(None, description="WHT payable GL account UUID")
+
+
+# --- Bank ---
+class ListBankAccountsArgs(BaseModel):
+    is_active: Optional[bool] = Field(None, description="Filter by active status")
+
+
+class CreateBankAccountArgs(BaseModel):
+    account_name: str = Field(..., description="Bank account display name")
+    bank_name: str = Field(..., description="Bank institution name")
+    account_number_masked: Optional[str] = Field(None, description="Masked account number (e.g. ****1234)")
+    iban: Optional[str] = Field(None, description="IBAN")
+    branch_code: Optional[str] = Field(None, description="Branch code")
+    currency_code: str = Field("PKR", description="Currency code")
+    is_default: bool = Field(False, description="Whether this is the default bank account")
+
+
+class RecordBankTransferArgs(BaseModel):
+    source_bank_account_id: str = Field(..., description="Source bank account UUID or name")
+    destination_bank_account_id: str = Field(..., description="Destination bank account UUID or name")
+    amount: float = Field(..., description="Transfer amount")
+    transfer_date: Optional[str] = Field(None, description="Transfer date (YYYY-MM-DD)")
+    reference: Optional[str] = Field(None, description="Transfer reference")
+    notes: Optional[str] = Field(None, description="Notes")
+
+
+# --- Journal ---
+class PrepareJournalArgs(BaseModel):
+    transaction_date: str = Field(..., description="Transaction date (YYYY-MM-DD)")
+    description: str = Field(..., description="Journal narration")
+    lines: List[JournalLineArgs] = Field(..., description="Balanced debit/credit journal lines")
+    source_type: Optional[str] = Field(None, description="Source document type")
+    source_id: Optional[str] = Field(None, description="Source document UUID")
+    currency_code: str = Field("PKR", description="Currency code")
+
+
+class ValidateJournalArgs(BaseModel):
+    entry_id: str = Field(..., description="Journal entry UUID")
+
+
+class PostJournalArgs(BaseModel):
+    entry_id: str = Field(..., description="Journal entry UUID")
+
+
+class ReverseJournalArgs(BaseModel):
+    entry_id: str = Field(..., description="Journal entry UUID")
+    reason: Optional[str] = Field(None, description="Reason for reversal")
+
+
+class CreateCompoundJournalArgs(BaseModel):
+    transaction_date: Optional[str] = Field(None, description="Transaction date (YYYY-MM-DD)")
+    description: str = Field("Compound journal entry", description="Journal narration")
+    lines: List[JournalLineArgs] = Field(..., description="Balanced debit/credit lines")
+    entry_type: str = Field("MANUAL", description="Entry type")
+    currency_code: str = Field("PKR", description="Currency code")
+    user_id: Optional[str] = Field(None, description="Optional user UUID")
+
+
+# --- Loans ---
+class RecordLoanArgs(BaseModel):
+    direction: str = Field(..., description="BORROWED or GIVEN")
+    narration: str = Field(..., description="Unique descriptive narration identifying the loan facility")
+    counterparty: str = Field(..., description="Lender or borrower name")
+    principal: float = Field(..., description="Principal loan amount")
+    loan_date: Optional[str] = Field(None, description="Loan start date (YYYY-MM-DD)")
+    first_payment_date: Optional[str] = Field(None, description="First installment due date (YYYY-MM-DD)")
+    tenure_months: int = Field(..., description="Total tenure in months")
+    frequency: str = Field("MONTHLY", description="MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUALLY, or CUSTOM")
+    interest_rate: float = Field(0.0, description="Annual interest rate percentage")
+    interest_method: str = Field("REDUCING", description="REDUCING or FLAT")
+    custom_interval_months: Optional[int] = Field(None, description="Interval months when frequency=CUSTOM")
+    grace_months: int = Field(0, description="Grace period in months")
+    balloon_amount: float = Field(0.0, description="Balloon payment at maturity")
+    fees_charges: float = Field(0.0, description="Upfront fees/charges")
+    purpose: Optional[str] = Field(None, description="Loan purpose")
+    currency_code: str = Field("PKR", description="Currency code")
+    cash_account_id: Optional[str] = Field(None, description="Optional cash/bank GL account UUID")
+    party_id: Optional[str] = Field(None, description="Optional party UUID")
+
+
+class RecordLoanRepaymentArgs(BaseModel):
+    loan_id: str = Field(..., description="Loan UUID")
+    installment_no: int = Field(..., description="Installment number to settle")
+    amount_paid: Optional[float] = Field(None, description="Amount paid override")
+    paid_date: Optional[str] = Field(None, description="Payment date (YYYY-MM-DD)")
+
+
+class ListLoansArgs(BaseModel):
+    direction: Optional[str] = Field(None, description="Filter by BORROWED or GIVEN")
+    status: Optional[str] = Field(None, description="Filter by loan status")
+
+
+class GetLoanScheduleArgs(BaseModel):
+    loan_id: str = Field(..., description="Loan UUID")
+
+
+class CheckDueLoanInstallmentsArgs(BaseModel):
+    as_of: Optional[str] = Field(None, description="Check due installments as of date (YYYY-MM-DD)")
+
+
+class RecordLoanRestructureArgs(BaseModel):
+    loan_id: str = Field(..., description="Loan UUID")
+    first_payment_date: str = Field(..., description="New first payment date (YYYY-MM-DD)")
+    tenure_months: int = Field(..., description="New tenure in months")
+    frequency: str = Field("MONTHLY", description="Repayment frequency")
+    interest_rate: float = Field(0.0, description="New annual interest rate percentage")
+    interest_method: str = Field("REDUCING", description="REDUCING or FLAT")
+    custom_interval_months: Optional[int] = Field(None, description="Custom interval months")
+    grace_months: int = Field(0, description="Grace months")
+    balloon_amount: float = Field(0.0, description="Balloon amount")
+    reason: Optional[str] = Field(None, description="Reason for restructuring")
+
+
+class WriteOffLoanArgs(BaseModel):
+    loan_id: str = Field(..., description="Loan UUID")
+    write_off_date: Optional[str] = Field(None, description="Write-off date (YYYY-MM-DD)")
+    reason: Optional[str] = Field(None, description="Reason for write-off")
+
+
+# --- Reporting ---
+class GetGeneralLedgerArgs(BaseModel):
+    from_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    to_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+    account_id: Optional[str] = Field(None, description="Optional account UUID filter")
+    limit: int = Field(500, description="Maximum rows")
+
+
+class GetTrialBalanceArgs(BaseModel):
+    pass
+
+
+class GetProfitLossArgs(BaseModel):
+    pass
+
+
+class GetBalanceSheetArgs(BaseModel):
+    pass
+
+
+class GetCashFlowArgs(BaseModel):
+    pass
+
+
+class ListExpensesArgs(BaseModel):
+    from_date: Optional[str] = Field(None, description="Filter from date (YYYY-MM-DD)")
+    to_date: Optional[str] = Field(None, description="Filter to date (YYYY-MM-DD)")
+
+
+class GenerateReportArgs(BaseModel):
+    report_type: str = Field(..., description="Report type")
+    from_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    to_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+    account_id: Optional[str] = Field(None, description="Account UUID")
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    supplier_id: Optional[str] = Field(None, description="Supplier UUID")
+    project_id: Optional[str] = Field(None, description="Project UUID")
+    limit: int = Field(500, description="Maximum rows")
+
+
+# --- Project ---
+class CreateProjectArgs(BaseModel):
+    name: str = Field(..., description="Project name")
+    project_code: Optional[str] = Field(None, description="Project code")
+    description: Optional[str] = Field(None, description="Project description")
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    start_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    end_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+    budget: Optional[float] = Field(None, description="Project budget")
+    currency_code: str = Field("PKR", description="Currency code")
+    billing_type: Optional[str] = Field(None, description="Billing type")
+    status: str = Field("PLANNING", description="Project status")
+
+
+class GetProjectArgs(BaseModel):
+    project_id: str = Field(..., description="Project UUID")
+
+
+class GetProjectProfitabilityArgs(BaseModel):
+    project_id: str = Field(..., description="Project UUID")
+
+
+# --- Purchase Orders, Quotations, Credit Notes, Purchase Returns ---
+class CreatePurchaseOrderArgs(BaseModel):
+    supplier_id: Optional[str] = Field(None, description="Supplier UUID")
+    supplier_name: Optional[str] = Field(None, description="Supplier name")
+    party_name: Optional[str] = Field(None, description="Alias for supplier_name")
+    counterparty: Optional[str] = Field(None, description="Alias for supplier_name")
+    items: Optional[List[LineItemArgs]] = Field(None, description="Order line items [{description, quantity, unit_price}]")
+    product_name: Optional[str] = Field(None, description="Single item product name")
+    item_name: Optional[str] = Field(None, description="Alias for product_name")
+    description: Optional[str] = Field(None, description="Single item description")
+    quantity: Optional[float] = Field(None, description="Single item quantity")
+    unit_price: Optional[float] = Field(None, description="Single item unit price")
+    price: Optional[float] = Field(None, description="Alias for unit_price")
+    amount: Optional[float] = Field(None, description="Total amount if single item")
+    status: str = Field("RFQ", description="Status: RFQ or ORDERED")
+    order_date: Optional[str] = Field(None, description="Order date (YYYY-MM-DD)")
+    date: Optional[str] = Field(None, description="Alias for order_date")
+    expected_delivery_date: Optional[str] = Field(None, description="Expected delivery date (YYYY-MM-DD)")
+    transaction_nature: Optional[str] = Field(None, description="Optional transaction nature (e.g. INVENTORY)")
+    notes: Optional[str] = Field(None, description="Notes")
+    terms: Optional[str] = Field(None, description="Terms & conditions")
+
+
+class GetPurchaseOrderArgs(BaseModel):
+    order_id: Optional[str] = Field(None, description="Purchase order UUID")
+    po_number: Optional[str] = Field(None, description="PO number")
+    query: Optional[str] = Field(None, description="Search query")
+
+
+class CreateQuotationArgs(BaseModel):
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    customer_name: Optional[str] = Field(None, description="Customer name")
+    items: List[LineItemArgs] = Field(..., description="Quotation line items")
+    quotation_date: Optional[str] = Field(None, description="Quotation date (YYYY-MM-DD)")
+    valid_until: Optional[str] = Field(None, description="Valid until date (YYYY-MM-DD)")
+    currency_code: Optional[str] = Field("PKR", description="Currency code")
+    project_id: Optional[str] = Field(None, description="Optional project UUID")
+    notes: Optional[str] = Field(None, description="Notes")
+    terms: Optional[str] = Field(None, description="Terms & conditions")
+
+
+class ConvertQuotationArgs(BaseModel):
+    quotation_id: str = Field(..., description="Quotation UUID")
+    invoice_date: Optional[str] = Field(None, description="Invoice date (YYYY-MM-DD)")
+    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD)")
+    payment_terms_days: Optional[int] = Field(None, description="Payment terms in days")
+    notes: Optional[str] = Field(None, description="Notes")
+    terms: Optional[str] = Field(None, description="Terms & conditions")
+
+
+class CreateCreditNoteArgs(BaseModel):
+    customer_id: Optional[str] = Field(None, description="Customer UUID")
+    customer_name: Optional[str] = Field(None, description="Customer name")
+    invoice_id: Optional[str] = Field(None, description="Source invoice UUID")
+    invoice_number: Optional[str] = Field(None, description="Source invoice number (e.g. INV-000011)")
+    items: Optional[List[LineItemArgs]] = Field(None, description="Credit note line items")
+    reason: str = Field(..., description="Reason for credit note")
+    credit_note_date: Optional[str] = Field(None, description="Credit note date (YYYY-MM-DD)")
+    currency_code: Optional[str] = Field("PKR", description="Currency code")
+    amount: Optional[float] = Field(None, description="Return amount when items omitted")
+    quantity: Optional[float] = Field(None, description="Return quantity when items omitted")
+    description: Optional[str] = Field(None, description="Return item description")
+    item_description: Optional[str] = Field(None, description="Alias for description")
+
+
+class CreatePurchaseReturnArgs(BaseModel):
+    supplier_id: Optional[str] = Field(None, description="Supplier UUID")
+    supplier_name: Optional[str] = Field(None, description="Supplier name")
+    bill_id: Optional[str] = Field(None, description="Source purchase bill UUID")
+    bill_number: Optional[str] = Field(None, description="Source purchase bill number (e.g. PUR-000013)")
+    items: Optional[List[LineItemArgs]] = Field(None, description="Purchase return line items")
+    reason: str = Field(..., description="Reason for purchase return")
+    return_date: Optional[str] = Field(None, description="Purchase return date (YYYY-MM-DD)")
+    currency_code: Optional[str] = Field("PKR", description="Currency code")
+    amount: Optional[float] = Field(None, description="Return amount when items omitted")
+    quantity: Optional[float] = Field(None, description="Return quantity when items omitted")
+    description: Optional[str] = Field(None, description="Return item description")
+    item_description: Optional[str] = Field(None, description="Alias for description")
+
+
+# --- Product & Service Catalogue ---
+class SearchProductArgs(BaseModel):
+    query: str = Field("", description="Product name or SKU query")
+    limit: int = Field(25, description="Maximum results")
+
+
+class GetInventoryStatusArgs(BaseModel):
+    product_name: Optional[str] = Field(None, description="Optional product name filter")
+    name: Optional[str] = Field(None, description="Alias for product_name")
+    query: Optional[str] = Field(None, description="Search query")
+    only_low_stock: bool = Field(False, description="Only show low/out-of-stock products")
+    out_of_stock: bool = Field(False, description="Alias for only_low_stock")
+
+
+class CreateProductArgs(BaseModel):
+    name: str = Field(..., description="Product name")
+    product_name: Optional[str] = Field(None, description="Alias for name")
+    product_code: Optional[str] = Field(None, description="Optional SKU / product code")
+    description: Optional[str] = Field(None, description="Product description")
+    unit: Optional[str] = Field(None, description="Unit of measure (e.g. pcs, kg)")
+    is_stock_tracked: bool = Field(False, description="True only when user confirms resale stock tracking")
+    is_inventory: bool = Field(False, description="Alias for is_stock_tracked")
+    unit_price: float = Field(0.0, description="Selling price per unit")
+    sales_price: Optional[float] = Field(None, description="Alias for unit_price")
+    cost_price: Optional[float] = Field(None, description="Purchase/cost price per unit")
+    revenue_account_id: Optional[str] = Field(None, description="Revenue GL account UUID")
+    tax_rate_id: Optional[str] = Field(None, description="Tax rate UUID")
+    category_id: Optional[str] = Field(None, description="Category UUID")
+
+
+class UpdateProductArgs(BaseModel):
+    product_id: Optional[str] = Field(None, description="Product UUID")
+    name: Optional[str] = Field(None, description="Product name (lookup key or new name)")
+    description: Optional[str] = Field(None, description="Updated description")
+    unit: Optional[str] = Field(None, description="Updated unit")
+    unit_price: Optional[float] = Field(None, description="Updated selling price")
+    cost_price: Optional[float] = Field(None, description="Updated cost price")
+    is_stock_tracked: Optional[bool] = Field(None, description="Updated stock-tracking flag")
+    is_active: Optional[bool] = Field(None, description="Active flag")
+
+
+class DeleteProductArgs(BaseModel):
+    product_id: Optional[str] = Field(None, description="Product UUID")
+    name: Optional[str] = Field(None, description="Product name")
+
+
+class SearchServiceArgs(BaseModel):
+    query: str = Field("", description="Service name or code query")
+    limit: int = Field(25, description="Maximum results")
+
+
+class CreateServiceArgs(BaseModel):
+    name: str = Field(..., description="Service name")
+    service_name: Optional[str] = Field(None, description="Alias for name")
+    service_code: Optional[str] = Field(None, description="Optional service code")
+    description: Optional[str] = Field(None, description="Service description")
+    billing_unit: str = Field("HOUR", description="Billing unit: HOUR, DAY, MONTH, FIXED, or ITEM")
+    standard_rate: float = Field(0.0, description="Standard billing rate")
+    sales_price: Optional[float] = Field(None, description="Alias for standard_rate")
+    cost_rate: Optional[float] = Field(None, description="Cost rate")
+    category_id: Optional[str] = Field(None, description="Category UUID")
+    revenue_account_id: Optional[str] = Field(None, description="Revenue GL account UUID")
+    tax_rate_id: Optional[str] = Field(None, description="Tax rate UUID")
+
+
+class UpdateServiceArgs(BaseModel):
+    service_id: Optional[str] = Field(None, description="Service UUID")
+    name: Optional[str] = Field(None, description="Service name")
+    description: Optional[str] = Field(None, description="Updated description")
+    billing_unit: Optional[str] = Field(None, description="Updated billing unit")
+    standard_rate: Optional[float] = Field(None, description="Updated standard rate")
+    cost_rate: Optional[float] = Field(None, description="Updated cost rate")
+    is_active: Optional[bool] = Field(None, description="Active flag")
+
+
+class DeleteServiceArgs(BaseModel):
+    service_id: Optional[str] = Field(None, description="Service UUID")
+    name: Optional[str] = Field(None, description="Service name")
+
+
+# --- Fixed Assets ---
+class SearchFixedAssetArgs(BaseModel):
+    query: str = Field("", description="Search query (asset name or code)")
+    limit: int = Field(25, description="Maximum results")
+
+
+class GetFixedAssetArgs(BaseModel):
+    asset_id: str = Field(..., description="Fixed asset UUID")
+
+
+class RegisterFixedAssetArgs(BaseModel):
+    name: str = Field(..., description="Asset name")
+    purchase_cost: float = Field(..., description="Acquisition cost")
+    transaction_date: Optional[str] = Field(None, description="Acquisition date (YYYY-MM-DD)")
+    payment_method: str = Field("CASH", description="CASH, BANK_TRANSFER, or CREDIT")
+    supplier_id: Optional[str] = Field(None, description="Supplier UUID if credit/supplier purchase")
+    supplier_name: Optional[str] = Field(None, description="Supplier name")
+    asset_account_id: Optional[str] = Field(None, description="Existing Fixed Asset GL account UUID")
+    asset_account_name: Optional[str] = Field(None, description="Name for new Fixed Asset GL account if none exists")
+    payment_account_id: Optional[str] = Field(None, description="Cash/Bank GL account UUID")
+    useful_life_years: Optional[int] = Field(None, description="Useful life in years")
+    depreciation_method: str = Field("STRAIGHT_LINE", description="STRAIGHT_LINE or REDUCING_BALANCE")
+    salvage_value: float = Field(0.0, description="Residual / salvage value")
+    description: Optional[str] = Field(None, description="Asset description")
+    category_id: Optional[str] = Field(None, description="Asset category UUID")
+    depreciation_expense_account_id: Optional[str] = Field(None, description="Depreciation expense GL account UUID")
+    accumulated_depreciation_account_id: Optional[str] = Field(None, description="Accumulated depreciation GL account UUID")
+
+
+class DisposeFixedAssetArgs(BaseModel):
+    asset_id: Optional[str] = Field(None, description="Fixed asset UUID")
+    asset_name: Optional[str] = Field(None, description="Fixed asset name")
+    disposal_amount: float = Field(0.0, description="Disposal proceeds amount")
+    transaction_date: Optional[str] = Field(None, description="Disposal date (YYYY-MM-DD)")
+    disposal_type: str = Field("DISPOSAL", description="DISPOSAL, SALE, or WRITE_OFF")
+    proceeds_account_id: Optional[str] = Field(None, description="Cash/Bank proceeds GL account UUID")
+    gain_loss_account_id: Optional[str] = Field(None, description="Gain/loss on disposal GL account UUID")
+
+
+class RecordAssetDepreciationArgs(BaseModel):
+    asset_id: Optional[str] = Field(None, description="Fixed asset UUID")
+    asset_name: Optional[str] = Field(None, description="Fixed asset name")
+    depreciation_amount: Optional[float] = Field(None, description="Depreciation amount")
+    transaction_date: Optional[str] = Field(None, description="Depreciation date (YYYY-MM-DD)")
+    depreciation_expense_account_id: Optional[str] = Field(None, description="Depreciation expense GL account UUID")
+    accumulated_depreciation_account_id: Optional[str] = Field(None, description="Accumulated depreciation GL account UUID")
+
+
+# --- Financial Health ---
+class CalculateHealthArgs(BaseModel):
+    pass
+
+
+class GetHealthArgs(BaseModel):
+    pass
+
+
+# --- Recurring ---
+class CreateRecurringTemplateArgs(BaseModel):
+    name: str = Field(..., description="Template name")
+    frequency: str = Field(..., description="Recurrence frequency (MONTHLY, WEEKLY, QUARTERLY, ANNUALLY)")
+    next_due_date: str = Field(..., description="Next due date (YYYY-MM-DD)")
+    journal_template: Dict[str, Any] = Field(..., description="Balanced journal template payload")
+    description: Optional[str] = Field(None, description="Template description")
+    auto_post: bool = Field(False, description="Whether generated journals auto-post")
+    reminder_days: int = Field(3, description="Reminder lead days")
+    source_type: str = Field("recurring", description="Source type")
+
+
+class GetRecurringTemplatesArgs(BaseModel):
+    status: Optional[str] = Field(None, description="Filter by template status")
+    limit: int = Field(100, description="Maximum templates")
+
+
+class GetRecurringTemplateArgs(BaseModel):
+    template_id: str = Field(..., description="Recurring template UUID")
+
+
+class UpdateRecurringTemplateArgs(BaseModel):
+    template_id: str = Field(..., description="Recurring template UUID")
+    status: str = Field(..., description="Target status: ACTIVE, PAUSED, COMPLETED, or CANCELLED")
+
+
+class GenerateRecurringArgs(BaseModel):
+    as_of: Optional[str] = Field(None, description="Generate due recurring journals as of date (YYYY-MM-DD)")
+
+
+class GetRecurringExecutionsArgs(BaseModel):
+    template_id: Optional[str] = Field(None, description="Optional recurring template UUID filter")
+    limit: int = Field(100, description="Maximum executions")
+
+
+# --- Document Status, Tax, Leave Policy, Discovery ---
+class UpdateDocumentStatusArgs(BaseModel):
+    document_type: str = Field(..., description="Document type: purchase_bill, purchase_order, invoice, quotation, or product")
+    target_status: str = Field(..., description="Target status")
+    reference_numbers: Optional[List[str]] = Field(None, description="List of document reference numbers for bulk update")
+    document_reference: Optional[str] = Field(None, description="Single document reference number or UUID")
+    reason: Optional[str] = Field(None, description="Optional reason for status change")
+
+
+class GetOrganizationTaxProfileArgs(BaseModel):
+    pass
+
+
+class SetOrganizationTaxProfileArgs(BaseModel):
+    is_sales_tax_registered: Optional[bool] = Field(None, description="Whether organization is registered for sales tax")
+    tax_authority: Optional[str] = Field(None, description="Tax authority: FBR, PRA, SRB, KPRA, or BRA")
+    default_tax_pricing: Optional[str] = Field(None, description="Default tax pricing mode: exclusive, inclusive, or exempt")
+    sales_tax_rate: Optional[float] = Field(None, description="Sales tax rate percentage (e.g. 18.0)")
+
+
+class GetOrganizationLeavePolicyArgs(BaseModel):
+    pass
+
+
+class SetOrganizationLeavePolicyArgs(BaseModel):
+    monthly_allowed_leaves: Optional[int] = Field(None, description="Monthly allowed paid leaves")
+    annual_allowed_leaves: Optional[int] = Field(None, description="Annual allowed paid leaves")
+    standard_working_days: Optional[int] = Field(None, description="Standard working days per month (e.g. 30)")
+
+
+class DiscoverErpCapabilitiesArgs(BaseModel):
+    query: Optional[str] = Field(None, description="Search keyword for tools, modules, or endpoints")
+    section: Optional[str] = Field(None, description="ERP module/section filter")
+    task: Optional[str] = Field(None, description="Specific task filter")
+    include_http_routes: bool = Field(True, description="Include matching FastAPI HTTP routes")
 
 
 # ===================================================================
@@ -4756,13 +5596,13 @@ async def _pay_employee_salary(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 # Customer
 
-register("search_customer", handler=_search_customer, read_only=True, description="Search customers by name or code")
+register("search_customer", handler=_search_customer, read_only=True, args_model=SearchCustomerArgs, description="Search customers by name or code")
 
-register("get_customer", handler=_get_customer, read_only=True, description="Get customer details")
+register("get_customer", handler=_get_customer, read_only=True, args_model=GetCustomerArgs, description="Get customer details")
 
-register("create_customer", handler=_create_customer, read_only=False, contract=contract_from_callable(customer_service.create), description="Create a new customer")
+register("create_customer", handler=_create_customer, read_only=False, contract=contract_from_callable(customer_service.create), args_model=CreateCustomerArgs, description="Create a new customer")
 
-register("get_customer_ledger", handler=_get_customer_ledger, read_only=True, description="Get customer ledger")
+register("get_customer_ledger", handler=_get_customer_ledger, read_only=True, args_model=GetCustomerLedgerArgs, description="Get customer ledger")
 
 
 
@@ -4772,13 +5612,13 @@ register("get_customer_ledger", handler=_get_customer_ledger, read_only=True, de
 
 # service validates each component and writes one row per part.
 
-register("search_employee", handler=_search_employee, read_only=True, description="Search employees by name, code, department or designation")
+register("search_employee", handler=_search_employee, read_only=True, args_model=SearchEmployeeArgs, description="Search employees by name, code, department or designation")
 
-register("get_employee", handler=_get_employee, read_only=True, description="Get one employee's full details plus allowance records")
+register("get_employee", handler=_get_employee, read_only=True, args_model=GetEmployeeArgs, description="Get one employee's full details plus allowance records")
 
-register("create_employee", handler=_create_employee, read_only=False, contract=contract_from_callable(employee_service.create), description="Create an employee: mandatory full_name, date_of_joining, basic_salary; every other detail is optional")
+register("create_employee", handler=_create_employee, read_only=False, contract=contract_from_callable(employee_service.create), args_model=CreateEmployeeArgs, description="Create an employee: mandatory full_name, date_of_joining, basic_salary; every other detail is optional")
 
-register("set_employee_allowances", handler=_set_employee_allowances, read_only=False, contract=contract_from_callable(employee_service.set_allowances), description="Record an employee's allowances: structure the user's natural-language sentence into allowances=[{description, amount, frequency(monthly|one-time|annual), allowance_type, effective_from}] and pass raw_text; Python validates each entry and writes the rows (rejections name what to ask the user)")
+register("set_employee_allowances", handler=_set_employee_allowances, read_only=False, contract=contract_from_callable(employee_service.set_allowances), args_model=SetEmployeeAllowancesArgs, description="Record an employee's allowances: structure the user's natural-language sentence into allowances=[{description, amount, frequency(monthly|one-time|annual), allowance_type, effective_from}] and pass raw_text; Python validates each entry and writes the rows (rejections name what to ask the user)")
 
 
 
@@ -4786,41 +5626,41 @@ register("set_employee_allowances", handler=_set_employee_allowances, read_only=
 
 # service computes every amount from the employee records and posts the journal.
 
-register("run_payroll", handler=_run_payroll, read_only=False, contract=contract_from_callable(payroll_service.run_payroll, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "employee_absences", "absences")), description="Run payroll for every active employee: computes gross salary, actual days worked based on organization leave policy (absences <= allowed leaves receive full salary; excess days deducted at 1/30th), Section 149 salary tax deductions (auto-applied), and posts ONE journal — Dr Gross Salaries / Cr WHT Payable u/s 149 / Cr Accrued Salaries (or Cr Bank when payment_method=PAID). Pass payment_method=PAID when paid immediately, ACCRUED when owed (default)")
+register("run_payroll", handler=_run_payroll, read_only=False, contract=contract_from_callable(payroll_service.run_payroll, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "employee_absences", "absences")), args_model=RunPayrollArgs, description="Run payroll for every active employee: computes gross salary, actual days worked based on organization leave policy (absences <= allowed leaves receive full salary; excess days deducted at 1/30th), Section 149 salary tax deductions (auto-applied), and posts ONE journal — Dr Gross Salaries / Cr WHT Payable u/s 149 / Cr Accrued Salaries (or Cr Bank when payment_method=PAID). Pass payment_method=PAID when paid immediately, ACCRUED when owed (default)")
 
-register("pay_employee_salary", handler=_pay_employee_salary, read_only=False, contract=contract_from_callable(payroll_service.pay_employee_salary, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "absences")), description="Pay ONE employee's salary (settles the accrual): resolves employee by code/name, calculates salary based on organization leave policy and days_absent, debits Accrued Salaries (or Salaries expense) and credits bank/cash. Automatically applies Section 149 salary income tax into WHT Payable u/s 149")
+register("pay_employee_salary", handler=_pay_employee_salary, read_only=False, contract=contract_from_callable(payroll_service.pay_employee_salary, extra_arguments=("withholding_tax", "deduct_tax", "days_absent", "absences")), args_model=PayEmployeeSalaryArgs, description="Pay ONE employee's salary (settles the accrual): resolves employee by code/name, calculates salary based on organization leave policy and days_absent, debits Accrued Salaries (or Salaries expense) and credits bank/cash. Automatically applies Section 149 salary income tax into WHT Payable u/s 149")
 
 
 
 # Supplier
 
-register("search_supplier", handler=_search_supplier, read_only=True, description="Search suppliers by name or code")
+register("search_supplier", handler=_search_supplier, read_only=True, args_model=SearchSupplierArgs, description="Search suppliers by name or code")
 
-register("get_supplier", handler=_get_supplier, read_only=True, description="Get supplier details")
+register("get_supplier", handler=_get_supplier, read_only=True, args_model=GetSupplierArgs, description="Get supplier details")
 
-register("create_supplier", handler=_create_supplier, read_only=False, contract=contract_from_callable(supplier_service.create), description="Create a new supplier")
+register("create_supplier", handler=_create_supplier, read_only=False, contract=contract_from_callable(supplier_service.create), args_model=CreateSupplierArgs, description="Create a new supplier")
 
-register("get_supplier_ledger", handler=_get_supplier_ledger, read_only=True, description="Get supplier ledger")
-register("get_open_payables", handler=_get_open_payables, read_only=True, description="Fetch open and unpaid purchase bills with outstanding balances and upcoming due dates across all suppliers (or for one supplier)")
-register("get_open_receivables", handler=_get_open_receivables, read_only=True, description="Fetch open and unpaid sales invoices with outstanding balances and upcoming due dates across all customers (or for one customer)")
+register("get_supplier_ledger", handler=_get_supplier_ledger, read_only=True, args_model=GetSupplierLedgerArgs, description="Get supplier ledger")
+register("get_open_payables", handler=_get_open_payables, read_only=True, args_model=GetOpenPayablesArgs, description="Fetch open and unpaid purchase bills with outstanding balances and upcoming due dates across all suppliers (or for one supplier)")
+register("get_open_receivables", handler=_get_open_receivables, read_only=True, args_model=GetOpenReceivablesArgs, description="Fetch open and unpaid sales invoices with outstanding balances and upcoming due dates across all customers (or for one customer)")
 
 
 
 # Account
 
-register("search_account", handler=_search_account, read_only=True, description="Search chart of accounts")
+register("search_account", handler=_search_account, read_only=True, args_model=SearchAccountArgs, description="Search chart of accounts")
 
-register("get_chart_of_accounts", handler=_get_chart_of_accounts, read_only=True, description="Get full chart of accounts")
+register("get_chart_of_accounts", handler=_get_chart_of_accounts, read_only=True, args_model=GetChartOfAccountsArgs, description="Get full chart of accounts")
 
-register("create_account", handler=_create_account, read_only=False, description="Create a new account. Optionally pass parent_account_name to file it under a section heading (e.g. 'Operating Expenses', 'Current Assets'); an existing heading of the same account type is reused, and a missing one is created automatically as a grouping account — the account never fails on a sparse chart")
+register("create_account", handler=_create_account, read_only=False, args_model=CreateAccountArgs, description="Create a new account. Optionally pass parent_account_name to file it under a section heading (e.g. 'Operating Expenses', 'Current Assets'); an existing heading of the same account type is reused, and a missing one is created automatically as a grouping account — the account never fails on a sparse chart")
 
 
 
 # Invoice
 
-register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice, extra_arguments=("tax_pricing_mode", "tax_rate_percent", "tax_amount", "customer_name", "amount", "description")), description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] or total/amount. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent (e.g. 18.0 for FBR, 16.0 for PRA, 15.0 for SRB/KPRA), and tax_amount")
+register("create_invoice", handler=_create_invoice, read_only=False, contract=contract_from_callable(invoice_service.create_invoice, extra_arguments=("tax_pricing_mode", "tax_rate_percent", "tax_amount", "customer_name", "amount", "description")), args_model=CreateInvoiceArgs, description="Create a sales invoice with line items: pass items=[{description, quantity, unit_price, ...}] or total/amount. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent (e.g. 18.0 for FBR, 16.0 for PRA, 15.0 for SRB/KPRA), and tax_amount")
 
-register("get_invoice", handler=_get_invoice, read_only=True, description="Get invoice details — pass invoice_id (uuid) OR invoice_number (the human number, e.g. INV-000011; exact match against this organization's books)")
+register("get_invoice", handler=_get_invoice, read_only=True, args_model=GetInvoiceArgs, description="Get invoice details — pass invoice_id (uuid) OR invoice_number (the human number, e.g. INV-000011; exact match against this organization's books)")
 
 
 
@@ -4832,52 +5672,55 @@ register("create_purchase_bill", handler=_create_purchase_bill, read_only=False,
 
                                          extra_arguments=("account_id", "transaction_nature", "payment_method")),
 
+         args_model=CreatePurchaseBillArgs,
+
          description="Create a purchase bill (supplier invoice). For INVENTORY purchases (resale stock) pass transaction_nature='INVENTORY' so the debit lands on the Inventory asset account, the product is created/linked in the catalogue, and the stock ledger records the receipt; pass payment_method='CASH' when the goods were paid for immediately (Cash/Bank is credited and the bill is marked paid)")
 
-register("get_purchase_bill", handler=_get_purchase_bill, read_only=True, description="Get purchase bill details")
+register("get_purchase_bill", handler=_get_purchase_bill, read_only=True, args_model=GetPurchaseBillArgs, description="Get purchase bill details")
 
 
 
 # Expense
 
-register("create_expense", handler=_create_expense, read_only=False, contract=contract_from_callable(expense_service.create_expense, extra_arguments=("account_id",)), description="Record an expense")
+register("create_expense", handler=_create_expense, read_only=False, contract=contract_from_callable(expense_service.create_expense, extra_arguments=("account_id",)), args_model=CreateExpenseArgs, description="Record an expense")
 
-register("classify_expense", handler=_classify_expense, read_only=True, description="Classify expense category")
+register("classify_expense", handler=_classify_expense, read_only=True, args_model=ClassifyExpenseArgs, description="Classify expense category")
 
 
 
 # Payment
 
-register("record_customer_receipt", handler=_record_customer_receipt, read_only=False, contract=contract_from_callable(payment_service.record_customer_receipt, extra_arguments=("customer_name", "payment_mode", "wht_rate", "withholding_tax_rate")), description="Record customer receipt with journal and allocation")
+register("record_customer_receipt", handler=_record_customer_receipt, read_only=False, contract=contract_from_callable(payment_service.record_customer_receipt, extra_arguments=("customer_name", "payment_mode", "wht_rate", "withholding_tax_rate")), args_model=RecordCustomerReceiptArgs, description="Record customer receipt with journal and allocation")
 
-register("record_supplier_payment", handler=_record_supplier_payment, read_only=False, contract=contract_from_callable(payment_service.record_supplier_payment, extra_arguments=("supplier_name", "payment_mode", "wht_rate", "withholding_tax_rate")), description="Record supplier payment with journal and allocation. Supports Section 153 Withholding Tax (WHT) deduction: pass wht_rate_percent (or wht_rate/withholding_tax_rate) and optionally wht_amount. Debits AP, credits Bank net, and credits WHT Payable u/s 153")
+register("record_supplier_payment", handler=_record_supplier_payment, read_only=False, contract=contract_from_callable(payment_service.record_supplier_payment, extra_arguments=("supplier_name", "payment_mode", "wht_rate", "withholding_tax_rate")), args_model=RecordSupplierPaymentArgs, description="Record supplier payment with journal and allocation. Supports Section 153 Withholding Tax (WHT) deduction: pass wht_rate_percent (or wht_rate/withholding_tax_rate) and optionally wht_amount. Debits AP, credits Bank net, and credits WHT Payable u/s 153")
 
 
 
 # Bank
 
-register("list_bank_accounts", handler=_list_bank_accounts, read_only=True, description="List bank accounts")
+register("list_bank_accounts", handler=_list_bank_accounts, read_only=True, args_model=ListBankAccountsArgs, description="List bank accounts")
 
-register("create_bank_account", handler=_create_bank_account, read_only=False, description="Create a new bank account with linked GL account")
+register("create_bank_account", handler=_create_bank_account, read_only=False, args_model=CreateBankAccountArgs, description="Create a new bank account with linked GL account")
 
-register("record_bank_transfer", handler=_record_bank_transfer, read_only=False, description="Record bank-to-bank transfer with journal")
+register("record_bank_transfer", handler=_record_bank_transfer, read_only=False, args_model=RecordBankTransferArgs, description="Record bank-to-bank transfer with journal")
 
 
 
 # Journal
 
-register("prepare_journal", handler=_prepare_journal, read_only=False, contract=contract_from_callable(accounting_service.prepare_journal), description="Prepare a draft journal entry")
+register("prepare_journal", handler=_prepare_journal, read_only=False, contract=contract_from_callable(accounting_service.prepare_journal), args_model=PrepareJournalArgs, description="Prepare a draft journal entry")
 
-register("validate_journal", handler=_validate_journal, read_only=False, contract=contract_from_callable(accounting_service.validate_journal), description="Validate a journal entry")
+register("validate_journal", handler=_validate_journal, read_only=False, contract=contract_from_callable(accounting_service.validate_journal), args_model=ValidateJournalArgs, description="Validate a journal entry")
 
-register("post_journal", handler=_post_journal, read_only=False, contract=contract_from_callable(accounting_service.post_journal), description="Post a validated journal entry")
+register("post_journal", handler=_post_journal, read_only=False, contract=contract_from_callable(accounting_service.post_journal), args_model=PostJournalArgs, description="Post a validated journal entry")
 
-register("reverse_journal", handler=_reverse_journal, read_only=False, description="Reverse a posted journal entry")
+register("reverse_journal", handler=_reverse_journal, read_only=False, args_model=ReverseJournalArgs, description="Reverse a posted journal entry")
 register(
     "create_compound_journal",
     handler=_create_compound_journal,
     read_only=False,
     contract=contract_from_callable(record_compound_journal),
+    args_model=CreateCompoundJournalArgs,
     description="Create and post a compound multi-line journal entry directly. Lines must be balanced (total debits == total credits > 0). Each line must provide account_id, account_code, or account_name, and either debit or credit.",
 )
 
@@ -4906,7 +5749,7 @@ register(
 # inventory COGS trigger hangs off it (see _record_cash_sale).
 
 register("record_cash_sale", handler=_record_cash_sale, read_only=False,
-
+         args_model=RecordCashSaleArgs,
          description="Record an immediate cash sale: resolves Cash and Revenue accounts, prepares, validates and posts the journal via the accounting engine. Supports tax_pricing_mode ('exclusive', 'inclusive', 'exempt'), tax_rate_percent, and tax_amount to split gross vs net revenue and credit Sales Tax Output Payable (Account 2110). For sales of stock-tracked goods pass items=[{product_id, quantity}] to post Cost of Sales")
 
 
@@ -4920,7 +5763,7 @@ register("record_cash_sale", handler=_record_cash_sale, read_only=False,
 # catalogue and receives stock units (cash purchases track units too).
 
 register("record_cash_purchase", handler=_record_cash_purchase, read_only=False,
-
+         args_model=RecordCashPurchaseArgs,
          description="Record an immediate CASH purchase (settled now — NOT a supplier bill, no payable is created): Dr Inventory (resale stock) / fixed-asset / expense and Cr Cash-or-Bank, resolving the debit and cash ledgers deterministically (creating a Cash account when the chart lacks one). For stock-resale goods pass transaction_nature='INVENTORY' and items=[{description, quantity, unit_price}] so the product is created/linked in the catalogue and the stock ledger receives the units")
 
 
@@ -5097,11 +5940,15 @@ register("record_loan", handler=_record_loan, read_only=False,
 
              extra_arguments=("cash_account_id", "party_id")),
 
+         args_model=RecordLoanArgs,
+
          description="Record a BORROWING (direction='BORROWED': Dr Bank / Cr Loan ledger) or a LENDING (direction='GIVEN': Dr Loan receivable / Cr Bank). Requires a UNIQUE descriptive narration (e.g. 'Loan - HBL - Vehicle Financing - 2026') that identifies the facility in every journal. Collect the terms up front: counterparty, purpose, principal, loan_date, first_payment_date, tenure_months, frequency (MONTHLY/QUARTERLY/SEMI_ANNUAL/ANNUALLY/CUSTOM), interest_rate (annual %), interest_method (REDUCING or FLAT), optional grace_months/balloon_amount/fees_charges. The service builds the full amortization schedule, creates a dedicated ledger under Long-Term Loans (or Loans Receivable) and posts the initial journal automatically")
 
 register("record_loan_repayment", handler=_record_loan_repayment, read_only=False,
 
          contract=contract_from_callable(loan_service.record_installment_payment),
+
+         args_model=RecordLoanRepaymentArgs,
 
          description="Settle one loan installment BY NUMBER. The principal/interest split comes from the schedule (never guessed): BORROWED posts Dr Loan ledger (principal) + Dr Interest Expense / Cr Bank; GIVEN posts Dr Bank / Cr Loan ledger (principal) + Cr Interest Income. Only interest reaches the P&L")
 
@@ -5109,17 +5956,23 @@ register("list_loans", handler=_list_loans, read_only=True,
 
          contract=contract_from_callable(loan_service.list_loans),
 
+         args_model=ListLoansArgs,
+
          description="List loans with schedule-derived position: outstanding principal, current portion (principal due within 12 months), non-current portion, next due date, overdue count. direction='BORROWED' or 'GIVEN' filters")
 
 register("get_loan_schedule", handler=_get_loan_schedule, read_only=True,
 
          contract=contract_from_callable(loan_service.get_schedule),
 
+         args_model=GetLoanScheduleArgs,
+
          description="Full amortization schedule of one loan: installment no, due date, opening principal, principal, interest, total, closing principal, live status")
 
 register("check_due_loan_installments", handler=_check_due_loan_installments, read_only=True,
 
          contract=contract_from_callable(loan_service.due_installments),
+
+         args_model=CheckDueLoanInstallmentsArgs,
 
          description="Scheduled-event sweep: installments DUE or OVERDUE as of a date (default today), across all loans. Use it to propose the segregated installment journals (principal + interest) for confirmation — a due date alone never posts cash")
 
@@ -5211,11 +6064,15 @@ register("record_loan_restructure", handler=_record_loan_restructure, read_only=
 
          contract=contract_from_callable(loan_service.restructure_loan),
 
+         args_model=RecordLoanRestructureArgs,
+
          description="Restructure a loan: re-amortize the UNPAID future installments from a new first_payment_date under new tenure/frequency/rate/method terms. Paid or partial installments are never touched and NO journal posts (a restructure changes future terms, not the ledger balance); the change is recorded in the loan's restructure audit trail with old and new terms plus the reason")
 
 register("write_off_loan", handler=_write_off_loan, read_only=False,
 
          contract=contract_from_callable(loan_service.write_off_loan),
+
+         args_model=WriteOffLoanArgs,
 
          description="Write off a loan's real remaining principal with a proper segregated journal: a BORROWED loan posts Dr Loan ledger / Cr Loan Forgiveness Gain (Other Income); a GIVEN loan posts Dr Loan Impairment Loss (Other Expenses) / Cr Loan receivable. Unpaid installments are waived, status flips to WRITTEN_OFF, and every line carries the loan narration. Use only with explicit owner confirmation of the reason")
 
@@ -5225,39 +6082,39 @@ register("write_off_loan", handler=_write_off_loan, read_only=False,
 
 # Reporting
 
-register("get_general_ledger", handler=_get_general_ledger, read_only=True, description="Get general ledger")
+register("get_general_ledger", handler=_get_general_ledger, read_only=True, args_model=GetGeneralLedgerArgs, description="Get general ledger")
 
-register("get_trial_balance", handler=_get_trial_balance, read_only=True, description="Get trial balance")
+register("get_trial_balance", handler=_get_trial_balance, read_only=True, args_model=GetTrialBalanceArgs, description="Get trial balance")
 
-register("get_profit_loss", handler=_get_profit_loss, read_only=True, description="Get the multi-step profit & loss statement: Operating Revenue less Cost of Sales = Gross Profit, less Operating Expenses (Administrative / Selling & Marketing / Distribution / Other Operating) = Operating Profit, then plus Other Income, less Finance Costs and Tax Expense = Net Profit. Returns rows (flat per-account) and statement (sections + subtotals)")
+register("get_profit_loss", handler=_get_profit_loss, read_only=True, args_model=GetProfitLossArgs, description="Get the multi-step profit & loss statement: Operating Revenue less Cost of Sales = Gross Profit, less Operating Expenses (Administrative / Selling & Marketing / Distribution / Other Operating) = Operating Profit, then plus Other Income, less Finance Costs and Tax Expense = Net Profit. Returns rows (flat per-account) and statement (sections + subtotals)")
 
-register("get_balance_sheet", handler=_get_balance_sheet, read_only=True, description="Get balance sheet")
+register("get_balance_sheet", handler=_get_balance_sheet, read_only=True, args_model=GetBalanceSheetArgs, description="Get balance sheet")
 
-register("get_cash_flow", handler=_get_cash_flow, read_only=True, description="Get cash flow data")
+register("get_cash_flow", handler=_get_cash_flow, read_only=True, args_model=GetCashFlowArgs, description="Get cash flow data")
 
-register("list_expenses", handler=_list_expenses, read_only=True, description="List recorded expenses with dates, payees and totals (supports from_date/to_date)")
+register("list_expenses", handler=_list_expenses, read_only=True, args_model=ListExpensesArgs, description="List recorded expenses with dates, payees and totals (supports from_date/to_date)")
 
-register("generate_report", handler=_generate_report, read_only=True, description="Generate a custom report")
+register("generate_report", handler=_generate_report, read_only=True, args_model=GenerateReportArgs, description="Generate a custom report")
 
 
 
 # Project
 
-register("create_project", handler=_create_project, read_only=False, contract=contract_from_callable(project_service.create), description="Create a project")
+register("create_project", handler=_create_project, read_only=False, contract=contract_from_callable(project_service.create), args_model=CreateProjectArgs, description="Create a project")
 
-register("get_project", handler=_get_project, read_only=True, description="Get project details")
+register("get_project", handler=_get_project, read_only=True, args_model=GetProjectArgs, description="Get project details")
 
-register("get_project_profitability", handler=_get_project_profitability, read_only=True, description="Get project profitability")
+register("get_project_profitability", handler=_get_project_profitability, read_only=True, args_model=GetProjectProfitabilityArgs, description="Get project profitability")
 
 
 
 # Quotation
 
-register("create_purchase_order", handler=_create_purchase_order, read_only=False, description="Create a purchase order or vendor quotation / RFQ with status 'RFQ' or 'ORDERED'. Line items require description, quantity, and unit_price.")
-register("get_purchase_order", handler=_get_purchase_order, read_only=True, description="Get purchase order or vendor quotation details.")
-register("create_quotation", handler=_create_quotation, read_only=False, description="Create a sales quotation")
+register("create_purchase_order", handler=_create_purchase_order, read_only=False, args_model=CreatePurchaseOrderArgs, description="Create a purchase order or vendor quotation / RFQ with status 'RFQ' or 'ORDERED'. Line items require description, quantity, and unit_price.")
+register("get_purchase_order", handler=_get_purchase_order, read_only=True, args_model=GetPurchaseOrderArgs, description="Get purchase order or vendor quotation details.")
+register("create_quotation", handler=_create_quotation, read_only=False, args_model=CreateQuotationArgs, description="Create a sales quotation")
 
-register("convert_quotation", handler=_convert_quotation, read_only=False, contract=contract_from_callable(quotation_service.convert_quotation), description="Convert an accepted quotation into a sales invoice: creates the invoice linked to the source quotation, posts the receivable journal, and marks the quotation CONVERTED (double conversion is refused)")
+register("convert_quotation", handler=_convert_quotation, read_only=False, contract=contract_from_callable(quotation_service.convert_quotation), args_model=ConvertQuotationArgs, description="Convert an accepted quotation into a sales invoice: creates the invoice linked to the source quotation, posts the receivable journal, and marks the quotation CONVERTED (double conversion is refused)")
 
 
 
@@ -5271,19 +6128,19 @@ register("convert_quotation", handler=_convert_quotation, read_only=False, contr
 
 # itself is DECLARED_REFERENCES, plan_materialization).
 
-register("create_credit_note", handler=_create_credit_note, read_only=False, contract=contract_from_callable(credit_note_service.create_credit_note), description="Create a credit note")
+register("create_credit_note", handler=_create_credit_note, read_only=False, contract=contract_from_callable(credit_note_service.create_credit_note), args_model=CreateCreditNoteArgs, description="Create a credit note")
 
 
 
 # Purchase Return
 
-register("create_purchase_return", handler=_create_purchase_return, read_only=False, description="Create a purchase return")
+register("create_purchase_return", handler=_create_purchase_return, read_only=False, args_model=CreatePurchaseReturnArgs, description="Create a purchase return")
 
 
 
 # Expense Payment
 
-register("record_expense_payment", handler=_record_expense_payment, read_only=False, description="Record payment for an expense or bill")
+register("record_expense_payment", handler=_record_expense_payment, read_only=False, args_model=RecordExpensePaymentArgs, description="Record payment for an expense or bill")
 
 
 
@@ -5487,37 +6344,37 @@ async def _record_asset_depreciation(organization_id: uuid.UUID, **kw) -> ToolRe
 
 # Product catalog
 
-register("search_product", handler=_search_product, read_only=True, description="Search the product catalog by name (empty result = no product exists yet)")
+register("search_product", handler=_search_product, read_only=True, args_model=SearchProductArgs, description="Search the product catalog by name (empty result = no product exists yet)")
 
-register("get_inventory_status", handler=_get_inventory_status, read_only=True, description="Get current inventory valuation, quantities on hand, inward received, and outward issued stock across catalogue products")
+register("get_inventory_status", handler=_get_inventory_status, read_only=True, args_model=GetInventoryStatusArgs, description="Get current inventory valuation, quantities on hand, inward received, and outward issued stock across catalogue products")
 
-register("create_product", handler=_create_product, read_only=False, contract=contract_from_callable(product_service.create), description="Create a catalog product (catalog only — the ERP has no stock-quantity ledger). Set is_stock_tracked=true ONLY when the user explicitly answered the inventory question confirming resale stock — never infer it")
-register("update_product", handler=_update_product, read_only=False, live_target=product_service.update, description="Update an existing product in the catalog (unit_price, cost_price, description, name, is_stock_tracked)")
-register("delete_product", handler=_delete_product, read_only=False, description="Delete a product from the catalog, or deactivate it if documents already reference it")
+register("create_product", handler=_create_product, read_only=False, contract=contract_from_callable(product_service.create), args_model=CreateProductArgs, description="Create a catalog product (catalog only — the ERP has no stock-quantity ledger). Set is_stock_tracked=true ONLY when the user explicitly answered the inventory question confirming resale stock — never infer it")
+register("update_product", handler=_update_product, read_only=False, live_target=product_service.update, args_model=UpdateProductArgs, description="Update an existing product in the catalog (unit_price, cost_price, description, name, is_stock_tracked)")
+register("delete_product", handler=_delete_product, read_only=False, args_model=DeleteProductArgs, description="Delete a product from the catalog, or deactivate it if documents already reference it")
 
 
 
 # Service catalog
 
-register("search_service", handler=_search_service, read_only=True, description="Search the service catalog by name (empty result = no service exists yet)")
+register("search_service", handler=_search_service, read_only=True, args_model=SearchServiceArgs, description="Search the service catalog by name (empty result = no service exists yet)")
 
-register("create_service", handler=_create_service, read_only=False, contract=contract_from_callable(service_service.create), description="Create a catalog service (billing unit HOUR/DAY/MONTH/FIXED/ITEM — services never involve stock or assets)")
-register("update_service", handler=_update_service, read_only=False, live_target=service_service.update, description="Update an existing service in the catalog (standard_rate, description, name, billing_unit)")
-register("delete_service", handler=_delete_service, read_only=False, description="Delete a service from the catalog, or deactivate it if documents already reference it")
+register("create_service", handler=_create_service, read_only=False, contract=contract_from_callable(service_service.create), args_model=CreateServiceArgs, description="Create a catalog service (billing unit HOUR/DAY/MONTH/FIXED/ITEM — services never involve stock or assets)")
+register("update_service", handler=_update_service, read_only=False, live_target=service_service.update, args_model=UpdateServiceArgs, description="Update an existing service in the catalog (standard_rate, description, name, billing_unit)")
+register("delete_service", handler=_delete_service, read_only=False, args_model=DeleteServiceArgs, description="Delete a service from the catalog, or deactivate it if documents already reference it")
 
 
 
 # Fixed asset lifecycle
 
-register("search_fixed_asset", handler=_search_fixed_asset, read_only=True, description="Search registered fixed assets by name or code (empty result = asset not registered)")
+register("search_fixed_asset", handler=_search_fixed_asset, read_only=True, args_model=SearchFixedAssetArgs, description="Search registered fixed assets by name or code (empty result = asset not registered)")
 
-register("get_fixed_asset", handler=_get_fixed_asset, read_only=True, description="Get fixed asset details by id")
+register("get_fixed_asset", handler=_get_fixed_asset, read_only=True, args_model=GetFixedAssetArgs, description="Get fixed asset details by id")
 
-register("register_fixed_asset", handler=_register_fixed_asset, read_only=False, contract=contract_from_callable(fixed_asset_service.register_asset), description="Acquire and capitalise a fixed asset: creates the asset record and posts the acquisition journal (Dr asset / Cr cash-bank or payable). Account is EXACTLY ONE of asset_account_id (a fitting ledger already exists — reuse it) or asset_account_name (NONE exists — create it first with a descriptive name, e.g. 'Building - Model Town', then pin it here)")
+register("register_fixed_asset", handler=_register_fixed_asset, read_only=False, contract=contract_from_callable(fixed_asset_service.register_asset), args_model=RegisterFixedAssetArgs, description="Acquire and capitalise a fixed asset: creates the asset record and posts the acquisition journal (Dr asset / Cr cash-bank or payable). Account is EXACTLY ONE of asset_account_id (a fitting ledger already exists — reuse it) or asset_account_name (NONE exists — create it first with a descriptive name, e.g. 'Building - Model Town', then pin it here)")
 
-register("dispose_fixed_asset", handler=_dispose_fixed_asset, read_only=False, contract=contract_from_callable(fixed_asset_service.dispose_asset), description="Dispose of / sell / write off a fixed asset: removes cost and accumulated depreciation, records proceeds and any gain or loss via a posted journal")
+register("dispose_fixed_asset", handler=_dispose_fixed_asset, read_only=False, contract=contract_from_callable(fixed_asset_service.dispose_asset), args_model=DisposeFixedAssetArgs, description="Dispose of / sell / write off a fixed asset: removes cost and accumulated depreciation, records proceeds and any gain or loss via a posted journal")
 
-register("record_asset_depreciation", handler=_record_asset_depreciation, read_only=False, contract=contract_from_callable(fixed_asset_service.record_depreciation), description="Record asset depreciation: posts the depreciation journal and updates accumulated depreciation and book value")
+register("record_asset_depreciation", handler=_record_asset_depreciation, read_only=False, contract=contract_from_callable(fixed_asset_service.record_depreciation), args_model=RecordAssetDepreciationArgs, description="Record asset depreciation: posts the depreciation journal and updates accumulated depreciation and book value")
 
 
 
@@ -5555,9 +6412,9 @@ async def _get_health(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 
-register("calculate_health", handler=_calculate_health, read_only=False, description="Calculate financial health score")
+register("calculate_health", handler=_calculate_health, read_only=False, args_model=CalculateHealthArgs, description="Calculate financial health score")
 
-register("get_health", handler=_get_health, read_only=True, description="Get financial health history")
+register("get_health", handler=_get_health, read_only=True, args_model=GetHealthArgs, description="Get financial health history")
 
 
 
@@ -5655,17 +6512,17 @@ async def _get_recurring_executions(organization_id: uuid.UUID, **kw) -> ToolRes
 
 
 
-register("create_recurring_template", handler=_create_recurring_template, read_only=False, live_target="app.services.recurring_service:create_template", description="Create a recurring transaction template (balanced journal lines + frequency + next due date)")
+register("create_recurring_template", handler=_create_recurring_template, read_only=False, live_target="app.services.recurring_service:create_template", args_model=CreateRecurringTemplateArgs, description="Create a recurring transaction template (balanced journal lines + frequency + next due date)")
 
-register("get_recurring_templates", handler=_get_recurring_templates, read_only=True, description="List recurring transaction templates (optionally filter by status)")
+register("get_recurring_templates", handler=_get_recurring_templates, read_only=True, args_model=GetRecurringTemplatesArgs, description="List recurring transaction templates (optionally filter by status)")
 
-register("get_recurring_template", handler=_get_recurring_template, read_only=True, description="Get a single recurring transaction template")
+register("get_recurring_template", handler=_get_recurring_template, read_only=True, args_model=GetRecurringTemplateArgs, description="Get a single recurring transaction template")
 
-register("update_recurring_template", handler=_update_recurring_template, read_only=False, description="Pause / resume / complete / cancel a recurring template")
+register("update_recurring_template", handler=_update_recurring_template, read_only=False, args_model=UpdateRecurringTemplateArgs, description="Pause / resume / complete / cancel a recurring template")
 
-register("generate_recurring", handler=_generate_recurring, read_only=False, description="Generate journal entries for every due recurring template (draft unless auto_post); advances next due dates")
+register("generate_recurring", handler=_generate_recurring, read_only=False, args_model=GenerateRecurringArgs, description="Generate journal entries for every due recurring template (draft unless auto_post); advances next due dates")
 
-register("get_recurring_executions", handler=_get_recurring_executions, read_only=True, description="List recurring executions (generated/failed journal runs)")
+register("get_recurring_executions", handler=_get_recurring_executions, read_only=True, args_model=GetRecurringExecutionsArgs, description="List recurring executions (generated/failed journal runs)")
 
 
 # ===================================================================
@@ -5680,6 +6537,7 @@ register(
     handler=_update_document_status,
     read_only=False,
     live_target="app.tools.document_status_tools:update_document_status",
+    args_model=UpdateDocumentStatusArgs,
     description="Update status of single or bulk documents across all modules (purchase_bill, purchase_order, invoice, quotation, product) with verification audit table.",
 )
 # ===================================================================
@@ -5703,6 +6561,7 @@ register(
     "get_organization_tax_profile",
     handler=_get_organization_tax_profile,
     read_only=True,
+    args_model=GetOrganizationTaxProfileArgs,
     description="Get the organization's tax profile: whether registered for sales tax, tax authority (FBR, PRA, SRB, KPRA, BRA), default tax pricing mode (exclusive, inclusive, exempt), and configured sales tax rate.",
 )
 
@@ -5711,6 +6570,7 @@ register(
     handler=_set_organization_tax_profile,
     read_only=False,
     contract=contract_from_callable(tax_service.set_organization_tax_profile),
+    args_model=SetOrganizationTaxProfileArgs,
     description="Configure organization's tax profile: set is_sales_tax_registered (bool), tax_authority ('FBR', 'PRA', 'SRB', 'KPRA', 'BRA'), default_tax_pricing ('exclusive', 'inclusive', 'exempt'), and sales_tax_rate (e.g. 18.0).",
 )
 
@@ -5735,6 +6595,7 @@ register(
     "get_organization_leave_policy",
     handler=_get_organization_leave_policy,
     read_only=True,
+    args_model=GetOrganizationLeavePolicyArgs,
     description="Get the organization's leave and payroll calculation policy: monthly allowed leaves (e.g. 2 days), annual allowed leaves (e.g. 27 days), and standard working days per month (e.g. 30 days).",
 )
 
@@ -5743,6 +6604,7 @@ register(
     handler=_set_organization_leave_policy,
     read_only=False,
     contract=contract_from_callable(payroll_service.set_organization_leave_policy),
+    args_model=SetOrganizationLeavePolicyArgs,
     description="Configure organization's leave policy for payroll: set monthly_allowed_leaves (int), annual_allowed_leaves (int), and standard_working_days (int). Employees with absences <= monthly_allowed_leaves receive full salary; excess days are deducted at 1/standard_working_days.",
 )
 
@@ -5831,5 +6693,6 @@ register(
     "discover_erp_capabilities",
     handler=_discover_erp_capabilities,
     read_only=True,
+    args_model=DiscoverErpCapabilitiesArgs,
     description="Real-time live discovery of all registered ERP tools, their latest Python parameter schemas, ERP modules/sections, and live FastAPI HTTP endpoints filtered by section/task query.",
 )

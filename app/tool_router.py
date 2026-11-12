@@ -34,11 +34,227 @@ from app.validator import validate_operation
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tool-definition cache.  ai.tools + ai.tool_parameters are
-# read-only metadata: cache the built declarations in-process for 5 minutes.
+# Tool-definition cache.  Definitions are cached per section key in-process
+# for 5 minutes and cleared via invalidate_tool_definition_cache().
 # ---------------------------------------------------------------------------
 _TOOL_DEFS_TTL_SECONDS = 300.0
-_TOOL_DEFS_CACHE = None  # (loaded_at: float, tools: list[dict]) | None
+_TOOL_DEFS_CACHE: Optional[Dict[Optional[str], tuple[float, list[Dict[str, Any]]]]] = None
+
+# ---------------------------------------------------------------------------
+# 2-Tier Dynamic Tool Loading
+# ---------------------------------------------------------------------------
+# Tier 1: Always-loaded read & discovery tools (~15 tools).
+TIER_1_TOOLS: frozenset[str] = frozenset({
+    "discover_erp_capabilities",
+    "get_trial_balance",
+    "get_profit_loss",
+    "get_balance_sheet",
+    "get_cash_flow",
+    "get_open_payables",
+    "get_open_receivables",
+    "get_supplier_ledger",
+    "get_customer_ledger",
+    "search_account",
+    "get_chart_of_accounts",
+    "list_bank_accounts",
+    "search_customer",
+    "search_supplier",
+    "get_inventory_status",
+})
+
+# Maps ERP_MODULES task names in app/erp_endpoints.py that differ from
+# canonical _TOOL_REGISTRY slugs.
+_ERP_TASK_TO_TOOL_SLUG: Dict[str, str] = {
+    "record_payment": "record_supplier_payment",
+    "record_receipt": "record_customer_receipt",
+    "record_expense": "create_expense",
+    "generate_trial_balance": "get_trial_balance",
+    "generate_balance_sheet": "get_balance_sheet",
+    "generate_profit_loss": "get_profit_loss",
+    "generate_cash_flow": "get_cash_flow",
+    "generate_general_ledger": "get_general_ledger",
+    "project_profitability": "get_project_profitability",
+    "record_credit_sale": "create_invoice",
+    "record_credit_purchase": "create_purchase_bill",
+    "customer_balance": "get_open_receivables",
+    "supplier_balance": "get_open_payables",
+}
+
+_SECTION_ALIASES: Dict[str, str] = {
+    "payroll": "employees",
+    "hr": "employees",
+    "inventory": "catalogue",
+    "products": "catalogue",
+    "services": "catalogue",
+    "assets": "fixed_assets",
+    "fixed_asset": "fixed_assets",
+    "bank": "banking",
+    "cash": "banking",
+    "finance": "accounting",
+    "journal": "accounting",
+    "journals": "accounting",
+    "gl": "accounting",
+    "vat": "tax",
+    "gst": "tax",
+    "wht": "tax",
+    "purchase": "purchases",
+    "procurement": "purchases",
+    "sale": "sales",
+    "revenue": "sales",
+    "expense": "expenses",
+    "loan": "loans",
+    "project": "projects",
+    "report": "reports",
+    "customer": "customers",
+    "supplier": "suppliers",
+}
+
+_EXTRA_SECTION_TOOLS: Dict[str, frozenset[str]] = {
+    "accounting": frozenset({"validate_journal", "create_compound_journal"}),
+    "purchases": frozenset({
+        "create_purchase_order",
+        "get_purchase_order",
+        "get_purchase_bill",
+        "create_supplier",
+        "get_supplier",
+        "update_document_status",
+    }),
+    "sales": frozenset({
+        "get_invoice",
+        "create_customer",
+        "get_customer",
+        "update_document_status",
+    }),
+    "expenses": frozenset({"classify_expense"}),
+    "employees": frozenset({
+        "get_organization_leave_policy",
+        "set_organization_leave_policy",
+    }),
+    "catalogue": frozenset({"update_document_status"}),
+    "reports": frozenset({"generate_report"}),
+    "customers": frozenset({"get_open_receivables"}),
+    "suppliers": frozenset({"get_open_payables"}),
+    "tax": frozenset({
+        "get_organization_tax_profile",
+        "set_organization_tax_profile",
+    }),
+}
+
+
+def get_section_tools(section: str) -> frozenset[str]:
+    """Return Tier 2 tool slugs for *section* using ``ERP_MODULES``."""
+    from app.erp_endpoints import ERP_MODULES
+
+    norm = section.strip().lower().replace("-", "_").replace(" ", "_")
+    norm = _SECTION_ALIASES.get(norm, norm)
+
+    registered = set(list_tools())
+    resolved: set[str] = set()
+
+    mod = ERP_MODULES.get(norm)
+    if mod:
+        for task in mod.get("tasks", []):
+            mapped = _ERP_TASK_TO_TOOL_SLUG.get(task, task)
+            canonical = resolve_tool_alias(mapped)
+            if canonical in registered:
+                resolved.add(canonical)
+
+    for extra in _EXTRA_SECTION_TOOLS.get(norm, ()):
+        if extra in registered:
+            resolved.add(extra)
+
+    return frozenset(resolved)
+
+
+def _resolve_json_schema_node(node: Any, defs: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a Pydantic JSON-Schema property node for Gemini/OpenAI compatibility."""
+    if not isinstance(node, dict):
+        return {"type": "string"}
+
+    if "$ref" in node:
+        ref = str(node["$ref"])
+        ref_name = ref.rsplit("/", 1)[-1]
+        target = defs.get(ref_name, {})
+        merged = dict(target)
+        for k, v in node.items():
+            if k != "$ref":
+                merged[k] = v
+        node = merged
+
+    # Unwrap Optional[...] anyOf / oneOf variants, dropping null.
+    for union_key in ("anyOf", "oneOf"):
+        if union_key in node and isinstance(node[union_key], list):
+            non_null = [
+                sub for sub in node[union_key]
+                if not (isinstance(sub, dict) and sub.get("type") == "null")
+            ]
+            if non_null:
+                chosen = _resolve_json_schema_node(non_null[0], defs)
+                result = dict(chosen)
+                if node.get("description") and not result.get("description"):
+                    result["description"] = node["description"]
+                return result
+
+    schema_type = node.get("type", "string")
+    if isinstance(schema_type, list):
+        non_null_types = [t for t in schema_type if t != "null"]
+        schema_type = non_null_types[0] if non_null_types else "string"
+
+    out: Dict[str, Any] = {"type": schema_type}
+    if node.get("description"):
+        out["description"] = node["description"]
+    if "enum" in node:
+        out["enum"] = list(node["enum"])
+
+    if schema_type == "array":
+        raw_items = node.get("items")
+        if isinstance(raw_items, dict):
+            out["items"] = _resolve_json_schema_node(raw_items, defs)
+        else:
+            out["items"] = {"type": "object"}
+    elif schema_type == "object":
+        raw_props = node.get("properties")
+        if isinstance(raw_props, dict) and raw_props:
+            out["properties"] = {
+                pk: _resolve_json_schema_node(pv, defs)
+                for pk, pv in raw_props.items()
+            }
+            if node.get("required"):
+                out["required"] = [
+                    r for r in node["required"] if r in out["properties"]
+                ]
+
+    return out
+
+
+def _pydantic_schema_to_gemini_parameters(args_model: Any) -> Optional[Dict[str, Any]]:
+    """Build Gemini-compatible ``parameters`` dict from a Pydantic ``BaseModel``."""
+    raw = args_model.model_json_schema()
+    defs = raw.get("$defs") or {}
+    raw_props = raw.get("properties") or {}
+    ignored = {"organization_id", "created_by", "ai_execution_id"}
+
+    properties: Dict[str, Any] = {}
+    for pname, pschema in raw_props.items():
+        if pname in ignored:
+            continue
+        prop = _resolve_json_schema_node(pschema, defs)
+        if not prop.get("description"):
+            prop["description"] = pschema.get("title") or pname
+        properties[pname] = prop
+
+    if not properties:
+        return None
+
+    required = [
+        req for req in (raw.get("required") or [])
+        if req in properties
+    ]
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    }
 
 # ---------------------------------------------------------------------------
 # transaction-date protocol.  Mutation tools whose native
@@ -414,67 +630,104 @@ async def route_tool_call(
         )
 
 
-async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
+async def get_gemini_tool_definitions(
+    section: Optional[str] = None,
+) -> list[Dict[str, Any]]:
     """Return tool definitions formatted for Gemini's function-calling API.
 
-    Reads real parameter definitions from ``ai.tool_parameters`` so that
-    Gemini receives accurate JSON-Schema parameter contracts instead of
-    a bare ``organization_id`` placeholder.
+    Uses ``handler._args_model.model_json_schema()`` as the single source of
+    truth whenever a handler declares a Pydantic ``Args`` model, eliminating
+    the ``ai.tools`` / ``ai.tool_parameters`` DB split-brain. Falls back to
+    DB + AST inspection only for handlers without ``_args_model``.
 
-    definitions are READ-ONLY metadata, so they are cached
-    in-process with a 5-minute TTL and refreshed explicitly via
-    :func:`invalidate_tool_definition_cache` (the DB is hit once across
-    requests instead of once per request).
+    Supports 2-tier dynamic tool loading via *section*:
+    - ``section=None`` (or ``"all"``): returns all tools (backward compat).
+    - ``section="tier1"``: returns Tier 1 read/discovery tools only.
+    - ``section="<module>"``: returns Tier 1 + that ERP module's Tier 2 tools.
     """
     global _TOOL_DEFS_CACHE
+    norm_section: Optional[str] = None
+    if section is not None:
+        cleaned = section.strip().lower().replace("-", "_").replace(" ", "_")
+        if cleaned and cleaned != "all":
+            norm_section = _SECTION_ALIASES.get(cleaned, cleaned)
+
     now = time.monotonic()
-    if _TOOL_DEFS_CACHE is not None:
-        loaded_at, tools_cached = _TOOL_DEFS_CACHE
+    if isinstance(_TOOL_DEFS_CACHE, dict) and norm_section in _TOOL_DEFS_CACHE:
+        loaded_at, tools_cached = _TOOL_DEFS_CACHE[norm_section]
         if now - loaded_at < _TOOL_DEFS_TTL_SECONDS:
             return tools_cached
 
-    # Bulk-load parameter definitions for all IMPLEMENTED tools (cached
-    # per-process via the Supabase query; ~78 rows for 36 tools).
-    all_tool_rows = await fetch_many(
-        "ai_tools",
-        filters={"status": "IMPLEMENTED"},
-        select="id,slug",
-        limit=200,
+    all_slugs = list_tools()
+    if norm_section is None:
+        target_slugs = all_slugs
+    elif norm_section in ("tier1", "tier_1", "core", "discovery"):
+        target_slugs = [s for s in all_slugs if s in TIER_1_TOOLS]
+    else:
+        allowed = TIER_1_TOOLS | get_section_tools(norm_section)
+        target_slugs = [s for s in all_slugs if s in allowed]
+
+    # Only query ai.tools / ai.tool_parameters when at least one selected
+    # handler lacks a Pydantic _args_model (backward-compatibility fallback).
+    needs_db_fallback = any(
+        getattr((get_handler(slug) or {}).get("handler"), "_args_model", None) is None
+        for slug in target_slugs
     )
-    slug_to_id = {r["slug"]: r["id"] for r in all_tool_rows}
 
-    tool_params: Dict[str, list] = {}  # tool_id -> [param rows]
-    if slug_to_id:
-        tool_ids = list(slug_to_id.values())
-        # Single query using Supabase .in_() filter
-        from app.database import _execute, get_service_client
-
-        param_rows = (
-            (
-                await _execute(
-                    get_service_client()
-                    .schema("ai")
-                    .table("tool_parameters")
-                    .select("tool_id,parameter_name,description,data_type,required,position")
-                    .in_("tool_id", tool_ids)
-                    .limit(2000)
-                )
-            ).data
-            or []
+    slug_to_id: Dict[str, Any] = {}
+    tool_params: Dict[str, list] = {}
+    if needs_db_fallback:
+        all_tool_rows = await fetch_many(
+            "ai_tools",
+            filters={"status": "IMPLEMENTED"},
+            select="id,slug",
+            limit=200,
         )
-        for row in param_rows:
-            tool_params.setdefault(row["tool_id"], []).append(row)
+        slug_to_id = {r["slug"]: r["id"] for r in all_tool_rows}
+        if slug_to_id:
+            tool_ids = list(slug_to_id.values())
+            from app.database import _execute, get_service_client
+
+            param_rows = (
+                (
+                    await _execute(
+                        get_service_client()
+                        .schema("ai")
+                        .table("tool_parameters")
+                        .select("tool_id,parameter_name,description,data_type,required,position")
+                        .in_("tool_id", tool_ids)
+                        .limit(2000)
+                    )
+                ).data
+                or []
+            )
+            for row in param_rows:
+                tool_params.setdefault(row["tool_id"], []).append(row)
 
     tools: list[Dict[str, Any]] = []
-    for slug in list_tools():
+    for slug in target_slugs:
         entry = get_handler(slug)
         if not entry:
             continue
 
+        handler = entry.get("handler")
+        args_model = getattr(handler, "_args_model", None)
+
+        declaration: Dict[str, Any] = {
+            "name": slug,
+            "description": entry.get("description", slug),
+        }
+
+        if args_model is not None:
+            parameters = _pydantic_schema_to_gemini_parameters(args_model)
+            if parameters:
+                declaration["parameters"] = parameters
+            tools.append(declaration)
+            continue
+
+        # Fallback: DB + AST inspection for handlers without _args_model.
         tool_id = slug_to_id.get(slug)
         params = tool_params.get(tool_id, []) if tool_id else []
-
-        # Sort by position (NULLs last)
         params.sort(key=lambda p: p.get("position") or 999)
 
         live_schema = derive_live_parameter_schema(slug)
@@ -487,11 +740,8 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
 
         for p in params:
             pname = p["parameter_name"]
-            # organization_id is auto-injected by the executor — never
-            # expose it to Gemini.
             if pname in ("organization_id", "created_by", "ai_execution_id"):
                 continue
-            # Drop stale DB-only parameters when Python declares a strict contract.
             if strict_contract and pname not in live_props:
                 continue
             properties[pname] = {
@@ -501,8 +751,6 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             if p.get("required"):
                 required_fields.append(pname)
 
-        # Merge ALL live Python parameters so new/updated backend parameters and
-        # tools without DB migrations are always exposed in real time.
         for pname, lprop in live_props.items():
             if pname not in properties:
                 properties[pname] = dict(lprop)
@@ -512,78 +760,6 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             if req not in required_fields and req in properties:
                 required_fields.append(req)
 
-        if slug == "record_cash_sale":
-            if "items" not in properties:
-                properties["items"] = {
-                    "type": "array",
-                    "description": (
-                        "Stock-tracked goods or services sold. Pass "
-                        "items=[{description, quantity, unit_price, product_id}] so "
-                        "the accounting engine posts the Cost-of-Sales entry "
-                        "(Dr Cost of Sales / Cr Inventory) and relieves the stock ledger "
-                        "at weighted-average cost."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "description": "Item name or description"},
-                            "quantity": {"type": "number", "description": "Quantity sold (>0)"},
-                            "unit_price": {"type": "number", "description": "Selling price per unit"},
-                            "product_id": {"type": "string", "description": "Optional catalogue product UUID if matched"},
-                        },
-                        "required": ["description", "quantity", "unit_price"],
-                    },
-                }
-            if "revenue_account_id" not in properties:
-                properties["revenue_account_id"] = {
-                    "type": "string",
-                    "description": "Optional revenue account UUID to credit directly",
-                }
-        elif slug == "record_cash_purchase":
-            if "amount" not in properties:
-                properties["amount"] = {
-                    "type": "number",
-                    "description": "Total cash amount paid",
-                }
-            if "transaction_date" not in properties:
-                properties["transaction_date"] = {
-                    "type": "string",
-                    "description": "Date of the purchase (YYYY-MM-DD)",
-                }
-            if "description" not in properties:
-                properties["description"] = {
-                    "type": "string",
-                    "description": "What was purchased",
-                }
-            if "transaction_nature" not in properties:
-                properties["transaction_nature"] = {
-                    "type": "string",
-                    "description": "Transaction nature: INVENTORY, FIXED_ASSET, or OPERATING_EXPENSE",
-                }
-            if "items" not in properties:
-                properties["items"] = {
-                    "type": "array",
-                    "description": (
-                        "Purchased items. For INVENTORY, pass items=[{description, quantity, unit_price}] "
-                        "so catalogue products are linked/created and stock units are received."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "description": "Item description or product name"},
-                            "quantity": {"type": "number", "description": "Quantity purchased (>0)"},
-                            "unit_price": {"type": "number", "description": "Unit purchase price"},
-                        },
-                        "required": ["description", "quantity", "unit_price"],
-                    },
-                }
-
-        declaration: Dict[str, Any] = {
-            "name": slug,
-            "description": entry.get("description", slug),
-        }
-        # Only include a parameters schema when the tool actually has
-        # parameters — Gemini rejects an OBJECT schema with empty properties.
         if properties:
             declaration["parameters"] = {
                 "type": "object",
@@ -592,5 +768,7 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             }
         tools.append(declaration)
 
-    _TOOL_DEFS_CACHE = (time.monotonic(), tools)
+    if not isinstance(_TOOL_DEFS_CACHE, dict):
+        _TOOL_DEFS_CACHE = {}
+    _TOOL_DEFS_CACHE[norm_section] = (time.monotonic(), tools)
     return tools

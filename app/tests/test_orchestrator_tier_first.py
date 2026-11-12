@@ -35,8 +35,10 @@ def _order(candidates):
 
 def test_default_text_order_is_the_harbor_chain_only():
     settings = get_settings()
+    gemini_model = settings.gemini_model or "gemini-3.8-flash"
     assert _order(_text_candidates()) == [
-        ("token-harbor", m) for m in settings.th_text_chain_list
+        *[("token-harbor", m) for m in settings.th_text_chain_list],
+        ("gemini", gemini_model),
     ]
 
 
@@ -54,37 +56,42 @@ def test_the_primary_is_deepseek_and_thinking_is_off():
 
 def test_no_request_ever_reaches_qwen_or_gemini():
     """The removal contract: no mode, no requested chain, no tier flag may
-    introduce a qwen or gemini candidate."""
+    introduce a qwen candidate; Token Harbor is always primary ahead of Gemini fallback."""
     for kw in (
         {},
         {"text_chain": ["qwen3-max", "qwen-flash"], "tier_first": True},
         {"text_chain": ["qwen3-max"], "tier_first": False},
         {"tier_first": True},
     ):
-        providers = {p for p, _ in _order(_text_candidates(**kw))}
-        assert providers == {"token-harbor"}, (kw, providers)
+        ordered = _order(_text_candidates(**kw))
+        providers = [p for p, _ in ordered]
+        assert "qwen" not in providers, (kw, providers)
+        assert providers[0] == "token-harbor"
+        assert set(providers) == {"token-harbor", "gemini"}, (kw, providers)
 
 
-def test_the_removed_builders_refuse_instead_of_resurrecting():
-    """A stale caller fails honestly — never constructs a dead provider."""
+def test_the_removed_builders_refuse_instead_of_resurrecting(monkeypatch):
+    """Qwen still refuses unconditionally; _get_gemini lazily initialises GeminiClient."""
     orch = AIOrchestrator()
     try:
         orch._get_qwen("qwen3-max")
         raise AssertionError("_get_qwen must refuse")
     except Exception as exc:  # noqa: BLE001 — ProviderError from qwen_client
         assert "Token Harbor" in str(exc)
-    try:
-        orch._get_gemini()
-        raise AssertionError("_get_gemini must refuse")
-    except RuntimeError as exc:
-        assert "Token Harbor" in str(exc)
+
+    sentinel = object()
+    monkeypatch.setattr("app.gemini_client.GeminiClient", lambda: sentinel)
+    assert orch._get_gemini() is sentinel
+    assert orch._get_gemini() is sentinel
 
 
 def test_vision_is_the_harbor_vision_chain_only():
     settings = get_settings()
+    gemini_model = settings.gemini_model or "gemini-3.8-flash"
     default = AIOrchestrator()._candidate_providers(requires_vision=True)
     assert _order(default) == [
-        ("token-harbor", m) for m in settings.th_vision_chain_list
+        *[("token-harbor", m) for m in settings.th_vision_chain_list],
+        ("gemini", gemini_model),
     ]
     # tier_first / requested chains never change the vision order either
     opted = AIOrchestrator()._candidate_providers(

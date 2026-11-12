@@ -197,6 +197,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "generate_customer_ledger", "generate_supplier_ledger",
         "project_profitability", "customer_balance", "supplier_balance",
         "list_expenses", "list_bank_accounts", "get_inventory_status",
+        "get_open_payables", "get_open_receivables",
         # §12.8 expressibility repair — model-only, no planner routing yet
         # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment).
         "reverse_journal", "record_correction", "record_adjustment", "update_document_status",

@@ -2391,9 +2391,9 @@ def plan(
 
                 entities["item_quantity"] = _pv
 
-                if not entities.get("quantity"):
+            if not entities.get("quantity"):
 
-                    entities["quantity"] = _pv
+                entities["quantity"] = _pv
 
             continue
 
@@ -2644,7 +2644,6 @@ def plan(
             str(x) for x in (
                 entities.get("item_description"),
                 entities.get("description"),
-                msg_lower,
             ) if x
         )
         if _cat_text:
@@ -2652,8 +2651,6 @@ def plan(
             _derived_opt = purpose_option(str(_derived)) if _derived else None
             if _derived_opt is not None and _derived_opt.keywords:
                 entities["transaction_purpose"] = _derived
-                if not entities.get("item_description"):
-                    entities["item_description"] = _derived_opt.label
 
     purpose_now = entities.get("transaction_purpose")
 
@@ -4012,7 +4009,7 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
             if entities.get("quantity") is None:
                 _nature = str(entities.get("transaction_nature") or "").upper()
                 _desc = str(entities.get("item_description") or entities.get("description") or "").lower()
-                if _nature == "SERVICE" or "service" in _desc or "consulting" in _desc or entities.get("amount"):
+                if _nature == "SERVICE" or "service" in _desc or "consulting" in _desc:
                     entities["quantity"] = 1.0
                     entities.setdefault("item_quantity", 1.0)
                 else:

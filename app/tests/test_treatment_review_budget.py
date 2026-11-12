@@ -66,7 +66,7 @@ async def test_review_plan_treatment_tax_deviation_authority_split(monkeypatch):
 
     entities = {
         "subtotal": 1000.0,
-        "printed_tax": 250.0, # 25% printed vs 17% computed (170.0) -> diff 80.0 > 1.0
+        "printed_tax": 250.0, # 25% printed vs 18% computed (180.0) -> diff 70.0 > 1.0
         "tax_code": "STANDARD",
     }
     calls = [DummyCall("create_purchase_bill", {"subtotal": 1000.0, "total": 1250.0})]
@@ -82,7 +82,7 @@ async def test_review_plan_treatment_tax_deviation_authority_split(monkeypatch):
 
     assert review.blocked is True
     assert review.ok is False
-    assert any("Printed tax (250.0) differs from computed tax (170.0)" in f["why"] for f in review.flags)
+    assert any("Printed tax (250.0) differs from computed tax (180.0)" in f["why"] for f in review.flags)
     assert "Please clarify the correct tax amount" in review.question
 
 @pytest.mark.asyncio
@@ -91,10 +91,10 @@ async def test_review_plan_treatment_clean_pass(monkeypatch):
 
     entities = {
         "subtotal": 1000.0,
-        "printed_tax": 170.0, # exact match with 17% STANDARD
+        "printed_tax": 180.0, # exact match with 18% STANDARD
         "tax_code": "STANDARD",
     }
-    calls = [DummyCall("create_purchase_bill", {"subtotal": 1000.0, "total": 1170.0})]
+    calls = [DummyCall("create_purchase_bill", {"subtotal": 1000.0, "total": 1180.0})]
     client = MockClient({"contradictions": [], "missing_material_facts": []})
 
     review = await review_plan_treatment(

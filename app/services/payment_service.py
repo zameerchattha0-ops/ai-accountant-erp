@@ -399,6 +399,9 @@ async def record_customer_receipt(
     # without its journal (the partial state the previous create-then-journal
     # sequence allowed, where a journal failure was swallowed into a warning).
     # Arithmetic/validation stays here; only the writes are transactional.
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     money_gl = await _resolve_settlement_gl(
         organization_id,
         payment_method=payment_method,
@@ -537,6 +540,9 @@ async def record_supplier_payment(
     # sequence allowed, where a journal failure was swallowed into a warning).
     # NOTE: DB enum payment_direction = {INFLOW, OUTFLOW} (migration 034).
     # The database contract is authoritative — supplier payments are OUTFLOW.
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     money_gl = await _resolve_settlement_gl(
         organization_id,
         payment_method=payment_method,
@@ -710,6 +716,9 @@ async def record_bank_transfer(
     two bank_transactions (one per account).
     """
     t_date = transfer_date or date.today().isoformat()
+
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
 
     # 1. Resolve GL accounts for both bank accounts
     src_ba = await bank_repo.get_bank_account(organization_id, bank_account_id=source_bank_account_id)

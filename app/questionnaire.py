@@ -73,6 +73,39 @@ _DATE_OPTIONS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+_FIELD_TO_DRAFT_FIELD_ID: Dict[str, str] = {
+    "transaction_intent": "intent",
+    "transaction_nature": "transaction_nature",
+    "amount": "total_amount",
+    "basic_salary": "total_amount",
+    "proceeds_amount": "total_amount",
+    "depreciation_amount": "total_amount",
+    "transaction_date": "transaction_date",
+    "date_of_joining": "transaction_date",
+    "payment_type": "payment_channel",
+    "payment_method": "payment_channel",
+    "settlement_position": "payment_channel",
+    "supplier_name": "counterparty",
+    "customer_name": "counterparty",
+    "employee_name": "counterparty",
+    "party_name": "counterparty",
+    "counterparty": "counterparty",
+    "counterparty_role": "counterparty",
+    "item_description": "line_items",
+    "description": "line_items",
+    "product_name": "line_items",
+    "service_name": "line_items",
+    "quantity": "line_items",
+    "unit_price": "line_items",
+}
+
+
+def draft_field_id_for(field_name: str) -> str:
+    """Map a questionnaire field name to its StructuredTransactionDraft field_id."""
+    name = str(field_name or "").strip()
+    return _FIELD_TO_DRAFT_FIELD_ID.get(name, name)
+
+
 @dataclass(frozen=True)
 class QuestionSpec:
     """One clarification question: field, kind, text, finite options."""
@@ -83,6 +116,11 @@ class QuestionSpec:
     options: Tuple[Tuple[str, str], ...] = ()  # (value, label) pairs
     answer_hint: Optional[str] = None
     why: Optional[str] = None
+    field_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.field_id is None:
+            object.__setattr__(self, "field_id", draft_field_id_for(self.field))
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +436,7 @@ def questionnaire_schema() -> Dict[str, Any]:
                     "properties": {
                         "id": {"type": "string"},
                         "field": {"type": "string"},
+                        "field_id": {"type": "string"},
                         "kind": {"enum": sorted(_KINDS)},
                         "question": {"type": "string", "maxLength": _QUESTION_MAX},
                         "options": {
@@ -483,6 +522,7 @@ class Questionnaire:
                 {
                     "id": f"q{i}",
                     "field": q.field,
+                    "field_id": q.field_id or draft_field_id_for(q.field),
                     "kind": q.kind if q.kind in _KINDS else KIND_TEXT,
                     "question": q.question,
                     "options": [{"value": v, "label": lbl} for v, lbl in q.options]

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 from google.genai import Client
 from google.genai import types
+from google.genai.errors import APIError
 from tenacity import (
     retry,
     retry_if_not_exception_type,
@@ -81,7 +82,9 @@ def _provider_error_from_sdk(exc: Exception) -> Exception:
         )
     if isinstance(exc, ProviderError):
         return exc
-    return ProviderError(f"Gemini API error: {text[:250]}")
+    if isinstance(exc, (APIError, TimeoutError, ConnectionError)):
+        return ProviderError(f"Gemini API error: {text[:250]}")
+    return exc
 
 
 class GeminiClient:

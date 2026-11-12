@@ -140,6 +140,7 @@ class AIOrchestrator:
     def __init__(self) -> None:
         self._harbor_clients: Dict[str, Any] = {}  # model -> QwenClient (Token Harbor)
         self._harbor_unavailable: Dict[str, str] = {}  # model -> cached reason
+        self._gemini: Optional[Any] = None
         # (provider, model) pairs that answered HTTP 403 AccessDenied — dead
         # for the life of this process, never offered again.
         self._unentitled_models: set = set()

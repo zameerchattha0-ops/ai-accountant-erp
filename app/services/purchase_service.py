@@ -47,6 +47,9 @@ async def create_purchase_bill(
     if not supplier:
         raise ValueError(f"Supplier {supplier_id} not found")
 
+    from app.services.org_prerequisites import ensure_org_prerequisites_safe
+    await ensure_org_prerequisites_safe(organization_id)
+
     # PARITY: validate + normalise lines BEFORE any write (no header-only
     # partial state when a line is invalid).
     normalized_items: List[Dict[str, Any]] = []
