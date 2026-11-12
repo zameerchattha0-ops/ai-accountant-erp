@@ -444,6 +444,15 @@ async def _resolve_settlement_account(
             return await account_repo.get_account(
                 organization_id, account_id=uuid.UUID(str(gl_id))
             )
+    if method in ("BANK", "BANK_TRANSFER", "CHEQUE", "CHECK", "CARD", "WIRE", "ONLINE"):
+        from app.accounting_engine import ensure_bank_account
+        ensured = await ensure_bank_account(organization_id)
+        if ensured and ensured.get("gl_account_id"):
+            acct = await account_repo.get_account(
+                organization_id, account_id=uuid.UUID(str(ensured["gl_account_id"]))
+            )
+            if acct:
+                return acct
     return await _resolve_default_account(
         organization_id, "ASSET", fallback_type="CURRENT_ASSET"
     )

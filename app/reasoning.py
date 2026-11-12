@@ -1658,10 +1658,18 @@ def analyze_requirements(
         # missing, please resend" dead-end.  A derivable half is recorded as
         # a RESOLVED node (never an open question); the final numbers still
         # pass the confirmation card the user approves.
-        if item and (
-            entities.get("item_quantity") is None
-            or entities.get("item_unit_price") is None
-        ):
+        _qty_val = entities.get("item_quantity")
+        if _qty_val is None:
+            _qty_val = entities.get("quantity")
+        if _qty_val is None and isinstance(entities.get("line_items"), list) and len(entities["line_items"]) == 1:
+            _qty_val = (entities["line_items"][0] or {}).get("quantity")
+        _price_val = entities.get("item_unit_price")
+        if _price_val is None:
+            _price_val = entities.get("unit_price")
+        if _price_val is None and isinstance(entities.get("line_items"), list) and len(entities["line_items"]) == 1:
+            _price_val = (entities["line_items"][0] or {}).get("unit_price")
+
+        if item and (_qty_val is None or _price_val is None):
             def _num(value: Any) -> Optional[float]:
                 try:
                     out = float(value)  # type: ignore[arg-type]
@@ -1669,10 +1677,10 @@ def analyze_requirements(
                     return None
                 return out if out > 0 else None
 
-            has_qty = entities.get("item_quantity") is not None
-            has_price = entities.get("item_unit_price") is not None
-            _qty = _num(entities.get("item_quantity"))
-            _price = _num(entities.get("item_unit_price"))
+            has_qty = _qty_val is not None
+            has_price = _price_val is not None
+            _qty = _num(_qty_val)
+            _price = _num(_price_val)
             _amount = _num(entities.get("amount"))
             if not has_price and _qty and _amount:
                 nodes.append(DependencyNode(

@@ -598,11 +598,12 @@ def single_question_payload(
 # ---------------------------------------------------------------------------
 QUESTIONNAIRE_LLM_INSTRUCTIONS = """You write the clarification questionnaire of an accounting agent acting as Senior CFO and Chartered Accountant.
 
-When a user informs about purchasing or intending to buy items (especially capital items like furniture — sofas/tables/chairs, computers/IT, machinery, office equipment, vehicles, or bulk inventory) without finalized invoice or price:
+When a user informs about PLANNING or INTENDING to buy items (e.g. "I am purchasing 2 sofas", "planning to buy", NOT an already-completed booking command like "record a purchase" or "purchased") without a finalized invoice:
 - The "intro" MUST advise the user like an experienced CFO & procurement consultant:
-  1) Advise that for purchasing furniture items like "sofas", standard corporate procurement control requires requesting quotations from multiple furniture vendors to select the best vendor based on price, quality, warranty, delivery terms, and active tax filer status.
+  1) Advise that for planned capital purchases like furniture, standard corporate procurement control requires requesting quotations from multiple vendors to select the best vendor based on price, quality, warranty, delivery terms, and active tax filer status.
   2) Advise that once quotations are obtained and a vendor is selected, they can send the quotation details so you can create a formal Request for Quotation (RFQ) or Purchase Order (PO) to issue to the vendor for the actual purchase.
-  3) Explain that once delivered with an invoice, it will be capitalized under Fixed Assets (Office Furniture & Fixtures) and depreciated annually under the 3rd Schedule of ITO 2001 (15%), subject to Section 73 (payments > PKR 50,000 via bank transfer) and Section 153 WHT.
+  3) Explain that once delivered with an invoice, it will be capitalized under Fixed Assets and depreciated annually under the 3rd Schedule of ITO 2001, subject to Section 73 (payments > PKR 50,000 via bank transfer) and Section 153 WHT.
+Otherwise, when the user is recording an already-completed transaction ("record a purchase...", "purchased...", "paid...", "sold..."), write a concise 1-2 sentence plain-English intro explaining what transaction/document is being recorded and why the missing details are needed — do NOT lecture them to obtain vendor quotations first.
 
 You are given:
   * INTENT — what the user is trying to record;
@@ -1118,15 +1119,15 @@ _AUTHORED_QUESTIONNAIRE_PROMPT = """You are the Senior CFO, Chartered Accountant
 A user has requested an action or is informing the system about an intended purchase/transaction where material facts are missing or advisory is needed. You analyze the user's request, the facts already extracted and the answers already given, then WRITE an authoritative, experienced CFO consultation and the questions that close any remaining gaps — in the product's fixed JSON format.
 
 CFO & PROCUREMENT CONSULTANT PROTOCOL:
-When the user informs about purchasing or intending to buy items (especially capital items like furniture — sofas/tables/chairs, computers/IT, machinery, office equipment, vehicles, or bulk inventory) without finalized invoice or price:
+ONLY when the user informs about a PLANNED / INTENDED / IN-PROGRESS purchase (e.g. "I am purchasing 2 sofas", "planning to buy laptops" — NOT when they say "record a purchase", "purchased", or "bought"):
 1. ADVISE ON PROCUREMENT BEST PRACTICE:
-   Clearly advise that before finalizing the purchase of items like furniture, standard corporate financial controls require requesting quotations from 2 to 3 different vendors to evaluate competitive pricing, build quality, warranty terms, delivery timelines, and FBR Active Taxpayer (ATL) status.
+   Clearly advise that before finalizing the purchase of items like furniture/equipment, standard corporate financial controls require requesting quotations from 2 to 3 different vendors to evaluate competitive pricing, build quality, warranty terms, delivery timelines, and FBR Active Taxpayer (ATL) status.
 2. OFFER RFQ / PURCHASE ORDER (PO) GENERATION:
    Advise the user that once quotations are obtained and a vendor is selected, they can send the quotation details so you can immediately create a formal Request for Quotation (RFQ) or Purchase Order (PO) to issue to the vendor for the actual purchase.
 3. STATUTORY CAPITALIZATION & TAX COMPLIANCE (IAS 16 / Sec 73 / Sec 153):
-   Explain that once delivered with a formal invoice, the purchase will be capitalized under Fixed Assets (Office Furniture & Fixtures) and depreciated annually (typically 15% reducing balance under the 3rd Schedule of ITO 2001), subject to Section 73 banking channel compliance (payments > PKR 50,000 must be by bank transfer/cheque) and Section 153 withholding tax.
+   Explain that once delivered with a formal invoice, the purchase will be capitalized under Fixed Assets and depreciated annually (e.g. 15% reducing balance under the 3rd Schedule of ITO 2001), subject to Section 73 banking channel compliance (payments > PKR 50,000 must be by bank transfer/cheque) and Section 153 withholding tax.
 4. INTRO FORMAT:
-   In "intro", write this authoritative, helpful CFO/CA consultation clearly and warmly (2-4 sentences).
+   For planned purchases, write that advisory in "intro" (2-4 sentences). For already-completed transaction requests ("record a purchase", "purchased", etc.), keep "intro" concise (1-2 friendly sentences focused strictly on recording the transaction without lecturing to get quotations).
 
 Reply with ONLY this JSON object (no prose, no markdown outside the JSON):
 

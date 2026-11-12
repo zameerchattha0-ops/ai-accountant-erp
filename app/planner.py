@@ -926,6 +926,7 @@ _NON_PARTY_WORDS = {
     "summary", "summaries", "order", "orders", "po", "pos", "voucher", "vouchers",
     "payment", "payments", "receipt", "receipts", "expense", "expenses",
     "tax", "taxes", "return", "returns", "outstanding", "open", "upcoming",
+    "of", "for", "on", "in", "at", "by", "with", "from", "as", "into",
 }
 
 def _is_plausible_party(value: str) -> bool:
@@ -1047,18 +1048,10 @@ _PARTY_PATTERNS = [
 
 _ITEM_PATTERNS = [
     re.compile(
-        r"\b(?:for|towards|rendering|providing)\s+"
-        r"(?!an?\s+amount|the\s+amount|payment\b|cash\b|bank\b|credit\b|rs\.?\b|pkr\b|\d)"
-        r"([a-zA-Z][\w\s-]*?)"
-        r"(?=\s+(?:on credit|on\b|dated|today|via|to\b|from\b|against|worth|amounting)\b|[,.!?;]|\s*$)",
-        re.IGNORECASE,
-    ),
-
-    re.compile(
 
         r"\b(?:purchas(?:e|es|ed|ing)|bought|buy(?:ing)?|procured?|acquired?)\s+"
 
-        r"(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+        r"(?:of\s+)?(?:an?\s+|the\s+|some\s+|\d+\s+)?"
 
         # (2026-10-07, AES) — never capture the SOURCE side as the item:
 
@@ -1080,7 +1073,7 @@ _ITEM_PATTERNS = [
 
     re.compile(
 
-        r"\b(?:sold|sells?|selling)\s+(?:an?\s+|the\s+|some\s+|\d+\s+)?"
+        r"\b(?:sold|sells?|selling)\s+(?:of\s+)?(?:an?\s+|the\s+|some\s+|\d+\s+)?"
 
         # (2026-10-07, AES production) — same guard on the sale verb:
 
@@ -1182,6 +1175,25 @@ _ITEM_PATTERNS = [
 
         re.IGNORECASE,
 
+    ),
+
+    # "for <qty> <item> [at <price> each]" — digit-led item specification
+    # after a party ("CREATE PO FOR SHABBIR FURNITURE FOR 5 OFFICE CHAIRS AT 15000 EACH").
+    # Placed BEFORE the generic "for|towards" pattern so the count-led item
+    # is never lost behind a party name or trailing amount stop lookahead.
+    re.compile(
+        r"\b(?:for|order\s+(?:of|for)|supply\s+of)\s+"
+        r"(\d+\s+[a-zA-Z][\w\s-]*?(?:\s+(?:at|@|worth)\s+(?:rs\.?|pkr|₨|\$)?\s*[\d,]+(?:\.\d+)?(?:\s*(?:each|per\s+unit|a\s+piece))?)?)"
+        r"(?=\s+(?:on credit|on\b|dated|today|via|to\b|from\b|against)\b|[,.!?;]|\s*$)",
+        re.IGNORECASE,
+    ),
+
+    re.compile(
+        r"\b(?:for|towards|rendering|providing)\s+"
+        r"(?!an?\s+amount|the\s+amount|payment\b|cash\b|bank\b|credit\b|rs\.?\b|pkr\b|\d)"
+        r"([a-zA-Z][\w\s-]*?)"
+        r"(?=\s+(?:on credit|on\b|dated|today|via|to\b|from\b|for\b|against|worth|amounting)\b|[,.!?;]|\s*$|\s+\d)",
+        re.IGNORECASE,
     ),
 
 ]
@@ -4276,15 +4288,15 @@ def _split_answer_parts(answer: str) -> List[str]:
 
         return []
 
-    # Numbered parts ("1) cash 2) yes" / "1. cash\n2. yes")
+    # Numbered parts ("1) cash 2) yes" / "1. cash\n2. yes" / "1: cash 2: yes")
 
-    if re.search(r"(?:^|\s)1\s*[.)]\s*\S", text):
+    if re.search(r"(?:^|\s)1\s*[:.)]\s+\S", text):
 
         parts = [
 
-            p.strip(" ,;")
+            re.sub(r"^\s*\d{1,2}\s*[:.)]\s+(?=\S)", "", p).strip(" ,;")
 
-            for p in re.split(r"\s*\d+\s*[.)]\s*", text)
+            for p in re.split(r"(?:^|\s)\d{1,2}\s*[:.)]\s+", text)
 
             if p.strip(" ,;")
 
@@ -4298,7 +4310,11 @@ def _split_answer_parts(answer: str) -> List[str]:
 
     if "\n" in text:
 
-        parts = [p.strip(" ,;") for p in text.splitlines() if p.strip(" ,;")]
+        parts = [
+            re.sub(r"^\s*\d{1,2}\s*[:.)]\s+(?=\S)", "", p).strip(" ,;")
+            for p in text.splitlines()
+            if p.strip(" ,;")
+        ]
 
         if len(parts) >= 2:
 
@@ -4308,15 +4324,34 @@ def _split_answer_parts(answer: str) -> List[str]:
 
     segments = re.split(r",(?!\d)\s*|\s+and\s+", text)
 
-    parts = [p.strip(" ,;") for p in segments if p.strip(" ,;")]
+    parts = [
+        re.sub(r"^\s*\d{1,2}\s*[:.)]\s+(?=\S)", "", p).strip(" ,;")
+        for p in segments
+        if p.strip(" ,;")
+    ]
 
     return parts if len(parts) >= 2 else [text]
 
+def _qa_answer_text(raw: Any) -> str:
+    """Safely normalise a clarification answer (str, list, dict, or scalar) to stripped text."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, (list, dict)):
+        import json as _json
+        try:
+            return _json.dumps(raw, default=str).strip()
+        except Exception:
+            return str(raw).strip()
+    return str(raw).strip()
+
+
 def _explode_multi_answers(
 
-    qa_history: List[Dict[str, str]],
+    qa_history: List[Dict[str, Any]],
 
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
 
     """Pair each part of a multi-question answer with its own question.
 
@@ -4328,17 +4363,31 @@ def _explode_multi_answers(
 
     """
 
-    exploded: List[Dict[str, str]] = []
+    exploded: List[Dict[str, Any]] = []
 
     for qa in qa_history or []:
 
         question = qa.get("question") or ""
 
-        answer = (qa.get("answer") or "").strip()
+        raw_answer = qa.get("answer")
+
+        if isinstance(raw_answer, (list, dict)):
+            if raw_answer:
+                exploded.append({
+                    "question": question,
+                    "answer": raw_answer,
+                    "field": qa.get("field"),
+                    "required_information": qa.get("required_information"),
+                })
+            continue
+
+        answer = _qa_answer_text(raw_answer)
 
         if not answer:
 
             continue
+
+        req_info = qa.get("required_information") if isinstance(qa.get("required_information"), list) else None
 
         sub_questions = _split_numbered_questions(question)
 
@@ -4346,9 +4395,11 @@ def _explode_multi_answers(
 
         if len(sub_questions) >= 2 and len(parts) == len(sub_questions):
 
-            for sq, part in zip(sub_questions, parts):
-
-                exploded.append({"question": sq, "answer": part})
+            for idx, (sq, part) in enumerate(zip(sub_questions, parts)):
+                pair: Dict[str, Any] = {"question": sq, "answer": part}
+                if req_info and len(req_info) == len(sub_questions):
+                    pair["field"] = str(req_info[idx])
+                exploded.append(pair)
 
         elif (
 
@@ -4360,29 +4411,11 @@ def _explode_multi_answers(
 
         ):
 
-            # A leading PREAMBLE is not a question ("To record this transaction
-
-            # I need a few things:\n1. …\n2. …\n3. …").  Dropping it makes the
-
-            # counts line up so each numbered answer still reaches its own
-
-            # field — without this, the whole consolidated answer fell through
-
-            # as one blob and the depreciation trio repeated forever
-
-            # (production 2026-10-01, building session 6b78909c).
-
-            # A first item that ASKS (contains "?") is a real question even
-
-            # when a trailing sentence follows the mark — dropping it paired
-
-            # a bare "Yes" with the WRONG question and silently lost the
-
-            # account-creation approval (Zameer Labs 2026-10-07).
-
-            for sq, part in zip(sub_questions[1:], parts):
-
-                exploded.append({"question": sq, "answer": part})
+            for idx, (sq, part) in enumerate(zip(sub_questions[1:], parts)):
+                pair = {"question": sq, "answer": part}
+                if req_info and len(req_info) == len(parts):
+                    pair["field"] = str(req_info[idx])
+                exploded.append(pair)
 
         elif (
 
@@ -4394,17 +4427,17 @@ def _explode_multi_answers(
 
         ):
 
-            # 
-
             # choosing CREDIT on the payment question reveals an extra
 
             # "N) supplier: X" part.  Pair the base parts with their
 
             # questions and route the trailing part to the supplier field.
 
-            for sq, part in zip(sub_questions, parts[:-1]):
-
-                exploded.append({"question": sq, "answer": part})
+            for idx, (sq, part) in enumerate(zip(sub_questions, parts[:-1])):
+                pair = {"question": sq, "answer": part}
+                if req_info and len(req_info) == len(sub_questions):
+                    pair["field"] = str(req_info[idx])
+                exploded.append(pair)
 
             value = re.split(
 
@@ -4419,6 +4452,8 @@ def _explode_multi_answers(
                     "question": "Who is the supplier?",
 
                     "answer": value,
+
+                    "field": "supplier_name",
 
                 })
 
@@ -4440,15 +4475,17 @@ def _explode_multi_answers(
 
                 "field": qa.get("field"),
 
+                "required_information": qa.get("required_information"),
+
             })
 
     return exploded
 
 def _resolve_same_answers(
 
-    qa_history: List[Dict[str, str]],
+    qa_history: List[Dict[str, Any]],
 
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
 
     """Resolve "SAME" answers to the prior answer for the same question.
 
@@ -4466,13 +4503,25 @@ def _resolve_same_answers(
 
         return (q or "").split("(previously")[0].strip().lower()
 
-    resolved: List[Dict[str, str]] = []
+    resolved: List[Dict[str, Any]] = []
 
     for qa in qa_history or []:
 
         question = qa.get("question") or ""
 
-        answer = (qa.get("answer") or "").strip()
+        raw_answer = qa.get("answer")
+
+        if isinstance(raw_answer, (list, dict)):
+            if raw_answer:
+                resolved.append({
+                    "question": question,
+                    "answer": raw_answer,
+                    "field": qa.get("field"),
+                    "required_information": qa.get("required_information"),
+                })
+            continue
+
+        answer = _qa_answer_text(raw_answer)
 
         if answer.lower() == "same":
 
@@ -4486,7 +4535,7 @@ def _resolve_same_answers(
 
                     if _norm(p.get("question")) == _norm(question)
 
-                    and (p.get("answer") or "").strip().lower() != "same"
+                    and _qa_answer_text(p.get("answer")).lower() != "same"
 
                 ),
 
@@ -4498,7 +4547,10 @@ def _resolve_same_answers(
 
                 resolved.append({
 
-                    "question": question, "answer": prior, "field": qa.get("field"),
+                    "question": question,
+                    "answer": prior,
+                    "field": qa.get("field"),
+                    "required_information": qa.get("required_information"),
 
                 })
 
@@ -4506,7 +4558,10 @@ def _resolve_same_answers(
 
         resolved.append({
 
-            "question": question, "answer": answer, "field": qa.get("field"),
+            "question": question,
+            "answer": answer,
+            "field": qa.get("field"),
+            "required_information": qa.get("required_information"),
 
         })
 
@@ -5050,9 +5105,11 @@ def _merge_clarification_answers(
 
         question = (qa.get("question") or "").lower()
 
-        answer = (qa.get("answer") or "").strip()
+        raw_answer = qa.get("answer")
 
-        if not answer:
+        answer = _qa_answer_text(raw_answer)
+
+        if not answer and not isinstance(raw_answer, (list, dict)):
 
             continue
 
@@ -5098,7 +5155,7 @@ def _merge_clarification_answers(
 
         if field_tag and _merge_field_answer(
 
-            merged, field_tag, answer, intent=intent
+            merged, field_tag, raw_answer if raw_answer is not None else answer, intent=intent
 
         ):
 
@@ -5166,7 +5223,7 @@ def _merge_clarification_answers(
 
         if re.fullmatch(r"[a-z][a-z0-9_]{2,40}", _bare):
 
-            if _merge_field_answer(merged, _bare, answer, intent=intent):
+            if _merge_field_answer(merged, _bare, raw_answer if raw_answer is not None else answer, intent=intent):
 
                 continue
 
@@ -5722,7 +5779,12 @@ def _merge_clarification_answers(
 
                 merged["amount"] = value
 
-        elif "supplier" in question and (
+        elif "supplier" in question and not any(
+            w in question for w in ("settled", "payment", "cash, bank", "by bank transfer")
+        ) and answer.strip().lower() not in (
+            "bank", "cash", "credit", "bank transfer", "bank_transfer", "today", "yesterday",
+            "fixed_asset", "fixed asset", "inventory", "operating_expense", "consumable",
+        ) and (
 
             _is_control_answer(answer) or not merged.get("supplier_name")
 
@@ -6090,7 +6152,48 @@ def _merge_field_answer(
 
     field = (field_name or "").strip().lower()
 
-    raw = (answer or "").strip()
+    if field == "line_items":
+        parsed_li = None
+        parsed_total = None
+        if isinstance(answer, list):
+            parsed_li = answer
+        elif isinstance(answer, dict) and "line_items" in answer:
+            parsed_li = answer["line_items"]
+            parsed_total = answer.get("total_amount")
+        elif isinstance(answer, str) and answer.strip().startswith(("[", "{")):
+            import ast as _ast
+            import json as _json
+            s_ans = answer.strip()
+            for loader in (_json.loads, _ast.literal_eval):
+                try:
+                    loaded = loader(s_ans)
+                    if isinstance(loaded, list):
+                        parsed_li = loaded
+                        break
+                    if isinstance(loaded, dict) and isinstance(loaded.get("line_items"), list):
+                        parsed_li = loaded["line_items"]
+                        parsed_total = loaded.get("total_amount")
+                        break
+                except Exception:
+                    continue
+        if parsed_li and isinstance(parsed_li, list):
+            merged["line_items"] = parsed_li
+            total_val = parsed_total or _line_items_total(parsed_li)
+            if total_val and not merged.get("amount"):
+                merged["amount"] = total_val
+            if len(parsed_li) == 1 and isinstance(parsed_li[0], dict):
+                item0 = parsed_li[0]
+                desc0 = str(item0.get("description") or item0.get("product_name") or item0.get("name") or "").strip()
+                if desc0:
+                    merged["item_description"] = desc0
+                if item0.get("quantity") is not None and not merged.get("item_quantity"):
+                    merged["item_quantity"] = item0["quantity"]
+                    merged.setdefault("quantity", item0["quantity"])
+                if item0.get("unit_price") is not None and not merged.get("item_unit_price"):
+                    merged["item_unit_price"] = item0["unit_price"]
+            return True
+
+    raw = _qa_answer_text(answer)
 
     if not field or not raw:
 
@@ -6099,24 +6202,6 @@ def _merge_field_answer(
     low = raw.lower().strip(" .)'\"")
 
     value = raw.strip()
-
-    if field == "line_items":
-
-        if isinstance(answer, list):
-
-            merged["line_items"] = answer
-
-            merged["amount"] = _line_items_total(answer)
-
-            return True
-
-        elif isinstance(answer, dict) and "line_items" in answer:
-
-            merged["line_items"] = answer["line_items"]
-
-            merged["amount"] = answer.get("total_amount") or _line_items_total(answer["line_items"])
-
-            return True
 
     # Master data / Setup and Operational field routing
 
@@ -6441,7 +6526,23 @@ def _merge_field_answer(
 
         _allowed = tuple(_family) if _family else tuple(_NATURE_VALUES)
 
+        _SYNONYMS = {
+            "ASSET": "FIXED_ASSET",
+            "FIXED_ASSETS": "FIXED_ASSET",
+            "CAPITAL_ASSET": "FIXED_ASSET",
+            "PPE": "FIXED_ASSET",
+            "EXPENSE": "OPERATING_EXPENSE",
+            "CONSUMABLE": "OPERATING_EXPENSE",
+            "CONSUMABLES": "OPERATING_EXPENSE",
+            "ONE_OFF_EXPENSE": "OPERATING_EXPENSE",
+            "STOCK": "INVENTORY",
+            "RESALE": "INVENTORY",
+            "MERCHANDISE": "INVENTORY",
+        }
+
         candidate = low.replace(" ", "_").upper()
+        if candidate not in _allowed and _SYNONYMS.get(candidate) in _allowed:
+            candidate = _SYNONYMS[candidate]
 
         if candidate in _allowed:
 
@@ -7004,7 +7105,10 @@ def _is_plausible_item(value: str) -> bool:
 
     )
 
-    return _is_plausible_party(text or value)
+    candidate_check = text or value or ""
+    if not any(ch.isalpha() for ch in candidate_check):
+        return False
+    return _is_plausible_party(candidate_check)
 
 # A legal-entity suffix: "zeta pvt ltd", "Beta Traders Inc".  A product is
 

@@ -14812,7 +14812,7 @@ async def resume_with_clarification(
                 if _parsed_multi and _parsed_multi.get('line_items'):
                     history = [
                         *history,
-                        {'field': 'line_items', 'question': 'line_items', 'answer': _parsed_multi['line_items']},
+                        {'field': 'line_items', 'question': 'line_items', 'answer': json.dumps(_parsed_multi['line_items'])},
                         {'field': 'amount', 'question': 'amount', 'answer': str(_parsed_multi.get('total_amount', ''))},
                     ]
             if parsed_endpoints:
@@ -14924,6 +14924,14 @@ async def resume_with_clarification(
                         if b_keyword in ans_up:
                             merged_entities["bank_name"] = b_keyword.title()
                             break
+                elif any(k in part.upper() for k in ("FIXED_ASSET", "FIXED ASSET", "INVENTORY", "OPERATING_EXPENSE", "CONSUMABLE")):
+                    ans_up = part.upper()
+                    if "FIXED" in ans_up:
+                        merged_entities["transaction_nature"] = "FIXED_ASSET"
+                    elif "INVENTORY" in ans_up or "RESALE" in ans_up:
+                        merged_entities["transaction_nature"] = "INVENTORY"
+                    elif "CONSUMABLE" in ans_up or "OPERATING" in ans_up:
+                        merged_entities["transaction_nature"] = "OPERATING_EXPENSE"
                 elif any(k in part.upper() for k in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY")):
                     ans_up = part.upper()
                     for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):

@@ -47,8 +47,14 @@ _INTENT_TOOLS: dict[str, set[str]] = {
         "prepare_journal", "validate_journal", "post_journal",
     },
     "record_purchase": {
-        "create_supplier", "create_purchase_bill",
+        "create_supplier", "create_purchase_bill", "create_purchase_order", "get_purchase_order",
         "prepare_journal", "validate_journal", "post_journal",
+    },
+    "create_purchase_order": {
+        "create_supplier", "create_purchase_order", "get_purchase_order",
+    },
+    "update_document_status": {
+        "update_document_status", "get_invoice", "get_purchase_bill", "get_purchase_order",
     },
     "record_cash_sale": {"create_customer", "record_cash_sale"},
     "record_credit_sale": {
@@ -231,7 +237,7 @@ def excluded_for_intent(
 _LOOKUP_UNIVERSE = (
     _CUSTOMER_LOOKUPS | _SUPPLIER_LOOKUPS | _ACCOUNT_LOOKUPS
     | _PRODUCT_LOOKUPS | _ASSET_LOOKUPS | _BANK_LOOKUPS
-    | _EMPLOYEE_LOOKUPS
+    | _EMPLOYEE_LOOKUPS | {"discover_erp_capabilities"}
 )
 _JOURNAL_HELPERS = {"prepare_journal", "validate_journal", "post_journal"}
 

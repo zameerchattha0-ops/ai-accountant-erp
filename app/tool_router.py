@@ -28,7 +28,7 @@ from app import idempotency as idem
 from app.error_normalizer import normalize_error
 from app.models.schemas import ToolCall, ToolResult
 from app.permissions import authorize_tool
-from app.tools import get_handler, list_tools, resolve_tool_alias
+from app.tools import derive_live_parameter_schema, get_handler, list_tools, resolve_tool_alias
 from app.validator import validate_operation
 
 log = structlog.get_logger(__name__)
@@ -457,7 +457,7 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
                     .table("tool_parameters")
                     .select("tool_id,parameter_name,description,data_type,required,position")
                     .in_("tool_id", tool_ids)
-                    .limit(500)
+                    .limit(2000)
                 )
             ).data
             or []
@@ -477,6 +477,11 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
         # Sort by position (NULLs last)
         params.sort(key=lambda p: p.get("position") or 999)
 
+        live_schema = derive_live_parameter_schema(slug)
+        live_props = dict(live_schema.get("properties") or {})
+        live_required = list(live_schema.get("required") or [])
+        strict_contract = bool(live_schema.get("strict_contract"))
+
         properties: Dict[str, Any] = {}
         required_fields: list[str] = []
 
@@ -484,7 +489,10 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             pname = p["parameter_name"]
             # organization_id is auto-injected by the executor — never
             # expose it to Gemini.
-            if pname == "organization_id":
+            if pname in ("organization_id", "created_by", "ai_execution_id"):
+                continue
+            # Drop stale DB-only parameters when Python declares a strict contract.
+            if strict_contract and pname not in live_props:
                 continue
             properties[pname] = {
                 "type": p.get("data_type", "string"),
@@ -493,20 +501,16 @@ async def get_gemini_tool_definitions() -> list[Dict[str, Any]]:
             if p.get("required"):
                 required_fields.append(pname)
 
-        # Fallback to Python signature contract if DB parameters are empty
-        if not properties and entry.get("contract"):
-            contract = entry["contract"]
-            for pname in contract.get("accepted") or ():
-                if pname in ("organization_id", "created_by"):
-                    continue
-                is_uuid = pname in (contract.get("uuid_params") or ())
-                properties[pname] = {
-                    "type": "string",
-                    "description": f"UUID for {pname}" if is_uuid else f"Parameter {pname}",
-                }
-            for req in contract.get("required") or ():
-                if req not in ("organization_id", "created_by"):
-                    required_fields.append(req)
+        # Merge ALL live Python parameters so new/updated backend parameters and
+        # tools without DB migrations are always exposed in real time.
+        for pname, lprop in live_props.items():
+            if pname not in properties:
+                properties[pname] = dict(lprop)
+            elif not properties[pname].get("description") and lprop.get("description"):
+                properties[pname]["description"] = lprop["description"]
+        for req in live_required:
+            if req not in required_fields and req in properties:
+                required_fields.append(req)
 
         if slug == "record_cash_sale":
             if "items" not in properties:

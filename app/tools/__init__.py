@@ -20,6 +20,9 @@ from __future__ import annotations
 
 
 
+import ast
+import inspect
+import textwrap
 import uuid
 
 from typing import Any, Callable, Coroutine, Dict, Optional
@@ -136,6 +139,8 @@ def register(
 
     contract: Optional[Dict[str, Any]] = None,
 
+    live_target: Optional[Callable[..., Any]] = None,
+
 ):
 
     """Register a tool handler.
@@ -161,6 +166,8 @@ def register(
         "description": description,
 
         "contract": contract,
+
+        "live_target": live_target,
 
     }
 
@@ -280,6 +287,175 @@ def tool_contracts() -> Dict[str, Dict[str, Any]]:
 
         if entry.get("contract")
 
+    }
+
+
+def _infer_param_schema(pname: str, *, is_uuid: bool = False, annotation: Any = None) -> Dict[str, Any]:
+    """Infer a JSON-Schema property definition from parameter name & type hint."""
+    ann_str = str(annotation or "").lower()
+    low = pname.lower()
+    if "bool" in ann_str or low.startswith(("is_", "only_", "out_of_", "apply_", "deduct_", "withholding_tax")):
+        if low in ("withholding_tax_rate",):
+            return {"type": "number", "description": f"Numeric parameter {pname}"}
+        return {"type": "boolean", "description": f"Boolean flag {pname}"}
+    if "int" in ann_str and "float" not in ann_str:
+        return {"type": "integer", "description": f"Integer parameter {pname}"}
+    if "float" in ann_str or "decimal" in ann_str or low in (
+        "amount", "unit_price", "cost_price", "sales_price", "price", "quantity",
+        "total", "subtotal", "tax_amount", "tax_rate_percent", "sales_tax_rate",
+        "wht_amount", "wht_rate", "wht_rate_percent", "withholding_tax_rate",
+        "discount_total", "tax_total", "credit_limit", "basic_salary", "salary",
+        "salvage_value", "absences", "days_absent", "interest_rate",
+    ):
+        return {"type": "number", "description": f"Numeric parameter {pname}"}
+    if "list" in ann_str or "sequence" in ann_str or low in (
+        "items", "lines", "reference_numbers", "allowances", "employee_absences",
+    ):
+        if low in ("items", "lines"):
+            return {
+                "type": "array",
+                "description": f"Line items list ({pname})",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string", "description": "Line item description"},
+                        "quantity": {"type": "number", "description": "Quantity (>0)"},
+                        "unit_price": {"type": "number", "description": "Unit price"},
+                    },
+                },
+            }
+        return {"type": "array", "description": f"List parameter {pname}", "items": {"type": "string"}}
+    if "dict" in ann_str or "mapping" in ann_str:
+        return {"type": "object", "description": f"Structured object {pname}"}
+    if is_uuid or low.endswith("_id"):
+        return {"type": "string", "description": f"UUID for {pname}"}
+    return {"type": "string", "description": f"Parameter {pname}"}
+
+
+def _resolve_live_target(target: Any) -> Optional[Callable[..., Any]]:
+    if callable(target):
+        return target
+    if isinstance(target, str) and ":" in target:
+        mod_name, attr_name = target.split(":", 1)
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, attr_name, None)
+            if callable(fn):
+                return fn
+        except Exception:
+            return None
+    return None
+
+
+def derive_live_parameter_schema(slug: str) -> Dict[str, Any]:
+    """Derive live parameter properties & required fields directly from Python handlers.
+
+    Merges:
+    1) Explicit ``entry["contract"]`` (service/domain signature contracts),
+    2) Live ``entry["live_target"]`` callable signature (for thin wrappers that
+       forward ``**kw`` to a typed service function), and
+    3) Direct AST inspection of ``kw.get(...)`` / ``kw[...]`` and explicit
+       parameters on ``entry["handler"]``.
+
+    Returns ``{"properties": {...}, "required": [...], "strict_contract": bool}``.
+    """
+    entry = get_handler(slug)
+    if not entry:
+        return {"properties": {}, "required": [], "strict_contract": False}
+
+    properties: Dict[str, Any] = {}
+    required: list[str] = []
+    strict_contract = False
+    ignored = {"organization_id", "created_by", "ai_execution_id", "kw", "kwargs"}
+
+    contract = entry.get("contract")
+    if contract:
+        strict_contract = not bool(contract.get("accepts_extra"))
+        uuid_set = set(contract.get("uuid_params") or ())
+        for pname in contract.get("accepted") or ():
+            if pname in ignored:
+                continue
+            properties[pname] = _infer_param_schema(pname, is_uuid=(pname in uuid_set))
+        for req in contract.get("required") or ():
+            if req not in ignored and req not in required:
+                required.append(req)
+
+    live_fn = _resolve_live_target(entry.get("live_target"))
+    if live_fn is not None:
+        try:
+            sig = inspect.signature(live_fn)
+            for pname, param in sig.parameters.items():
+                if pname in ignored or param.kind in (
+                    inspect.Parameter.VAR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                ):
+                    continue
+                if pname not in properties:
+                    properties[pname] = _infer_param_schema(
+                        pname,
+                        is_uuid=("uuid" in str(param.annotation).lower()),
+                        annotation=param.annotation,
+                    )
+                if param.default is inspect.Parameter.empty and pname not in required:
+                    required.append(pname)
+        except Exception:
+            pass
+
+    handler = entry.get("handler")
+    if callable(handler):
+        try:
+            hsig = inspect.signature(handler)
+            for pname, param in hsig.parameters.items():
+                if pname in ignored or param.kind in (
+                    inspect.Parameter.VAR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                ):
+                    continue
+                if pname not in properties:
+                    properties[pname] = _infer_param_schema(pname, annotation=param.annotation)
+                if param.default is inspect.Parameter.empty and pname not in required:
+                    required.append(pname)
+
+            src = textwrap.dedent(inspect.getsource(handler))
+            tree = ast.parse(src)
+            kw_keys: set[str] = set()
+            req_kw_keys: set[str] = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "kw"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    kw_keys.add(node.args[0].value)
+                elif (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "kw"
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)
+                ):
+                    kw_keys.add(node.slice.value)
+                    req_kw_keys.add(node.slice.value)
+            for kname in sorted(kw_keys):
+                if kname in ignored or kname in properties:
+                    continue
+                properties[kname] = _infer_param_schema(kname)
+            for rk in sorted(req_kw_keys):
+                if rk not in ignored and rk not in required and rk in properties:
+                    required.append(rk)
+        except Exception:
+            pass
+
+    return {
+        "properties": properties,
+        "required": required,
+        "strict_contract": strict_contract,
     }
 
 
@@ -1637,9 +1813,23 @@ async def _record_cash_purchase(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
 
-    # ---- CASH LEDGER (resolve, CREATE when missing) -----------------------
+    # ---- SETTLEMENT LEDGER (Cash vs Bank, resolved & created when missing) --
 
-    cash_account = await ensure_cash_account(organization_id)
+    _pm_hint = str(
+        kw.get("payment_method")
+        or kw.get("payment_type")
+        or kw.get("payment_channel")
+        or "CASH"
+    ).strip().upper()
+    _is_bank_pm = _pm_hint in ("BANK", "BANK_TRANSFER", "BANK TRANSFER", "CHEQUE", "CHECK", "CARD", "WIRE", "ONLINE")
+
+    cash_account = None
+    if _is_bank_pm:
+        ensured_bank = await _engine.ensure_bank_account(organization_id, bank_name=kw.get("bank_name"))
+        if ensured_bank and ensured_bank.get("gl_account_id"):
+            cash_account = {"id": ensured_bank["gl_account_id"], "name": ensured_bank.get("account_name") or "Bank"}
+    if not cash_account:
+        cash_account = await ensure_cash_account(organization_id)
 
     if not cash_account:
 
@@ -5302,7 +5492,7 @@ register("search_product", handler=_search_product, read_only=True, description=
 register("get_inventory_status", handler=_get_inventory_status, read_only=True, description="Get current inventory valuation, quantities on hand, inward received, and outward issued stock across catalogue products")
 
 register("create_product", handler=_create_product, read_only=False, contract=contract_from_callable(product_service.create), description="Create a catalog product (catalog only — the ERP has no stock-quantity ledger). Set is_stock_tracked=true ONLY when the user explicitly answered the inventory question confirming resale stock — never infer it")
-register("update_product", handler=_update_product, read_only=False, description="Update an existing product in the catalog (unit_price, cost_price, description, name, is_stock_tracked)")
+register("update_product", handler=_update_product, read_only=False, live_target=product_service.update, description="Update an existing product in the catalog (unit_price, cost_price, description, name, is_stock_tracked)")
 register("delete_product", handler=_delete_product, read_only=False, description="Delete a product from the catalog, or deactivate it if documents already reference it")
 
 
@@ -5312,7 +5502,7 @@ register("delete_product", handler=_delete_product, read_only=False, description
 register("search_service", handler=_search_service, read_only=True, description="Search the service catalog by name (empty result = no service exists yet)")
 
 register("create_service", handler=_create_service, read_only=False, contract=contract_from_callable(service_service.create), description="Create a catalog service (billing unit HOUR/DAY/MONTH/FIXED/ITEM — services never involve stock or assets)")
-register("update_service", handler=_update_service, read_only=False, description="Update an existing service in the catalog (standard_rate, description, name, billing_unit)")
+register("update_service", handler=_update_service, read_only=False, live_target=service_service.update, description="Update an existing service in the catalog (standard_rate, description, name, billing_unit)")
 register("delete_service", handler=_delete_service, read_only=False, description="Delete a service from the catalog, or deactivate it if documents already reference it")
 
 
@@ -5465,7 +5655,7 @@ async def _get_recurring_executions(organization_id: uuid.UUID, **kw) -> ToolRes
 
 
 
-register("create_recurring_template", handler=_create_recurring_template, read_only=False, description="Create a recurring transaction template (balanced journal lines + frequency + next due date)")
+register("create_recurring_template", handler=_create_recurring_template, read_only=False, live_target="app.services.recurring_service:create_template", description="Create a recurring transaction template (balanced journal lines + frequency + next due date)")
 
 register("get_recurring_templates", handler=_get_recurring_templates, read_only=True, description="List recurring transaction templates (optionally filter by status)")
 
@@ -5489,6 +5679,7 @@ register(
     "update_document_status",
     handler=_update_document_status,
     read_only=False,
+    live_target="app.tools.document_status_tools:update_document_status",
     description="Update status of single or bulk documents across all modules (purchase_bill, purchase_order, invoice, quotation, product) with verification audit table.",
 )
 # ===================================================================
@@ -5553,4 +5744,92 @@ register(
     read_only=False,
     contract=contract_from_callable(payroll_service.set_organization_leave_policy),
     description="Configure organization's leave policy for payroll: set monthly_allowed_leaves (int), annual_allowed_leaves (int), and standard_working_days (int). Employees with absences <= monthly_allowed_leaves receive full salary; excess days are deducted at 1/standard_working_days.",
+)
+
+
+# ===================================================================
+# REAL-TIME LIVE ENDPOINT & CAPABILITY DISCOVERY
+# ===================================================================
+def _capability_matches(query: str, *fields: str) -> bool:
+    if not query:
+        return True
+    hay = " ".join(str(f or "").replace("_", " ").lower() for f in fields)
+    q_norm = query.replace("_", " ").strip().lower()
+    if q_norm in hay:
+        return True
+    tokens = [t for t in q_norm.split() if len(t) >= 2]
+    if not tokens:
+        return True
+    for tok in tokens:
+        stem = tok[:-1] if len(tok) > 3 and tok.endswith("s") else tok
+        if tok not in hay and stem not in hay:
+            return False
+    return True
+
+
+async def _discover_erp_capabilities(organization_id: uuid.UUID, **kw) -> ToolResult:
+    """Inspect live registered ERP tools, parameter schemas, modules, and HTTP endpoints in real time."""
+    query = str(kw.get("query") or kw.get("section") or kw.get("task") or "").strip().lower()
+    include_routes = bool(kw.get("include_http_routes", True))
+
+    matched_tools = []
+    for slug in sorted(_TOOL_REGISTRY.keys()):
+        entry = _TOOL_REGISTRY[slug]
+        desc = str(entry.get("description") or "")
+        if not _capability_matches(query, slug, desc):
+            continue
+        live = derive_live_parameter_schema(slug)
+        matched_tools.append({
+            "slug": slug,
+            "read_only": bool(entry.get("read_only")),
+            "description": desc[:240],
+            "parameters": sorted(live["properties"].keys()),
+            "required": live["required"],
+        })
+
+    from app.erp_endpoints import ERP_MODULES
+    modules = {}
+    for mod_key, mod_info in ERP_MODULES.items():
+        if _capability_matches(
+            query,
+            mod_key,
+            mod_info.get("label", ""),
+            mod_info.get("description", ""),
+            " ".join(mod_info.get("tasks", [])),
+        ):
+            modules[mod_key] = mod_info
+
+    http_routes = []
+    if include_routes:
+        try:
+            from app.main import app as fastapi_app
+            for route in getattr(fastapi_app, "routes", []):
+                path = getattr(route, "path", "")
+                if not path.startswith("/api/"):
+                    continue
+                methods = sorted(m for m in (getattr(route, "methods", None) or []) if m not in ("HEAD", "OPTIONS"))
+                name = getattr(route, "name", "") or ""
+                if not _capability_matches(query, path, name):
+                    continue
+                http_routes.append({"methods": methods, "path": path, "name": name})
+        except Exception:
+            pass
+
+    return ToolResult(
+        tool_name="discover_erp_capabilities",
+        success=True,
+        data={
+            "total_registered_tools": len(_TOOL_REGISTRY),
+            "tools": matched_tools[:60],
+            "modules": modules,
+            "http_routes": http_routes[:60],
+        },
+    )
+
+
+register(
+    "discover_erp_capabilities",
+    handler=_discover_erp_capabilities,
+    read_only=True,
+    description="Real-time live discovery of all registered ERP tools, their latest Python parameter schemas, ERP modules/sections, and live FastAPI HTTP endpoints filtered by section/task query.",
 )
