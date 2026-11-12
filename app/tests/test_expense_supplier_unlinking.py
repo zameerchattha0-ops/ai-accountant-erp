@@ -160,3 +160,85 @@ def test_transactional_clarification_question_not_wiped_after_coa_lookup():
         "Here are your current cash and bank balances:\n| Account | Balance |\n| Cash | 0.00 |\nWould you like a breakdown?",
         read_tool_ok,
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_validate_and_post_journal_idempotent_when_already_posted(monkeypatch):
+    """validate_journal & post_journal succeed idempotently when entry was already auto-posted."""
+    import uuid
+    from app.tools import _validate_journal, _post_journal
+
+    org_id = uuid.uuid4()
+    entry_id = uuid.uuid4()
+
+    async def fake_validate(*, entry_id):
+        raise RuntimeError("Error P0001:\nMessage: Only DRAFT entries can be validated, entry is POSTED")
+
+    async def fake_post(*, entry_id):
+        raise RuntimeError("Error P0001:\nMessage: Journal entry JV-000002 cannot be posted from status POSTED")
+
+    async def fake_get_entry(oid, *, entry_id):
+        return {"id": str(entry_id), "status": "POSTED", "journal_number": "JV-000002"}
+
+    monkeypatch.setattr("app.tools.accounting_service.validate_journal", fake_validate)
+    monkeypatch.setattr("app.tools.accounting_service.post_journal", fake_post)
+    monkeypatch.setattr("app.tools.accounting_service.get_entry", fake_get_entry)
+
+    v_res = await _validate_journal(org_id, entry_id=str(entry_id))
+    assert v_res.success is True
+    assert v_res.data["already_validated"] is True
+    assert v_res.data["already_posted"] is True
+
+    p_res = await _post_journal(org_id, entry_id=str(entry_id))
+    assert p_res.success is True
+    assert p_res.data["already_posted"] is True
+
+
+def test_normalize_error_extracts_postgrest_p0001_message():
+    """Error P0001 multi-line PostgREST messages classify as CONSTRAINT_VIOLATION with exact reason."""
+    from app.error_normalizer import CONSTRAINT_VIOLATION, normalize_error
+
+    raw = "Error P0001:\nMessage: Journal entry JV-000002 cannot be posted from status POSTED"
+    norm = normalize_error(raw, operation="post_journal")
+    assert norm["category"] == CONSTRAINT_VIOLATION
+    assert norm["recoverable"] is True
+    assert norm["requires_user_input"] is False
+    assert "cannot be posted from status POSTED" in norm["reason"]
+
+
+@pytest.mark.asyncio
+async def test_create_expense_links_journal_entry_and_marks_paid(monkeypatch):
+    """_create_expense links journal_entry_id and marks status=PAID when journal posts."""
+    import uuid
+    from app.tools import _create_expense
+
+    org_id = uuid.uuid4()
+    exp_id = uuid.uuid4()
+    entry_id = uuid.uuid4()
+    linked_calls = []
+
+    async def fake_create_exp(**kw):
+        return {"id": str(exp_id), "total": 15000.0, "expense_date": "2026-11-12", "description": "Office rent", "status": "DRAFT"}
+
+    async def fake_auto_journal(**kw):
+        return {"journal_entry": {"entry": {"id": str(entry_id), "journal_number": "JV-000003"}}}
+
+    async def fake_ok(*args, **kwargs):
+        return {"success": True}
+
+    async def fake_link(*, expense_id, journal_entry_id, status=None):
+        linked_calls.append((expense_id, journal_entry_id, status))
+        return {"id": str(expense_id), "journal_entry_id": str(journal_entry_id), "status": status}
+
+    monkeypatch.setattr("app.tools.expense_service.create_expense", fake_create_exp)
+    monkeypatch.setattr("app.tools.auto_journal", fake_auto_journal)
+    monkeypatch.setattr("app.tools.accounting_service.validate_journal", fake_ok)
+    monkeypatch.setattr("app.tools.accounting_service.post_journal", fake_ok)
+    monkeypatch.setattr("app.repositories.expense_repository.link_journal_to_expense", fake_link)
+
+    res = await _create_expense(org_id, description="Office rent", subtotal=15000.0, total=15000.0, payment_mode="BANK_TRANSFER")
+    assert res.success is True
+    assert res.data["journal_posted"] is True
+    assert res.data["journal_entry_id"] == str(entry_id)
+    assert res.data["status"] == "PAID"
+    assert linked_calls == [(exp_id, entry_id, "PAID")]

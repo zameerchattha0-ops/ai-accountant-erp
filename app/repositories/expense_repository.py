@@ -73,10 +73,13 @@ async def create_expense(
 
 
 async def link_journal_to_expense(
-    *, expense_id: uuid.UUID, journal_entry_id: uuid.UUID
+    *, expense_id: uuid.UUID, journal_entry_id: uuid.UUID, status: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
+    payload: Dict[str, Any] = {"journal_entry_id": str(journal_entry_id)}
+    if status:
+        payload["status"] = status
     return await update_one(
         "expenses",
         row_id=expense_id,
-        data={"journal_entry_id": str(journal_entry_id)},
+        data=payload,
     )

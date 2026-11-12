@@ -614,6 +614,12 @@ async def route_tool_call(
                 f"{normalized['reason']}. This value must be supplied by the "
                 "user — do not guess or use a default."
             )
+        elif normalized["category"] in (
+            error_norm.CONSTRAINT_VIOLATION,
+            error_norm.VALIDATION_ERROR,
+            error_norm.INVALID_REFERENCE,
+        ) and normalized.get("reason"):
+            model_message = normalized["reason"]
         else:
             model_message = "An unexpected error occurred while executing this operation."
         if _is_closed_period_error(str(exc)):

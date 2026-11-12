@@ -4207,6 +4207,19 @@ async def _create_expense(organization_id: uuid.UUID, **kw) -> ToolResult:
 
                 data["journal_posted"] = True
 
+                if data.get("id"):
+                    try:
+                        from app.repositories import expense_repository
+                        await expense_repository.link_journal_to_expense(
+                            expense_id=uuid.UUID(str(data["id"])),
+                            journal_entry_id=entry_id,
+                            status="PAID",
+                        )
+                        data["journal_entry_id"] = str(entry_id)
+                        data["status"] = "PAID"
+                    except Exception as link_exc:  # noqa: BLE001 — non-fatal if stubbed
+                        log.warning("tools.create_expense.link_journal_failed", error=str(link_exc)[:200])
+
             except Exception as exc:  # noqa: BLE001 — posting failure must
 
                 # not fake success: surface it as a warning; verification
@@ -4544,17 +4557,59 @@ async def _prepare_journal(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 async def _validate_journal(organization_id: uuid.UUID, **kw) -> ToolResult:
 
-    data = await accounting_service.validate_journal(entry_id=uuid.UUID(kw["entry_id"]))
-
-    return ToolResult(tool_name="validate_journal", success=True, data=data)
+    eid = uuid.UUID(kw["entry_id"])
+    try:
+        data = await accounting_service.validate_journal(entry_id=eid)
+        return ToolResult(tool_name="validate_journal", success=True, data=data)
+    except Exception as exc:
+        err_low = str(exc).lower()
+        if "entry is posted" in err_low or "entry is validated" in err_low:
+            entry = None
+            try:
+                entry = await accounting_service.get_entry(organization_id, entry_id=eid)
+            except Exception:  # noqa: BLE001
+                entry = None
+            status = (entry or {}).get("status") or ("POSTED" if "posted" in err_low else "VALIDATED")
+            return ToolResult(
+                tool_name="validate_journal",
+                success=True,
+                data={
+                    "success": True,
+                    "already_validated": True,
+                    "already_posted": str(status).upper() == "POSTED",
+                    "status": status,
+                    "entry_id": str(eid),
+                },
+            )
+        raise
 
 
 
 async def _post_journal(organization_id: uuid.UUID, **kw) -> ToolResult:
 
-    data = await accounting_service.post_journal(entry_id=uuid.UUID(kw["entry_id"]))
-
-    return ToolResult(tool_name="post_journal", success=True, data=data)
+    eid = uuid.UUID(kw["entry_id"])
+    try:
+        data = await accounting_service.post_journal(entry_id=eid)
+        return ToolResult(tool_name="post_journal", success=True, data=data)
+    except Exception as exc:
+        err_low = str(exc).lower()
+        if "cannot be posted from status posted" in err_low or "already posted" in err_low:
+            entry = None
+            try:
+                entry = await accounting_service.get_entry(organization_id, entry_id=eid)
+            except Exception:  # noqa: BLE001
+                entry = None
+            return ToolResult(
+                tool_name="post_journal",
+                success=True,
+                data={
+                    "success": True,
+                    "already_posted": True,
+                    "status": (entry or {}).get("status") or "POSTED",
+                    "entry_id": str(eid),
+                },
+            )
+        raise
 
 
 

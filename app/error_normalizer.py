@@ -84,7 +84,7 @@ def _extract_postgres_details(raw: str) -> Optional[Dict[str, Any]]:
     except (ValueError, TypeError):
         pass
 
-    code_m = re.search(r"'code':\s*'?(\d{5})'?", raw)
+    code_m = re.search(r"'code':\s*'?([A-Z0-9]{5})'?", raw)
     if code_m:
         msg_m = re.search(r"'message':\s*'([^']*)'", raw)
         details_m = re.search(r"'details':\s*'([^']*)'", raw)
@@ -92,6 +92,20 @@ def _extract_postgres_details(raw: str) -> Optional[Dict[str, Any]]:
             "code": code_m.group(1),
             "message": msg_m.group(1) if msg_m else raw,
             "details": details_m.group(1) if details_m else "",
+            "hint": "",
+        }
+
+    err_m = re.search(
+        r"(?:^|\n)\s*Error\s+([A-Z0-9]{5})\s*:\s*(?:\n?\s*Message\s*:\s*(.+?))?(?:\n\s*(?:Details|Hint)\s*:|$)",
+        raw,
+        re.DOTALL,
+    )
+    if err_m:
+        msg = (err_m.group(2) or "").strip() or raw
+        return {
+            "code": err_m.group(1),
+            "message": msg,
+            "details": "",
             "hint": "",
         }
 
@@ -209,6 +223,12 @@ def normalize_error(
         requires_user_input = True
         reason = "The provided values violate a database check constraint"
         user_action = "Ask the user for a valid value for the offending field."
+    elif code == "P0001":
+        category = CONSTRAINT_VIOLATION
+        recoverable = True
+        requires_user_input = False
+        reason = (pg.get("message") or raw_str)[:300]
+        user_action = "Inspect the business rule constraint and adjust parameters or reuse the existing state."
     elif pg and code:
         category = VALIDATION_ERROR
         recoverable = True
