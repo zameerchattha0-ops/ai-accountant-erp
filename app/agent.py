@@ -12568,44 +12568,49 @@ async def execute(
 
                 return {"success": result.success, "data": result.data}
 
-            # ---- P1: SELF-CORRECTION & ENDPOINT CONTRACT GROUNDING (Layer 1) ----
+            # ---- P1: COGNITIVE SELF-HEALING & ENDPOINT CONTRACT GROUNDING ----
             if not result.success:
                 _tool_failure_counts[tool_name] = _tool_failure_counts.get(tool_name, 0) + 1
                 fail_count = _tool_failure_counts[tool_name]
                 raw_err = result.error or "tool invocation failed"
 
                 from app.tools import tool_contracts
-                contract = tool_contracts().get(tool_name)
+                contract = tool_contracts().get(tool_name) or {}
 
-                if fail_count == 1:
-                    augmented_err = (
-                        f"Tool '{tool_name}' failed with error: {raw_err}. "
-                        "Please self-correct the parameters and retry the call."
+                grounding = ""
+                if contract:
+                    grounding = (
+                        f"\n[ENDPOINT CONTRACT for '{tool_name}']:\n"
+                        f"- Required arguments: {list(contract.get('required', ()))} \n"
+                        f"- Accepted arguments: {list(contract.get('accepted', ()))} \n"
+                        f"- UUID parameters: {list(contract.get('uuid_params', ()))} \n"
+                        f"- Extra arguments allowed: {contract.get('accepts_extra', False)}\n"
                     )
-                else:
-                    if contract:
-                        grounding = (
-                            f"\n[ENDPOINT CONTRACT GROUNDING for '{tool_name}']\n"
-                            f"- Required arguments: {list(contract.get('required', ()))} \n"
-                            f"- Accepted arguments: {list(contract.get('accepted', ()))} \n"
-                            f"- UUID arguments: {list(contract.get('uuid_params', ()))} \n"
-                            f"- Extra arguments allowed: {contract.get('accepts_extra', False)}\n"
-                            "You MUST strictly provide only the accepted and required parameters."
-                        )
-                        augmented_err = f"Tool '{tool_name}' failed again ({raw_err}). {grounding}"
-                    else:
-                        augmented_err = f"Tool '{tool_name}' failed again: {raw_err}. Please verify argument names and types."
+
+                augmented_err = (
+                    f"Tool '{tool_name}' failed with error: {raw_err}.{grounding}"
+                    "COGNITIVE RECOVERY INSTRUCTION: Read the error and inspect your book state. "
+                    "If a prerequisite (account, supplier, customer, product, period) is missing, execute the "
+                    "necessary search or creation tool first. If arguments were invalid or missing, match the contract "
+                    "above and retry. If the underlying ledger event is already satisfied, complete your answer."
+                )
 
                 await _log_step(session_id, "SELF_CORRECTION", {
                     "tool": tool_name,
                     "attempt": fail_count,
-                    "contract_grounded": fail_count >= 2,
+                    "contract_grounded": True,
                     "error": raw_err[:400],
                 })
                 return {
                     "success": False,
                     "error": augmented_err,
+                    "raw_error": raw_err,
                     "error_category": getattr(result, "error_category", None) or "EXECUTION_FAILURE",
+                    "error_details": getattr(result, "error_details", None),
+                    "endpoint_contract": {
+                        "required": list(contract.get("required", ())),
+                        "accepted": list(contract.get("accepted", ())),
+                    } if contract else None,
                 }
 
             return {"success": result.success, "error": result.error}
@@ -13620,33 +13625,49 @@ async def execute(
                 # When a planned mutation fails execution, re-prompt the LLM
                 # grounded with the endpoint contract before marking FAILED.
                 if failed_results:
-                    failed_tr = failed_results[0]
+                    succeeded_summary = "\n".join([f"- Tool '{r.tool_name}' succeeded: {r.data}" for r in successful_results]) or "None"
+                    failed_summary = "\n".join([f"- Tool '{r.tool_name}' failed with error: {r.error}" for r in failed_results])
+
                     from app.tools import tool_contracts
-                    c = tool_contracts().get(failed_tr.tool_name)
-                    c_info = (
-                        f"\n[ENDPOINT CONTRACT GROUNDING for '{failed_tr.tool_name}']:\n"
-                        f"- Required arguments: {list(c.get('required', ()) if c else [])}\n"
-                        f"- Accepted arguments: {list(c.get('accepted', ()) if c else [])}\n"
-                        f"- Parameter rules: {list(c.get('uuid_params', ()) if c else [])}\n"
-                    ) if c else ""
+                    contracts = tool_contracts()
+                    c_blocks = []
+                    for r in failed_results:
+                        c = contracts.get(r.tool_name)
+                        if c:
+                            c_blocks.append(
+                                f"Contract for '{r.tool_name}':\n"
+                                f"  - Required args: {list(c.get('required', ()))} \n"
+                                f"  - Accepted args: {list(c.get('accepted', ()))} \n"
+                                f"  - UUID parameters: {list(c.get('uuid_params', ()))} \n"
+                            )
+                    contract_info_str = "\n".join(c_blocks)
 
                     remediation_prompt = (
-                        f"The execution of tool '{failed_tr.tool_name}' failed with error:\n"
-                        f"{failed_tr.error}\n{c_info}\n"
-                        f"User request: {user_message}\n"
-                        "Please analyze the failure, correct the parameters to strictly match the contract, and execute the correct tool call."
+                        "You are an expert Chartered Accountant acting as the ERP Autonomous Self-Healing Engine.\n"
+                        f"User request: '{user_message}'\n\n"
+                        f"Execution State so far:\n"
+                        f"Operations Succeeded:\n{succeeded_summary}\n\n"
+                        f"Operations Failed:\n{failed_summary}\n\n"
+                        f"{contract_info_str}\n"
+                        "Your objective is to diagnose the failure, resolve any prerequisite or parameter gap, and complete the transaction.\n"
+                        "RECOVERY PROTOCOL:\n"
+                        "1. Read the exact failure message and inspect the live books.\n"
+                        "2. If the user's financial transaction was already posted/recorded by a preceding tool (e.g. entry already POSTED or VALIDATED), verify the record and output the final completion summary without repeating redundant posting calls.\n"
+                        "3. If a prerequisite record (account head, counterparty, product, or period) is missing, call the appropriate discovery or creation tool first, then complete the transaction.\n"
+                        "4. If parameter names or types were wrong, correct them to match the contract and call the tool.\n"
+                        "Execute any necessary corrective tool calls now."
                     )
                     try:
                         rem_client = get_client()
                         await _log_step(session_id, "SELF_CORRECTION_TRIGGERED", {
-                            "failed_tool": failed_tr.tool_name,
-                            "error": str(failed_tr.error)[:300],
+                            "failed_tool": failed_results[0].tool_name,
+                            "error": str(failed_results[0].error)[:300],
                         })
                         rem_out = await rem_client.generate_with_tools(
                             user_message=remediation_prompt,
                             context=context,
                             executor=_executor,
-                            max_tool_iterations=3,
+                            max_tool_iterations=4,
                             thinking_off=True,
                         )
                         rem_trs = rem_out.get("tool_results", [])
@@ -13665,53 +13686,32 @@ async def execute(
                 if not successful_results:
                     await _update_status(session_id, ExecutionStatus.FAILED)
 
-                await create_execution_result(
+                    await create_execution_result(
+                        session_id=session_id,
+                        result_data={
+                            "error": first_error,
+                            "tool": failed_results[0].tool_name if failed_results else (execution_plan.intent or "unknown"),
+                            "failed_tools": [
+                                {"tool": tr.tool_name, "error": tr.error}
+                                for tr in failed_results
+                            ],
+                        },
+                        summary=f"Error: {first_error}",
+                        verification_status="FAILED",
+                    )
 
-                    session_id=session_id,
+                    await _log_step(session_id, "FAILED", {
+                        "stage": "execution",
+                        "reason": "no_tool_succeeded",
+                        "failed": [tr.tool_name for tr in failed_results],
+                        "controlled": True,
+                    })
 
-                    result_data={
-
-                        "error": first_error,
-
-                        "tool": failed_results[0].tool_name,
-
-                        "failed_tools": [
-
-                            {"tool": tr.tool_name, "error": tr.error}
-
-                            for tr in failed_results
-
-                        ],
-
-                    },
-
-                    summary=f"Error: {first_error}",
-
-                    verification_status="FAILED",
-
-                )
-
-                await _log_step(session_id, "FAILED", {
-
-                    "stage": "execution",
-
-                    "reason": "no_tool_succeeded",
-
-                    "failed": [tr.tool_name for tr in failed_results],
-
-                    "controlled": True,
-
-                })
-
-                return AgentResponse(
-
-                    status=ExecutionStatus.FAILED,
-
-                    execution_id=session_id,
-
-                    summary=f"Operation failed: {first_error}",
-
-                )
+                    return AgentResponse(
+                        status=ExecutionStatus.FAILED,
+                        execution_id=session_id,
+                        summary=f"Operation failed: {first_error}",
+                    )
 
             # Operation-level verification: a successful AUXILIARY step never
 
@@ -13822,10 +13822,82 @@ async def execute(
                 )
 
                 if _rescue is not None:
-
                     return _rescue
 
-                failed_ops = [tr.tool_name for tr in required_failures]
+                # ---- AUTONOMOUS LLM RECOVERY TURN FOR REQUIRED MUTATIONS ----
+                if required_failures and _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                    try:
+                        rem_client = get_client()
+                        if rem_client:
+                            succeeded_summary = "\n".join([f"- Tool '{r.tool_name}' succeeded: {r.data}" for r in successful_results]) or "None"
+                            failed_summary = "\n".join([f"- Tool '{r.tool_name}' failed with error: {r.error}" for r in required_failures])
+
+                            from app.tools import tool_contracts
+                            contracts = tool_contracts()
+                            c_blocks = []
+                            for r in required_failures:
+                                c = contracts.get(r.tool_name)
+                                if c:
+                                    c_blocks.append(
+                                        f"Contract for '{r.tool_name}':\n"
+                                        f"  - Required args: {list(c.get('required', ()))} \n"
+                                        f"  - Accepted args: {list(c.get('accepted', ()))} \n"
+                                        f"  - UUID parameters: {list(c.get('uuid_params', ()))} \n"
+                                    )
+                            contract_info_str = "\n".join(c_blocks)
+
+                            remediation_prompt = (
+                                "You are an expert Chartered Accountant acting as the ERP Autonomous Self-Healing Engine.\n"
+                                f"User request: '{user_message}'\n\n"
+                                f"Current Execution Trajectory:\n"
+                                f"Operations Succeeded so far:\n{succeeded_summary}\n\n"
+                                f"Operations Failed:\n{failed_summary}\n\n"
+                                f"{contract_info_str}\n"
+                                "Your objective is to diagnose the failure, resolve the issue, and complete the transaction.\n"
+                                "RECOVERY PROTOCOL:\n"
+                                "1. Read the exact failure message and inspect the live books.\n"
+                                "2. If the user's financial transaction was already posted/recorded by a preceding tool (e.g. entry already POSTED or VALIDATED), verify the record and output the final completion summary without repeating redundant posting calls.\n"
+                                "3. If a prerequisite record (account head, counterparty, product, or period) is missing, call the appropriate discovery or creation tool first, then complete the transaction.\n"
+                                "4. If parameter names or types were wrong, correct them to match the contract and call the tool.\n"
+                                "Execute any necessary corrective tool calls now."
+                            )
+
+                            await _log_step(session_id, "SELF_CORRECTION_TRIGGERED", {
+                                "failed_tools": [r.tool_name for r in required_failures],
+                                "error": str(required_failures[0].error)[:300],
+                            })
+                            rem_out = await rem_client.generate_with_tools(
+                                user_message=remediation_prompt,
+                                context=context,
+                                executor=_executor,
+                                max_tool_iterations=4,
+                                thinking_off=True,
+                            )
+                            rem_trs = rem_out.get("tool_results", [])
+                            if any(r.success for r in rem_trs) or (
+                                successful_results and not any(
+                                    r.tool_name in _intent_tool_names(execution_plan.intent) and not r.success
+                                    for r in rem_trs
+                                )
+                            ):
+                                tool_calls = list(tool_calls) + rem_out.get("tool_calls", [])
+                                tool_results = list(tool_results) + rem_trs
+                                successful_results = [r for r in tool_results if r.success]
+                                failed_results = [r for r in tool_results if not r.success]
+                                required_failures = [
+                                    tr for tr in _financial_mutation_failures(tool_results)
+                                    if not any(sr.tool_name == tr.tool_name and sr.success for sr in successful_results)
+                                ]
+                                if not required_failures:
+                                    llm_text = rem_out.get("text", "") or llm_text or "Operation successfully completed after autonomous recovery."
+                                    await _log_step(session_id, "SELF_CORRECTION_SUCCEEDED", {
+                                        "tools": [r.tool_name for r in rem_trs if r.success],
+                                    })
+                    except Exception as rem_exc:
+                        log.warning("agent.autonomous_recovery_failed", error=str(rem_exc)[:200])
+
+                if required_failures:
+                    failed_ops = [tr.tool_name for tr in required_failures]
 
                 failed_detail = "; ".join(
 
@@ -15550,27 +15622,37 @@ async def resume_with_clarification(
                 else:
                     result_summary = f"Operation failed: {tool_result.error or 'Unknown error'}"
 
-                final_status = ExecutionStatus.COMPLETED if tool_result.success else ExecutionStatus.FAILED
-                await asyncio.gather(
-                    _update_status(session_id, final_status),
-                    _log_step(session_id, "SINGLE_HOP_EXECUTION", {
-                        "intent": intent,
-                        "tool": single_hop_call.tool_name,
-                        "success": tool_result.success,
-                        "summary": result_summary,
-                    }),
-                )
+                if tool_result.success:
+                    final_status = ExecutionStatus.COMPLETED
+                    await asyncio.gather(
+                        _update_status(session_id, final_status),
+                        _log_step(session_id, "SINGLE_HOP_EXECUTION", {
+                            "intent": intent,
+                            "tool": single_hop_call.tool_name,
+                            "success": True,
+                            "summary": result_summary,
+                        }),
+                    )
 
-                return AgentResponse(
-                    status=final_status,
-                    execution_id=session_id,
-                    summary=result_summary,
-                    action=intent,
-                    data={"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data},
-                    requires_user_input=False,
-                    confirmation_required=False,
-                    verification_status="VERIFIED" if tool_result.success else "FAILED",
-                )
+                    return AgentResponse(
+                        status=final_status,
+                        execution_id=session_id,
+                        summary=result_summary,
+                        action=intent,
+                        data={"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data},
+                        requires_user_input=False,
+                        confirmation_required=False,
+                        verification_status="VERIFIED",
+                    )
+                else:
+                    # Single-hop shortcut failed — fall through to the full LLM reasoning loop
+                    # so the LLM can diagnose the endpoint error and self-heal autonomously.
+                    log.info(
+                        "agent.single_hop_failed_fallback_to_llm",
+                        intent=intent,
+                        tool=single_hop_call.tool_name,
+                        error=tool_result.error,
+                    )
 
     original_request = session.get("user_request", "") or ""
 

@@ -608,7 +608,7 @@ async def route_tool_call(
         if normalized["category"] == error_norm.DUPLICATE_RECORD:
             model_message = error_norm.build_duplicate_guidance(normalized.get("entity"))
         elif normalized["category"] == error_norm.INFRASTRUCTURE_ERROR:
-            model_message = "An unexpected error occurred while executing this operation."
+            model_message = f"Infrastructure unavailable: {str(exc)}"
         elif normalized.get("requires_user_input"):
             model_message = (
                 f"{normalized['reason']}. This value must be supplied by the "
@@ -621,7 +621,7 @@ async def route_tool_call(
         ) and normalized.get("reason"):
             model_message = normalized["reason"]
         else:
-            model_message = "An unexpected error occurred while executing this operation."
+            model_message = normalized.get("reason") or str(exc) or "Operation failed with unspecified error."
         if _is_closed_period_error(str(exc)):
             model_message = (
                 f"{str(exc)} Guidance: {_PERIOD_GUIDANCE}."

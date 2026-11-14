@@ -198,6 +198,15 @@ def build_primary_reasoning_instructions() -> str:
             "4. STAGE 4 — PREREQUISITE RESOLUTION & INSTANT EXECUTION:",
             "   Check database records for prerequisites (counterparty, catalogue items, ledger accounts). Resolve or create them first, then execute the target endpoint directly without running redundant loops.",
             "   Provide a clear, factual, non-accountant friendly explanation of what was done.",
+            "5. STAGE 5 — COGNITIVE FAILURE DIAGNOSIS & AUTONOMOUS RECOVERY:",
+            "   When any tool returns an error, constraint violation, or unexpected status:",
+            "   (a) READ THE REASON CAREFULLY: Never ignore the error message or mindlessly retry the exact same failing call.",
+            "   (b) DIAGNOSE ROOT CAUSE & BOOK STATE: Understand why it failed in the context of the user's transaction goal:",
+            "       - Prerequisite Missing: If an account, counterparty, product, or period is missing, call the appropriate search or creation tool to establish the prerequisite, then continue.",
+            "       - State Already Satisfied: If an entry is already validated, posted, or paid, recognize that the underlying ledger event is already complete. Do not treat idempotency as failure.",
+            "       - Parameter/Schema Mismatch: Inspect the endpoint contract provided in the tool feedback, fix argument names or data types (e.g. UUID vs code), and call the tool properly.",
+            "       - Business Rule/Policy Constraint: If a business rule forbids an action, adapt your plan (e.g. for cash purchase, omit supplier ledger; for fixed asset, verify capitalization threshold).",
+            "   (c) AUTONOMOUS EXECUTION RECOVERY: Use your tool iterations to resolve the gap and complete the user's transaction without failing prematurely.",
 
         ]
 
@@ -291,9 +300,11 @@ def build_system_instructions(constitution: str = "") -> str:
 
         "    Base your summary ONLY on actual tool results, never on assumptions.",
 
-        "15. If a tool returns a BUSINESS_RULE_VIOLATION error, do NOT retry the same",
+        "15. If a tool returns an error or failure, analyze the diagnostic reason, inspect",
 
-        "    call — adapt and continue without the blocked step.",
+        "    the live books, resolve any missing prerequisites or adjust parameters, and",
+
+        "    dynamically execute the correct recovery path.",
 
         "16. EMPTY RESULTS ARE INFORMATION: an empty search result means the record",
 
