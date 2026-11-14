@@ -318,4 +318,49 @@ class TestPlannerOffersTheTool:
         assert "create_account" not in p.potential_tools
 
 
+@pytest.mark.asyncio
+async def test_resolve_inventory_account_accepts_uuid_and_string_hints():
+    from unittest.mock import AsyncMock, patch
+    from app.accounting_engine import resolve_inventory_account, resolve_cogs_account
+
+    dummy_org = uuid.uuid4()
+    dummy_acc_id = uuid.uuid4()
+
+    with patch("app.repositories.account_repository.get_account", new_callable=AsyncMock) as mock_get_acc, \
+         patch("app.accounting_engine._grouping_account_ids", new_callable=AsyncMock) as mock_groups, \
+         patch("app.repositories.account_repository.search_accounts", new_callable=AsyncMock) as mock_search:
+        mock_get_acc.return_value = {
+            "id": str(dummy_acc_id),
+            "code": "1200",
+            "name": "Inventory",
+            "account_type": "ASSET",
+            "is_active": True,
+        }
+        mock_groups.return_value = set()
+        mock_search.return_value = []
+
+        # Passing raw UUID must resolve the account and NOT raise AttributeError
+        res = await resolve_inventory_account(dummy_org, hint_account=dummy_acc_id)
+        assert res is not None
+        assert res["name"] == "Inventory"
+
+        # Passing raw UUID string
+        res_str = await resolve_inventory_account(dummy_org, hint_account=str(dummy_acc_id))
+        assert res_str is not None
+        assert res_str["code"] == "1200"
+
+        # COGS hint resolution with UUID
+        mock_get_acc.return_value = {
+            "id": str(dummy_acc_id),
+            "code": "5000",
+            "name": "Cost of Sales",
+            "account_type": "EXPENSE",
+            "is_active": True,
+        }
+        res_cogs = await resolve_cogs_account(dummy_org, hint_account=dummy_acc_id)
+        assert res_cogs is not None
+        assert res_cogs["name"] == "Cost of Sales"
+
+
+
 

@@ -874,7 +874,7 @@ _COGS_LEDGER_RE = re.compile(
 async def resolve_inventory_account(
     organization_id: uuid.UUID,
     *,
-    hint_account: Optional[Dict[str, Any]] = None,
+    hint_account: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """The ASSET ledger that carries stock valuation.
 
@@ -883,9 +883,22 @@ async def resolve_inventory_account(
     skipped — a heading ("Inventory" over "Finished Goods" children) must
     never carry the posting.
     """
-    if hint_account and hint_account.get("account_type") == "ASSET":
-        if _INVENTORY_LEDGER_RE.search(str(hint_account.get("name") or "")):
-            return hint_account
+    resolved_hint = None
+    if isinstance(hint_account, dict):
+        resolved_hint = hint_account
+    elif isinstance(hint_account, (uuid.UUID, str)):
+        try:
+            val_str = str(hint_account).strip()
+            if len(val_str) == 36 and "-" in val_str:
+                resolved_hint = await a_repo.get_account(organization_id, account_id=uuid.UUID(val_str))
+            elif val_str:
+                resolved_hint = await a_repo.get_account_by_code(organization_id, code=val_str)
+        except Exception:
+            resolved_hint = None
+
+    if resolved_hint and isinstance(resolved_hint, dict) and resolved_hint.get("account_type") == "ASSET":
+        if _INVENTORY_LEDGER_RE.search(str(resolved_hint.get("name") or "")):
+            return resolved_hint
     group_ids = await _grouping_account_ids(organization_id)
     for term in ("Inventory", "Merchandise", "Stock"):
         try:
@@ -913,12 +926,25 @@ async def resolve_inventory_account(
 async def resolve_cogs_account(
     organization_id: uuid.UUID,
     *,
-    hint_account: Optional[Dict[str, Any]] = None,
+    hint_account: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """The EXPENSE ledger that carries Cost of Sales (credited on a sale)."""
-    if hint_account and hint_account.get("account_type") == "EXPENSE":
-        if _COGS_LEDGER_RE.search(str(hint_account.get("name") or "")):
-            return hint_account
+    resolved_hint = None
+    if isinstance(hint_account, dict):
+        resolved_hint = hint_account
+    elif isinstance(hint_account, (uuid.UUID, str)):
+        try:
+            val_str = str(hint_account).strip()
+            if len(val_str) == 36 and "-" in val_str:
+                resolved_hint = await a_repo.get_account(organization_id, account_id=uuid.UUID(val_str))
+            elif val_str:
+                resolved_hint = await a_repo.get_account_by_code(organization_id, code=val_str)
+        except Exception:
+            resolved_hint = None
+
+    if resolved_hint and isinstance(resolved_hint, dict) and resolved_hint.get("account_type") == "EXPENSE":
+        if _COGS_LEDGER_RE.search(str(resolved_hint.get("name") or "")):
+            return resolved_hint
     group_ids = await _grouping_account_ids(organization_id)
     for term in ("Cost of Sales", "Cost of Goods", "COGS"):
         try:
@@ -947,7 +973,7 @@ async def resolve_cogs_account(
 async def ensure_inventory_account(
     organization_id: uuid.UUID,
     *,
-    hint_account: Optional[Dict[str, Any]] = None,
+    hint_account: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """The Inventory ASSET ledger — creating it when the chart lacks one.
 

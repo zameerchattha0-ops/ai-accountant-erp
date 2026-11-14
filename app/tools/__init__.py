@@ -2562,61 +2562,51 @@ async def _record_cash_purchase(organization_id: uuid.UUID, **kw) -> ToolResult:
 
 
     # ---- DEBIT LEDGER -----------------------------------------------------
-
-    account_hint = _safe_account_hint(kw.get("account_id"))
+    raw_account_hint = kw.get("account_id")
+    account_hint = None
+    if isinstance(raw_account_hint, dict):
+        account_hint = raw_account_hint
+    elif raw_account_hint:
+        hint_uuid = _safe_account_hint(raw_account_hint)
+        if hint_uuid:
+            try:
+                from app.repositories import account_repository as _a_repo
+                account_hint = await _a_repo.get_account(organization_id, account_id=hint_uuid)
+            except Exception:
+                account_hint = None
+        elif isinstance(raw_account_hint, str) and raw_account_hint.strip():
+            try:
+                from app.repositories import account_repository as _a_repo
+                account_hint = await _a_repo.get_account_by_code(organization_id, code=raw_account_hint.strip())
+            except Exception:
+                account_hint = None
 
     inventory_ledger = None
-
     if is_inventory:
-
         try:
-
             inventory_ledger = await _engine.ensure_inventory_account(
-
                 organization_id, hint_account=account_hint
-
             )
-
         except Exception as exc:  # noqa: BLE001 — lookup failure ≠ absence
-
             log.warning(
-
                 "tools.record_cash_purchase.inventory_resolve_failed",
-
                 error=str(exc)[:200],
-
             )
-
             inventory_ledger = None
-
         if not inventory_ledger:
-
             return ToolResult(
-
                 tool_name="record_cash_purchase", success=False,
-
                 error=(
-
                     "INVENTORY cash purchase refused: no postable 'Inventory' "
-
                     "ASSET ledger exists and one could not be created. NOTHING "
-
                     "was recorded. Create an Inventory asset account, then "
-
                     "repeat the purchase."
-
                 ),
-
             )
-
         debit_account = inventory_ledger
-
     else:
-
         debit_account = None
-
-        if account_hint and account_hint.get("account_type") in ("EXPENSE", "ASSET"):
-
+        if account_hint and isinstance(account_hint, dict) and account_hint.get("account_type") in ("EXPENSE", "ASSET"):
             debit_account = account_hint
 
         if not debit_account:
