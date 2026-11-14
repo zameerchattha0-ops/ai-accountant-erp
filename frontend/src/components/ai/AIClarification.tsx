@@ -247,7 +247,9 @@ export default function AIClarification({
   const headerText = sanitizeMarkdown(
     hasStructured
       ? (parsed.intro || "Please provide the following details to proceed:")
-      : (multi ? introText(question) : question)
+      : parsed.intro
+      ? `${parsed.intro}${parsed.questions[0]?.question ? `\n${parsed.questions[0].question}` : ""}`
+      : (parsed.questions[0]?.question || (multi ? introText(question) : question))
   );
 
   const isCfoAdvisory = /procurement|quotation|cfo|chartered accountant|capital procurement|capital acquisition/i.test(headerText);
@@ -287,7 +289,7 @@ export default function AIClarification({
             ))}
           </div>
           <p className="text-[11px] text-text-muted">
-            Tap an option above or type your answer in the command bar below.
+            Tap an option above or type your answer below.
           </p>
         </div>
       )}
@@ -309,7 +311,7 @@ export default function AIClarification({
             ))}
           </div>
           <p className="text-[11px] text-text-muted">
-            Tap an option above or type your answer in the command bar below.
+            Tap an option above or type your answer below.
           </p>
         </div>
       )}
@@ -421,41 +423,43 @@ export default function AIClarification({
           </div>
         </div>
       ) : (
-        /* Single question without predefined chips */
-        !singleOpts?.length && !legacyOptions.length && (
-          <div className="space-y-1.5">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={custom}
-                autoFocus
-                disabled={disabled}
-                onChange={(e) => setCustom(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && custom.trim() && !disabled) {
-                    onAnswer(custom.trim());
-                    setCustom("");
-                  }
-                }}
-                placeholder="Type your answer here..."
-                className="flex-1 px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
-              />
-              <button
-                onClick={() => {
-                  if (custom.trim() && !disabled) {
-                    onAnswer(custom.trim());
-                    setCustom("");
-                  }
-                }}
-                disabled={!custom.trim() || disabled}
-                className="btn-3d px-3 py-2 rounded-xl bg-ai-500 text-white hover:bg-ai-600 transition flex items-center gap-1.5 text-xs font-semibold disabled:opacity-50"
-              >
-                <Send className="w-3.5 h-3.5" />
-                Submit
-              </button>
-            </div>
+        /* Single question input — ALWAYS available whether chips exist or not! */
+        <div className="space-y-1.5 pt-1">
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={custom}
+              autoFocus={!singleOpts?.length && !legacyOptions.length}
+              disabled={disabled}
+              onChange={(e) => setCustom(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && custom.trim() && !disabled) {
+                  onAnswer(custom.trim());
+                  setCustom("");
+                }
+              }}
+              placeholder={
+                singleOpts?.length || legacyOptions.length
+                  ? "Or type a custom answer..."
+                  : "Type your answer here..."
+              }
+              className="flex-1 px-3 py-2 rounded-xl border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
+            />
+            <button
+              onClick={() => {
+                if (custom.trim() && !disabled) {
+                  onAnswer(custom.trim());
+                  setCustom("");
+                }
+              }}
+              disabled={!custom.trim() || disabled}
+              className="btn-3d px-3 py-2 rounded-xl bg-ai-500 text-white hover:bg-ai-600 transition flex items-center gap-1.5 text-xs font-semibold disabled:opacity-50"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Submit
+            </button>
           </div>
-        )
+        </div>
       )}
     </div>
   );

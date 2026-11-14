@@ -85,4 +85,34 @@ Please answer 1 and 2 and I will proceed.`;
     expect(result.questions[1].options?.[1].value).toBe("b");
     expect(result.questions[1].options?.[2].value).toBe("c");
   });
+
+  it("parses single numbered question with options", () => {
+    const raw = `Please clarify the following to record this transaction:
+1. What is the intended usage of the furniture?
+(a) Fixed Asset (Office Furniture)
+(b) Inventory (for resale)
+(c) Consumable Expense`;
+
+    const result = parseEmbeddedSubQuestions(raw);
+    expect(result.questions).toHaveLength(1);
+    expect(result.intro).toContain("Please clarify");
+    expect(result.questions[0].question).toContain("What is the intended usage");
+    expect(result.questions[0].options).toHaveLength(3);
+    expect(result.questions[0].options?.[0].value).toBe("a");
+    expect(result.questions[0].options?.[1].value).toBe("b");
+    expect(result.questions[0].options?.[2].value).toBe("c");
+  });
+
+  it("parses unnumbered question with embedded letter options", () => {
+    const raw = `What is the usage intent of the sofas for this purchase?
+(a) Office Furniture (Fixed Asset)
+(b) Resale Inventory
+(c) Office Expense`;
+
+    const result = parseEmbeddedSubQuestions(raw);
+    expect(result.questions).toHaveLength(1);
+    expect(result.questions[0].question).toContain("What is the usage intent");
+    expect(result.questions[0].options).toHaveLength(3);
+    expect(result.questions[0].options?.[0].value).toBe("a");
+  });
 });

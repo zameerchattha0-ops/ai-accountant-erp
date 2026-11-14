@@ -1522,10 +1522,17 @@ def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionn
                 any(k in low_clean for k in (
                     "fixed asset", "capitalis", "capitaliz",
                     "own use", "office use", "office furniture", "business use",
+                    "usage intent", "intended use", "what are these", "what is this for",
                 ))
-                and any(k in low_clean for k in ("resale", "resell", "inventory", "stock"))
+                and any(k in low_clean for k in ("resale", "resell", "inventory", "stock", "expense", "consumable", "capital", "asset", "use"))
             )
             if _asks_asset_vs_resale:
+                _opts = [
+                    ("FIXED_ASSET", "Fixed asset (office / business use)"),
+                    ("INVENTORY", "Inventory (for resale)"),
+                ]
+                if any(k in low_clean for k in ("expense", "consumable")):
+                    _opts.append(("CONSUMABLE", "Consumable / one-off expense"))
                 return Questionnaire(
                     intent=intent,
                     intro=QUESTIONNAIRE_INTRO,
@@ -1534,10 +1541,7 @@ def parse_model_question_text(text: str, intent: str = "") -> Optional[Questionn
                             field="transaction_nature",
                             kind=KIND_CHOICE,
                             question=clean,
-                            options=(
-                                ("FIXED_ASSET", "Fixed asset (office / business use)"),
-                                ("INVENTORY", "Inventory (for resale)"),
-                            ),
+                            options=tuple(_opts),
                         )
                     ],
                     source="llm_parsed_single",

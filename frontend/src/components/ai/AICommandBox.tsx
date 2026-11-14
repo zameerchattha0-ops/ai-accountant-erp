@@ -93,6 +93,21 @@ export default function AICommandBox() {
   const handleSend = async (customText?: string) => {
     const textToSend = (customText ?? message).trim();
     if (!textToSend && attachments.length === 0) return;
+
+    // If currently awaiting clarification, typing an answer into the command bar submits the clarification
+    if (
+      response?.status === ExecutionStatus.AWAITING_CLARIFICATION &&
+      response?.execution_id &&
+      attachments.length === 0
+    ) {
+      setMessage("");
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "auto";
+      }
+      await handleClarify(textToSend);
+      return;
+    }
+
     const req = buildRequest(textToSend);
     setMessage("");
     setAttachments([]);

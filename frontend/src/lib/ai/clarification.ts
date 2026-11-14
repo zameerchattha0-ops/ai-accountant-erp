@@ -80,7 +80,7 @@ export function parseEmbeddedSubQuestions(rawText: string): ParsedQuestionnaire 
     });
   }
 
-  if (matches.length >= 2) {
+  if (matches.length >= 1) {
     const firstMatch = matches[0];
     const rawIntro = text.slice(0, firstMatch.index).trim();
     const questions: ParsedQuestionBlock[] = [];
@@ -118,6 +118,39 @@ export function parseEmbeddedSubQuestions(rawText: string): ParsedQuestionnaire 
     }
 
     return { intro: rawIntro, questions };
+  }
+
+  // Handle unnumbered question with embedded (a), (b), (c) options
+  const optRegex = /(?:^|\n)\s*[-*•]?\s*\(?([a-zA-Z0-9])\)?[.)]\s*(.+)/g;
+  const opts: QuestionOption[] = [];
+  let firstOptIdx = -1;
+  let om: RegExpExecArray | null;
+
+  while ((om = optRegex.exec(text)) !== null) {
+    if (firstOptIdx === -1) {
+      firstOptIdx = om.index;
+    }
+    const val = om[1].trim();
+    const desc = om[2].trim();
+    opts.push({
+      value: val,
+      label: desc.startsWith("(") ? desc : `(${val}) ${desc}`,
+    });
+  }
+
+  if (opts.length >= 2 && firstOptIdx > 0) {
+    let qText = text.slice(0, firstOptIdx).trim();
+    qText = qText.replace(/(?:^|\n)\s*(?:please answer|let me know|reply with).+$/i, "").trim();
+    return {
+      intro: "",
+      questions: [
+        {
+          id: 1,
+          question: qText,
+          options: opts,
+        },
+      ],
+    };
   }
 
   return { intro: text, questions: [] };

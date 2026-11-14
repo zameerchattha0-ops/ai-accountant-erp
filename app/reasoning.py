@@ -208,7 +208,7 @@ _NATURE_MATRIX: Dict[str, Dict[str, Any]] = {
             {"value": "d", "label": "Service"},
         ),
         "keywords": (
-            (r"fixed\s*asset|capitalis|capitaliz|long.term", "FIXED_ASSET"),
+            (r"fixed\s*asset|capitalis|capitaliz|long.term|office\s*use|own\s*use|internal\s*use|business\s*use|staff\s*use|employee\s*use", "FIXED_ASSET"),
             (r"inventory|stock|resale|drives?|ssd|hdd|parts?|goods|hardware|accessories|merchandise|items?|units?|supplies", "INVENTORY"),
             (r"consumable|expense|expensed", "OPERATING_EXPENSE"),
             (r"service", "SERVICE"),
