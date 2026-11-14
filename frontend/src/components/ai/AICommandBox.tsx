@@ -8,6 +8,7 @@ import {
   Loader2,
   Sparkles,
   Zap,
+  MessageCircleQuestion,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import type {
@@ -43,6 +44,20 @@ const QUICK_CHIPS = [
   { label: "🧾 Unpaid Bills", prompt: "Show me all outstanding supplier bills and upcoming due dates." },
 ];
 
+function getClarificationSummary(rawQuestion?: string): string {
+  if (!rawQuestion) return "Clarification needed";
+  const clean = rawQuestion
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/`/g, "")
+    .trim();
+  const firstLine = clean.split("\n")[0].trim();
+  if (firstLine.toLowerCase().includes("clarif") && clean.includes("1.")) {
+    const q1 = clean.match(/1[.)]\s*(.+?)(?:\n|$)/);
+    if (q1 && q1[1]) return q1[1].trim();
+  }
+  return firstLine.length > 55 ? firstLine.slice(0, 52) + "..." : firstLine;
+}
+
 export default function AICommandBox() {
   const [placeholderIdx, setPlaceholderIdx] = useState(0);
   useEffect(() => {
@@ -73,6 +88,13 @@ export default function AICommandBox() {
   useEffect(() => {
     agentRunStore.ensureReattach();
   }, []);
+
+  const isAwaitingClarification =
+    response?.status === ExecutionStatus.AWAITING_CLARIFICATION &&
+    Boolean(response?.execution_id);
+  const clarificationSummary = isAwaitingClarification
+    ? getClarificationSummary(response?.question)
+    : "";
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -139,7 +161,31 @@ export default function AICommandBox() {
   return (
     <div className="w-full max-w-4xl mx-auto space-y-3">
       {/* Sleek, Compact Hero Input Bar */}
-      <div className="glass rounded-2xl p-1.5 shadow-md border border-border-default hover:border-ai-300 focus-within:border-ai-400 focus-within:ring-2 focus-within:ring-ai-100 transition-all bg-bg-surface">
+      <div className={cn(
+        "glass rounded-2xl p-1.5 shadow-md border transition-all bg-bg-surface",
+        isAwaitingClarification
+          ? "border-ai-300 ring-2 ring-ai-100"
+          : "border-border-default hover:border-ai-300 focus-within:border-ai-400 focus-within:ring-2 focus-within:ring-ai-100"
+      )}>
+        {/* Active Clarification Turn Indicator Pill */}
+        {isAwaitingClarification && (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 mb-1 mx-1 rounded-xl bg-ai-50 border border-ai-200 text-ai-800 text-xs shadow-3xs animate-in fade-in duration-150">
+            <MessageCircleQuestion className="w-3.5 h-3.5 text-ai-600 shrink-0" />
+            <span className="truncate flex-1">
+              <span className="font-semibold text-ai-900">Answering:</span>{" "}
+              <span className="text-ai-700">{clarificationSummary}</span>
+            </span>
+            <button
+              type="button"
+              onClick={handleDismissResult}
+              title="Dismiss clarification and start new command"
+              className="text-ai-400 hover:text-ai-700 hover:bg-ai-100 p-0.5 rounded-md transition-colors shrink-0"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+
         <div className="flex items-start gap-2.5 px-3 py-1.5">
           <div className="p-1.5 text-ai-500 shrink-0 mt-0.5">
             <Sparkles className="w-4 h-4" />
@@ -153,7 +199,11 @@ export default function AICommandBox() {
               autoGrow();
             }}
             onKeyDown={handleKeyDown}
-            placeholder={PLACEHOLDERS[placeholderIdx]}
+            placeholder={
+              isAwaitingClarification
+                ? `Answering: "${clarificationSummary}" (or type answer here)...`
+                : PLACEHOLDERS[placeholderIdx]
+            }
             rows={1}
             className="flex-1 bg-transparent text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none py-1 min-h-[38px] max-h-[140px] leading-relaxed"
           />
@@ -215,6 +265,8 @@ export default function AICommandBox() {
                 "btn-3d flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all",
                 loading
                   ? "bg-ai-100 text-ai-500 cursor-wait"
+                  : isAwaitingClarification && message.trim()
+                  ? "bg-ai-600 hover:bg-ai-700 text-white shadow-2xs"
                   : "bg-ai-500 hover:bg-ai-600 text-white shadow-2xs"
               )}
             >
@@ -222,6 +274,11 @@ export default function AICommandBox() {
                 <>
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   <span>Thinking</span>
+                </>
+              ) : isAwaitingClarification ? (
+                <>
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Submit Answer</span>
                 </>
               ) : (
                 <>

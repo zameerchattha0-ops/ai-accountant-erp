@@ -197,6 +197,7 @@ def build_primary_reasoning_instructions() -> str:
             "   Perform gap analysis for what mandatory fields are genuinely MISSING. If missing, compose a unified questionnaire for ONLY those missing fields. Never re-ask what was already provided!",
             "4. STAGE 4 — PREREQUISITE RESOLUTION & INSTANT EXECUTION:",
             "   Check database records for prerequisites (counterparty, catalogue items, ledger accounts). Resolve or create them first, then execute the target endpoint directly without running redundant loops.",
+            "   POST-CLARIFICATION EXECUTION MANDATE: When resuming an execution after clarification answers have been provided and all required parameters (amount, date, accounts) are resolved, you MUST generate the transactional tool call (record_cash_purchase, create_purchase_bill, create_expense, register_fixed_asset, record_payment, etc.) in this turn. Do not stop at exploratory searches alone.",
             "   Provide a clear, factual, non-accountant friendly explanation of what was done.",
             "5. STAGE 5 — COGNITIVE FAILURE DIAGNOSIS & AUTONOMOUS RECOVERY:",
             "   When any tool returns an error, constraint violation, or unexpected status:",
@@ -542,6 +543,7 @@ def build_system_instructions(constitution: str = "") -> str:
         "       Re-visit the user's initial query + answers against the target endpoint requirements. Extract whatever values are already stated. Formulate questions for ONLY the missing mandatory fields. Never re-ask provided data.",
         "    d. STAGE 4 — PREREQUISITE RESOLUTION & INSTANT FINAL EXECUTION:",
         "       Check live database records for missing prerequisites (vendor records, catalogue products, accounts). Create/link prerequisites first, then execute the target endpoint directly in a single pass.",
+        "       POST-CLARIFICATION EXECUTION MANDATE: When resuming an execution after clarification answers have been provided and all required parameters (amount, date, accounts) are resolved, you MUST generate the transactional tool call (record_cash_purchase, create_purchase_bill, create_expense, register_fixed_asset, record_payment, etc.) in this turn. Do not stop at exploratory searches alone.",
     ]
 
     if constitution:
@@ -1077,6 +1079,13 @@ def build_user_content(message: str, context: AgentContext) -> str:
         for qa in context.clarification_history:
 
             parts.append(f"  - Q: {qa.get('question', '')} -> A: {qa.get('answer', '')}")
+
+        parts.append(
+            "POST-CLARIFICATION DIRECTIVE: When resuming an execution after clarification answers "
+            "have been provided and all required parameters (amount, date, accounts) are resolved, "
+            "you MUST generate the transactional tool call (record_cash_purchase, create_purchase_bill, "
+            "create_expense, register_fixed_asset, record_payment, etc.) in this turn. Do not stop at exploratory searches alone."
+        )
 
 
 

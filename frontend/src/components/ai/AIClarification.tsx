@@ -321,7 +321,6 @@ export default function AIClarification({
         <div className="space-y-3">
           {subQuestions.map((q, i) => {
             const opts = optionsForSubQuestion(q, i, questionOptions, parsed.questions);
-            const hasSelectedChip = Boolean(answers[i] && opts?.some(o => o.value.toUpperCase() === answers[i]?.toUpperCase()));
 
             return (
               <div key={i} className="space-y-1.5 p-3 rounded-xl bg-bg-muted/40 border border-border-subtle">
@@ -360,25 +359,23 @@ export default function AIClarification({
                   </div>
                 )}
 
-                {/* Only render text input if no chips exist OR if user wants to type custom value */}
-                {(!opts || opts.length === 0 || !hasSelectedChip) && (
-                  <input
-                    type="text"
-                    value={answers[i] ?? ""}
-                    autoFocus={i === 0 && !opts}
-                    disabled={disabled}
-                    onChange={(e) =>
-                      setAnswers((prev) =>
-                        prev.map((a, j) => (j === i ? e.target.value : a))
-                      )
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && allAnswered) sendMulti();
-                    }}
-                    placeholder={opts ? "Or type a custom answer..." : "Type your answer here..."}
-                    className="w-full px-3 py-1.5 rounded-lg border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
-                  />
-                )}
+                {/* Universal Dual Input: text input is always available alongside chips */}
+                <input
+                  type="text"
+                  value={answers[i] ?? ""}
+                  autoFocus={i === 0 && !opts}
+                  disabled={disabled}
+                  onChange={(e) =>
+                    setAnswers((prev) =>
+                      prev.map((a, j) => (j === i ? e.target.value : a))
+                    )
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && allAnswered) sendMulti();
+                  }}
+                  placeholder={opts && opts.length > 0 ? "Or type a custom answer..." : "Type your answer here..."}
+                  className="w-full px-3 py-1.5 rounded-lg border border-border-default bg-bg-surface text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-ai-500 transition"
+                />
 
                 {/* Conditional party box for credit ledger */}
                 {(i === paymentIdx || i === settlementIdx) && creditSelected && (
