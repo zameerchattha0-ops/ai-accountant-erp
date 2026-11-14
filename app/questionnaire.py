@@ -566,10 +566,36 @@ def build_questionnaire(
     """
     ents = entities or {}
     q_by_field: Dict[str, str] = {}
-    for f, q in zip(list(missing_fields), list(questions)):
-        q_by_field[str(f)] = str(q)
+    missing_list = [str(f).strip() for f in missing_fields if str(f).strip()]
+    q_list = [str(q).strip() for q in questions if str(q).strip()]
+
+    # Guard against length or semantic field mismatch:
+    is_mismatched = len(missing_list) != len(q_list)
+    if not is_mismatched and missing_list and q_list:
+        for f, q in zip(missing_list, q_list):
+            q_low = q.lower()
+            if f in ("amount", "payment_type", "transaction_date") and any(k in q_low for k in ("fixed asset", "resale stock", "consumable")):
+                is_mismatched = True
+                break
+
+    if is_mismatched:
+        if intent:
+            try:
+                from app.planner import _questions_for_fields
+                synced_qs = _questions_for_fields(intent, missing_list, ents)
+                for f, q in zip(missing_list, synced_qs):
+                    q_by_field[f] = q
+            except Exception:
+                pass
+        for f in missing_list:
+            if f not in q_by_field:
+                q_by_field[f] = spec_for(f).question
+    else:
+        for f, q in zip(missing_list, q_list):
+            q_by_field[f] = q
+
     ordered: List[str] = []
-    for f in list(missing_fields) + [k for k in q_by_field if k not in missing_fields]:
+    for f in missing_list + [k for k in q_by_field if k not in missing_list]:
         name = str(f or "").strip()
         if name and name not in ordered:
             ordered.append(name)

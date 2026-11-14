@@ -101,6 +101,8 @@ _RATE_LIMIT_MARKERS = (
     "free tier",
     "insufficient balance",
     "exceeded your current",
+    "balance_zero",
+    "no active plan",
 )
 
 
@@ -125,10 +127,8 @@ class ProviderNotEntitled(ProviderError):
 
 def is_entitlement_error(status_code: Optional[int], body: Optional[str]) -> bool:
     """True when the provider says the KEY/ACCOUNT may not use this model."""
-    if status_code == 401:
+    if status_code in (401, 403):
         return True
-    if status_code != 403:
-        return False
     low = (body or "").lower()
     return (
         "unpurchased" in low
@@ -137,6 +137,9 @@ def is_entitlement_error(status_code: Optional[int], body: Optional[str]) -> boo
         or "access to model denied" in low
         or "permission" in low
         or "denied" in low
+        or "free_models_disabled" in low
+        or "confirm free-model data sharing" in low
+        or "balance_zero" in low
     )
 
 

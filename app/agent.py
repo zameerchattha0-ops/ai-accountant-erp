@@ -8363,7 +8363,7 @@ async def execute(
                 if not _rem_missing:
                     execution_plan.requires_clarification = False
                     execution_plan.clarification_questions = []
-                elif not execution_plan.clarification_questions:
+                else:
                     execution_plan.requires_clarification = True
                     execution_plan.clarification_questions = _questions_for_fields(
                         _model_intent, _rem_missing, execution_plan.extracted_entities
@@ -8925,13 +8925,21 @@ async def execute(
 
         from app.questionnaire import drop_resolved_fields as _drop_resolved
 
-
-
-        execution_plan.missing_fields = _drop_resolved(
-
+        _dropped_missing = _drop_resolved(
             execution_plan.missing_fields, classification
-
         )
+        if _dropped_missing != execution_plan.missing_fields:
+            execution_plan.missing_fields = _dropped_missing
+            from app.planner import _questions_for_fields
+            if not execution_plan.missing_fields:
+                execution_plan.requires_clarification = False
+                execution_plan.clarification_questions = []
+            else:
+                execution_plan.clarification_questions = _questions_for_fields(
+                    execution_plan.intent,
+                    execution_plan.missing_fields,
+                    execution_plan.extracted_entities,
+                )
 
         if (
 

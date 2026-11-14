@@ -317,6 +317,16 @@ class GeminiClient:
         )
         return response.text if response.text else ""
 
+    async def generate_text_light(
+        self,
+        *,
+        prompt: str,
+        context: Optional[AgentContext] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Lightweight text generation compatibility method."""
+        return await self.generate_text(prompt=prompt, context=context)
+
     # -------------------------------------------------------------------
     # Private helpers
     # -------------------------------------------------------------------

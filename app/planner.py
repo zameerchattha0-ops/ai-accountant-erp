@@ -4406,11 +4406,23 @@ def _explode_multi_answers(
         parts = _split_answer_parts(answer)
 
         if len(sub_questions) >= 2 and len(parts) == len(sub_questions):
-
             for idx, (sq, part) in enumerate(zip(sub_questions, parts)):
                 pair: Dict[str, Any] = {"question": sq, "answer": part}
                 if req_info and len(req_info) == len(sub_questions):
-                    pair["field"] = str(req_info[idx])
+                    assigned_field = str(req_info[idx])
+                    try:
+                        from app.questionnaire import _infer_field_name
+                        inferred = _infer_field_name(sq, idx)
+                        if inferred and not inferred.startswith("clarification_"):
+                            if assigned_field in ("payment_type", "payment_method") and inferred == "transaction_nature":
+                                assigned_field = "transaction_nature"
+                            elif assigned_field == "amount" and inferred in ("payment_method", "transaction_nature"):
+                                assigned_field = inferred
+                            elif assigned_field == "transaction_date" and inferred in ("amount", "payment_method", "transaction_nature"):
+                                assigned_field = inferred
+                    except Exception:
+                        pass
+                    pair["field"] = assigned_field
                 exploded.append(pair)
 
         elif (
