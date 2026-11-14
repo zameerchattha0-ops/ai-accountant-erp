@@ -76,7 +76,9 @@ _INSTRUCTION = """You are the PRIMARY intelligence and fact-extraction engine fo
   "candidate_subject_areas": ["<area>", ...],
   "target_status": "<PAID|OPEN|ORDERED|RECEIVED|BILLED|CANCELLED|ISSUED|VOIDED|ACCEPTED|ACTIVE|INACTIVE>"|null,
   "document_type": "<purchase_bill|purchase_order|invoice|quotation|product>"|null,
-  "reference_numbers": ["<ref1>", "<ref2>", ...]
+  "reference_numbers": ["<ref1>", "<ref2>", ...],
+  "economic_event": "<ACQUISITION|DISPOSAL|EXPENDITURE|SETTLEMENT_IN|SETTLEMENT_OUT|INTERNAL_TRANSFER|RETURN_OUT|RETURN_IN|DOCUMENT|RECORD_CREATION|REPORTING|DEPRECIATION|UNKNOWN>"|null,
+  "impact_map": {"party_ledger": <bool>, "cash_bank": <bool>, "inventory": <bool>, "fixed_asset": <bool>, "expense": <bool>}|null
 }
 
 RULES:
@@ -306,6 +308,29 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
     if clean.get("product_name"):
         clean["product_name"] = re.sub(r"^(?:units?|pieces?|pcs|items?)\s+of\s+", "", clean["product_name"], flags=re.I).strip()
 
+    raw_ev = payload.get("economic_event")
+    if raw_ev is not None:
+        ev_norm = str(raw_ev).strip().upper()
+        if ev_norm in (
+            "ACQUISITION", "DISPOSAL", "EXPENDITURE", "SETTLEMENT_IN", "SETTLEMENT_OUT",
+            "INTERNAL_TRANSFER", "RETURN_OUT", "RETURN_IN", "DOCUMENT", "RECORD_CREATION",
+            "REPORTING", "DEPRECIATION", "UNKNOWN"
+        ):
+            clean["economic_event"] = ev_norm
+
+    raw_imp = payload.get("impact_map")
+    if isinstance(raw_imp, dict):
+        clean_imp: Dict[str, bool] = {}
+        for dim in ("party_ledger", "ar_ap", "cash_bank", "inventory", "fixed_asset", "expense", "revenue", "journal", "documents", "dimensions"):
+            if dim in raw_imp:
+                v = raw_imp[dim]
+                if isinstance(v, bool):
+                    clean_imp[dim] = v
+                elif isinstance(v, (int, str)):
+                    clean_imp[dim] = str(v).strip().lower() in ("true", "1", "yes")
+        if clean_imp:
+            clean["impact_map"] = clean_imp
+
     return clean, failures
 
 
@@ -474,6 +499,12 @@ async def enrich_preliminary(
     if clean.get("provisional_intent_hint"):
         merged["provisional_intent_hint"] = clean["provisional_intent_hint"]
         filled.append("provisional_intent_hint")
+    if clean.get("economic_event"):
+        merged["economic_event"] = clean["economic_event"]
+        filled.append("economic_event")
+    if clean.get("impact_map"):
+        merged["impact_map"] = clean["impact_map"]
+        filled.append("impact_map")
     audit["llm"] = "ok"
     audit["filled"] = filled
     return merged, audit

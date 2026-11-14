@@ -124,6 +124,28 @@ UNIVERSAL CA COGNITIVE PROTOCOL — 4-STAGE PIPELINE:
 4. PREREQUISITE RESOLUTION & EXECUTION: Check live database records for
    parties/items/accounts, resolve prerequisites first, then propose execution.
 
+ECONOMIC EVENT & 360° IMPACT MAP AUTHORSHIP:
+You are the authoritative source of the economic event and 360° impact map:
+- economic_event: ACQUISITION, DISPOSAL, EXPENDITURE, SETTLEMENT_IN, SETTLEMENT_OUT,
+  INTERNAL_TRANSFER, RETURN_OUT, RETURN_IN, DOCUMENT, RECORD_CREATION, REPORTING,
+  DEPRECIATION, or UNKNOWN.
+- impact_map: Specify true/false for each of the 10 dimensions:
+  * party_ledger: False for cash/immediate settlement; True only when a counterparty ledger account is required (credit/AP/AR).
+  * ar_ap: True only for credit transactions tracking receivables/payables.
+  * cash_bank: True if cash or bank is moving now; False for credit until settlement.
+  * inventory: True only for physical stock held for resale; False for fixed assets, services, and operating expenses.
+  * fixed_asset: True for capital equipment/furniture/vehicles acquired for business use.
+  * expense: True for operating expenses/consumables; False for capital assets at acquisition.
+  * revenue: True for sales revenue; False for capital asset disposal proceeds.
+  * journal: True for GL accounting entries; False for non-posting documents or master data.
+  * documents: True when invoice/bill/receipt document is generated.
+  * dimensions: True for cost-center or project tracking.
+- prohibited_actions: Negative reasoning (what must NOT happen). State explicit prohibitions:
+  * "party_ledger_creation": for cash purchases/sales (no supplier/customer ledger required).
+  * "inventory_movement": for fixed assets or services (no inventory items or stock movements).
+  * "fixed_asset_capitalization": for operating expenses or consumables.
+  Python's execution kernel enforces your impact map and blocks prohibited mutations.
+
 HARD PROHIBITIONS:
 - Never invent accounts, parties, assets, documents, amounts or dates.
 - Never decide a treatment from a keyword alone.
@@ -472,7 +494,27 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
      "question": "<the question to ask the user>"}
   ],
   "question": null,
-  "decision": {"intent": "<planner intent>", "treatment": "<nature>", "document_nature": "<GOODS|SERVICE|ASSET_DISPOSAL|OTHER_INCOME>"},
+  "decision": {
+    "intent": "<planner intent>",
+    "treatment": "<nature: FIXED_ASSET|INVENTORY|OPERATING_EXPENSE|CONSUMABLE|SERVICE|PREPAYMENT|DEPOSIT_ADVANCE>",
+    "document_nature": "<GOODS|SERVICE|ASSET_DISPOSAL|OTHER_INCOME>",
+    "economic_event": "<ACQUISITION|DISPOSAL|EXPENDITURE|SETTLEMENT_IN|SETTLEMENT_OUT|INTERNAL_TRANSFER|RETURN_OUT|RETURN_IN|DOCUMENT|RECORD_CREATION|REPORTING|DEPRECIATION|UNKNOWN>",
+    "impact_map": {
+      "party_ledger": false,
+      "ar_ap": false,
+      "cash_bank": true,
+      "inventory": false,
+      "fixed_asset": false,
+      "expense": true,
+      "revenue": false,
+      "journal": true,
+      "documents": true,
+      "dimensions": false
+    },
+    "prohibited_actions": [
+      {"action": "<party_ledger_creation|inventory_movement|fixed_asset_capitalization|mutation>", "reason": "<why>"}
+    ]
+  },
   "entities": {
     "amount": null,
     "currency": null,
@@ -490,7 +532,7 @@ RESPONSE FORMAT — output ONLY this JSON object, no prose:
     "transaction_date": null
   },
   "prerequisites": [{"name": "", "status": "present|missing|ambiguous", "resolution": "reuse|create|ask"}],
-OPTIONAL BLOCK: "decision" and "prerequisites" are observation metadata. Use ONLY canonical values (a planner intent, a nature from your own vocabulary) — omit them rather than invent one.
+AUTHORITATIVE REASONING BLOCK: "decision" and "prerequisites" are observation metadata for the plan and authoritative for the Economic Event & Impact Map. You author the intent, treatment, economic_event, 360° impact_map (boolean per dimension), and prohibited_actions. Python executes and enforces your impact map.
   "proposal": {
     "interpretation": "<the business interpretation you are proposing>",
     "affected_records": ["<record/ledger that will change>"],
@@ -1332,18 +1374,15 @@ def _clean_entities(raw: Any) -> Dict[str, Any]:
     return out
 
 
-def _clean_decision(raw: Any) -> Dict[str, str]:
-    """Parse the optional Wave A ``decision`` block (strings only, bounded).
+def _clean_decision(raw: Any) -> Dict[str, Any]:
+    """Parse the authoritative ``decision`` block, including economic event & impact map.
 
-    Deliberately NO vocabulary check here: canonicality is evaluated by the
-    DIVERGENCE COMPARISON in agent.py, so a non-canonical value is recorded as
-    MODEL_NONCANONICAL instead of silently dropped — and instead of rejecting
-    the whole proposal, which would change behavior in an observation-only
-    Wave (AUDIT_REPORT §7/§8).  Wave B turns canonicality into a violation.
+    Deliberately NO vocabulary check here on intent: canonicality is evaluated
+    by the DIVERGENCE COMPARISON in agent.py.
     """
     if not isinstance(raw, dict):
         return {}
-    out: Dict[str, str] = {}
+    out: Dict[str, Any] = {}
     intent = str(raw.get("intent") or "").strip().lower()
     if intent:
         out["intent"] = intent[:64]
@@ -1351,6 +1390,43 @@ def _clean_decision(raw: Any) -> Dict[str, str]:
         value = str(raw.get(key) or "").strip().upper()
         if value:
             out[key] = value[:40]
+
+    # Authoritative Economic Event (LLM-determined)
+    raw_ev = raw.get("economic_event")
+    if raw_ev:
+        ev_str = str(raw_ev).strip().upper()
+        if ev_str:
+            out["economic_event"] = ev_str[:40]
+
+    # Authoritative 360° Impact Map (LLM-determined)
+    raw_impact = raw.get("impact_map")
+    if isinstance(raw_impact, dict):
+        from app.reasoning import IMPACT_DIMENSIONS
+
+        clean_impact: Dict[str, bool] = {}
+        for dim in IMPACT_DIMENSIONS:
+            if dim in raw_impact:
+                v = raw_impact[dim]
+                if isinstance(v, bool):
+                    clean_impact[dim] = v
+                elif isinstance(v, (int, str)):
+                    clean_impact[dim] = str(v).strip().lower() in ("true", "1", "yes")
+        if clean_impact:
+            out["impact_map"] = clean_impact
+
+    # Authoritative Prohibited Actions (negative reasoning from LLM)
+    raw_prohib = raw.get("prohibited_actions")
+    if isinstance(raw_prohib, list):
+        clean_prohib: List[Dict[str, str]] = []
+        for item in raw_prohib[:8]:
+            if isinstance(item, dict):
+                act = str(item.get("action") or "").strip()[:60]
+                reason = str(item.get("reason") or "").strip()[:240]
+                if act:
+                    clean_prohib.append({"action": act, "reason": reason})
+        if clean_prohib:
+            out["prohibited_actions"] = clean_prohib
+
     return out
 
 

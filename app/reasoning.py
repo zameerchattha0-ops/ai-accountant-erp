@@ -34,7 +34,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Requirement resolution states (the complete state vocabulary)
@@ -1390,6 +1390,7 @@ def analyze_requirements(
     relevant_customers: Optional[List[Dict[str, Any]]] = None,
     relevant_suppliers: Optional[List[Dict[str, Any]]] = None,
     relevant_bank_accounts: Optional[List[Dict[str, Any]]] = None,
+    impact_map: Optional[Dict[str, bool]] = None,
 ) -> List[DependencyNode]:
     """Build the transaction-specific dependency graph with resolved states.
 
@@ -1469,7 +1470,11 @@ def analyze_requirements(
 
     # --- 3. Counterparty (customer/supplier) ---------------------------------
     party_field = _CREDIT_PARTY_INTENTS.get(intent)
-    if intent in _NO_PARTY_INTENTS:
+    no_party = (
+        intent in _NO_PARTY_INTENTS
+        or (impact_map is not None and impact_map.get("party_ledger") is False)
+    )
+    if no_party:
         named = entities.get("supplier_name") or entities.get("customer_name")
         # The party LEDGER dependency is optional for this event regardless
         # of whether a name was mentioned — the name is informational only.
@@ -2168,99 +2173,141 @@ _EXPENSE_EVENTS = {EconomicEvent.ACQUISITION, EconomicEvent.EXPENDITURE,
 def build_event_profile(
     intent: str,
     classification: Optional[Any] = None,
+    *,
+    llm_event: Optional[Union[str, EconomicEvent]] = None,
+    llm_impact_map: Optional[Dict[str, bool]] = None,
+    llm_prohibited_actions: Optional[Sequence[Union[Dict[str, str], ProhibitedAction]]] = None,
+    llm_nature: Optional[str] = None,
 ) -> EventProfile:
-    """Produce the full economic event profile for an intent.
+    """Produce the economic event profile for an intent.
 
-    *classification* (when available) refines the impact map with the
-    transaction NATURE (INVENTORY vs FIXED_ASSET vs EXPENSE vs SERVICE…)
-    and adds the prohibited-mutation set (negative reasoning).
+    When LLM-authored parameters (llm_event, llm_impact_map, llm_prohibited_actions)
+    are provided, the LLM is AUTHORITATIVE and its judgments govern the profile.
+    Python acts as the invariant-verifying execution kernel and uses deterministic
+    heuristics only as a defensive fallback for missing/unspecified dimensions.
     """
-    event = classify_economic_event(intent)
-    affected = dict(_EVENT_BASE_IMPACT[event])
+    # 1. Resolve Economic Event
+    event: EconomicEvent
+    if isinstance(llm_event, EconomicEvent):
+        event = llm_event
+    elif isinstance(llm_event, str) and llm_event.strip():
+        ev_norm = llm_event.strip().upper()
+        try:
+            event = EconomicEvent(ev_norm)
+        except (ValueError, KeyError):
+            event = classify_economic_event(intent)
+    else:
+        event = classify_economic_event(intent)
 
-    # Cash-vs-credit refinement — a party ledger and AR/AP exist ONLY for
-    # credit semantics; cash events explicitly set them False so no agent
-    # layer can mistake a named party for a required ledger dependency.
-    if intent in _CREDIT_INTENTS:
-        affected["party_ledger"] = True
-        affected["ar_ap"] = True
-        # CREDIT ACQUISITION/DISPOSAL/DOCUMENT: nothing settles at this event —
-        # settlement is its OWN later event (SETTLEMENT_OUT/IN).  The base
-        # template's cash_bank=True is generic; leaving it set on a credit
-        # purchase tells the model "cash is affected — create cash records",
-        # which invites a fabricated cash line (prompts.py renders True dims
-        # as AFFECTED).  Settlement intents (record_payment/receipt) keep the
-        # template value — their event IS the cash movement.
-        if event not in (EconomicEvent.SETTLEMENT_IN, EconomicEvent.SETTLEMENT_OUT):
-            affected["cash_bank"] = False
-    elif intent in _CASH_INTENT_HINTS:
-        affected["party_ledger"] = False
-        affected["ar_ap"] = False
+    # 2. Base Affected Map
+    base_template = _EVENT_BASE_IMPACT.get(event, _EVENT_BASE_IMPACT[EconomicEvent.UNKNOWN])
+    affected = dict(base_template)
 
-    nature = getattr(classification, "transaction_nature", None) if classification else None
-    if intent in _ASSET_LIFECYCLE_INTENTS:
-        # Economic reality of the asset lifecycle overrides item inference:
-        # an asset transaction affects the ASSET dimension and can NEVER
-        # create stock or be treated as ordinary inventory.
-        affected["fixed_asset"] = True
-        affected["inventory"] = False
-        if intent == "dispose_fixed_asset":
-            affected["revenue"] = False  # proceeds are NOT sales revenue
-        if intent == "register_fixed_asset":
-            affected["expense"] = False  # capitalised, never expensed
-    if nature:
-        effects = _nature_effects(nature)
-        affected["inventory"] = effects["inventory"]
-        affected["fixed_asset"] = effects["fixed_asset"]
-        if effects["expense"]:
-            affected["expense"] = True
-        if (effects["inventory"] or effects["fixed_asset"]) and event in _EXPENSE_EVENTS:
-            # Asset-side acquisition: capitalised, NOT expensed at acquisition.
-            affected["expense"] = False
+    nature = llm_nature or (getattr(classification, "transaction_nature", None) if classification else None)
 
+    # If LLM did NOT provide an impact map, use deterministic fallback derivation:
+    if not llm_impact_map:
+        if intent in _CREDIT_INTENTS:
+            affected["party_ledger"] = True
+            affected["ar_ap"] = True
+            if event not in (EconomicEvent.SETTLEMENT_IN, EconomicEvent.SETTLEMENT_OUT):
+                affected["cash_bank"] = False
+        elif intent in _CASH_INTENT_HINTS:
+            affected["party_ledger"] = False
+            affected["ar_ap"] = False
+
+        if intent in _ASSET_LIFECYCLE_INTENTS:
+            affected["fixed_asset"] = True
+            affected["inventory"] = False
+            if intent == "dispose_fixed_asset":
+                affected["revenue"] = False
+            if intent == "register_fixed_asset":
+                affected["expense"] = False
+        if nature:
+            effects = _nature_effects(nature)
+            affected["inventory"] = effects["inventory"]
+            affected["fixed_asset"] = effects["fixed_asset"]
+            if effects["expense"]:
+                affected["expense"] = True
+            if (effects["inventory"] or effects["fixed_asset"]) and event in _EXPENSE_EVENTS:
+                affected["expense"] = False
+    else:
+        # LLM-AUTHORITATIVE: Apply fallback first to fill defaults, but LLM values WIN for all provided dimensions
+        if intent in _CREDIT_INTENTS:
+            affected["party_ledger"] = True
+            affected["ar_ap"] = True
+            if event not in (EconomicEvent.SETTLEMENT_IN, EconomicEvent.SETTLEMENT_OUT):
+                affected["cash_bank"] = False
+        elif intent in _CASH_INTENT_HINTS:
+            affected["party_ledger"] = False
+            affected["ar_ap"] = False
+        if nature:
+            effects = _nature_effects(nature)
+            for k, v in effects.items():
+                affected[k] = v
+
+        for dim in IMPACT_DIMENSIONS:
+            if dim in llm_impact_map:
+                val = llm_impact_map[dim]
+                affected[dim] = bool(val)
+
+    # 3. Prohibited Actions
     prohibited: List[ProhibitedAction] = []
-    if intent in _CASH_INTENT_HINTS:
-        prohibited.append(ProhibitedAction(
-            action="party_ledger_creation",
-            reason=(
-                "a supplier/customer ledger is NOT required for a cash "
-                "transaction — the named party is informational only"
-            ),
-        ))
-    if intent in _ASSET_LIFECYCLE_INTENTS:
-        prohibited.append(ProhibitedAction(
-            action="inventory_movement",
-            reason=(
-                "a fixed-asset lifecycle event is NOT an inventory "
-                "operation — no stock item or stock movement may be "
-                "created for it"
-            ),
-        ))
-    if nature == "SERVICE":
-        prohibited.append(ProhibitedAction(
-            action="inventory_movement",
-            reason=(
-                "a service has NO inventory impact — never create stock "
-                "items or stock movements for a service transaction"
-            ),
-        ))
-    if nature in ("OPERATING_EXPENSE", "CONSUMABLE"):
-        prohibited.append(ProhibitedAction(
-            action="fixed_asset_capitalization",
-            reason=(
-                "an ordinary operating expense/consumable must NOT be "
-                "capitalised as a fixed asset"
-            ),
-        ))
-    if nature == "FIXED_ASSET":
-        prohibited.append(ProhibitedAction(
-            action="inventory_movement",
-            reason=(
-                "a fixed asset is NOT inventory — no stock item or stock "
-                "movement may be created for it"
-            ),
-        ))
-    if event is EconomicEvent.REPORTING:
+    if llm_prohibited_actions:
+        for p in llm_prohibited_actions:
+            if isinstance(p, ProhibitedAction):
+                prohibited.append(p)
+            elif isinstance(p, dict) and p.get("action"):
+                prohibited.append(ProhibitedAction(
+                    action=str(p["action"]),
+                    reason=str(p.get("reason") or ""),
+                ))
+    else:
+        # Fallback heuristic prohibitions
+        if intent in _CASH_INTENT_HINTS:
+            prohibited.append(ProhibitedAction(
+                action="party_ledger_creation",
+                reason=(
+                    "a supplier/customer ledger is NOT required for a cash "
+                    "transaction — the named party is informational only"
+                ),
+            ))
+        if intent in _ASSET_LIFECYCLE_INTENTS:
+            prohibited.append(ProhibitedAction(
+                action="inventory_movement",
+                reason=(
+                    "a fixed-asset lifecycle event is NOT an inventory "
+                    "operation — no stock item or stock movement may be "
+                    "created for it"
+                ),
+            ))
+        if nature == "SERVICE":
+            prohibited.append(ProhibitedAction(
+                action="inventory_movement",
+                reason=(
+                    "a service has NO inventory impact — never create stock "
+                    "items or stock movements for a service transaction"
+                ),
+            ))
+        if nature in ("OPERATING_EXPENSE", "CONSUMABLE"):
+            prohibited.append(ProhibitedAction(
+                action="fixed_asset_capitalization",
+                reason=(
+                    "an ordinary operating expense/consumable must NOT be "
+                    "capitalised as a fixed asset"
+                ),
+            ))
+        if nature == "FIXED_ASSET":
+            prohibited.append(ProhibitedAction(
+                action="inventory_movement",
+                reason=(
+                    "a fixed asset is NOT inventory — no stock item or stock "
+                    "movement may be created for it"
+                ),
+            ))
+
+    # Invariant safety: REPORTING requests must NEVER mutate ERP records
+    if event is EconomicEvent.REPORTING and not any(p.action == "mutation" for p in prohibited):
         prohibited.append(ProhibitedAction(
             action="mutation",
             reason="a reporting request must not mutate any ERP records",

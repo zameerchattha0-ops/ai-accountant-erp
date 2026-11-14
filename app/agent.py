@@ -5630,12 +5630,21 @@ def _prefill_from_reasoning(reasoning: Any, preliminary: Any) -> Dict[str, Any]:
         prefill["semantic_intent"] = (preliminary or {}).get("provisional_intent_hint")
 
     treatment = str(decision.get("treatment") or "").strip().upper()
-
     if treatment:
-
         prefill["transaction_nature"] = treatment
 
+    if decision.get("economic_event"):
+        prefill["economic_event"] = decision["economic_event"]
+    elif (preliminary or {}).get("economic_event"):
+        prefill["economic_event"] = (preliminary or {}).get("economic_event")
 
+    if decision.get("impact_map"):
+        prefill["impact_map"] = decision["impact_map"]
+    elif (preliminary or {}).get("impact_map"):
+        prefill["impact_map"] = (preliminary or {}).get("impact_map")
+
+    if decision.get("prohibited_actions"):
+        prefill["prohibited_actions"] = decision["prohibited_actions"]
 
     return prefill
 
@@ -8331,10 +8340,6 @@ async def execute(
             execution_plan.intent = _model_intent
             if not execution_plan.potential_tools:
                 execution_plan.potential_tools = _tools_for_intent(_model_intent)
-            _ev_prof = build_event_profile(_model_intent)
-            execution_plan.economic_event = _ev_prof.event.value
-            execution_plan.impact_map = dict(_ev_prof.affected)
-            execution_plan.prohibited_actions = [p.as_dict() for p in _ev_prof.prohibited]
             _treatment = str(_decision.get("treatment") or "").strip().upper()
             if _treatment and is_supported_treatment(_treatment):
                 execution_plan.transaction_nature = _treatment
@@ -8363,6 +8368,22 @@ async def execute(
                     execution_plan.clarification_questions = _questions_for_fields(
                         _model_intent, _rem_missing, execution_plan.extracted_entities
                     )
+
+        # LLM-Authoritative Economic Event & 360° Impact Map:
+        _llm_event = _decision.get("economic_event") or getattr(execution_plan, "economic_event", None)
+        _llm_impact = _decision.get("impact_map") or getattr(execution_plan, "impact_map", None)
+        _llm_prohibited = _decision.get("prohibited_actions") or getattr(execution_plan, "prohibited_actions", None)
+
+        _ev_prof = build_event_profile(
+            execution_plan.intent,
+            llm_event=_llm_event,
+            llm_impact_map=_llm_impact,
+            llm_prohibited_actions=_llm_prohibited,
+            llm_nature=execution_plan.transaction_nature,
+        )
+        execution_plan.economic_event = _ev_prof.event.value
+        execution_plan.impact_map = dict(_ev_prof.affected)
+        execution_plan.prohibited_actions = [p.as_dict() for p in _ev_prof.prohibited]
 
         for _k in (
             "product_name", "account_name", "bank_name", "employee_name",
@@ -9589,21 +9610,14 @@ async def execute(
 
 
         dependency_nodes = analyze_requirements(
-
             intent=execution_plan.intent,
-
             entities=execution_plan.extracted_entities,
-
             missing_fields=execution_plan.missing_fields,
-
             classification=classification,
-
             relevant_customers=context.relevant_customers,
-
             relevant_suppliers=context.relevant_suppliers,
-
             relevant_bank_accounts=context.relevant_bank_accounts,
-
+            impact_map=execution_plan.impact_map,
         )
 
         open_questions = collect_open_questions(dependency_nodes)
@@ -9637,17 +9651,18 @@ async def execute(
 
 
         event_profile = build_refined_profile(
-
-            execution_plan.intent, classification=classification
-
+            execution_plan.intent,
+            classification=classification,
+            llm_event=execution_plan.economic_event,
+            llm_impact_map=execution_plan.impact_map,
+            llm_prohibited_actions=execution_plan.prohibited_actions,
+            llm_nature=execution_plan.transaction_nature,
         )
 
+        execution_plan.economic_event = event_profile.event.value
         execution_plan.impact_map = dict(event_profile.affected)
-
         execution_plan.prohibited_actions = [
-
             p.as_dict() for p in event_profile.prohibited
-
         ]
 
         context.economic_event = event_profile.event.value

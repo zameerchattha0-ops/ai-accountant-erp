@@ -790,7 +790,7 @@ def build_user_content(message: str, context: AgentContext) -> str:
 
         parts.append("")
 
-        parts.append("ECONOMIC EVENT CLASSIFICATION (deterministic — authoritative):")
+        parts.append("ECONOMIC EVENT & 360° IMPACT MAP (LLM-authored — authoritative):")
 
         parts.append(f"  - Underlying event: {economic_event}")
 

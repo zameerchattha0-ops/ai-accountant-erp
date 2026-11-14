@@ -3076,7 +3076,18 @@ def plan(
 
     from app.reasoning import build_event_profile
 
-    event_profile = build_event_profile(intent)
+    _llm_event = entities.get("economic_event") or (prefill_entities or {}).get("economic_event")
+    _llm_impact = entities.get("impact_map") or (prefill_entities or {}).get("impact_map")
+    _llm_prohibited = entities.get("prohibited_actions") or (prefill_entities or {}).get("prohibited_actions")
+    _llm_nature = entities.get("transaction_nature") or (prefill_entities or {}).get("transaction_nature")
+
+    event_profile = build_event_profile(
+        intent,
+        llm_event=_llm_event,
+        llm_impact_map=_llm_impact,
+        llm_prohibited_actions=_llm_prohibited,
+        llm_nature=_llm_nature,
+    )
 
     # 6. Determine tools + context sources
 
