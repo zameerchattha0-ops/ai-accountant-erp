@@ -4728,6 +4728,8 @@ async def _depreciation_policy_gate(
 
         )
 
+    await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+
     await _log_step(
 
         session_id,
@@ -5509,6 +5511,8 @@ async def _try_report_fast_path(
         )
 
 
+
+    await _update_status(session_id, ExecutionStatus.COMPLETED)
 
     await _log_step(session_id, "COMPLETED", {
 
@@ -7437,6 +7441,16 @@ async def execute(
 
                         )
 
+                    await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+
+                    await _log_step(session_id, "AWAITING_CLARIFICATION", {
+
+                        "question": _clarify_q[:500],
+
+                        "source": "router",
+
+                    })
+
                     return AgentResponse(
 
                         status=ExecutionStatus.AWAITING_CLARIFICATION,
@@ -7481,13 +7495,57 @@ async def execute(
 
                     })
 
+                    await _update_status(session_id, ExecutionStatus.COMPLETED)
+
+                    await _log_step(session_id, "COMPLETED", {
+
+                        "route": "analytics",
+
+                        "answer_type": _answer["answer_type"],
+
+                    })
+
+                    _summary_md = _analytics_render(_answer)
+
+                    try:
+
+                        await create_execution_result(
+
+                            session_id=session_id,
+
+                            result_data={
+
+                                "summary": _summary_md,
+
+                                "answer_type": _answer["answer_type"],
+
+                                "results": _answer.get("results"),
+
+                                "route": "analytics",
+
+                            },
+
+                            summary=_summary_md,
+
+                            action_type=_answer["answer_type"],
+
+                            verification_status="UNVERIFIED",
+
+                            status="COMPLETED",
+
+                        )
+
+                    except Exception as _res_exc:  # noqa: BLE001
+
+                        log.warning("agent.analytics_result_save_failed", error=str(_res_exc)[:200])
+
                     return AgentResponse(
 
                         status=ExecutionStatus.COMPLETED,
 
                         execution_id=session_id,
 
-                        summary=_analytics_render(_answer),
+                        summary=_summary_md,
 
                     )
 
@@ -7501,27 +7559,117 @@ async def execute(
 
                            or _analytics["audit"].get("llm") or "unavailable")
 
+                await _update_status(session_id, ExecutionStatus.FAILED)
+
+                await _log_step(session_id, "FAILED", {
+
+                    "route": "analytics",
+
+                    "reason": _why[:160],
+
+                })
+
+                _fail_msg = (
+
+                    "I couldn't prepare that report right now "
+
+                    f"({_why[:160]}). Nothing was recorded. Please try "
+
+                    "again in a moment."
+
+                )
+
+                try:
+
+                    await create_execution_result(
+
+                        session_id=session_id,
+
+                        result_data={"error": _why, "route": "analytics"},
+
+                        summary=_fail_msg,
+
+                        action_type="analytics",
+
+                        verification_status="FAILED",
+
+                        status="FAILED",
+
+                    )
+
+                except Exception as _res_exc:  # noqa: BLE001
+
+                    log.warning("agent.analytics_result_save_failed", error=str(_res_exc)[:200])
+
                 return AgentResponse(
 
                     status=ExecutionStatus.FAILED,
 
                     execution_id=session_id,
 
-                    summary=(
-
-                        "I couldn't prepare that report right now "
-
-                        f"({_why[:160]}). Nothing was recorded. Please try "
-
-                        "again in a moment."
-
-                    ),
+                    summary=_fail_msg,
 
                 )
 
         except Exception as exc:  # noqa: BLE001 — routing/analytics never breaks a turn
 
             log.warning("agent.analytics_failed", error=str(exc)[:200])
+
+            if locals().get("_route") == "analytics":
+
+                _exc_why = str(exc)[:160]
+
+                await _update_status(session_id, ExecutionStatus.FAILED)
+
+                await _log_step(session_id, "FAILED", {
+
+                    "route": "analytics",
+
+                    "error": _exc_why,
+
+                })
+
+                _err_msg = (
+
+                    "I couldn't prepare that report right now "
+
+                    f"({_exc_why[:120]}). Nothing was recorded. Please try "
+
+                    "again in a moment."
+
+                )
+
+                try:
+
+                    await create_execution_result(
+
+                        session_id=session_id,
+
+                        result_data={"error": _exc_why, "route": "analytics"},
+
+                        summary=_err_msg,
+
+                        action_type="analytics",
+
+                        verification_status="FAILED",
+
+                        status="FAILED",
+
+                    )
+
+                except Exception as _res_exc:  # noqa: BLE001
+
+                    log.warning("agent.analytics_result_save_failed", error=str(_res_exc)[:200])
+
+                return AgentResponse(
+
+                    status=ExecutionStatus.FAILED,
+
+                    execution_id=session_id,
+
+                    summary=_err_msg,
+
+                )
 
 
 
