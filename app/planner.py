@@ -6365,6 +6365,7 @@ def _merge_field_answer(
         if low in _DECLINE_WORDS or low in ("c", "none for now"):
 
             merged["depreciation_declined"] = True
+            merged["transaction_nature"] = "FIXED_ASSET"
 
             return True
 
@@ -6373,6 +6374,7 @@ def _merge_field_answer(
         if number is not None and 1 <= number <= 60:
 
             merged["useful_life_years"] = int(number)
+            merged["transaction_nature"] = "FIXED_ASSET"
 
             return True
 
@@ -6393,6 +6395,7 @@ def _merge_field_answer(
         if low in _DECLINE_WORDS or low in ("c", "none for now"):
 
             merged["depreciation_declined"] = True
+            merged["transaction_nature"] = "FIXED_ASSET"
 
             return True
 
@@ -6422,6 +6425,7 @@ def _merge_field_answer(
 
             return False
 
+        merged["transaction_nature"] = "FIXED_ASSET"
         rate = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", low)
 
         if rate and merged.get("depreciation_method") == "REDUCING_BALANCE":
@@ -6441,6 +6445,7 @@ def _merge_field_answer(
         if low in _DECLINE_WORDS:
 
             merged["salvage_value"] = 0.0
+            merged["transaction_nature"] = "FIXED_ASSET"
 
             return True
 
@@ -6449,6 +6454,7 @@ def _merge_field_answer(
         if number is not None and number >= 0:
 
             merged["salvage_value"] = number
+            merged["transaction_nature"] = "FIXED_ASSET"
 
             return True
 

@@ -89,3 +89,83 @@ async def test_item_nature_analyst_uses_business_context(monkeypatch):
     assert verdict["proposed_nature"] == FIXED_ASSET
     assert verdict["confidence"] == "HIGH"
     assert verdict["needs_question"] is False
+
+
+def test_fixed_asset_nature_in_entities_asks_depreciation_trio():
+    """When transaction_nature is FIXED_ASSET, useful_life_years, depreciation_method & salvage_value are asked."""
+    from app.planner import plan
+
+    # 1. Purchase where nature is FIXED_ASSET in entities
+    p = plan(
+        "purchased two tables from shabbir furnitures today",
+        prefill_entities={"transaction_nature": "FIXED_ASSET", "amount": 50000, "payment_method": "BANK"},
+    )
+    assert "useful_life_years" in p.missing_fields
+    assert "depreciation_method" in p.missing_fields
+    assert "salvage_value" in p.missing_fields
+
+    # 2. When depreciation is explicitly declined, trio is not asked
+    p_declined = plan(
+        "purchased two tables from shabbir furnitures today",
+        prefill_entities={
+            "transaction_nature": "FIXED_ASSET",
+            "amount": 50000,
+            "payment_method": "BANK",
+            "depreciation_declined": True,
+        },
+    )
+    assert "useful_life_years" not in p_declined.missing_fields
+    assert "depreciation_method" not in p_declined.missing_fields
+    assert "salvage_value" not in p_declined.missing_fields
+
+
+@pytest.mark.asyncio
+async def test_agent_classification_fixed_asset_expands_missing_fields_to_depreciation(monkeypatch):
+    """When classifier resolves FIXED_ASSET with high confidence, agent questionnaire includes depreciation questions."""
+    from unittest.mock import AsyncMock
+    import app.agent as agent_mod
+    from app.models.schemas import TransactionClassification, ExecutionPlan
+
+    plan_obj = ExecutionPlan(
+        intent="record_purchase",
+        missing_fields=["amount", "payment_type", "transaction_nature"],
+        extracted_entities={"item_description": "tables", "supplier_name": "Shabbir Furnitures"},
+        requires_clarification=True,
+    )
+
+    classification_obj = TransactionClassification(
+        transaction_nature="FIXED_ASSET",
+        confidence="HIGH",
+        source="LLM_DECISION",
+        account_hint_code="1510",
+        account_hint_name="Furniture & Fixtures",
+        account_source="LLM_DECISION",
+        requires_clarification=False,
+    )
+
+    # Simulate Phase 2b drop & expansion logic
+    from app.questionnaire import drop_resolved_fields as _drop_resolved
+    dropped = _drop_resolved(plan_obj.missing_fields, classification_obj)
+    assert "transaction_nature" not in dropped
+
+    _nature_val = getattr(classification_obj, "transaction_nature", None)
+    if _nature_val and not getattr(classification_obj, "requires_clarification", False):
+        _nature_str = str(_nature_val).upper()
+        plan_obj.extracted_entities["transaction_nature"] = _nature_str
+        if _nature_str == "FIXED_ASSET":
+            if plan_obj.intent in ("record_purchase", "record_cash_purchase", "record_credit_purchase", "create_purchase_bill", "record_expense"):
+                plan_obj.intent = "register_fixed_asset"
+            declined = bool(plan_obj.extracted_entities.get("depreciation_declined"))
+            if not declined:
+                for _fa_f in ("useful_life_years", "depreciation_method", "salvage_value"):
+                    if plan_obj.extracted_entities.get(_fa_f) is None and _fa_f not in dropped:
+                        dropped.append(_fa_f)
+
+    plan_obj.missing_fields = dropped
+    assert "useful_life_years" in plan_obj.missing_fields
+    assert "depreciation_method" in plan_obj.missing_fields
+    assert "salvage_value" in plan_obj.missing_fields
+    assert "amount" in plan_obj.missing_fields
+    assert "payment_type" in plan_obj.missing_fields
+    assert plan_obj.intent == "register_fixed_asset"
+

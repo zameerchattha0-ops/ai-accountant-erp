@@ -9212,6 +9212,28 @@ async def execute(
         _dropped_missing = _drop_resolved(
             execution_plan.missing_fields, classification
         )
+        _nature_val = (
+            getattr(classification, "transaction_nature", None)
+            or execution_plan.extracted_entities.get("transaction_nature")
+        )
+        if _nature_val and not getattr(classification, "requires_clarification", False):
+            _nature_str = str(_nature_val).upper()
+            execution_plan.extracted_entities["transaction_nature"] = _nature_str
+            if _nature_str == "FIXED_ASSET":
+                if execution_plan.intent in (
+                    "record_purchase",
+                    "record_cash_purchase",
+                    "record_credit_purchase",
+                    "create_purchase_bill",
+                    "record_expense",
+                ):
+                    setattr(execution_plan, "intent", "register_fixed_asset")
+                declined = bool(execution_plan.extracted_entities.get("depreciation_declined"))
+                if not declined:
+                    for _fa_f in ("useful_life_years", "depreciation_method", "salvage_value"):
+                        if execution_plan.extracted_entities.get(_fa_f) is None and _fa_f not in _dropped_missing:
+                            _dropped_missing.append(_fa_f)
+
         if _dropped_missing != execution_plan.missing_fields:
             execution_plan.missing_fields = _dropped_missing
             from app.planner import _questions_for_fields
@@ -9219,6 +9241,7 @@ async def execute(
                 execution_plan.requires_clarification = False
                 execution_plan.clarification_questions = []
             else:
+                execution_plan.requires_clarification = True
                 execution_plan.clarification_questions = _questions_for_fields(
                     execution_plan.intent,
                     execution_plan.missing_fields,
