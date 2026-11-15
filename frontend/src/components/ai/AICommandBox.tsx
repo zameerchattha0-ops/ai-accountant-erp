@@ -113,6 +113,7 @@ export default function AICommandBox() {
   );
 
   const handleSend = async (customText?: string) => {
+    if (loading) return;
     const textToSend = (customText ?? message).trim();
     if (!textToSend && attachments.length === 0) return;
 
@@ -150,6 +151,7 @@ export default function AICommandBox() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (loading) return;
       handleSend();
     }
   };

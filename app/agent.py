@@ -152,6 +152,8 @@ _FAST_PATH_INTENTS = {
 
     "record_credit_purchase",   # R2: credit purchase bill path
 
+    "record_cash_purchase",     # Direct cash purchase settlement
+
     "record_expense",           # R3.5: generic expense (unambiguous)
 
     "record_receipt",           # R4.5: customer receipt
@@ -1782,6 +1784,122 @@ def _cash_sale_fast_path_call(
 
 
 
+def _cash_purchase_fast_path_call(
+
+    entities: Dict[str, Any],
+
+    classification: Optional[Any] = None,
+
+) -> Optional[List[ToolCall]]:
+
+    """Cash purchase fast path — direct cash settlement journal.
+
+    Builds the record_cash_purchase tool call when amount is resolved.
+
+    """
+
+    amount = entities.get("amount")
+
+    if amount is None or float(amount or 0) <= 0:
+
+        return None
+
+    txn_date = entities.get("transaction_date") or date.today().isoformat()
+
+    nature = (
+
+        str(entities.get("transaction_nature") or (getattr(classification, "transaction_nature", None) if classification else "") or "").upper()
+
+        or "INVENTORY"
+
+    )
+
+
+
+    item_desc = (
+
+        entities.get("item_description")
+
+        or entities.get("description")
+
+        or "Cash purchase"
+
+    )
+
+    supplier = (
+
+        entities.get("supplier_name")
+
+        or entities.get("payee_name")
+
+        or entities.get("party")
+
+    )
+
+    desc = f"Cash purchase — {item_desc}" if item_desc else "Cash purchase"
+
+    if supplier:
+
+        desc = f"{desc} from {supplier}"
+
+
+
+    params: Dict[str, Any] = {
+
+        "amount": float(amount),
+
+        "transaction_date": str(txn_date),
+
+        "description": desc,
+
+        "transaction_nature": nature,
+
+    }
+
+    if supplier:
+
+        params["supplier_name"] = str(supplier).strip()
+
+    if entities.get("item_description"):
+
+        params["item_description"] = str(entities["item_description"]).strip()
+
+
+
+    raw_qty = entities.get("quantity") or entities.get("item_quantity")
+
+    if raw_qty is not None:
+
+        try:
+
+            qty = float(raw_qty)
+
+            if qty > 0:
+
+                params["quantity"] = qty
+
+        except (TypeError, ValueError):
+
+            pass
+
+
+
+    if entities.get("account_id"):
+
+        params["account_id"] = str(entities["account_id"])
+
+    if entities.get("cash_account_id"):
+
+        params["cash_account_id"] = str(entities["cash_account_id"])
+
+
+
+    return [ToolCall(tool_name="record_cash_purchase", arguments=params)]
+
+
+
+
+
 def _fixed_asset_fast_path_call(
 
     entities: Dict[str, Any],
@@ -2773,6 +2891,10 @@ async def _deterministic_mutation_calls(
     if execution_plan.intent == "record_cash_sale":
 
         return _cash_sale_fast_path_call(entities)
+
+    if execution_plan.intent == "record_cash_purchase":
+
+        return _cash_purchase_fast_path_call(entities, classification)
 
     if execution_plan.intent == "record_bank_transfer":
 
@@ -13519,13 +13641,69 @@ async def execute(
 
                     )
 
-            await _update_status(session_id, ExecutionStatus.COMPLETED)
+            _intent_str = str(getattr(execution_plan, "intent", "") or "")
+            _is_write_intent = _intent_str.startswith((
+                "record_", "create_", "register_", "post_", "pay_", "receive_", "issue_",
+                "add_", "update_", "delete_", "void_", "reverse_",
+            ))
 
-            # Terminal marker for an INFORMATIONAL run: nothing was recorded,
+            if _is_write_intent:
+                try:
+                    _auto_mut = await _deterministic_mutation_calls(
+                        organization_id=organization_id,
+                        execution_plan=execution_plan,
+                        classification=classification,
+                    )
+                except Exception as _exc:
+                    log.warning("post_lookup_mutation_attempt_failed", error=str(_exc))
+                    _auto_mut = None
 
-            # so without this step the session looked "OPEN"/crashed in the
+                if _auto_mut:
+                    _mut_results = []
+                    for _tc in _auto_mut:
+                        _res_dict = await _executor(_tc.tool_name, _tc.arguments)
+                        _mut_results.append(ToolResult(
+                            tool_name=_tc.tool_name,
+                            success=_res_dict.get("success", True),
+                            data=_res_dict.get("data", _res_dict),
+                            error=_res_dict.get("error"),
+                        ))
+                    tool_calls = list(tool_calls) + list(_auto_mut)
+                    tool_results = list(tool_results) + _mut_results
 
-            # trail (production 2026-10-01, employee session 514fdddb).
+            if not _mutation_executed(tool_calls):
+                if _is_write_intent:
+                    intent_label = str(getattr(execution_plan, "intent", "transaction") or "transaction").replace("_", " ")
+                    write_ask = (
+                        f"Lookups completed, but no {intent_label} mutation was recorded. "
+                        f"Could you please confirm or provide the remaining details to complete the record?"
+                    )
+                    if _count_clarification_turns(prior_qa) < MODEL_MAX_CLARIFICATION_ROUNDS:
+                        await create_clarification(
+                            session_id=session_id,
+                            question=write_ask,
+                            required_fields=["confirm_record"],
+                        )
+                        await _log_step(session_id, "AWAITING_CLARIFICATION", {
+                            "source": "write_intent_no_mutation",
+                            "intent": execution_plan.intent,
+                            "question": write_ask[:300],
+                        })
+                        return AgentResponse(
+                            status=ExecutionStatus.AWAITING_CLARIFICATION,
+                            execution_id=session_id,
+                            question=write_ask,
+                            required_information=["confirm_record"],
+                            requires_user_input=True,
+                        )
+
+                await _update_status(session_id, ExecutionStatus.COMPLETED)
+
+                # Terminal marker for an INFORMATIONAL run: nothing was recorded,
+
+                # so without this step the session looked "OPEN"/crashed in the
+
+                # trail (production 2026-10-01, employee session 514fdddb).
 
             await _log_step(session_id, "COMPLETED", {
 
