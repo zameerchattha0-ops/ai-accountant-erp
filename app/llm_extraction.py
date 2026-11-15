@@ -84,8 +84,8 @@ _INSTRUCTION = """You are the PRIMARY intelligence and fact-extraction engine fo
 RULES:
 1. INTENT RECOGNITION (provisional_intent_hint): Select the exact canonical ERP intent from:
    - Personnel & Staff: create_employee (e.g. "record an employee", "add staff", "hire worker", "new employee"), list_employees, run_payroll
-   - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation
-   - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill
+   - Sales & Invoicing: record_sale, record_cash_sale, record_credit_sale, create_invoice, create_quotation, convert_quotation (NOTE: if payment terms are unspecified, choose generic record_sale; NEVER assume cash or credit)
+   - Purchases & Bills: record_purchase, record_cash_purchase, record_credit_purchase, create_purchase_bill (NOTE: if payment terms are unspecified, choose generic record_purchase; NEVER assume cash or credit)
    - Procurement & Orders: create_purchase_order (e.g. "create PO", "issue PO", "new PO for [supplier]", "RFQ", "purchase order for goods"), update_purchase_order_status (e.g. "issue PO RFQ-000001", "approve PO", "cancel PO")
    - Settlements & Cashflow: record_receipt (customer payments, receipts against invoice, e.g. "record payment receipt against invoice 12"), record_payment (supplier payments, payments against bill, e.g. "record payment against bill 5"), record_expense_payment, record_bank_transfer
    - Expenses: record_expense, list_expenses
@@ -219,8 +219,15 @@ def _validate(payload: Any) -> Tuple[Dict[str, Any], List[str]]:
         try:
             from app.accounting_vocabulary import is_canonical_intent
 
-            if is_canonical_intent(str(hint).strip().lower()):
-                clean["provisional_intent_hint"] = str(hint).strip().lower()
+            h_str = str(hint).strip().lower()
+            if is_canonical_intent(h_str):
+                # Guard against ungrounded payment specialization when payment channel is absent
+                if not clean.get("payment_channel"):
+                    if h_str in ("record_cash_purchase", "record_credit_purchase"):
+                        h_str = "record_purchase"
+                    elif h_str in ("record_cash_sale", "record_credit_sale"):
+                        h_str = "record_sale"
+                clean["provisional_intent_hint"] = h_str
         except Exception:  # noqa: BLE001 - vocabulary unavailable -> drop
             pass
     areas = payload.get("candidate_subject_areas")
@@ -503,7 +510,12 @@ async def enrich_preliminary(
         merged["economic_event"] = clean["economic_event"]
         filled.append("economic_event")
     if clean.get("impact_map"):
-        merged["impact_map"] = clean["impact_map"]
+        impact = dict(clean["impact_map"])
+        if clean.get("provisional_intent_hint") in ("record_purchase", "record_sale") and not clean.get("payment_channel"):
+            # Cash vs credit unknown: do not assume cash/bank or drop party ledger
+            impact["cash_bank"] = None
+            impact["party_ledger"] = True
+        merged["impact_map"] = impact
         filled.append("impact_map")
     audit["llm"] = "ok"
     audit["filled"] = filled

@@ -1694,8 +1694,19 @@ def plan(
                     break
 
     payment_method = _extract_payment_method(msg_lower)
+    if not payment_method:
+        payment_method = (prefill_entities or {}).get("payment_method")
 
-    intent = _refine_intent(intent, payment_method)
+    # Guard against ungrounded specialization: if neither the utterance nor
+    # grounded prefill stated payment terms, do NOT accept an LLM guess of
+    # cash or credit purchase/sale — keep generic so payment_type is clarified.
+    if not payment_method:
+        if intent in ("record_cash_purchase", "record_credit_purchase"):
+            intent = "record_purchase"
+        elif intent in ("record_cash_sale", "record_credit_sale"):
+            intent = "record_sale"
+    else:
+        intent = _refine_intent(intent, payment_method)
 
     # 2. Extract entities from the raw message
 
@@ -3921,9 +3932,19 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 
         missing.append("transaction_nature")
 
-    if intent in ("record_purchase", "record_sale") and not entities.get("payment_method"):
+    if (
+        intent in (
+            "record_purchase",
+            "record_sale",
+            "record_cash_purchase",
+            "record_credit_purchase",
+            "record_cash_sale",
+            "record_credit_sale",
+        )
+        and not entities.get("payment_method")
+    ):
 
-        # Generic intent means no payment keyword was found anywhere —
+        # Generic intent or ungrounded specialized intent means no payment keyword was found anywhere —
 
         # the cash/credit treatment is genuinely unknown.
 

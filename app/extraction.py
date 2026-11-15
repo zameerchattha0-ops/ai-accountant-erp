@@ -87,6 +87,7 @@ Rules:
 6. currency: default "PKR" unless another currency is stated.
 7. missing_fields: list material fields still unknown for transactional/advisory requests (e.g. ["total_amount", "transaction_date", "payment_channel"]). Empty for informational queries.
 8. confidence: 0.0-1.0 overall extraction confidence.
+9. payment_terms: If payment terms (cash vs credit vs bank) are not explicitly specified by the user or history, choose generic "record_purchase" (NOT "record_cash_purchase" or "record_credit_purchase") and generic "record_sale" (NOT "record_cash_sale" or "record_credit_sale").
 
 Context:
 {context_json}
@@ -208,6 +209,25 @@ class StructuredTransactionDraft(BaseModel):
         if value is None:
             return "transactional"
         return str(value).strip().lower()
+
+    @model_validator(mode="after")
+    def _normalize_purchase_sale_intent(self) -> "StructuredTransactionDraft":
+        if not self.payment_channel:
+            if self.intent in ("record_cash_purchase", "record_credit_purchase"):
+                self.intent = "record_purchase"
+            elif self.intent in ("record_cash_sale", "record_credit_sale"):
+                self.intent = "record_sale"
+        elif self.payment_channel in ("cash", "bank_transfer", "cheque"):
+            if self.intent == "record_purchase":
+                self.intent = "record_cash_purchase"
+            elif self.intent == "record_sale":
+                self.intent = "record_cash_sale"
+        elif self.payment_channel == "credit":
+            if self.intent == "record_purchase":
+                self.intent = "record_credit_purchase"
+            elif self.intent == "record_sale":
+                self.intent = "record_credit_sale"
+        return self
 
 
 def _compact_context(org_context: Optional[dict]) -> Dict[str, Any]:
