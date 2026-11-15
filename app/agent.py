@@ -7382,6 +7382,20 @@ async def execute(
 
             _org_profile = await _business_profile(organization_id, use_cache=True)
 
+            if _org_facts_task is not None and not _org_profile.get("organization"):
+
+                try:
+
+                    _facts_res = await asyncio.wait_for(asyncio.shield(_org_facts_task), timeout=0.5)
+
+                    if _facts_res and _facts_res[0]:
+
+                        _org_profile["organization"] = _facts_res[0]
+
+                except Exception:
+
+                    pass
+
         except Exception as exc:  # noqa: BLE001 — context never breaks a turn
 
             log.warning(

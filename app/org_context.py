@@ -28,7 +28,7 @@ from typing import Any, Dict, Tuple
 
 import structlog
 
-from app.database import fetch_many, fetch_one
+from app.database import fetch_many
 
 log = structlog.get_logger(__name__)
 
@@ -72,7 +72,6 @@ async def business_profile(
                 "accounts": list(data.get("accounts") or []),
                 "invoices": list(data.get("invoices") or []),
                 "bills": list(data.get("bills") or []),
-                "fixed_assets": list(data.get("fixed_assets") or []),
             }
 
     async def _safe(label: str, coro, default):
@@ -84,13 +83,8 @@ async def business_profile(
             )
             return default
 
-    org_info, products, customers, suppliers, accounts, invoices, bills, fixed_assets = (
+    products, customers, suppliers, accounts, invoices, bills = (
         await asyncio.gather(
-            _safe("organization", fetch_one(
-                "organizations",
-                filters={"id": org},
-                select="id,name,legal_name,business_type",
-            ), {}),
             _safe("products", fetch_many(
                 "products",
                 filters={"organization_id": org},
@@ -124,23 +118,16 @@ async def business_profile(
                 select="bill_number,total",
                 order="created_at.desc", limit=max_documents,
             ), []),
-            _safe("fixed_assets", fetch_many(
-                "fixed_assets",
-                filters={"organization_id": org},
-                select="asset_code,name,status",
-                limit=15,
-            ), []),
         )
     )
     res = {
-        "organization": org_info or {},
+        "organization": {},
         "products": list(products or []),
         "customers": [str(r.get("name") or "") for r in (customers or []) if r.get("name")],
         "suppliers": [str(r.get("name") or "") for r in (suppliers or []) if r.get("name")],
         "accounts": list(accounts or []),
         "invoices": list(invoices or []),
         "bills": list(bills or []),
-        "fixed_assets": list(fixed_assets or []),
     }
     _PROFILE_CACHE[org] = (now, res)
     return res
@@ -198,12 +185,21 @@ def render_profile(profile: Dict[str, Any] | None) -> str:
     accounts = prof.get("accounts") or []
     if accounts:
         acc_bits = []
+        asset_bits = []
         for a in accounts[:20]:
             code = str(a.get("code") or "").strip()
             name = str(a.get("name") or "").strip()
+            acct_type = str(a.get("account_type") or "").upper()
             if code or name:
                 acc_bits.append(f"{code} {name}".strip())
+                if acct_type == "ASSET" and (
+                    code.startswith("15")
+                    or any(w in name.lower() for w in ("equipment", "furniture", "property", "plant", "vehicle", "machinery", "fixed asset", "fixtures"))
+                ):
+                    asset_bits.append(f"{code} {name}".strip())
         lines.append("- Chart accounts: " + "; ".join(acc_bits))
+        if asset_bits and not prof.get("fixed_assets"):
+            lines.append("- Fixed Asset Ledgers: " + "; ".join(asset_bits))
     docs = []
     for row in (prof.get("invoices") or [])[:6]:
         if row.get("invoice_number"):
