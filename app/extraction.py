@@ -543,6 +543,7 @@ def draft_to_prefill_entities(draft: StructuredTransactionDraft) -> Dict[str, An
             prefill["payment_type"] = "BANK" if mapped == "BANK_TRANSFER" else mapped
     if draft.transaction_nature:
         prefill["transaction_nature"] = draft.transaction_nature
+    prefill["_extraction_source"] = "structured_extraction"
     if draft.transaction_date:
         prefill["transaction_date"] = draft.transaction_date
     if draft.total_amount is not None:

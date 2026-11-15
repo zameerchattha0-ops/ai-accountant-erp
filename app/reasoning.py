@@ -209,7 +209,7 @@ _NATURE_MATRIX: Dict[str, Dict[str, Any]] = {
         ),
         "keywords": (
             (r"fixed\s*asset|capitalis|capitaliz|long.term|office\s*use|own\s*use|internal\s*use|business\s*use|staff\s*use|employee\s*use", "FIXED_ASSET"),
-            (r"inventory|stock|resale|drives?|ssd|hdd|parts?|goods|hardware|accessories|merchandise|items?|units?|supplies", "INVENTORY"),
+            (r"inventory|stock|resale|for\s*resale|to\s*resell|merchandise", "INVENTORY"),
             (r"consumable|expense|expensed", "OPERATING_EXPENSE"),
             (r"service", "SERVICE"),
         ),

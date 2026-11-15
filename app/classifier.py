@@ -74,7 +74,7 @@ _EXPENSE_RULES = [
 
 # Consumables — expense, reuse existing supplies accounts; never ask.
 _CONSUMABLE_RULES = (
-    "toner|ink|cartridge|stationery|office suppl|printing paper|cleaning suppl"
+    r"\b(?:toner|ink|cartridge|stationery|supplies|paper)\b"
 )
 
 # Services — use the organisation's service/expense treatment.
@@ -343,17 +343,12 @@ def rule_based_nature(
     if _hit(_CONSUMABLE_RULES):
         return OPERATING_EXPENSE, "HIGH"
 
-    # 6. Durable goods — potentially fixed assets.  Bulk quantities lean
-    #    inventory; a single unit is MATERIALLY AMBIGUOUS (fixed asset vs
-    #    expense) unless ERP configuration resolves it — the caller checks
-    #    the COA before asking the user.
+    # 6. Durable goods — potentially fixed assets or office equipment.
+    #    Durable goods must never be assumed to be inventory solely based on quantity
+    #    (e.g. a software company buying 10 chairs or laptops for staff).
+    #    Ambiguity is resolved by business context (analyst/LLM decision) or asking.
     if _hit(_DURABLE_GOODS):
-        try:
-            if quantity is not None and float(quantity) >= 10:
-                return INVENTORY, "MEDIUM"
-        except (TypeError, ValueError):
-            pass
-        return None, "LOW"  # durable ambiguity → COA mapping or clarify
+        return None, "LOW"  # durable ambiguity → business context / COA mapping or clarify
 
     # 7. Unknown items: the conservative default is operating-expense ONLY
     #    for immaterial amounts (everyday unmapped items are never quizzed).
@@ -1099,14 +1094,32 @@ async def classify_transaction(
                 )
             nature = verdict.get("proposed_nature")
             if nature:
-                # The analyst routed it (purpose clear / unambiguous record):
-                # INVENTORY_ONLY, or a clear-purpose BOTH/NEITHER.  Return the
-                # nature; the accounting engine resolves the account.
+                # The analyst routed it (purpose clear from business context / registers):
+                # INVENTORY_ONLY, or a clear-purpose BOTH/NEITHER. Return the nature;
+                # resolve account hint via LLM decision layer or search accounts.
+                if resolve_account_hints:
+                    decision = await _llm_decision(
+                        organization_id, intent=intent, entities=entities,
+                        message=message, nature_hint=nature,
+                        org_context=org_context,
+                    )
+                    if decision is not None and (decision.account_hint_id or decision.proposed_account_name):
+                        decision.account_source = "LLM_DECISION"
+                        decision.catalogue_hint = hint
+                        return decision
+                account = (
+                    await _search_account_by_nature(organization_id, nature, item)
+                    if resolve_account_hints
+                    else None
+                )
                 return TransactionClassification(
                     transaction_nature=nature,
                     confidence=verdict.get("confidence") or "MEDIUM",
                     source="ITEM_MAPPING",
                     entity=item,
+                    account_hint_id=account.get("id") if account else None,
+                    account_hint_code=account.get("code") if account else None,
+                    account_hint_name=account.get("name") if account else None,
                     requires_clarification=False,
                     clarification_reason=None,
                     catalogue_hint=hint,

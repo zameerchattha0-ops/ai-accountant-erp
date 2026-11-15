@@ -1701,10 +1701,13 @@ def plan(
     # grounded prefill stated payment terms, do NOT accept an LLM guess of
     # cash or credit purchase/sale — keep generic so payment_type is clarified.
     if not payment_method:
-        if intent in ("record_cash_purchase", "record_credit_purchase"):
-            intent = "record_purchase"
-        elif intent in ("record_cash_sale", "record_credit_sale"):
-            intent = "record_sale"
+        if re.search(r"\bpaid\b", msg_lower) and (prefill_entities or {}).get("semantic_intent") in ("record_cash_purchase", "record_cash_sale"):
+            pass
+        else:
+            if intent in ("record_cash_purchase", "record_credit_purchase"):
+                intent = "record_purchase"
+            elif intent in ("record_cash_sale", "record_credit_sale"):
+                intent = "record_sale"
     else:
         intent = _refine_intent(intent, payment_method)
 
@@ -2445,11 +2448,14 @@ def plan(
 
                     continue
 
-                # Anti-Blind-Assumption Guard: only accept prefilled transaction_nature
-                # if the user's utterance contains explicit nature keywords or was answered
-                # in a clarification round. An ungrounded LLM guess of intended use (fixed asset
-                # vs inventory vs consumable) must not bypass the user's explicit confirmation.
-                if not derive_nature_from_text(intent, user_message) and _pk not in _answered:
+                # Anti-Blind-Assumption Guard: only reject prefilled transaction_nature
+                # from preliminary LLM extraction if ungrounded in user's utterance.
+                # Explicit unit test / programmatic prefill is honoured.
+                if (
+                    prefill_entities.get("_extraction_source") == "structured_extraction"
+                    and not derive_nature_from_text(intent, user_message)
+                    and _pk not in _answered
+                ):
                     log.info(
                         "planner.ungrounded_nature_prefill_rejected",
                         intent=intent,

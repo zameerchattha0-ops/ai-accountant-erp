@@ -110,6 +110,7 @@ def test_llm_extraction_validation_normalizes_hint():
 def test_turn1_asks_nature_payment_and_amount_together():
     """All open decisions (intended use, settlement, amount) are asked in Turn 1."""
     prefill = {
+        "_extraction_source": "structured_extraction",
         "semantic_intent": "record_purchase",
         "transaction_nature": "INVENTORY",  # ungrounded LLM guess
         "supplier_name": "Shabbir Furnitures",

@@ -41,37 +41,46 @@ _NATURES = {
 _LOCATIONS = {"INVENTORY_ONLY", "FIXED_ASSET_ONLY", "BOTH", "NEITHER"}
 
 _INSTRUCTION = (
-    'You are an item-nature analyst for an accounting/ERP system. Given a '
-    'PURCHASE/SALE request and the business LIVE registers, decide where '
-    'the item lives and how it should be treated. REASON IN THIS ORDER:\n'
-    '1. PURPOSE OF USE — if the request states WHY the item is bought/sold '
-    '(resale to customers, own business use, personal, service delivery), '
-    'that purpose is the strongest signal. Reselling -> INVENTORY. Own '
-    'long-term business use -> FIXED ASSET. Consumed immediately -> '
-    'CONSUMABLE/EXPENSE. A service -> SERVICE.\n'
-    '2. EXISTING RECORDS — check whether the item already exists as an '
-    'inventory product (stock you resell) and/or a registered fixed asset. '
-    'Set location to INVENTORY_ONLY, FIXED_ASSET_ONLY, BOTH, or NEITHER.\n'
-    '3. ROUTING:\n'
-    '   - INVENTORY_ONLY -> propose INVENTORY (no question).\n'
-    '   - FIXED_ASSET_ONLY -> this is usually a FIXED ASSET, but a business '
-    'may start reselling it, so ASK (needs_question=true) unless the purpose '
-    'is already crystal clear from the request.\n'
-    '   - BOTH -> the SAME item is sometimes stock, sometimes an asset: if '
-    'the purpose is stated, use it to decide; otherwise ASK.\n'
-    '   - NEITHER -> rely on purpose alone; if the purpose is clear propose '
-    'the nature, else ASK.\n'
-    '4. NEVER GUESS a material treatment. When unsure, set needs_question='
-    'true and write a short, specific question for the user.\n'
+    'You are an expert accounting item-nature analyst for an ERP system. Given a '
+    'PURCHASE/SALE request, the organization context and business profile, and live '
+    'registers, determine the economic nature and accounting treatment of the item under '
+    'accounting standards (IAS 16 / IAS 2 / IAS 38).\n\n'
+    'ANALYZE IN THIS SYSTEMATIC ORDER (Query + Business Model + Org Profile + Catalogue + Fixed Assets):\n'
+    '1. BUSINESS OPERATIONS & MODEL — inspect the organization name, business type, and '
+    'operations in BUSINESS CONTEXT:\n'
+    '   * Service / Software / Digital / Professional firms (e.g. SOFTWARE_HOUSE, digital '
+    'creators, software agencies, consulting, clinics, law firms): Their business model is '
+    'delivering digital services or expertise, NOT goods retail. When they acquire office '
+    'furniture (tables, chairs, desks, cabinets), computers, laptops, monitors, servers, '
+    'air conditioners, or office machinery, these items are NOT held for resale and will NOT '
+    'generate revenue from sale. Under IAS 16, they are tangible assets held for administrative '
+    'and office operations -> FIXED_ASSET (Property, Plant & Equipment) if durable (>1 year useful life), '
+    'or OPERATING_EXPENSE if consumable supplies. NEVER classify such items as INVENTORY for '
+    'a service firm unless explicitly in their sales catalogue as resale stock. Propose FIXED_ASSET '
+    'with confidence=HIGH and needs_question=false.\n'
+    '   * Retail / Wholesale / Trading firms (e.g. TRADING, RETAIL, merchandise distributors): '
+    'Items of their trade (e.g. tables for a furniture showroom) -> INVENTORY. Internal office fixtures -> FIXED_ASSET.\n'
+    '2. REQUEST CONTEXT & EXPLICIT PURPOSE — if the request explicitly states purpose ("for office use", '
+    '"for employees", "for our studio" -> FIXED_ASSET; "to resell to client", "for shop stock" -> INVENTORY).\n'
+    '3. EXISTING REGISTERS — check INVENTORY PRODUCTS (catalogue) and FIXED ASSETS:\n'
+    '   * Matches stock-tracked product in catalogue -> INVENTORY.\n'
+    '   * Matches existing fixed asset or asset class -> FIXED_ASSET.\n'
+    '   * Matches neither: deduce decisively from Business Model + Item Nature. If the business model '
+    'clearly dictates the treatment (e.g. software company buying office tables -> FIXED_ASSET), '
+    'propose the nature with confidence=HIGH and needs_question=false.\n'
+    '4. WHEN TO ASK — set needs_question=true ONLY if the item is genuinely unusual, ambiguous, or '
+    'dual-purpose after this 5-dimension analysis (e.g. personal drawing vs business, or an unusual '
+    'item completely unrelated to the business with unclear purpose). Never ask unnecessary questions '
+    'when the business model and operations make the accounting treatment obvious.\n\n'
     'Output STRICT JSON only, matching EXACTLY: {"location": '
     '"<INVENTORY_ONLY|FIXED_ASSET_ONLY|BOTH|NEITHER>", "inventory_index": '
     '<1-based int or null>, "asset_index": <1-based int or null>, "purpose": '
     '"<RESALE|BUSINESS_USE|CONSUMABLE|SERVICE|UNKNOWN>", "proposed_nature": '
     '"<canonical nature or null>", "confidence": "<HIGH|MEDIUM|LOW>", '
     '"needs_question": <true|false>, "question": "<short question or empty>", '
-    '"reasoning": "<one short sentence>"}.  inventory_index/asset_index are '
-    'POSITIONS (starting at 1) in the numbered INVENTORY/ASSET lists, or null '
-    'when the item matches none.'
+    '"reasoning": "<one short sentence explaining decision based on business model and item>"}. '
+    'inventory_index/asset_index are POSITIONS (starting at 1) in the numbered INVENTORY/ASSET lists, '
+    'or null when the item matches none.'
 )
 
 
@@ -160,11 +169,13 @@ async def analyse_item_nature(
             from app.ai_orchestrator import get_client
 
             client = get_client()
+        context_section = f"\n\nBUSINESS CONTEXT:\n{org_context}" if org_context else ""
         raw = await asyncio.wait_for(
             client.generate_text_light(
                 prompt=(
                     f"{_INSTRUCTION}\n\nREQUEST (intent={intent}):\n"
-                    f"{str(message or term)[:800]}\n\nITEM: {term[:200]}\n\n"
+                    f"{str(message or term)[:800]}\n\nITEM: {term[:200]}"
+                    f"{context_section}\n\n"
                     f"INVENTORY PRODUCTS:\n{_inv_block(products)}\n\n"
                     f"FIXED ASSETS:\n{_asset_block(assets)}"
                 )
