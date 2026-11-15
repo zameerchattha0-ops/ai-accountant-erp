@@ -198,6 +198,9 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "project_profitability", "customer_balance", "supplier_balance",
         "list_expenses", "list_bank_accounts", "get_inventory_status",
         "get_open_payables", "get_open_receivables",
+        # Virtual CFO Advisory & Analytical inquiries (Recommendation 1)
+        "financial_advisory", "financial_analysis", "health_check",
+        "cash_flow_analysis", "expense_analysis", "tax_advisory",
         # §12.8 expressibility repair — model-only, no planner routing yet
         # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment).
         "reverse_journal", "record_correction", "record_adjustment", "update_document_status",

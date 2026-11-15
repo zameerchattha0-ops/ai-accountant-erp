@@ -50,7 +50,7 @@ import re
 
 from datetime import date, timedelta
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import structlog
 
@@ -146,6 +146,16 @@ _EXPENSE_NATURE_INTENTS = frozenset({
 
 })
 
+# Advisory & Strategic Financial Analysis Intents (Virtual CFO - Recommendation 1)
+ADVISORY_INTENTS: FrozenSet[str] = frozenset({
+    "financial_advisory",
+    "financial_analysis",
+    "health_check",
+    "cash_flow_analysis",
+    "expense_analysis",
+    "tax_advisory",
+})
+
 # Intents that require explicit user authorization BEFORE any mutation
 
 # (the PHASE 5 confirmation gate).  Exported through
@@ -217,6 +227,25 @@ _BATCH_MAX_ITEMS = 10
 # ---------------------------------------------------------------------------
 
 _INTENT_PATTERNS: List[tuple[str, list[str]]] = [
+
+    # Advisory & Strategic Financial Analysis (Virtual CFO - Recommendation 1)
+    ("financial_advisory", [
+        r"(?:financial\s+)?health\s*(?:check|assessment|report|score|verdict)",
+        r"\bhealth\s*check\b",
+        r"\bfinancial\s+(?:health|wellness|condition|diagnostic|assessment|advisory|analysis)\b",
+        r"\bworking\s+capital\b",
+        r"\b(?:liquidity|solvency)\s*(?:ratio|analysis|assessment|health|position)\b",
+        r"\b(?:current\s+ratio|quick\s+ratio|acid\s+test|cash\s+runway|burn\s+rate)\b",
+        r"\b(?:virtual\s+)?cfo\b",
+        r"\b(?:cfo|strategic)(?:\s+financial)?\s*(?:advisory|advice|advisor|recommendations?|action\s+plan)\b",
+        r"\bfinancial\s+advice\b",
+        r"(?:analy[sz]e|analysis|trend|trends|evaluat\w+|diagnostic)[^.\n]*(?:cash\s*flow|expense|revenue|profit|margin|performance|working\s+capital|runway)",
+        r"(?:cash\s*flow|expense|revenue|profit|margin|performance)[^.\n]*(?:analy[sz]e|analysis|trend|trends|diagnostic)",
+        r"\bdupont\b",
+        r"(?:margin|profitability)\s+analysis",
+        r"\btax\s+advisory\b",
+        r"(?:statutory|tax)\s+compliance\s*(?:check|review|advisory|audit)?",
+    ]),
 
     # Reports (read-only, no mutation)
 
@@ -756,6 +785,9 @@ _SEMANTIC_INTENTS = frozenset({
     "generate_trial_balance", "generate_balance_sheet", "generate_profit_loss",
 
     "generate_cash_flow", "project_profitability", "record_bank_transfer",
+    # Advisory & Strategic Financial Analysis (Virtual CFO - Recommendation 1)
+    "financial_advisory", "financial_analysis", "health_check",
+    "cash_flow_analysis", "expense_analysis", "tax_advisory",
 
     "register_fixed_asset", "dispose_fixed_asset", "record_asset_depreciation",
 
@@ -3856,6 +3888,15 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
     """
 
     missing: List[str] = []
+
+    # Advisory & Strategic Financial inquiries bypass mutation questionnaires completely
+    if (
+        intent in ADVISORY_INTENTS
+        or intent.startswith("financial_")
+        or intent.endswith("_analysis")
+        or intent.endswith("_advisory")
+    ):
+        return []
 
     # 
 
@@ -8177,6 +8218,14 @@ def _tools_for_intent(intent: str) -> List[str]:
 
         "project_profitability": ["search_project", "get_project_profitability"],
 
+        # Advisory & Strategic Financial Analysis (Virtual CFO - Recommendation 1)
+        "financial_advisory": ["get_profit_loss", "get_balance_sheet", "get_cash_flow", "get_trial_balance"],
+        "financial_analysis": ["get_profit_loss", "get_balance_sheet", "get_cash_flow", "get_trial_balance"],
+        "health_check": ["get_profit_loss", "get_balance_sheet", "get_cash_flow", "get_trial_balance"],
+        "cash_flow_analysis": ["get_cash_flow", "get_balance_sheet"],
+        "expense_analysis": ["get_profit_loss", "list_expenses"],
+        "tax_advisory": ["get_profit_loss", "get_trial_balance"],
+
     }
 
     return mapping.get(intent, [])
@@ -8254,6 +8303,14 @@ def _context_for_intent(intent: str) -> List[str]:
         "generate_cash_flow": ["cash_flow", "balance_sheet", "income_statement", "accounting_periods"],
 
         "project_profitability": ["projects", "general_ledger", "accounting_periods"],
+
+        # Advisory & Strategic Financial Analysis (Virtual CFO - Recommendation 1)
+        "financial_advisory": ["chart_of_accounts", "accounting_periods"],
+        "financial_analysis": ["chart_of_accounts", "accounting_periods"],
+        "health_check": ["chart_of_accounts", "accounting_periods"],
+        "cash_flow_analysis": ["chart_of_accounts", "accounting_periods"],
+        "expense_analysis": ["chart_of_accounts", "accounting_periods"],
+        "tax_advisory": ["chart_of_accounts", "accounting_periods"],
 
     }
 
@@ -8356,6 +8413,17 @@ def _outcome(intent: str) -> str:
 
         "list_expenses": "Expense details retrieved",
 
+        "financial_advisory": "Virtual CFO advisory report generated",
+        "financial_analysis": "Financial analysis generated",
+        "health_check": "Financial health assessment generated",
+        "cash_flow_analysis": "Cash flow analysis generated",
+        "expense_analysis": "Expense analysis generated",
+        "tax_advisory": "Tax advisory analysis generated",
+
     }
 
     return outcomes.get(intent, "Operation completed")
+
+
+# Public alias for external callers
+run_planner = plan

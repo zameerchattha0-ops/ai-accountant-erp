@@ -209,12 +209,16 @@ _READ_ONLY_LOOKUPS_GATE = frozenset({
     "list_expenses", "list_bank_accounts", "list_customers",
     "list_suppliers", "list_employees", "get_chart_of_accounts",
     "get_inventory_status", "get_open_payables", "get_open_receivables",
+    # Advisory & Strategic Financial Analysis (Recommendation 1)
+    "financial_advisory", "financial_analysis", "health_check",
+    "cash_flow_analysis", "expense_analysis", "tax_advisory",
 })
 
 
 def _is_read_only_inquiry(message: str, intent: Optional[str] = None) -> bool:
     """True if message or intent represents an informational query / lookup rather than a transaction to book."""
-    if intent and intent in _READ_ONLY_LOOKUPS_GATE:
+    from app.planner import ADVISORY_INTENTS
+    if intent and (intent in _READ_ONLY_LOOKUPS_GATE or intent in ADVISORY_INTENTS):
         return True
     msg = (message or "").strip().lower()
     if not msg:
@@ -223,12 +227,39 @@ def _is_read_only_inquiry(message: str, intent: Optional[str] = None) -> bool:
         "how many", "what is", "what are", "check ", "show ", "list ", "view ", "tell me",
         "do we have", "is there", "are there", "units of", "quantity of", "stock of",
         "balance of", "status of", "how much stock", "how much balance", "can i see",
+        "analyze", "how is our", "give me a financial", "give us a financial",
     )
     if any(msg.startswith(s) or f" {s}" in msg for s in inquiry_starters):
         return True
     if msg.endswith("?") and not any(k in msg for k in ("bought", "purchased", "sold", "paid", "received rs", "recorded")):
         return True
     return False
+
+
+def _is_advisory_inquiry(message: str, intent: Optional[str] = None) -> bool:
+    """True if message or intent represents an advisory or strategic financial inquiry."""
+    from app.planner import ADVISORY_INTENTS, intent_for_message
+    if intent and intent in ADVISORY_INTENTS:
+        return True
+    detected = intent_for_message(message)
+    if detected in ADVISORY_INTENTS:
+        return True
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    advisory_keywords = (
+        "health check", "financial health", "working capital",
+        "cfo advisory", "virtual cfo", "cfo report", "strategic advice",
+        "dupont", "cash runway", "burn rate", "tax advisory", "financial advice",
+    )
+    if any(k in msg for k in advisory_keywords):
+        return True
+    if ("cash flow" in msg or "expense" in msg or "revenue" in msg) and any(
+        w in msg for w in ("trend", "analyze", "analysis", "diagnostic")
+    ):
+        return True
+    return False
+
 
 
 
@@ -488,6 +519,9 @@ async def _party_resolution_question(
         "list_expenses", "list_bank_accounts", "list_customers",
         "list_suppliers", "list_employees", "get_chart_of_accounts",
         "get_inventory_status",
+        # Advisory & Strategic Financial Analysis (Recommendation 1)
+        "financial_advisory", "financial_analysis", "health_check",
+        "cash_flow_analysis", "expense_analysis", "tax_advisory",
     }
     _CREDIT_OR_PARTY_REQUIRED_INTENTS = {
         "record_credit_sale", "record_credit_purchase",
@@ -7485,6 +7519,77 @@ async def execute(
         if not _is_read_only_inquiry(user_message):
             await _log_step(session_id, "PRELIMINARY_EXTRACTION", _preliminary)
 
+        # ---- VIRTUAL CFO ADVISORY ROUTE (Recommendation 1) ----------------
+        if _is_advisory_inquiry(user_message, confirmed_intent):
+            _adv_plan = run_planner(
+                user_message,
+                clarification_history=prior_qa,
+                org_preferences=org_prefs,
+            )
+            await _log_step(session_id, "PLANNING", {
+                "intent": _adv_plan.intent,
+                "extracted_entities": _adv_plan.extracted_entities,
+                "advisory_route": True,
+            })
+            await _log_step(session_id, "ADVISORY_ROUTING", {
+                "route": "financial_advisory",
+                "intent": _adv_plan.intent,
+            })
+            evidence: Dict[str, Any] = {}
+            advisory_report = ""
+            try:
+                from app.financial_advisor import generate_cfo_advisory, collect_cfo_evidence
+                if collect_cfo_evidence is not None:
+                    evidence = await collect_cfo_evidence(organization_id)
+                if generate_cfo_advisory is not None:
+                    advisory_report = await generate_cfo_advisory(
+                        user_query=user_message,
+                        evidence=evidence,
+                        org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                    )
+            except Exception as _cfo_err:
+                log.warning("agent.cfo_advisory_failed", error=str(_cfo_err))
+
+            if not advisory_report:
+                try:
+                    from app.financial_advisor import generate_deterministic_cfo_summary
+                    advisory_report = generate_deterministic_cfo_summary(
+                        evidence,
+                        org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                    )
+                except Exception:
+                    advisory_report = f"Financial advisory assessment completed for: {user_message}"
+
+            await _update_status(session_id, ExecutionStatus.COMPLETED)
+            await _log_step(session_id, "COMPLETED", {
+                "route": "financial_advisory",
+                "intent": _adv_plan.intent,
+            })
+            try:
+                await create_execution_result(
+                    session_id=session_id,
+                    result_data={
+                        "summary": advisory_report,
+                        "route": "financial_advisory",
+                        "intent": _adv_plan.intent,
+                        "evidence": evidence,
+                    },
+                    summary=advisory_report,
+                    action_type=_adv_plan.intent,
+                    verification_status="UNVERIFIED",
+                    status="COMPLETED",
+                )
+            except Exception as _res_exc:
+                log.warning("agent.advisory_result_save_failed", error=str(_res_exc)[:200])
+
+            return AgentResponse(
+                status=ExecutionStatus.COMPLETED,
+                execution_id=session_id,
+                action=_adv_plan.intent,
+                summary=advisory_report,
+                data={"intent": _adv_plan.intent, "route": "advisory"},
+            )
+
         # ---- ROUTING + ANALYTICS AGENT (flag-gated) ------------------------
         # LLM-FIRST: EVERY message goes through a short bounded routing call
         # that decides "analytics" (answer from existing data, READ-ONLY) vs
@@ -8653,6 +8758,12 @@ async def execute(
                         _model_intent, _rem_missing, execution_plan.extracted_entities
                     )
 
+        if execution_plan.intent in _READ_ONLY_LOOKUPS_GATE or _is_advisory_inquiry(user_message, execution_plan.intent):
+            execution_plan.requires_clarification = False
+            execution_plan.clarification_questions = []
+            execution_plan.missing_fields = []
+
+
         # LLM-Authoritative Economic Event & 360° Impact Map:
         _llm_event = _decision.get("economic_event") or getattr(execution_plan, "economic_event", None)
         _llm_impact = _decision.get("impact_map") or getattr(execution_plan, "impact_map", None)
@@ -9605,6 +9716,67 @@ async def execute(
             )
             if fast_response is not None:
                 return fast_response
+
+        # Fallback completion for Virtual CFO advisory route
+        if execution_plan.intent in (
+            "financial_advisory", "financial_analysis", "health_check",
+            "cash_flow_analysis", "expense_analysis", "tax_advisory",
+        ):
+            evidence: Dict[str, Any] = {}
+            advisory_report = ""
+            try:
+                from app.financial_advisor import generate_cfo_advisory, collect_cfo_evidence
+                if collect_cfo_evidence is not None:
+                    evidence = await collect_cfo_evidence(organization_id)
+                if generate_cfo_advisory is not None:
+                    advisory_report = await generate_cfo_advisory(
+                        user_query=user_message,
+                        evidence=evidence,
+                        org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                    )
+            except Exception as _cfo_err:
+                log.warning("agent.cfo_advisory_failed", error=str(_cfo_err))
+
+            if not advisory_report:
+                try:
+                    from app.financial_advisor import generate_deterministic_cfo_summary
+                    advisory_report = generate_deterministic_cfo_summary(
+                        evidence,
+                        org_context=_org_profile if isinstance(_org_profile, dict) else {},
+                    )
+                except Exception:
+                    advisory_report = f"Financial advisory assessment completed for: {user_message}"
+
+            await _update_status(session_id, ExecutionStatus.COMPLETED)
+            await _log_step(session_id, "COMPLETED", {
+                "route": "financial_advisory",
+                "intent": execution_plan.intent,
+            })
+            try:
+                await create_execution_result(
+                    session_id=session_id,
+                    result_data={
+                        "summary": advisory_report,
+                        "route": "financial_advisory",
+                        "intent": execution_plan.intent,
+                        "evidence": evidence,
+                    },
+                    summary=advisory_report,
+                    action_type=execution_plan.intent,
+                    verification_status="UNVERIFIED",
+                    status="COMPLETED",
+                )
+            except Exception as _res_exc:
+                log.warning("agent.advisory_result_save_failed", error=str(_res_exc)[:200])
+
+            return AgentResponse(
+                status=ExecutionStatus.COMPLETED,
+                execution_id=session_id,
+                action=execution_plan.intent,
+                summary=advisory_report,
+                data={"intent": execution_plan.intent, "route": "advisory"},
+            )
+
 
 
 
