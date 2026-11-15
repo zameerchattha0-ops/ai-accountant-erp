@@ -10131,7 +10131,8 @@ async def execute(
                     )
 
             else:
-                if execution_plan.intent in ("unknown", None, "") and not (entities.get("item_description") or entities.get("description")):
+                _extracted = execution_plan.extracted_entities or {}
+                if execution_plan.intent in ("unknown", None, "") and not (_extracted.get("item_description") or _extracted.get("description")):
                     from app.questionnaire import QUESTION_BANK
                     spec = QUESTION_BANK.get("transaction_intent")
                     question = spec.question if spec else "Could you please clarify what action you would like to take? (a) Pay a Supplier Bill, (b) Receive Customer Payment against an Invoice, (c) Record an Expense, (d) Direct Sale, or (e) Direct Purchase?"
@@ -10502,11 +10503,11 @@ async def execute(
 
                     "intent": getattr(execution_plan, "intent", "create_invoice"),
 
-                    "extracted_entities": entities,
+                    "extracted_entities": execution_plan.extracted_entities or {},
 
                     "missing_fields": ["revenue_ledger_decision"],
 
-                }),
+                }, default=str),
 
             )
 
