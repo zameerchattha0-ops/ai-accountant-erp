@@ -15340,7 +15340,15 @@ async def resume_with_clarification(
             ("," in answer or "\n" in answer or ";" in answer)
             or (req_info and len(req_info) > 1 and " " in answer)
         )
-        if latest_question and is_multi_endpoint:
+        should_parse_reply = bool(
+            latest_question and str(answer or "").strip()
+            and (
+                is_multi_endpoint
+                or (req_info and len(req_info) >= 1)
+                or any(sep in answer for sep in (",", "\n", ";", ":", "-", " and "))
+            )
+        )
+        if should_parse_reply:
 
             parsed_endpoints = await parse_packed_reply_to_endpoints(
 

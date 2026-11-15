@@ -6082,7 +6082,11 @@ _NATURE_VALUES = frozenset({
 
 })
 
-_DECLINE_WORDS = frozenset({"none", "no", "n/a", "na", "skip", "declined", "not now"})
+_DECLINE_WORDS = frozenset({
+    "none", "no", "n/a", "na", "skip", "declined", "not now",
+    "none for now", "no depreciation", "cost only", "not yet",
+    "don't depreciate", "dont depreciate", "zero", "nil", "no schedule",
+})
 
 _METHOD_VALUE_MAP = {
 

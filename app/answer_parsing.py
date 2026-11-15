@@ -30,37 +30,42 @@ log = structlog.get_logger(__name__)
 # Canonical field endpoints supported by app/planner.py:_merge_field_answer
 # and app/questionnaire.py:QUESTION_BANK.
 CANONICAL_FIELD_ENDPOINTS: Dict[str, str] = {
-    "amount": "The financial transaction money amount / cost (e.g. 150000, 2500.50).",
-    "transaction_date": "The purchase or transaction date (e.g. today, 2026-10-21, 01/01/2026).",
-    "useful_life_years": "Asset useful life in years as an integer (e.g. 5, 5 years, 10).",
+    "amount": "The financial transaction monetary amount / cost (e.g. 150000, 50000, 2500.50).",
+    "transaction_date": "The purchase or transaction date (e.g. today, 2026-10-21, 01/01/2026, yesterday).",
+    "useful_life_years": "Asset useful life in years as an integer (e.g. 5, 5 years, 10, or 'NONE' / 'no depreciation' if declined).",
     "depreciation_method": "Depreciation method: STRAIGHT_LINE, REDUCING_BALANCE, or NONE.",
-    "salvage_value": "Asset salvage / residual value at end of life (e.g. 0, 5000).",
+    "salvage_value": "Asset salvage / residual scrap value at end of life (e.g. 0, 5000; 0 if none/unspecified).",
     "payment_type": "Payment settlement method: CASH, BANK, or CREDIT.",
-    "supplier_name": "Name of the supplier or vendor.",
+    "payment_method": "Payment method: CASH, BANK_TRANSFER, CHEQUE, CARD, or CREDIT.",
+    "supplier_name": "Name of the supplier or vendor (e.g. Shabbir Furnitures).",
     "customer_name": "Name of the customer.",
     "item_description": "Description of the item, product, or service bought or sold.",
     "quantity": "Quantity or unit count (e.g. 2, 10).",
-    "asset_name": "Name or identifier of the fixed asset (e.g. Delivery Van).",
+    "asset_name": "Name or identifier of the fixed asset (e.g. Two Tables, Delivery Van, Workstation).",
     "transaction_nature": "Classification: FIXED_ASSET, INVENTORY, CONSUMABLE, or SERVICE.",
     "capitalization_decision": "CAPITALIZE or EXPENSE.",
     "settlement_position": "Settlement treatment: PAID_NOW, OUTSTANDING (payable/pay later), PREPAID, or SETTLE_EXISTING_PAYABLE.",
-    "payment_method": "Payment method: CASH, BANK_TRANSFER, CHEQUE, CARD, or CREDIT.",
     "account_name": "Specific ledger account name to post to.",
     "line_items": "Prices, quantities, or details of multiple item lines (e.g. 'tables 10000 each and chairs 3000 each').",
 }
 
 _SYSTEM_INSTRUCTION = (
-    "You are an exact form-field extraction parser for an accounting ERP system.\n"
-    "A user was asked clarification questions and replied with an unstructured, "
-    "potentially multi-part or packed answer.\n\n"
+    "You are an expert accounting ERP natural language clarification interpreter and form-field extraction parser.\n"
+    "A user was presented with questionnaire cards or questions and replied with an unstructured, conversational, "
+    "multi-part, bulleted, or colloquial reply (in English, mixed English/Urdu, or numbers).\n\n"
     "You are given:\n"
     "1. The exact questions asked;\n"
     "2. The user's reply;\n"
     "3. The EXACT ALLOWABLE FIELD ENDPOINTS with their specifications.\n\n"
-    "STRICT GROUNDING RULES:\n"
-    "- You must ONLY extract fields present in the ALLOWABLE FIELD ENDPOINTS list.\n"
-    "- NEVER invent, hallucinate, or abbreviate field names.\n"
-    "- Extract the verbatim substring or minimal raw value for each field from the user reply.\n"
+    "INTERPRETATION & EXTRACTION RULES:\n"
+    "- Accept ANY natural phrasing, slang, shorthand, or conversational response.\n"
+    "- Extract values for allowable field endpoints based on user meaning:\n"
+    "  * Useful life: numbers like '5 years', '5 yrs', '5 saal', '10' -> '5' or '10'. If user declines ('no depreciation', 'none', 'cost only', 'skip') -> 'NONE'.\n"
+    "  * Depreciation method: 'straight line', 'equal monthly', 'sl' -> 'STRAIGHT_LINE'; 'reducing balance', 'written down', 'rb', '15%' -> 'REDUCING_BALANCE'; 'none', 'cost only' -> 'NONE'.\n"
+    "  * Salvage value: '0', 'zero', 'none', 'nil', 'scrap 0' -> '0'; or numeric amount.\n"
+    "  * Payment method / type: 'bank', 'bank transfer', 'online', 'meezan', 'hbl', 'wire' -> 'BANK'; 'cash', 'cash in hand' -> 'CASH'; 'credit', 'pay later', 'bill', 'udhaar' -> 'CREDIT'.\n"
+    "  * Amount: parse numeric values, e.g. '50000', '50k', 'Rs 50,000' -> '50000'.\n"
+    "- ONLY output keys present in the ALLOWABLE FIELD ENDPOINTS list.\n"
     "- If an allowable field was NOT answered or cannot be determined from the reply, DO NOT include it.\n"
     "- Output STRICT JSON matching: {\"<field_name>\": \"<extracted_value>\"}.\n"
     "- Do not include explanations, notes, or markdown fences outside the JSON."
