@@ -191,8 +191,12 @@ class TestDepreciationPolicyGate:
         async def fake_step(session_id, name, data=None, **kw):
             seen["step"] = (name, data)
 
+        async def fake_update_status(session_id, phase):
+            seen["status"] = phase
+
         monkeypatch.setattr(agent_mod, "create_clarification", fake_clarification)
         monkeypatch.setattr(agent_mod, "_log_step", fake_step)
+        monkeypatch.setattr(agent_mod, "_update_status", fake_update_status)
         return agent_mod, seen
 
     async def test_an_unanswered_policy_is_asked_before_confirmation(self, monkeypatch):
