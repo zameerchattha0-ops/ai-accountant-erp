@@ -83,7 +83,7 @@ Rules:
 2. counterparty: extract ONLY if a specific named person/company is stated. NEVER treat generic words ("bills", "supplier", "vendor", "customer", "invoices", "cash") as a counterparty name. Set counterparty to null when absent.
 3. line_items: extract each item/service with singular/clean description, numeric quantity, unit_price, and unit if stated. Never put amounts into description.
 4. payment_channel: one of "cash", "bank_transfer", "credit", "cheque", or null.
-5. transaction_nature: e.g. OPERATING_EXPENSE, FIXED_ASSET, INVENTORY, REVENUE, SERVICE, or null.
+5. transaction_nature: e.g. OPERATING_EXPENSE, FIXED_ASSET, INVENTORY, REVENUE, SERVICE, or null. NEVER assume or guess the intended use of purchased equipment, furniture, or goods unless explicitly stated (e.g. "for resale" -> INVENTORY, "office use/long-term" -> FIXED_ASSET, "consumable" -> OPERATING_EXPENSE). Leave null when unstated so it is clarified upfront.
 6. currency: default "PKR" unless another currency is stated.
 7. missing_fields: list material fields still unknown for transactional/advisory requests (e.g. ["total_amount", "transaction_date", "payment_channel"]). Empty for informational queries.
 8. confidence: 0.0-1.0 overall extraction confidence.

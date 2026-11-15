@@ -212,6 +212,27 @@ QUESTION_BANK: Dict[str, QuestionSpec] = {
         question="Who is the customer?",
         answer_hint="Customer name", why="The receivable belongs to a party.",
     ),
+    "supplier_create_confirmed": QuestionSpec(
+        field="supplier_create_confirmed", kind=KIND_CHOICE,
+        question="This supplier does not exist in the ledger yet. Would you like to create a new supplier ledger record for them?",
+        options=(("yes", "Yes, create supplier"), ("no", "No, cancel")),
+        answer_hint="yes or no",
+        why="Confirming supplier ledger creation.",
+    ),
+    "customer_create_confirmed": QuestionSpec(
+        field="customer_create_confirmed", kind=KIND_CHOICE,
+        question="This customer does not exist in the ledger yet. Would you like to create a new customer ledger record for them?",
+        options=(("yes", "Yes, create customer"), ("no", "No, cancel")),
+        answer_hint="yes or no",
+        why="Confirming customer ledger creation.",
+    ),
+    "party_create_confirmed": QuestionSpec(
+        field="party_create_confirmed", kind=KIND_CHOICE,
+        question="This party does not exist in the ledger yet. Would you like to create a new party ledger record for them?",
+        options=(("yes", "Yes, create party record"), ("no", "No, cancel")),
+        answer_hint="yes or no",
+        why="Confirming party ledger creation.",
+    ),
     "item_description": QuestionSpec(
         field="item_description", kind=KIND_TEXT,
         question=(

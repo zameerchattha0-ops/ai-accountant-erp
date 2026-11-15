@@ -103,6 +103,7 @@ RULES:
    - Invoices & Bills: extract invoice_number (e.g. "12", "INV-000012"), bill_number (e.g. "5", "PUR-000005").
    - Parties vs Items: customer_name is who we sell to / receive from; supplier_name is who we buy from / pay to. Items/goods go in item_description.
    - Multi-item: extract each distinct product/service into line_items with description, quantity, unit_price, total_amount.
+   - Intended use: Never guess whether goods/equipment are INVENTORY vs FIXED_ASSET vs CONSUMABLE unless explicitly stated by the user.
    - Never guess values not stated; leave null when absent."""
 
 # Pronouns / fillers that are never a business counterparty (mirrors the

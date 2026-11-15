@@ -2431,11 +2431,8 @@ def plan(
                 }:
 
                     # A reading whose nature is outside this intent's family
-
                     # is dropped, never translated: the deterministic
-
                     # question still owns that decision.
-
                     log.info(
 
                         "planner.nature_prefill_rejected",
@@ -2446,6 +2443,18 @@ def plan(
 
                     )
 
+                    continue
+
+                # Anti-Blind-Assumption Guard: only accept prefilled transaction_nature
+                # if the user's utterance contains explicit nature keywords or was answered
+                # in a clarification round. An ungrounded LLM guess of intended use (fixed asset
+                # vs inventory vs consumable) must not bypass the user's explicit confirmation.
+                if not derive_nature_from_text(intent, user_message) and _pk not in _answered:
+                    log.info(
+                        "planner.ungrounded_nature_prefill_rejected",
+                        intent=intent,
+                        value=str(_pv)[:40],
+                    )
                     continue
 
             if _pk == "transaction_purpose" and intent != "record_expense":
@@ -6530,6 +6539,15 @@ def _merge_field_answer(
                 merged.setdefault("settlement_position", "OUTSTANDING")
 
         return True
+
+    if field in ("party_create_confirmed", "supplier_create_confirmed", "customer_create_confirmed"):
+        if any(w in low for w in ("yes", "create", "confirm", "y", "ok", "sure", "true")):
+            merged["supplier_create_confirmed"] = True
+            merged["customer_create_confirmed"] = True
+            return True
+        elif any(w in low for w in ("no", "cancel", "don't", "dont", "false", "n")):
+            merged["party_create_cancelled"] = True
+            return True
 
     if field == "transaction_nature":
 

@@ -627,7 +627,7 @@ async def _party_resolution_question(
 
         "options": [f"Yes - create '{name}'"],
 
-        "required_fields": [f"{kind}_name"],
+        "required_fields": [f"{kind}_create_confirmed"],
 
     }
 

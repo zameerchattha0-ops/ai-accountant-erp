@@ -2780,12 +2780,27 @@ async def _record_cash_purchase(organization_id: uuid.UUID, **kw) -> ToolResult:
     # ---- PERPETUAL INVENTORY: catalogue sync + stock receipt --------------
 
     # Settlement-agnostic (cash AND credit both receive units).  Only after a
-
     # posted journal — an unposted journal never moved value into Inventory,
-
     # so the quantity ledger must not move either.
+    items_to_sync = list(kw.get("items") or [])
+    if not items_to_sync and (kw.get("item_description") or kw.get("description")):
+        desc = str(kw.get("item_description") or kw.get("description")).strip()
+        if desc.lower().startswith("cash purchase — "):
+            desc = desc[16:].strip()
+        elif desc.lower().startswith("cash purchase"):
+            desc = desc[13:].strip()
+        if " from " in desc:
+            desc = desc.split(" from ")[0].strip()
+        if desc:
+            qty = float(kw.get("quantity") or kw.get("item_quantity") or 1.0)
+            unit_price = amount / qty if qty > 0 else amount
+            items_to_sync = [{
+                "description": desc,
+                "quantity": qty,
+                "unit_price": unit_price,
+            }]
 
-    if is_inventory and result.get("journal_posted") and kw.get("items"):
+    if is_inventory and result.get("journal_posted") and items_to_sync:
 
         stock_warnings: list = []
 
@@ -2793,7 +2808,7 @@ async def _record_cash_purchase(organization_id: uuid.UUID, **kw) -> ToolResult:
 
         synced_items: list = []
 
-        for raw in kw["items"]:
+        for raw in items_to_sync:
 
             item = dict(raw)
 

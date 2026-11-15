@@ -93,7 +93,7 @@ async def create_supplier(
         "legal_name": legal_name,
         "tax_number": tax_number,
         "strn": strn,
-        "sales_tax_status": sales_tax_status,
+        "sales_tax_status": sales_tax_status or "UNREGISTERED",
         "currency_code": currency_code,
         "payment_terms_days": payment_terms_days,
         # credit_limit is NOT NULL in the schema (default 0) — an explicit
