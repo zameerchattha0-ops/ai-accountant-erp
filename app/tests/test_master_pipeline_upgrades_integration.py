@@ -14,6 +14,7 @@ Deterministic and offline: Zero live network/database calls.
 
 from __future__ import annotations
 
+import json
 import pytest
 
 from app.config import get_settings
@@ -78,9 +79,91 @@ class TestMultiItemDisaggregationIntegration:
         assert monitor_line.amount == 85_000.0
         assert monitor_line.is_fixed_asset is True
 
+    @pytest.mark.asyncio
+    async def test_disaggregate_with_llm_stub_client(self, enable_all_intelligence_flags):
+        class _StubLLM:
+            async def generate_text_light(self, prompt: str) -> str:
+                return json.dumps({
+                    "is_composite": True,
+                    "total_amount": 250000.0,
+                    "payment_method": "BANK_TRANSFER",
+                    "bank_name": "Meezan Bank",
+                    "counterparty": "Apex Supplies",
+                    "line_items": [
+                        {
+                            "description": "Ergonomic Chairs",
+                            "quantity": 4.0,
+                            "amount": 100000.0,
+                            "unit_price": 25000.0,
+                            "nature": "FIXED_ASSET",
+                            "is_fixed_asset": True,
+                            "is_inventory": False,
+                            "category": "Furniture & Fixtures",
+                            "account_code": "1510",
+                            "account_name": "Furniture & Fixtures",
+                            "ifrs_standard": "IAS 16"
+                        },
+                        {
+                            "description": "MacBook Pro M3",
+                            "quantity": 1.0,
+                            "amount": 150000.0,
+                            "unit_price": 150000.0,
+                            "nature": "FIXED_ASSET",
+                            "is_fixed_asset": True,
+                            "is_inventory": False,
+                            "category": "Computer Equipment",
+                            "account_code": "1520",
+                            "account_name": "Computer & IT Equipment",
+                            "ifrs_standard": "IAS 16"
+                        }
+                    ],
+                    "reasoning": "Capital asset acquisition under IAS 16."
+                })
+
+        res = await disaggregate_conversational_items(
+            "Bought 4 ergonomic chairs and 1 MacBook Pro for Rs 250,000 via Meezan Bank",
+            client=_StubLLM(),
+        )
+        assert res.is_composite is True
+        assert len(res.line_items) == 2
+        assert res.total_amount == 250000.0
+        assert res.payment_method == "BANK_TRANSFER"
+        assert res.bank_name == "Meezan Bank"
+        assert res.is_balanced is True
+        assert len(res.fixed_asset_registrations_needed) == 2
+
 
 class TestContextualAccountingNatureIntegration:
     """Task 1: Contextual Nature Classification (Digital Creators scenario)."""
+
+    @pytest.mark.asyncio
+    async def test_classify_contextual_nature_with_llm_stub_client(self, enable_all_intelligence_flags):
+        class _StubNatureLLM:
+            async def generate_text_light(self, prompt: str) -> str:
+                return json.dumps({
+                    "identified_item": "Executive Workstation Desk",
+                    "nature": "FIXED_ASSET",
+                    "standard": "IAS 16",
+                    "confidence": 0.98,
+                    "requires_clarification": False,
+                    "clarification_question": None,
+                    "is_capitalized": True,
+                    "capitalization_threshold_applied": "SINGLE_ITEM_GE_50K",
+                    "reasoning": "Administrative equipment held for operational use by creative agency."
+                })
+
+        org_profile = {"name": "Digital Creators", "business_type": "agency"}
+        res = await classify_contextual_nature(
+            query="Purchased 1 Executive Workstation Desk for Rs 75,000",
+            org_profile=org_profile,
+            catalog_items=[],
+            asset_items=[],
+            client=_StubNatureLLM(),
+        )
+        assert res.nature == "FIXED_ASSET"
+        assert res.standard == "IAS 16"
+        assert res.decision_source == "llm"
+        assert res.is_capitalized is True
 
     @pytest.mark.asyncio
     async def test_digital_creators_studio_furniture_classified_as_fixed_asset(

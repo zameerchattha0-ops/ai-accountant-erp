@@ -7,6 +7,8 @@ for compound journal entries, cash purchases, or purchase bills.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, Field
@@ -545,19 +547,12 @@ def _parse_single_segment(segment: str) -> Optional[Tuple[str, float, float]]:
 # Main Disaggregation Engine
 # ---------------------------------------------------------------------------
 
-async def disaggregate_conversational_items(
+def _disaggregate_deterministic(
     user_message: str,
     entities: Optional[Dict[str, Any]] = None,
     default_currency: str = "PKR",
 ) -> MultiItemDisaggregationResult:
-    """Disaggregate composite conversational user messages into distinct line items.
-
-    Enforces:
-    - Extraction of multiple line items into LineItemArgs compatible structures.
-    - Mathematical invariant: sum(line_items) == total_amount paid.
-    - Categorization & accounting nature deduction (IAS 1 vs IAS 16 vs IAS 2).
-    - Fixed asset registration proposal triggers when items exceed capitalization thresholds.
-    """
+    """Deterministic, robust fallback disaggregation adhering to strict accounting rules."""
     entities = entities or {}
     msg = str(user_message or "").strip()
 
@@ -734,3 +729,172 @@ async def disaggregate_conversational_items(
         fixed_asset_registrations_needed=fixed_asset_registrations,
         statutory_notes=statutory_notes,
     )
+
+
+async def disaggregate_conversational_items(
+    user_message: str,
+    entities: Optional[Dict[str, Any]] = None,
+    default_currency: str = "PKR",
+    client: Optional[Any] = None,
+    timeout: Optional[float] = None,
+) -> MultiItemDisaggregationResult:
+    """Disaggregate composite conversational user messages into distinct line items via LLM-first reasoning.
+
+    Applies cognitive natural language understanding to extract items, quantities, and amounts,
+    enforcing double-entry arithmetic balance and IAS 16 / IAS 2 / IAS 1 classification.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    llm_enabled = getattr(settings, "multi_item_disaggregator_enabled", True)
+
+    if not llm_enabled:
+        return _disaggregate_deterministic(user_message, entities, default_currency)
+
+    try:
+        if client is None:
+            from app.ai_orchestrator import get_client
+            client = get_client()
+
+        prompt = (
+            "YOU ARE THE SENIOR CHARTERED ACCOUNTANT (FCA) & FINANCIAL CONTROLLER.\n"
+            "Decompose this conversational transaction message into discrete line items with rigorous accounting classification.\n\n"
+            f"TRANSACTION MESSAGE: {user_message}\n"
+            f"KNOWN EXTRACTED ENTITIES: {json.dumps(entities or {}, default=str)}\n\n"
+            "MANDATORY ACCOUNTING SPECIFICATIONS:\n"
+            "1. Identify all discrete goods or services purchased/sold.\n"
+            "2. For each line item:\n"
+            "   - description: clean, professional description (e.g. 'Office Chair', 'Dell 4K Editing Monitor')\n"
+            "   - quantity: numerical quantity (default 1.0)\n"
+            "   - amount: total line amount in PKR\n"
+            "   - unit_price: unit price (amount / quantity)\n"
+            "   - nature: FIXED_ASSET | INVENTORY | OPERATING_EXPENSE | CONSUMABLE | SERVICE\n"
+            "   - is_fixed_asset: true if durable asset meeting IAS 16 criteria (>= PKR 50,000 single or >= PKR 100,000 bulk)\n"
+            "   - is_inventory: true if held for resale under IAS 2\n"
+            "   - category: Accounting Category (e.g. 'Furniture & Fixtures', 'Computer Equipment', 'Office Supplies')\n"
+            "   - account_code: standard 4-digit code (e.g. 1510, 1520, 6140, 1200)\n"
+            "   - account_name: standard account title\n"
+            "   - ifrs_standard: IAS 16 | IAS 2 | IAS 1 | IFRS 15\n"
+            "3. Identify payment method: CASH | BANK_TRANSFER | CREDIT | UNKNOWN\n"
+            "4. Identify bank name if specified (e.g. Meezan Bank, HBL)\n"
+            "5. Calculate total amount (sum of all items or stated total).\n\n"
+            "Reply with STRICT JSON ONLY matching:\n"
+            "{\n"
+            '  "is_composite": true,\n'
+            '  "total_amount": 155000.0,\n'
+            '  "payment_method": "CASH",\n'
+            '  "bank_name": null,\n'
+            '  "counterparty": "Apex Supplies",\n'
+            '  "line_items": [\n'
+            '    {\n'
+            '      "description": "executive office chairs",\n'
+            '      "quantity": 2.0,\n'
+            '      "amount": 70000.0,\n'
+            '      "unit_price": 35000.0,\n'
+            '      "nature": "FIXED_ASSET",\n'
+            '      "is_fixed_asset": true,\n'
+            '      "is_inventory": false,\n'
+            '      "category": "Furniture & Fixtures",\n'
+            '      "account_code": "1510",\n'
+            '      "account_name": "Furniture & Fixtures",\n'
+            '      "ifrs_standard": "IAS 16"\n'
+            '    }\n'
+            '  ],\n'
+            '  "reasoning": "Accounting rationale"\n'
+            "}"
+        )
+
+        call_timeout = timeout or getattr(settings, "multi_item_disaggregator_timeout", 8.0)
+        raw_reply = await asyncio.wait_for(
+            client.generate_text_light(prompt=prompt),
+            timeout=call_timeout,
+        )
+
+        match = re.search(r"\{.*\}", str(raw_reply or ""), re.DOTALL)
+        if match:
+            parsed = json.loads(match.group(0))
+            raw_items = parsed.get("line_items") or []
+            if raw_items and isinstance(raw_items, list):
+                line_items: List[DisaggregatedLineItem] = []
+                fixed_asset_registrations: List[Dict[str, Any]] = []
+
+                for raw_i in raw_items:
+                    desc = str(raw_i.get("description") or "Item").strip()
+                    amt = float(raw_i.get("amount") or 0.0)
+                    qty = float(raw_i.get("quantity") or 1.0)
+                    unit_p = float(raw_i.get("unit_price") or (amt / qty if qty > 0 else amt))
+                    nature = str(raw_i.get("nature") or "OPERATING_EXPENSE").upper()
+                    is_fa = bool(raw_i.get("is_fixed_asset") or nature == "FIXED_ASSET")
+                    is_inv = bool(raw_i.get("is_inventory") or nature == "INVENTORY")
+                    cat = str(raw_i.get("category") or ("Computer Equipment" if "computer" in desc.lower() else "Office Supplies"))
+                    acc_code = str(raw_i.get("account_code") or ("1520" if is_fa else "6140"))
+                    acc_name = str(raw_i.get("account_name") or cat)
+                    ifrs_std = str(raw_i.get("ifrs_standard") or ("IAS 16" if is_fa else "IAS 1"))
+
+                    item = DisaggregatedLineItem(
+                        description=desc,
+                        amount=amt,
+                        quantity=qty,
+                        unit_price=unit_p,
+                        category=cat,
+                        nature=nature,
+                        is_fixed_asset=is_fa,
+                        is_inventory=is_inv,
+                        account_code=acc_code,
+                        account_name=acc_name,
+                        ifrs_standard=ifrs_std,
+                    )
+                    line_items.append(item)
+
+                    if is_fa and amt >= CAPITALIZATION_SINGLE_ITEM_THRESHOLD:
+                        fixed_asset_registrations.append({
+                            "asset_name": desc,
+                            "cost": amt,
+                            "asset_class": cat,
+                            "account_code": acc_code,
+                            "useful_life_years": 3 if "Computer" in cat else 5,
+                            "salvage_value": round(amt * 0.05, 2),
+                        })
+
+                sum_line_amounts = round(sum(i.amount for i in line_items), 2)
+                raw_total = parsed.get("total_amount")
+                total_amount = float(raw_total) if raw_total is not None and float(raw_total) > 0 else sum_line_amounts
+                discrepancy = round(abs(total_amount - sum_line_amounts), 2)
+                is_balanced = discrepancy < 0.01
+
+                payment_method = str(parsed.get("payment_method") or "").upper()
+                if not payment_method or payment_method == "UNKNOWN":
+                    pm_det, _, _ = _extract_payment_channel(user_message)
+                    payment_method = pm_det or "CASH"
+
+                bank_name = parsed.get("bank_name")
+                is_composite = bool(parsed.get("is_composite")) if "is_composite" in parsed else len(line_items) > 1
+
+                recommended_action = "COMPOUND_JOURNAL" if (is_composite or any(i.is_fixed_asset for i in line_items)) else "RECORD_CASH_PURCHASE"
+
+                statutory_notes = []
+                if payment_method == "CASH" and total_amount > 50000.0:
+                    statutory_notes.append(
+                        f"SECTION 73 HAZARD: Total cash outflow of PKR {total_amount:,.2f} exceeds "
+                        "the PKR 50,000 threshold under Section 73 & Section 21(l) of ITO 2001."
+                    )
+
+                return MultiItemDisaggregationResult(
+                    is_composite=is_composite,
+                    total_amount=total_amount,
+                    currency=default_currency,
+                    payment_method=payment_method,
+                    bank_name=bank_name,
+                    line_items=line_items,
+                    sum_line_amounts=sum_line_amounts,
+                    is_balanced=is_balanced,
+                    balance_discrepancy=discrepancy,
+                    recommended_action=recommended_action,
+                    validation_error=None if is_balanced else f"Sum of line items does not match total amount.",
+                    fixed_asset_registrations_needed=fixed_asset_registrations,
+                    statutory_notes=statutory_notes,
+                )
+    except Exception as exc:
+        log.warning("multi_item_disaggregator.llm_fallback", error=str(exc)[:160])
+
+    return _disaggregate_deterministic(user_message, entities, default_currency)

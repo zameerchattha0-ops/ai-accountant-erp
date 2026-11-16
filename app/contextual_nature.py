@@ -683,7 +683,7 @@ async def classify_contextual_nature(
     org_profile: Dict[str, Any],
     catalog_items: List[Dict[str, Any]],
     asset_items: List[Dict[str, Any]],
-    preliminary: Dict[str, Any],
+    preliminary: Optional[Dict[str, Any]] = None,
     *,
     client: Any = None,
     timeout: Optional[float] = None,
@@ -714,6 +714,8 @@ async def classify_contextual_nature(
         or getattr(settings, "llm_classification_enabled", False)
     )
 
+    preliminary = preliminary or {}
+
     if not llm_enabled:
         return _classify_contextual_nature_deterministic(
             query=query,
@@ -737,20 +739,22 @@ async def classify_contextual_nature(
             "YOU ARE THE SENIOR CHARTERED ACCOUNTANT (FCA) & FINANCIAL CONTROLLER.\n"
             "Apply the 4-Dimensional Convergence Engine (IAS 16 vs IAS 2 vs IAS 1) to determine the "
             "economic nature and accounting treatment for this acquisition.\n\n"
-            f"TRANSACTION QUERY: {query}\n"
-            f"ITEM IDENTIFIED: {item_text} (Qty: {quantity}, Total: PKR {total_amount:,.2f}, Unit: PKR {single_amount:,.2f})\n"
+            f"RAW TRANSACTION QUERY: {query}\n"
             f"ORGANIZATION PROFILE: {json.dumps(org_profile, default=str)}\n"
-            f"CATALOG PRODUCTS (Resale Inventory): {len(catalog_items)} items\n"
-            f"FIXED ASSET REGISTER (PPE): {len(asset_items)} asset classes\n\n"
+            f"CATALOG PRODUCTS (Resale Inventory): {len(catalog_items)} registered products\n"
+            f"FIXED ASSET REGISTER (PPE): {len(asset_items)} asset classes\n"
+            f"PRELIMINARY CONTEXT: {json.dumps(preliminary or {}, default=str)}\n\n"
             "MANDATORY ACCOUNTING SPECIFICATIONS:\n"
-            "1. Service / Software / Digital / Legal / Marketing firms acquiring office furniture, computers, "
+            "1. Extract the clean item description and economic outlay directly from the raw transaction query.\n"
+            "2. Service / Software / Digital / Legal / Marketing firms acquiring office furniture, computers, "
             "or monitors NEVER classify as INVENTORY (resale goods). Classify as FIXED_ASSET (IAS 16) if >= PKR 50,000 "
             "or bulk >= PKR 100,000; otherwise OPERATING_EXPENSE (IAS 1). NEVER ask what is the intended use.\n"
-            "2. Trading / Retail firms acquiring catalog goods classify as INVENTORY (IAS 2).\n"
-            "3. Explicit 'for resale' -> INVENTORY (IAS 2); explicit 'for office use' -> FIXED_ASSET or OPERATING_EXPENSE.\n"
-            "4. Only set requires_clarification=true when confidence < 0.65 (e.g. IT reseller buying laptops without purpose).\n\n"
+            "3. Trading / Retail firms acquiring catalog goods classify as INVENTORY (IAS 2).\n"
+            "4. Explicit 'for resale' -> INVENTORY (IAS 2); explicit 'for office use' -> FIXED_ASSET or OPERATING_EXPENSE.\n"
+            "5. Only set requires_clarification=true when confidence < 0.65 (e.g. IT reseller buying laptops without purpose).\n\n"
             "Reply with STRICT JSON ONLY matching:\n"
             "{\n"
+            '  "identified_item": "<extracted clean item description>",\n'
             '  "nature": "FIXED_ASSET|INVENTORY|OPERATING_EXPENSE|CONSUMABLE|SERVICE|EQUITY_DRAWING",\n'
             '  "standard": "IAS 16|IAS 2|IAS 1|IAS 38|IFRS 15",\n'
             '  "confidence": <float 0.0 to 1.0>,\n'
@@ -792,6 +796,10 @@ async def classify_contextual_nature(
             is_cap = bool(parsed.get("is_capitalized"))
             if nature == "FIXED_ASSET":
                 is_cap = True
+
+            extracted_item = str(parsed.get("identified_item") or "").strip()
+            if extracted_item:
+                item_text = extracted_item
 
             return ContextualNatureResult(
                 nature=nature,
