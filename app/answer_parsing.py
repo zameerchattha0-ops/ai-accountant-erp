@@ -112,13 +112,86 @@ async def parse_packed_reply_to_endpoints(
     if not allowed_set:
         return None
 
+    # Progressive Standard Schedule & Quick Decline Fast-Paths
+    from app.conversational_manager import is_standard_schedule_acceptance
+    if is_standard_schedule_acceptance(cleaned_reply):
+        dep_fields = [f for f in ("useful_life_years", "depreciation_method", "salvage_value") if f in allowed_set]
+        if dep_fields:
+            res: Dict[str, str] = {}
+            if "useful_life_years" in allowed_set:
+                res["useful_life_years"] = "5"
+            if "depreciation_method" in allowed_set:
+                res["depreciation_method"] = "STRAIGHT_LINE"
+            if "salvage_value" in allowed_set:
+                res["salvage_value"] = "0"
+            return res
+
+    if any(k in cleaned_reply.lower() for k in ("decline depreciation", "no depreciation", "cost only", "skip depreciation")):
+        res = {}
+        if "useful_life_years" in allowed_set:
+            res["useful_life_years"] = "NONE"
+        if "depreciation_method" in allowed_set:
+            res["depreciation_method"] = "NONE"
+        if "salvage_value" in allowed_set:
+            res["salvage_value"] = "0"
+        return res
+
     if client is None:
         try:
             from app.ai_orchestrator import get_client
             client = get_client()
         except Exception as exc:
             log.warning("answer_parsing.get_client_failed", error=str(exc)[:160])
-            return None
+            client = None
+
+    if client is None:
+        # Hermetic / offline deterministic fallback parser
+        fallback: Dict[str, str] = {}
+        low = cleaned_reply.lower()
+        if any(f in allowed_set for f in ("payment_type", "payment_method")):
+            if any(k in low for k in ("bank", "transfer", "meezan", "hbl", "ubl", "online")):
+                if "payment_method" in allowed_set:
+                    fallback["payment_method"] = "BANK"
+                if "payment_type" in allowed_set:
+                    fallback["payment_type"] = "BANK"
+            elif "cash" in low:
+                if "payment_method" in allowed_set:
+                    fallback["payment_method"] = "CASH"
+                if "payment_type" in allowed_set:
+                    fallback["payment_type"] = "CASH"
+            elif any(k in low for k in ("credit", "on credit", "payable")):
+                if "payment_method" in allowed_set:
+                    fallback["payment_method"] = "CREDIT"
+                if "payment_type" in allowed_set:
+                    fallback["payment_type"] = "CREDIT"
+        if "transaction_date" in allowed_set:
+            if "today" in low:
+                fallback["transaction_date"] = "today"
+            elif "yesterday" in low:
+                fallback["transaction_date"] = "yesterday"
+            else:
+                m_date = re.search(r"\b(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\b", low)
+                if m_date:
+                    fallback["transaction_date"] = m_date.group(1)
+        if "useful_life_years" in allowed_set:
+            m_yr = re.search(r"\b(\d+)\s*(?:years?|yrs?|saal)\b", low)
+            if m_yr:
+                fallback["useful_life_years"] = m_yr.group(1)
+        if "depreciation_method" in allowed_set:
+            if any(k in low for k in ("straight line", "slm", "equal")):
+                fallback["depreciation_method"] = "STRAIGHT_LINE"
+            elif any(k in low for k in ("reducing balance", "wdv", "written down")):
+                fallback["depreciation_method"] = "REDUCING_BALANCE"
+        if "salvage_value" in allowed_set:
+            if any(k in low for k in ("zero", "nil", "none", "0")):
+                fallback["salvage_value"] = "0"
+            else:
+                m_salv = re.search(r"\b(?:salvage|scrap|residual)\s*(?:of|is|was)?\s*(\d+)\b", low)
+                if m_salv:
+                    fallback["salvage_value"] = m_salv.group(1)
+        if fallback:
+            return fallback
+        return None
 
     endpoint_docs = [
         f"- {field}: {CANONICAL_FIELD_ENDPOINTS[field]}"
@@ -258,3 +331,122 @@ async def parse_line_items_reply_with_llm(
     except Exception as exc:
         log.warning("answer_parsing.multi_item_failed", error=str(exc)[:160])
     return None
+
+
+# ---------------------------------------------------------------------------
+# Out-of-Order Correction Detection & Absorption (Decision 3)
+# ---------------------------------------------------------------------------
+
+_CORRECTION_TRIGGER_RE = re.compile(
+    r"\b(?:actually|correction|correct\s+that|change\s+(?:the\s+)?|wait[,.]?|not\s+[a-zA-Z0-9\s]+,\s*(?:make\s+it|use)|update\s+(?:the\s+)?|no,\s*(?:make\s+it|use)|wrong\s+[a-zA-Z]+|instead\s+of|make\s+it\s+[a-zA-Z0-9\s]+instead)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_out_of_order_correction(
+    user_reply: str,
+    current_entities: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect whether user input is an out-of-order correction and extract corrected fields.
+
+    Handles seamless absorption of corrections mid-flow:
+      - "Wait, change the amount to 280,000" -> {"amount": 280000.0, "total_amount": 280000.0}
+      - "Actually paid via Meezan Bank, not cash" -> {"payment_method": "BANK", "payment_channel": "bank_transfer", "bank_name": "Meezan Bank"}
+      - "Supplier is actually Dell Pakistan" -> {"supplier_name": "Dell Pakistan", "counterparty": "Dell Pakistan"}
+      - "Make it 5 years straight line instead" -> {"useful_life_years": "5", "depreciation_method": "STRAIGHT_LINE"}
+      - "Expense it instead of capitalizing" -> {"transaction_nature": "OPERATING_EXPENSE", "capitalization_decision": "EXPENSE"}
+    """
+    reply = (user_reply or "").strip()
+    if not reply:
+        return None
+
+    if not _CORRECTION_TRIGGER_RE.search(reply):
+        return None
+
+    updates: Dict[str, Any] = {}
+    reply_low = reply.lower()
+    reply_up = reply.upper()
+
+    # 1. Amount correction
+    # Ignore numbers immediately followed by time units or count units (e.g. "5 years", "10 units")
+    m_amt = re.search(
+        r"(?:amount|cost|total|price|it\s+was|make\s+it)?\s*(?:to|is|was)?\s*(?:rs\.?|pkr|\$)?\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*(k|thousand)?(?!\s*(?:years?|yrs?|saal|months?|days?|units?|pcs?|%))\b",
+        reply,
+        re.IGNORECASE,
+    )
+    if m_amt:
+        raw_num = m_amt.group(1).replace(",", "")
+        try:
+            val = float(raw_num)
+            if m_amt.group(2):
+                val *= 1000.0
+            # Only set amount if explicitly mentioning amount or value is a realistic financial number
+            has_amt_context = any(w in reply_low for w in ("amount", "cost", "total", "price", "rs", "pkr", "$", "k", "thousand"))
+            if val > 0 and (has_amt_context or val >= 50.0):
+                updates["amount"] = val
+                updates["total_amount"] = val
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Payment channel / bank correction
+    if any(k in reply_low for k in ("bank", "transfer", "meezan", "hbl", "mcb", "ubl", "alfalah", "cash", "credit", "cheque", "check")):
+        if any(k in reply_low for k in ("bank", "transfer", "online", "wire")):
+            updates["payment_method"] = "BANK"
+            updates["payment_channel"] = "bank_transfer"
+        elif "cash" in reply_low:
+            updates["payment_method"] = "CASH"
+            updates["payment_channel"] = "cash"
+        elif any(k in reply_low for k in ("credit", "payable", "udhaar", "pay later")):
+            updates["payment_method"] = "CREDIT"
+            updates["payment_channel"] = "credit"
+        elif any(k in reply_low for k in ("cheque", "check")):
+            updates["payment_method"] = "CHEQUE"
+            updates["payment_channel"] = "cheque"
+
+        # Check bank name
+        for b_name in ("Meezan Bank", "Meezan", "HBL", "MCB", "UBL", "Bank Alfalah", "Alfalah", "Standard Chartered", "Allied Bank", "Faysal Bank"):
+            if b_name.lower() in reply_low:
+                updates["bank_name"] = b_name
+                updates["payment_method"] = "BANK"
+                updates["payment_channel"] = "bank_transfer"
+                break
+
+    # 3. Transaction nature / capitalization correction
+    if any(k in reply_low for k in ("expense", "operating expense", "p&l")):
+        updates["transaction_nature"] = "OPERATING_EXPENSE"
+        updates["capitalization_decision"] = "EXPENSE"
+    elif any(k in reply_low for k in ("capitalize", "fixed asset", "asset")):
+        updates["transaction_nature"] = "FIXED_ASSET"
+        updates["capitalization_decision"] = "CAPITALIZE"
+
+    # 4. Useful life / depreciation correction
+    m_life = re.search(r"\b(\d+)\s*(?:years|year|saal|yrs|yr)\b", reply_low)
+    if m_life:
+        updates["useful_life_years"] = m_life.group(1)
+    if "straight line" in reply_low or "sl" in reply_low:
+        updates["depreciation_method"] = "STRAIGHT_LINE"
+    elif "reducing balance" in reply_low or "rb" in reply_low:
+        updates["depreciation_method"] = "REDUCING_BALANCE"
+
+    # 5. Supplier / Counterparty correction
+    m_supp = re.search(
+        r"(?:supplier|vendor|from|party)\s+(?:is\s+)?(?:actually\s+)?([A-Za-z0-9\s&.-]+?)(?:\s*(?:not|,|\.|$))",
+        reply,
+        re.IGNORECASE,
+    )
+    if m_supp:
+        supp_name = m_supp.group(1).strip()
+        if supp_name and supp_name.lower() not in ("cash", "bank", "yesterday", "today"):
+            updates["supplier_name"] = supp_name
+            updates["counterparty"] = supp_name
+
+    # 6. Date correction
+    if any(k in reply_low for k in ("yesterday", "today")) or re.search(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", reply):
+        from app.date_parser import parse_transaction_date
+        d_res = parse_transaction_date(reply)
+        if d_res.ok and d_res.iso_date:
+            updates["transaction_date"] = d_res.iso_date
+            updates["expense_date"] = d_res.iso_date
+
+    return updates if updates else None
+

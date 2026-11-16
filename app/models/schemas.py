@@ -238,6 +238,9 @@ class AgentResponse(BaseModel):
     confirmation_required: bool = False
     risk_level: Optional[str] = None
     data: Optional[Dict[str, Any]] = None
+    # LIVING DRAFT VOUCHER (Pillar 2 / Decision 2A): structured preview card
+    # rendered in the frontend sidebar/preview pane while keeping foreground chat natural.
+    living_draft: Optional[Dict[str, Any]] = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -300,6 +303,9 @@ class ConfirmationResponse(BaseModel):
     risk_level: str = "MEDIUM"
     confirmation_required: bool = True
     data: Optional[Dict[str, Any]] = None
+    # LIVING DRAFT VOUCHER (Pillar 2 / Decision 2A): structured preview card
+    # rendered in the frontend sidebar/preview pane while keeping foreground chat natural.
+    living_draft: Optional[Dict[str, Any]] = None
 
 
 class ClarificationAnswer(BaseModel):

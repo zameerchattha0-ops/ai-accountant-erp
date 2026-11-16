@@ -648,6 +648,18 @@ class Settings(BaseSettings):
         default=8.0,
         description="Wall-clock cap for statutory tax audit call.",
     )
+    conversational_partner_enabled: bool = Field(
+        default=True,
+        description="Enable Claude-style LLM-first progressive conversational dialogue pacing with smart defaults.",
+    )
+    living_draft_enabled: bool = Field(
+        default=True,
+        description="Enable living draft voucher state accumulation for real-time sidebar preview.",
+    )
+    consultative_advisory_enabled: bool = Field(
+        default=True,
+        description="Enable mid-flow consultative Q&A and statutory accounting advisory support.",
+    )
     treatment_review_enabled: bool = Field(
         default=False,
         description=(

@@ -8883,6 +8883,24 @@ async def execute(
                     log.warning("agent.multi_item_disaggregation_failed", error=str(_exc)[:200])
 
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
+
+        # Pillar 1 & 3: Conversational Standard Schedule Expansion & Correction Absorption
+        if getattr(settings, "conversational_partner_enabled", True):
+            try:
+                from app.conversational_manager import (
+                    expand_standard_schedule_answers,
+                    extract_conversational_corrections,
+                )
+                _std_sched = expand_standard_schedule_answers(user_message, execution_plan.extracted_entities)
+                if _std_sched:
+                    execution_plan.extracted_entities.update(_std_sched)
+
+                _corrections = extract_conversational_corrections(user_message, execution_plan.extracted_entities)
+                if _corrections:
+                    execution_plan.extracted_entities.update(_corrections)
+            except Exception as _conv_exc:
+                log.warning("agent.conversational_processing_failed", error=str(_conv_exc)[:200])
+
         if execution_plan.extracted_entities.get("requires_disambiguation"):
             execution_plan.requires_clarification = True
             execution_plan.clarification_questions = [
@@ -8911,8 +8929,16 @@ async def execute(
                 _resolved_fields.add("transaction_purpose")
             if execution_plan.extracted_entities.get("payment_method"):
                 _resolved_fields.add("payment_method")
+            if execution_plan.extracted_entities.get("payment_type"):
+                _resolved_fields.add("payment_type")
             if execution_plan.extracted_entities.get("transaction_date"):
                 _resolved_fields.add("transaction_date")
+            if execution_plan.extracted_entities.get("useful_life_years") is not None:
+                _resolved_fields.add("useful_life_years")
+            if execution_plan.extracted_entities.get("depreciation_method"):
+                _resolved_fields.add("depreciation_method")
+            if execution_plan.extracted_entities.get("salvage_value") is not None:
+                _resolved_fields.add("salvage_value")
             if _resolved_fields:
                 execution_plan.missing_fields = [f for f in execution_plan.missing_fields if f not in _resolved_fields]
                 from app.planner import _questions_for_fields
@@ -9761,21 +9787,79 @@ async def execute(
 
             )
 
+            # Pillar 2 / Decision 2A: Living Draft Voucher Card in Sidebar/Preview Pane
+            _living_draft_dict = None
+            if getattr(settings, "living_draft_enabled", True):
+                try:
+                    from app.living_draft import build_living_draft
+                    _draft_obj = build_living_draft(
+                        intent=execution_plan.intent,
+                        entities=execution_plan.extracted_entities,
+                        missing_fields=list(_asked_fields),
+                        nature=(
+                            getattr(classification, "transaction_nature", None)
+                            or execution_plan.extracted_entities.get("transaction_nature")
+                        ),
+                    )
+                    _living_draft_dict = _draft_obj.to_dict() if hasattr(_draft_obj, "to_dict") else (_draft_obj.model_dump() if hasattr(_draft_obj, "model_dump") else dict(_draft_obj))
+                except Exception as _ld_exc:
+                    log.warning("agent.living_draft_failed", error=str(_ld_exc)[:200])
+
+            # Pillar 1 & 3: Consultative Advisory & Progressive Single-Turn Dialogue Pacing
+            _conv_q = question
+            _conv_options = question_options
+            if getattr(settings, "conversational_partner_enabled", True):
+                try:
+                    from app.consultative_advisory import get_consultative_advice, is_consultative_query
+                    from app.conversational_manager import (
+                        compose_consultative_response_with_draft,
+                        format_claude_style_progressive_question,
+                    )
+                    _prog_q, _prog_chips, _prog_opts = format_claude_style_progressive_question(
+                        intent=execution_plan.intent,
+                        missing_fields=list(_asked_fields),
+                        entities=execution_plan.extracted_entities,
+                        nature=(
+                            getattr(classification, "transaction_nature", None)
+                            or execution_plan.extracted_entities.get("transaction_nature")
+                        ),
+                    )
+                    if is_consultative_query(user_message):
+                        _advice = get_consultative_advice(user_message, entities=execution_plan.extracted_entities)
+                        _conv_q = compose_consultative_response_with_draft(
+                            user_query=user_message,
+                            living_draft=_living_draft_dict or {},
+                            next_question=_prog_q,
+                            advice=_advice,
+                        )
+                    elif _prog_q:
+                        _conv_q = _prog_q
+
+                    if _prog_chips:
+                        _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
+                except Exception as _cp_exc:
+                    log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
+
+            _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else None
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
 
                 execution_id=session_id,
 
-                question=clarification.get("question", question),
+                question=_conv_q or clarification.get("question", question),
 
                 required_information=_asked_fields,
 
-                question_options=question_options,
+                question_options=_conv_options or question_options,
 
                 questionnaire=_questionnaire.to_payload(),
 
                 requires_user_input=True,
+
+                living_draft=_living_draft_dict,
+
+                data=_resp_data,
 
             )
 
@@ -12751,6 +12835,23 @@ async def execute(
 
             })
 
+            _conf_ld = None
+            try:
+                from app.living_draft import build_living_draft
+                _conf_ld_obj = build_living_draft(
+                    intent=execution_plan.intent,
+                    entities=execution_plan.extracted_entities,
+                    missing_fields=[],
+                    nature=(
+                        getattr(classification, "transaction_nature", None)
+                        or execution_plan.extracted_entities.get("transaction_nature")
+                    ),
+                    session_phase="AWAITING_CONFIRMATION",
+                )
+                _conf_ld = _conf_ld_obj.to_dict()
+            except Exception as _cld_err:
+                log.warning("agent.confirmation_living_draft_failed", error=str(_cld_err)[:160])
+
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CONFIRMATION,
@@ -12764,6 +12865,10 @@ async def execute(
                 confirmation_required=True,
 
                 risk_level="MEDIUM",
+
+                living_draft=_conf_ld,
+
+                data={"living_draft": _conf_ld} if _conf_ld else None,
 
             )
 
@@ -15631,7 +15736,97 @@ async def resume_with_clarification(
         history = await get_clarification_history(session_id)
     log.info("clarification_resumed", session_id=str(session_id))
 
+    # ------------------------------------------------------------------
+    # Mid-Flow Consultative Query Handling (Pillar 3 / Decision 3)
+    # ------------------------------------------------------------------
+    try:
+        from app.consultative_advisory import is_consultative_query, get_consultative_advice
+        from app.living_draft import build_living_draft
+        from app.conversational_manager import (
+            compose_consultative_response_with_draft,
+            format_claude_style_progressive_question,
+            expand_standard_schedule_answers,
+            extract_conversational_corrections,
+        )
 
+        if is_consultative_query(answer):
+            _ents = dict((snapshot.get("extracted_entities") if snapshot else {}) or {})
+            _missing = list((snapshot.get("missing_fields") if snapshot else []) or [])
+            _intent = str((snapshot.get("intent") if snapshot else "") or session.get("user_request") or "")
+            _advice = get_consultative_advice(answer, entities=_ents)
+            _ld = build_living_draft(
+                intent=_intent,
+                entities=_ents,
+                missing_fields=_missing,
+            )
+            _ld_dict = _ld.to_dict()
+            _prog_q, _prog_chips, _prog_opts = format_claude_style_progressive_question(
+                intent=_intent,
+                missing_fields=_missing,
+                entities=_ents,
+            )
+            _composed_q = compose_consultative_response_with_draft(
+                user_query=answer,
+                living_draft=_ld_dict,
+                next_question=_prog_q,
+                advice=_advice,
+            )
+            from app.database import create_clarification
+            await create_clarification(
+                session_id=session_id,
+                question=_composed_q,
+                required_fields=_missing or ["consultative_resolution"],
+                options=_advice.suggested_chips or _prog_chips,
+                reason=json.dumps({
+                    "intent": _intent,
+                    "extracted_entities": _ents,
+                    "missing_fields": _missing,
+                    "is_consultative": True,
+                }),
+            )
+            await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+            return AgentResponse(
+                status=ExecutionStatus.AWAITING_CLARIFICATION,
+                execution_id=session_id,
+                question=_composed_q,
+                summary=_advice.advisory_markdown,
+                options=_advice.suggested_chips or _prog_chips,
+                question_options=[[{"value": c, "label": c} for c in (_advice.suggested_chips or _prog_chips)]] if (_advice.suggested_chips or _prog_chips) else None,
+                required_information=_missing,
+                requires_user_input=True,
+                living_draft=_ld_dict,
+                data={"living_draft": _ld_dict, "advisory": _advice.model_dump()},
+            )
+    except Exception as _c_err:
+        log.warning("agent.consultative_intercept_failed", error=str(_c_err)[:200])
+
+    # ------------------------------------------------------------------
+    # Out-of-Order Correction Absorption & Smart Schedule Expansion
+    # ------------------------------------------------------------------
+    try:
+        from app.conversational_manager import (
+            expand_standard_schedule_answers,
+            extract_conversational_corrections,
+        )
+        _current_ents = dict((snapshot.get("extracted_entities") if snapshot else {}) or {})
+        _corr = extract_conversational_corrections(answer, _current_ents)
+        if _corr:
+            log.info("agent.correction_absorbed", session_id=str(session_id), corrections=list(_corr.keys()))
+            for _ck, _cv in _corr.items():
+                history = [*history, {"field": _ck, "question": _ck, "answer": str(_cv)}]
+                _current_ents[_ck] = _cv
+
+        _sched = expand_standard_schedule_answers(answer, _current_ents)
+        if _sched:
+            log.info("agent.standard_schedule_absorbed", session_id=str(session_id), fields=list(_sched.keys()))
+            for _sk, _sv in _sched.items():
+                history = [*history, {"field": _sk, "question": _sk, "answer": str(_sv)}]
+                _current_ents[_sk] = _sv
+
+        if snapshot and (_corr or _sched):
+            snapshot["extracted_entities"] = _current_ents
+    except Exception as _cor_err:
+        log.warning("agent.correction_expansion_failed", error=str(_cor_err)[:200])
 
     # LLM-PARSED FIELD ROUTING (Issue 2):
 
@@ -15922,28 +16117,39 @@ async def resume_with_clarification(
         # Re-check missing fields
         still_missing = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
 
-        # REQUIREMENT 2: When payment_type is answered and transaction_date is omitted:
-        # DO NOT ASSUME TODAY! ASK THE USER DIRECTLY (<200ms) without restarting 5-stage pipeline!
-        if len(still_missing) == 1 and still_missing[0] in ("transaction_date", "expense_date", "date"):
-            amt_val = merged_entities.get("amount") or merged_entities.get("subtotal")
-            amt_str = f"Rs. {float(amt_val):,.2f} " if amt_val else ""
-            desc_val = merged_entities.get("description") or merged_entities.get("item_description") or "transaction"
-            pm_val = merged_entities.get("payment_method") or merged_entities.get("payment_type")
-            pm_str = f"paid via {pm_val} " if pm_val else ""
-            followup_q = f"What date was the {amt_str}{desc_val} {pm_str}paid on? (Reply TODAY, or YYYY-MM-DD)"
-            followup_opts = ["Today", "Yesterday"]
+        if still_missing:
+            from app.conversational_manager import (
+                pick_next_leverage_field,
+                author_single_focused_question,
+            )
+            from app.living_draft import build_living_draft
+
+            _ld = build_living_draft(
+                intent=intent,
+                entities=merged_entities,
+                missing_fields=still_missing,
+            )
+            _ld_dict = _ld.to_dict()
+
+            next_field = pick_next_leverage_field(still_missing) or still_missing[0]
+            prog_q = author_single_focused_question(
+                field_to_ask=next_field,
+                entities=merged_entities,
+                intent=intent,
+                missing_fields=still_missing,
+            )
 
             from app.database import create_clarification
             await asyncio.gather(
                 create_clarification(
                     session_id=session_id,
-                    question=followup_q,
-                    required_fields=["transaction_date"],
-                    options=followup_opts,
+                    question=prog_q.question_text,
+                    required_fields=[next_field],
+                    options=prog_q.chips,
                     reason=json.dumps({
                         "intent": intent,
                         "extracted_entities": merged_entities,
-                        "missing_fields": ["transaction_date"],
+                        "missing_fields": still_missing,
                     }),
                 ),
                 _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION),
@@ -15951,11 +16157,14 @@ async def resume_with_clarification(
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
-                summary=followup_q,
-                question=followup_q,
-                options=followup_opts,
-                required_information=["transaction_date"],
+                summary=prog_q.question_text,
+                question=prog_q.question_text,
+                options=prog_q.chips,
+                question_options=[[{"value": c, "label": c} for c in prog_q.chips]] if prog_q.chips else None,
+                required_information=[next_field],
                 requires_user_input=True,
+                living_draft=_ld_dict,
+                data={"living_draft": _ld_dict},
             )
 
         if not still_missing:
@@ -16352,12 +16561,30 @@ async def resume_with_clarification(
                         }),
                     )
 
+                    _completed_ld = None
+                    try:
+                        from app.living_draft import build_living_draft
+                        _c_ld_obj = build_living_draft(
+                            intent=intent,
+                            entities=merged_entities,
+                            missing_fields=[],
+                            session_phase="COMPLETED",
+                        )
+                        _completed_ld = _c_ld_obj.to_dict()
+                    except Exception:
+                        pass
+
+                    _data_payload = {"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data}
+                    if _completed_ld:
+                        _data_payload["living_draft"] = _completed_ld
+
                     return AgentResponse(
                         status=final_status,
                         execution_id=session_id,
                         summary=result_summary,
                         action=intent,
-                        data={"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data},
+                        data=_data_payload,
+                        living_draft=_completed_ld,
                         requires_user_input=False,
                         confirmation_required=False,
                         verification_status="VERIFIED",
