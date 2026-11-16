@@ -33,7 +33,11 @@ from app.statutory_tax_auditor import (
 
 @pytest.fixture
 def enable_all_intelligence_flags(monkeypatch):
-    """Enable all intelligence feature flags for testing."""
+    """Enable all intelligence feature flags for testing.
+
+    Enforces deterministic offline execution so unit tests never hit live
+    external AI endpoints or flake on network timeouts.
+    """
     settings = get_settings()
     monkeypatch.setattr(settings, "llm_contextual_nature_enabled", True)
     monkeypatch.setattr(settings, "llm_party_disambiguation_enabled", True)
@@ -41,6 +45,11 @@ def enable_all_intelligence_flags(monkeypatch):
     monkeypatch.setattr(settings, "semantic_catalog_reconciler_enabled", True)
     monkeypatch.setattr(settings, "multi_item_disaggregator_enabled", True)
     monkeypatch.setattr(settings, "statutory_tax_auditor_enabled", True)
+
+    def _no_live_ai_client(*args, **kwargs):
+        raise RuntimeError("OFFLINE_UNIT_TEST: live AI calls blocked in deterministic integration suite.")
+
+    monkeypatch.setattr("app.ai_orchestrator.get_client", _no_live_ai_client)
 
 
 class TestMultiItemDisaggregationIntegration:

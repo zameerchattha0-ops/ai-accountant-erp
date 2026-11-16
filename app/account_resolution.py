@@ -828,8 +828,9 @@ async def decide_fixed_asset_ledger(
         if row:
             return _reuse(row)
 
-    from app.config import settings
-    if getattr(settings, "intelligent_coa_mapper_enabled", False):
+    from app.config import get_settings
+    _settings = get_settings()
+    if getattr(_settings, "intelligent_coa_mapper_enabled", False):
         try:
             from app.intelligent_coa import resolve_or_propose_account
             _coa_res = await resolve_or_propose_account(
@@ -837,7 +838,7 @@ async def decide_fixed_asset_ledger(
                 nature="FIXED_ASSET",
                 chart_of_accounts=rows,
                 org_context={},
-                timeout=getattr(settings, "intelligent_coa_mapper_timeout", 8.0),
+                timeout=getattr(_settings, "intelligent_coa_mapper_timeout", 8.0),
             )
             if _coa_res.action == "reuse" and _coa_res.account_name:
                 row = _exact(_coa_res.account_name)

@@ -952,4 +952,21 @@ def get_settings() -> Settings:
     return Settings()
 
 
-settings: Settings = get_settings()
+class _SettingsProxy:
+    """Dynamic proxy ensuring attribute access always reflects the current get_settings() instance.
+
+    Guarantees that get_settings.cache_clear() or pytest monkeypatching stays in sync across
+    all modules importing either get_settings or settings.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_settings(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(get_settings(), name, value)
+
+    def __repr__(self) -> str:
+        return repr(get_settings())
+
+
+settings: Settings = _SettingsProxy()  # type: ignore[assignment]

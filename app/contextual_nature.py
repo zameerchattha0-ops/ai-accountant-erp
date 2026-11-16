@@ -325,14 +325,18 @@ def _extract_item_text(query: str, preliminary: Dict[str, Any]) -> str:
 
     # Heuristic extraction from query: remove common transaction verbs and prices
     cleaned = re.sub(
-        r"^(?:purchasing|purchased|bought|buying|paid\s+for|ordered|order|acquired|acquisition\s+of)\s+",
+        r"^(?:.*?\b)?(?:purchasing|purchased|bought|buying|paid\s+for|ordered|order|acquired|acquisition\s+of)\s+",
         "",
         query.strip(),
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\b(?:from|to|for|via|by|with)\s+.*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:rs\.?|pkr)?\s*[0-9,]+.*$", "", cleaned, flags=re.IGNORECASE)
-    return cleaned.strip() or query.strip()
+    cleaned = re.sub(r"\b(?:from|to|via|with)\s+[A-Za-z0-9\s&]+$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:in\s+cash|by\s+bank|via\s+bank|on\s+credit)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:for|costing|at|@|worth)?\s*(?:rs\.?|pkr)?\s*[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:for|costing|at|@|worth)?\s*(?:rs\.?|pkr)?\s*[0-9]{4,}(?:\.[0-9]+)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:rs\.?|pkr)\s*[0-9]+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or query.strip()
 
 
 def _is_durable_office_item(text: str) -> bool:
@@ -375,6 +379,7 @@ def _classify_contextual_nature_deterministic(
     is_service = _is_service_org(org_profile)
     is_trading = _is_trading_org(org_profile)
     org_name = org_profile.get("name") or "Entity"
+    is_durable = _is_durable_office_item(item_text) or _is_durable_office_item(query)
 
     # 1. EXPLICIT PURPOSE OVERRIDE (Confidence = 1.0)
     if _RESALE_PURPOSE_REGEX.search(query):
@@ -397,7 +402,7 @@ def _classify_contextual_nature_deterministic(
 
     if _OFFICE_PURPOSE_REGEX.search(query):
         # Explicit office / operational use
-        if _is_consumable_item(item_text):
+        if _is_consumable_item(item_text) and not is_durable:
             return ContextualNatureResult(
                 nature="OPERATING_EXPENSE",
                 standard="IAS 1",
@@ -486,7 +491,7 @@ def _classify_contextual_nature_deterministic(
         )
 
     # 2. CONSUMABLES CHECK (Never capitalize unless held as resale inventory by a stationery dealer)
-    if _is_consumable_item(item_text) and not (is_trading and matched_cat):
+    if _is_consumable_item(item_text) and not is_durable and not (is_trading and matched_cat):
         return ContextualNatureResult(
             nature="OPERATING_EXPENSE",
             standard="IAS 1",
@@ -505,7 +510,7 @@ def _classify_contextual_nature_deterministic(
         )
 
     # 3. SERVICE / AGENCY SECTOR REASONING (e.g. Software House, Digital Creators, Legal, Marketing)
-    if is_service and _is_durable_office_item(item_text):
+    if is_service and is_durable:
         # Service firms do NOT trade furniture or computers. Office equipment is PPE or direct expense.
         if single_amount >= CAPITALIZATION_SINGLE_ITEM_THRESHOLD_PKR:
             return ContextualNatureResult(
