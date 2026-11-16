@@ -20,6 +20,12 @@ os.environ["ANALYTICS_AGENT_ENABLED"] = "0"
 os.environ["LLM_ROUTER_ENABLED"] = "0"
 os.environ["LLM_CATALOGUE_MATCH_ENABLED"] = "0"
 os.environ["LLM_ITEM_NATURE_ENABLED"] = "0"
+os.environ["LLM_CONTEXTUAL_NATURE_ENABLED"] = "0"
+os.environ["LLM_PARTY_DISAMBIGUATION_ENABLED"] = "0"
+os.environ["INTELLIGENT_COA_MAPPER_ENABLED"] = "0"
+os.environ["SEMANTIC_CATALOG_RECONCILER_ENABLED"] = "0"
+os.environ["MULTI_ITEM_DISAGGREGATOR_ENABLED"] = "0"
+os.environ["STATUTORY_TAX_AUDITOR_ENABLED"] = "0"
 
 import pytest  # noqa: E402
 
@@ -36,6 +42,12 @@ _settings.analytics_agent_enabled = False
 _settings.llm_router_enabled = False
 _settings.llm_catalogue_match_enabled = False
 _settings.llm_item_nature_enabled = False
+_settings.llm_contextual_nature_enabled = False
+_settings.llm_party_disambiguation_enabled = False
+_settings.intelligent_coa_mapper_enabled = False
+_settings.semantic_catalog_reconciler_enabled = False
+_settings.multi_item_disaggregator_enabled = False
+_settings.statutory_tax_auditor_enabled = False
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +60,12 @@ def _keep_llm_classification_off_by_default(monkeypatch):
     monkeypatch.setattr(_settings, "llm_router_enabled", False)
     monkeypatch.setattr(_settings, "llm_catalogue_match_enabled", False)
     monkeypatch.setattr(_settings, "llm_item_nature_enabled", False)
+    monkeypatch.setattr(_settings, "llm_contextual_nature_enabled", False)
+    monkeypatch.setattr(_settings, "llm_party_disambiguation_enabled", False)
+    monkeypatch.setattr(_settings, "intelligent_coa_mapper_enabled", False)
+    monkeypatch.setattr(_settings, "semantic_catalog_reconciler_enabled", False)
+    monkeypatch.setattr(_settings, "multi_item_disaggregator_enabled", False)
+    monkeypatch.setattr(_settings, "statutory_tax_auditor_enabled", False)
 
 
 @pytest.fixture(autouse=True)

@@ -594,6 +594,60 @@ class Settings(BaseSettings):
         default=8.0,
         description="Wall-clock cap for the answer parsing call.",
     )
+    llm_contextual_nature_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the LLM contextual accounting nature classifier (app/contextual_nature.py). "
+            "Applies 4-dimensional convergence (IAS 16 vs IAS 2 vs IAS 1) to determine accounting nature."
+        ),
+    )
+    llm_contextual_nature_timeout: float = Field(
+        default=10.0,
+        description="Wall-clock cap for the contextual nature classification call.",
+    )
+    llm_party_disambiguation_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable LLM-assisted party role disambiguation (app/party_disambiguation.py). "
+            "Evaluates money-flow vector and 5-stage skeptical evidentiary audit."
+        ),
+    )
+    llm_party_disambiguation_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for the party disambiguation call.",
+    )
+    intelligent_coa_mapper_enabled: bool = Field(
+        default=True,
+        description="Enable the Intelligent COA and Category Mapper (app/intelligent_coa.py).",
+    )
+    intelligent_coa_mapper_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for intelligent COA mapping LLM call.",
+    )
+    semantic_catalog_reconciler_enabled: bool = Field(
+        default=True,
+        description="Enable the Semantic Catalog Reconciler (app/catalog_reconciler.py).",
+    )
+    semantic_catalog_reconciler_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for semantic catalog reconciliation LLM call.",
+    )
+    multi_item_disaggregator_enabled: bool = Field(
+        default=True,
+        description="Enable multi-item conversational disaggregator (app/multi_item_disaggregator.py).",
+    )
+    multi_item_disaggregator_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for multi-item disaggregation call.",
+    )
+    statutory_tax_auditor_enabled: bool = Field(
+        default=True,
+        description="Enable pre-flight statutory & tax compliance auditor (app/statutory_tax_auditor.py).",
+    )
+    statutory_tax_auditor_timeout: float = Field(
+        default=8.0,
+        description="Wall-clock cap for statutory tax audit call.",
+    )
     treatment_review_enabled: bool = Field(
         default=False,
         description=(
@@ -896,3 +950,6 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return cached singleton settings instance."""
     return Settings()
+
+
+settings: Settings = get_settings()

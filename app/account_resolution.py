@@ -828,6 +828,30 @@ async def decide_fixed_asset_ledger(
         if row:
             return _reuse(row)
 
+    from app.config import settings
+    if getattr(settings, "intelligent_coa_mapper_enabled", False):
+        try:
+            from app.intelligent_coa import resolve_or_propose_account
+            _coa_res = await resolve_or_propose_account(
+                item_description=name,
+                nature="FIXED_ASSET",
+                chart_of_accounts=rows,
+                org_context={},
+                timeout=getattr(settings, "intelligent_coa_mapper_timeout", 8.0),
+            )
+            if _coa_res.action == "reuse" and _coa_res.account_name:
+                row = _exact(_coa_res.account_name)
+                if row:
+                    return _reuse(row)
+            elif _coa_res.action == "create" and _coa_res.account_name:
+                return AssetLedgerDecision(
+                    mode="create",
+                    category=_coa_res.statement_section or category,
+                    name=_coa_res.account_name,
+                )
+        except Exception as _exc:  # noqa: BLE001
+            log.warning("account_resolution.intelligent_coa_failed", error=str(_exc)[:200])
+
     # 2) Unique categories: EVERY parcel keeps its own ledger.
     if category in _SEGREGATED_CATEGORIES:
         target = segregated or category

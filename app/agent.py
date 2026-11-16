@@ -98,6 +98,7 @@ from app.database import (
 
 )
 
+from app.config import get_settings, settings
 from app.ai_orchestrator import get_client
 
 from app.error_normalizer import build_missing_field_question
@@ -618,6 +619,34 @@ async def _party_resolution_question(
     if exact:
 
         return None  # exact party exists - proceed
+
+    if getattr(settings, "llm_party_disambiguation_enabled", False):
+        try:
+            from app.party_disambiguation import disambiguate_party_role
+            _dir = "OUT" if kind == "supplier" else "IN"
+            _role_res = await disambiguate_party_role(
+                party_name=name,
+                money_direction=_dir,
+                open_receivables=rows if kind == "customer" else [],
+                open_payables=rows if kind == "supplier" else [],
+                employees=[],
+                org_officers=[],
+                timeout=getattr(settings, "llm_party_disambiguation_timeout", 8.0),
+            )
+            if _role_res.matched_party_id or (
+                _role_res.confidence >= 0.70
+                and not _role_res.is_ambiguous
+                and not _role_res.requires_clarification
+            ):
+                return None
+            if _role_res.requires_clarification and _role_res.clarification_question:
+                return {
+                    "question": _role_res.clarification_question,
+                    "options": _role_res.suggested_options or [f"Create new party '{name}'"],
+                    "required_fields": [f"{kind}_name"],
+                }
+        except Exception as _exc:  # noqa: BLE001
+            log.warning("agent.party_disambiguation_failed", error=str(_exc)[:200])
 
     similar = [
 
@@ -2384,16 +2413,27 @@ async def _catalog_unmatched_names(
 
             rows = await product_service.search(organization_id, query=name, limit=5)
 
-        if not any(
-
+        is_matched = any(
             str(r.get("name", "")).strip().lower() == name.lower()
-
             for r in rows
+        )
+        if not is_matched and getattr(settings, "semantic_catalog_reconciler_enabled", False):
+            try:
+                from app.catalog_reconciler import reconcile_catalog_item
+                _cat_res = await reconcile_catalog_item(
+                    item_description=name,
+                    is_inventory=(nature != "SERVICE"),
+                    catalog_products=rows if nature != "SERVICE" else [],
+                    catalog_services=rows if nature == "SERVICE" else [],
+                    timeout=getattr(settings, "semantic_catalog_reconciler_timeout", 8.0),
+                )
+                if _cat_res.action in ("match_product", "expense_only"):
+                    is_matched = True
+            except Exception as _exc:  # noqa: BLE001
+                log.warning("agent.catalog_reconciler_failed", error=str(_exc)[:200])
 
-        ):
-
+        if not is_matched:
             if name.lower() not in (n.lower() for n in unmatched):
-
                 unmatched.append(name)
 
     return unmatched
@@ -8819,6 +8859,29 @@ async def execute(
         if not execution_plan.extracted_entities.get("payment_method") and execution_plan.extracted_entities.get("payment_channel"):
             execution_plan.extracted_entities["payment_method"] = execution_plan.extracted_entities["payment_channel"]
 
+        if getattr(settings, "multi_item_disaggregator_enabled", False):
+            if not execution_plan.extracted_entities.get("line_items"):
+                try:
+                    from app.multi_item_disaggregator import disaggregate_conversational_items
+                    _disagg_res = await disaggregate_conversational_items(
+                        user_message,
+                        entities=execution_plan.extracted_entities,
+                    )
+                    if _disagg_res.is_composite and _disagg_res.line_items:
+                        execution_plan.extracted_entities["line_items"] = [
+                            ln.to_dict() for ln in _disagg_res.line_items
+                        ]
+                        if not execution_plan.extracted_entities.get("amount") or float(execution_plan.extracted_entities.get("amount") or 0) <= 0:
+                            if _disagg_res.total_amount > 0:
+                                execution_plan.extracted_entities["amount"] = _disagg_res.total_amount
+                                execution_plan.extracted_entities["total_amount"] = _disagg_res.total_amount
+                        if _disagg_res.payment_method and not execution_plan.extracted_entities.get("payment_method"):
+                            execution_plan.extracted_entities["payment_method"] = _disagg_res.payment_method
+                        if _disagg_res.bank_name and not execution_plan.extracted_entities.get("bank_name"):
+                            execution_plan.extracted_entities["bank_name"] = _disagg_res.bank_name
+                except Exception as _exc:  # noqa: BLE001
+                    log.warning("agent.multi_item_disaggregation_failed", error=str(_exc)[:200])
+
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
         if execution_plan.extracted_entities.get("requires_disambiguation"):
             execution_plan.requires_clarification = True
@@ -9245,6 +9308,46 @@ async def execute(
             org_context=_profile_block,
 
         )
+
+        if getattr(settings, "llm_contextual_nature_enabled", False):
+            if (
+                getattr(classification, "requires_clarification", False)
+                or classification.transaction_nature in (None, "UNKNOWN", "OTHER", "OPERATING_EXPENSE")
+                or getattr(classification, "confidence", "") == "LOW"
+            ):
+                try:
+                    from app.contextual_nature import classify_contextual_nature
+                    _org_prof = {
+                        "business_type": getattr(execution_plan, "business_type", None) or "",
+                        "industry": getattr(execution_plan, "industry", None) or "",
+                        "profile_block": _profile_block,
+                    }
+                    _nature_res = await classify_contextual_nature(
+                        query=user_message,
+                        org_profile=_org_prof,
+                        catalog_items=[],
+                        asset_items=[],
+                        preliminary=execution_plan.extracted_entities,
+                        timeout=getattr(settings, "llm_contextual_nature_timeout", 10.0),
+                    )
+                    if _nature_res.confidence >= 0.65:
+                        classification.transaction_nature = _nature_res.nature
+                        classification.confidence = "HIGH"
+                        classification.requires_clarification = _nature_res.requires_clarification
+                        classification.source = _nature_res.decision_source
+                        execution_plan.extracted_entities["transaction_nature"] = _nature_res.nature
+                        if _nature_res.nature == "FIXED_ASSET":
+                            execution_plan.extracted_entities["capitalization_threshold_met"] = _nature_res.is_capitalized
+                            if execution_plan.intent in (
+                                "record_purchase",
+                                "record_cash_purchase",
+                                "record_credit_purchase",
+                                "create_purchase_bill",
+                                "record_expense",
+                            ):
+                                setattr(execution_plan, "intent", "register_fixed_asset")
+                except Exception as _exc:  # noqa: BLE001
+                    log.warning("agent.contextual_nature_failed", error=str(_exc)[:200])
 
         execution_plan.classification = classification
 
@@ -12517,6 +12620,54 @@ async def execute(
             # confirmation sentence) — not a keyword-intent summary.
 
             _disclosure = _reasoning_disclosure(_reasoning)
+
+            if getattr(settings, "statutory_tax_auditor_enabled", False):
+                try:
+                    from app.statutory_tax_auditor import preflight_tax_compliance_audit
+                    _ent_tax = execution_plan.extracted_entities or {}
+                    _pay_m = str(
+                        _ent_tax.get("payment_method")
+                        or _ent_tax.get("payment_channel")
+                        or _ent_tax.get("payment_type")
+                        or ""
+                    ).upper()
+                    _tot_amt = float(
+                        _ent_tax.get("amount")
+                        or _ent_tax.get("total_amount")
+                        or 0.0
+                    )
+                    _party_inf = {
+                        "name": (
+                            _ent_tax.get("supplier_name")
+                            or _ent_tax.get("customer_name")
+                            or _ent_tax.get("party_name")
+                            or ""
+                        ),
+                        "filer_status": _ent_tax.get("filer_status", "filer"),
+                        "ntn": _ent_tax.get("ntn", ""),
+                    }
+                    _is_fa = (
+                        str(getattr(execution_plan, "transaction_nature", "")).upper() == "FIXED_ASSET"
+                        or execution_plan.intent == "register_fixed_asset"
+                        or bool(_ent_tax.get("has_fixed_asset_lines"))
+                    )
+                    _audit_res = await preflight_tax_compliance_audit(
+                        transaction_type=execution_plan.intent,
+                        payment_method=_pay_m,
+                        total_amount=_tot_amt,
+                        party_info=_party_inf,
+                        line_items=_ent_tax.get("line_items") or [],
+                        is_fixed_asset=_is_fa,
+                    )
+                    await _log_step(session_id, "STATUTORY_TAX_AUDIT", _audit_res.to_dict())
+                    if _audit_res.statutory_warnings or _audit_res.section_73_violation:
+                        _warn_text = "\n".join(f"[STATUTORY NOTICE] {w}" for w in _audit_res.statutory_warnings)
+                        if _disclosure:
+                            _disclosure = f"{_disclosure}\n\n{_warn_text}"
+                        else:
+                            _disclosure = _warn_text
+                except Exception as _exc:  # noqa: BLE001
+                    log.warning("agent.statutory_tax_audit_failed", error=str(_exc)[:200])
 
             # P1-⑤: carry THIS request's already-fetched evidence into the
 
