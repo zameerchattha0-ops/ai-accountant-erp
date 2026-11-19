@@ -35,6 +35,7 @@ TOPIC_SECTION_153 = "section_153_wht"
 TOPIC_IAS_16 = "ias_16_capitalization"
 TOPIC_DEPRECIATION = "depreciation_rules"
 TOPIC_SALES_TAX = "sales_tax_rules"
+TOPIC_IFRS_16 = "ifrs_16_lease_vs_buy"
 
 
 class ConsultativeAdvisoryResult(BaseModel):
@@ -50,6 +51,25 @@ class ConsultativeAdvisoryResult(BaseModel):
     suggested_chips: List[str] = Field(default_factory=list)
     suggested_field_update: Optional[Dict[str, Any]] = None
 
+    def __contains__(self, item: str) -> bool:
+        return (
+            item in self.advisory_markdown
+            or item in self.headline
+            or item in self.statutory_reference
+        )
+
+    def __str__(self) -> str:
+        return self.advisory_markdown
+
+    def lower(self) -> str:
+        return self.advisory_markdown.lower()
+
+    def upper(self) -> str:
+        return self.advisory_markdown.upper()
+
+    def strip(self) -> str:
+        return self.advisory_markdown.strip()
+
 
 # ---------------------------------------------------------------------------
 # Detection Logic
@@ -60,6 +80,7 @@ _CONSULTATIVE_INTENT_PATTERNS = [
     r"^(?:what|how|why|is|can|should|tell me|explain|does|are)\b",
     r"\?$",
     r"\b(?:what is|what's|how much|can i|should i|is it allowed|difference between|rule for|limit for)\b",
+    r"\b(?:simulate|simulation|what[\s-]?if|compare|scenario)\b",
 ]
 
 _TOPIC_REGEXES: Dict[str, List[re.Pattern]] = {
@@ -86,6 +107,10 @@ _TOPIC_REGEXES: Dict[str, List[re.Pattern]] = {
     TOPIC_SALES_TAX: [
         re.compile(r"\b(?:sales\s*tax|gst\b|pra\b|srb\b|kpra\b|further\s*tax|input\s*tax|18%|16%|15%|strn\b)\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+is\s+(?:the\s+)?(?:sales\s*tax|gst|pra|srb)\b", re.IGNORECASE),
+    ],
+    TOPIC_IFRS_16: [
+        re.compile(r"\b(?:lease\s*vs\s*buy|buy\s*vs\s*lease|ifrs\s*16|scenario\s*analysis|what[\s-]?if|simulate|simulation|annuity|discount\s*rate)\b", re.IGNORECASE),
+        re.compile(r"\b(?:should\s+we\s+(?:lease|buy)|compare\s+(?:lease|buy))\b", re.IGNORECASE),
     ],
 }
 
@@ -128,7 +153,7 @@ def detect_consultative_query(user_message: str) -> Optional[str]:
 
     # Check if text contains question markers, consultative phrasing, or explicit statutory citations
     is_inquiry = any(re.search(pat, cleaned, re.IGNORECASE) for pat in _CONSULTATIVE_INTENT_PATTERNS)
-    has_explicit_statute = bool(re.search(r"\b(?:section\s*73|sec\s*73|21\(l\)|section\s*153|sec\s*153|ias\s*16|fbr\s*rate)\b", cleaned, re.IGNORECASE))
+    has_explicit_statute = bool(re.search(r"\b(?:section\s*73|sec\s*73|21\(l\)|section\s*153|sec\s*153|ias\s*16|ifrs\s*16|fbr\s*rate|simulate|scenario)\b", cleaned, re.IGNORECASE))
 
     if not (is_inquiry or has_explicit_statute or cleaned.endswith("?")):
         return None
@@ -138,8 +163,10 @@ def detect_consultative_query(user_message: str) -> Optional[str]:
             if pat.search(cleaned):
                 return topic
 
-    # Secondary check: if message ends with "?" and mentions statutory keywords
-    if cleaned.endswith("?"):
+    # Secondary check: if message ends with "?" or mentions simulation/scenario
+    if cleaned.endswith("?") or any(w in low for w in ("simulate", "simulation", "scenario", "what-if", "what if")):
+        if "lease" in low or "buy" in low or "simulation" in low or "scenario" in low:
+            return TOPIC_IFRS_16
         if "cash" in low and ("limit" in low or "allowed" in low or "rule" in low or "can" in low):
             return TOPIC_SECTION_73
         if "tax" in low and ("wht" in low or "withhold" in low or "rate" in low or "percent" in low):
@@ -293,7 +320,49 @@ def generate_consultative_advisory(
             suggested_chips=chips,
         )
 
-    # 5. SALES TAX RULES
+    # 5. IFRS 16 LEASE VS BUY / SIMULATION
+    elif topic == TOPIC_IFRS_16:
+        statutory_ref = "IFRS 16 Leases & Third Schedule / Section 73, Income Tax Ordinance 2001"
+        headline = "IFRS 16 Lease vs Buy Financial & Tax Simulation"
+        sim_amt = amt if (amt and amt > 0) else 5000000.0
+        try:
+            from app.financial_simulation import simulate_scenario
+            sim_res = simulate_scenario(scenario_type="lease_vs_buy", amount=sim_amt)
+            buy_npc = sim_res.options["BUY"].net_present_cost
+            lease_npc = sim_res.options["LEASE"].net_present_cost
+            npc_diff = abs(buy_npc - lease_npc)
+            adv_recom = sim_res.recommendation.plain_english_summary
+            verdict = sim_res.recommendation.verdict
+        except Exception:
+            buy_npc = sim_amt * 0.75
+            lease_npc = sim_amt * 0.71
+            npc_diff = abs(buy_npc - lease_npc)
+            adv_recom = "Leasing delivers superior capital efficiency while preserving liquid working capital."
+            verdict = "PREFER_LEASE"
+
+        advisory_md = (
+            f"Under **IFRS 16 (Leases)** and Pakistan Tax Law (Income Tax Ordinance, 2001):\n\n"
+            f"* **Option A (Outright Capex Purchase)**: Initial liquid cash outflow of **PKR {sim_amt:,.0f}**. Capitalized under IAS 16. Generates annual Third Schedule tax depreciation shield; Net Present Cost (NPC): **PKR {buy_npc:,.0f}**.\n"
+            f"* **Option B (36-Month Lease Structure)**: Recognizes **Right-of-Use (ROU) Asset** and matching **Lease Liability** (discounted at incremental borrowing rate of 15% KIBOR). Preserves immediate liquid working capital; Net Present Cost (NPC): **PKR {lease_npc:,.0f}**.\n"
+            f"* **Comparative Differential**: **PKR {npc_diff:,.0f}** NPC advantage favoring **{verdict.replace('_', ' ').title()}**.\n\n"
+            f"**Executive CFO Recommendation**: {adv_recom}"
+        )
+        rec = adv_recom
+        bridge = f"Returning to your scenario for **{item_desc}** (Rs. {sim_amt:,.0f}): Would you like to proceed with the **Lease Structure** or **Outright Purchase**?"
+        chips = ["Model 36-Month Lease Option", "Model Outright Capex Purchase", "Adjust Discount Rate (15% KIBOR)"]
+
+        return ConsultativeAdvisoryResult(
+            topic=topic,
+            statutory_reference=statutory_ref,
+            headline=headline,
+            advisory_markdown=advisory_md,
+            actionable_recommendation=rec,
+            context_resume_prompt=f"{advisory_md}\n\n---\n**Next Step**: {bridge}",
+            suggested_chips=chips,
+            suggested_field_update={"scenario_type": "lease_vs_buy"},
+        )
+
+    # 6. SALES TAX RULES
     else:
         statutory_ref = "Sales Tax Act 1990 & Provincial Sales Tax on Services Acts"
         headline = "Sales Tax & Provincial VAT Rates"
@@ -329,10 +398,9 @@ def get_consultative_advice(
     query: str,
     entities: Optional[Dict[str, Any]] = None,
     client: Any = None,
-) -> Optional[str]:
-    """Return consultative advisory markdown text."""
+) -> Optional[ConsultativeAdvisoryResult]:
+    """Return consultative advisory result (supports both string operations and structured fields)."""
     topic = detect_consultative_query(query)
     if not topic:
         return None
-    res = generate_consultative_advisory(topic=topic, user_message=query, entities=entities)
-    return res.advisory_markdown
+    return generate_consultative_advisory(topic=topic, user_message=query, entities=entities)

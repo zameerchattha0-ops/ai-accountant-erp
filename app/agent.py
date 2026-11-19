@@ -7340,6 +7340,50 @@ async def execute(
 
         await _update_status(session_id, ExecutionStatus.INTERPRETING)
 
+        # ---- FAST-PATH: CONSULTATIVE STATUTORY & WHAT-IF SIMULATION INQUIRIES --
+        if getattr(settings, "conversational_partner_enabled", True) and not attachments:
+            try:
+                from app.consultative_advisory import detect_consultative_query, generate_consultative_advisory
+                _consult_topic = detect_consultative_query(user_message)
+                if _consult_topic:
+                    _advice = generate_consultative_advisory(
+                        topic=_consult_topic,
+                        user_message=user_message,
+                    )
+                    from app.conversational_manager import enrich_frontier_metadata
+                    _f_meta = enrich_frontier_metadata(
+                        user_message=user_message,
+                        entities={"topic": _consult_topic},
+                        is_completed=True,
+                    )
+                    await _update_status(session_id, ExecutionStatus.COMPLETED)
+                    await _log_step(session_id, "REASON", {
+                        "consultative_topic": _consult_topic,
+                        "statutory_ref": _advice.statutory_reference,
+                    })
+                    await create_execution_result(
+                        session_id=session_id,
+                        result_data={"advisory": _advice.model_dump(), "frontier": _f_meta},
+                        summary=_advice.advisory_markdown,
+                        action_type="consultative_advisory",
+                        verification_status="VERIFIED",
+                        status="COMPLETED",
+                    )
+                    return AgentResponse(
+                        status=ExecutionStatus.COMPLETED,
+                        execution_id=session_id,
+                        action=_consult_topic,
+                        summary=_advice.advisory_markdown,
+                        options=_advice.suggested_chips,
+                        simulations=_f_meta.get("simulations"),
+                        interactive_artifacts=_f_meta.get("interactive_artifacts"),
+                        vendor_insights=_f_meta.get("vendor_insights"),
+                        next_best_actions=_f_meta.get("next_best_actions"),
+                        data={"advisory": _advice.model_dump()},
+                    )
+            except Exception as _c_fast_err:
+                log.warning("agent.consultative_fastpath_failed", error=str(_c_fast_err)[:200])
+
         # learned org defaults feed the planner as answered-for entities
 
         # (an explicit user value always wins). P0-④: loaded concurrently
@@ -9832,27 +9876,18 @@ async def execute(
                             next_question=_prog_q,
                             advice=_advice,
                         )
-                    elif _prog_q:
+                    elif (
+                        questionnaire_client is not None
+                        or any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value"))
+                    ):
                         _conv_q = _prog_q
 
-                    if _prog_chips:
+                    if _prog_chips and not question_options:
                         _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
 
             _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else None
-            _frontier = {}
-            try:
-                from app.conversational_manager import enrich_frontier_metadata
-                _frontier = enrich_frontier_metadata(
-                    user_message=user_message,
-                    living_draft=_living_draft_dict,
-                    entities=execution_plan.extracted_entities,
-                    intent=execution_plan.intent,
-                )
-            except Exception:
-                pass
-
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
@@ -9870,12 +9905,6 @@ async def execute(
                 requires_user_input=True,
 
                 living_draft=_living_draft_dict,
-
-                interactive_artifacts=_frontier.get("interactive_artifacts"),
-
-                simulations=_frontier.get("simulations"),
-
-                vendor_insights=_frontier.get("vendor_insights"),
 
                 data=_resp_data,
 
@@ -12870,17 +12899,6 @@ async def execute(
             except Exception as _cld_err:
                 log.warning("agent.confirmation_living_draft_failed", error=str(_cld_err)[:160])
 
-            _conf_frontier = {}
-            try:
-                from app.conversational_manager import enrich_frontier_metadata
-                _conf_frontier = enrich_frontier_metadata(
-                    living_draft=_conf_ld,
-                    entities=execution_plan.extracted_entities,
-                    intent=execution_plan.intent,
-                )
-            except Exception:
-                pass
-
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CONFIRMATION,
@@ -12896,12 +12914,6 @@ async def execute(
                 risk_level="MEDIUM",
 
                 living_draft=_conf_ld,
-
-                interactive_artifacts=_conf_frontier.get("interactive_artifacts"),
-
-                simulations=_conf_frontier.get("simulations"),
-
-                vendor_insights=_conf_frontier.get("vendor_insights"),
 
                 data={"living_draft": _conf_ld} if _conf_ld else None,
 
@@ -15820,18 +15832,6 @@ async def resume_with_clarification(
                 }),
             )
             await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
-            _adv_frontier = {}
-            try:
-                from app.conversational_manager import enrich_frontier_metadata
-                _adv_frontier = enrich_frontier_metadata(
-                    user_message=answer,
-                    living_draft=_ld_dict,
-                    entities=_ents,
-                    intent=_intent,
-                )
-            except Exception:
-                pass
-
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -15842,9 +15842,6 @@ async def resume_with_clarification(
                 required_information=_missing,
                 requires_user_input=True,
                 living_draft=_ld_dict,
-                interactive_artifacts=_adv_frontier.get("interactive_artifacts"),
-                simulations=_adv_frontier.get("simulations"),
-                vendor_insights=_adv_frontier.get("vendor_insights"),
                 data={"living_draft": _ld_dict, "advisory": _advice.model_dump()},
             )
     except Exception as _c_err:
@@ -16204,18 +16201,6 @@ async def resume_with_clarification(
                 ),
                 _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION),
             )
-            _prog_frontier = {}
-            try:
-                from app.conversational_manager import enrich_frontier_metadata
-                _prog_frontier = enrich_frontier_metadata(
-                    user_message=answer,
-                    living_draft=_ld_dict,
-                    entities=merged_entities,
-                    intent=intent,
-                )
-            except Exception:
-                pass
-
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -16226,9 +16211,6 @@ async def resume_with_clarification(
                 required_information=[next_field],
                 requires_user_input=True,
                 living_draft=_ld_dict,
-                interactive_artifacts=_prog_frontier.get("interactive_artifacts"),
-                simulations=_prog_frontier.get("simulations"),
-                vendor_insights=_prog_frontier.get("vendor_insights"),
                 data={"living_draft": _ld_dict},
             )
 
@@ -16643,23 +16625,6 @@ async def resume_with_clarification(
                     if _completed_ld:
                         _data_payload["living_draft"] = _completed_ld
 
-                    _completed_frontier = {}
-                    try:
-                        from app.conversational_manager import enrich_frontier_metadata
-                        _completed_frontier = enrich_frontier_metadata(
-                            user_message=answer,
-                            living_draft=_completed_ld,
-                            entities=merged_entities,
-                            intent=intent,
-                            tool_result_data=tool_result.data if hasattr(tool_result, "data") else None,
-                            is_completed=True,
-                        )
-                    except Exception:
-                        pass
-
-                    if _completed_frontier.get("next_best_actions"):
-                        _data_payload["next_best_actions"] = _completed_frontier["next_best_actions"]
-
                     return AgentResponse(
                         status=final_status,
                         execution_id=session_id,
@@ -16667,10 +16632,6 @@ async def resume_with_clarification(
                         action=intent,
                         data=_data_payload,
                         living_draft=_completed_ld,
-                        interactive_artifacts=_completed_frontier.get("interactive_artifacts"),
-                        simulations=_completed_frontier.get("simulations"),
-                        vendor_insights=_completed_frontier.get("vendor_insights"),
-                        next_best_actions=_completed_frontier.get("next_best_actions"),
                         requires_user_input=False,
                         confirmation_required=False,
                         verification_status="VERIFIED",

@@ -67,6 +67,7 @@ export default function AICommandBox() {
   }, []);
 
   const [message, setMessage] = useState("");
+  const [lastSubmittedText, setLastSubmittedText] = useState("");
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -118,6 +119,7 @@ export default function AICommandBox() {
     if (loading) return;
     const textToSend = (customText ?? message).trim();
     if (!textToSend && attachments.length === 0) return;
+    setLastSubmittedText(textToSend);
 
     // If currently awaiting clarification, typing an answer into the command bar submits the clarification
     if (
@@ -196,6 +198,9 @@ export default function AICommandBox() {
           </div>
 
           <textarea
+            id="ai-command-input"
+            name="ai-command-input"
+            aria-label="AI accountant command prompt"
             ref={textareaRef}
             value={message}
             onChange={(e) => {
@@ -415,12 +420,28 @@ export default function AICommandBox() {
           </div>
 
           {/* Body Content */}
-          <div className="p-4 max-h-[460px] overflow-y-auto space-y-4">
+          <div className="p-4 max-h-[75vh] md:max-h-[85vh] overflow-y-auto space-y-4">
             {/* Real-time Living Draft Voucher Card (Pillar 2 / Decision 2A) */}
             {Boolean(response.living_draft || response.data?.living_draft) && (
               <LivingDraftCard
                 draft={(response.living_draft || (response.data?.living_draft as LivingDraft))!}
                 className="mb-2"
+                onAction={(actionType, payload) => {
+                  const actionId = (payload?.action_id as string) || actionType;
+                  if (actionId === "post_to_ledger" || actionId === "submit") {
+                    handleConfirm(true);
+                  } else if (actionId === "modify_terms") {
+                    textareaRef.current?.focus();
+                  } else if (actionId === "run_scenario") {
+                    handleSend("Simulate lease vs buy for this asset");
+                  } else if (actionType === "select_account" && payload?.account_name) {
+                    handleClarify(`Use account ${payload.account_code || ""} (${payload.account_name})`);
+                  } else if (actionType === "adjust_slider" && payload?.slider_value) {
+                    handleClarify(`Set useful life to ${payload.slider_value} years`);
+                  } else if (actionType === "toggle_wht") {
+                    handleClarify(payload?.is_enabled ? "Apply Section 153 WHT deduction" : "Do not deduct Section 153 WHT");
+                  }
+                }}
               />
             )}
 
@@ -464,10 +485,21 @@ export default function AICommandBox() {
             )}
 
             {response.status === ExecutionStatus.FAILED && (
-              <div className="p-4 rounded-xl bg-error-50 text-xs text-error-700 space-y-1">
-                <p className="font-semibold">Operation failed</p>
+              <div className="p-4 rounded-xl bg-error-50 text-xs text-error-700 space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="font-semibold text-error-800">Operation could not be completed</p>
+                  {Boolean(lastSubmittedText) && (
+                    <button
+                      type="button"
+                      onClick={() => handleSend(lastSubmittedText)}
+                      className="px-2.5 py-1 text-[11px] font-medium bg-white hover:bg-error-50 text-error-700 border border-error-200 rounded-lg shadow-2xs transition-colors"
+                    >
+                      Retry Request
+                    </button>
+                  )}
+                </div>
                 <p className="text-error-600">
-                  {response.summary || "The operation could not be completed."}
+                  {response.summary || "The operation could not be completed. Please try again."}
                 </p>
               </div>
             )}

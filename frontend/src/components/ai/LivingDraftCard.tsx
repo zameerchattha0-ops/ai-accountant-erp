@@ -303,11 +303,11 @@ export default function LivingDraftCard({
               <div className="space-y-0.5 pr-2">
                 <div className="flex items-center gap-1.5 font-semibold text-[11px]">
                   <Percent className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Section 153 Withholding Tax ({toggleCtrl.toggle.rate_percent}%)</span>
+                  <span>Section 153 Withholding Tax ({toggleCtrl.toggle?.rate_percent != null ? `${toggleCtrl.toggle.rate_percent}%` : "5%"})</span>
                 </div>
                 <p className="text-[10px] text-emerald-700">
                   {whtEnabled
-                    ? `Withholding PKR ${(totalCost * (toggleCtrl.toggle.rate_percent / 100)).toLocaleString("en-PK")} (Net: PKR ${(totalCost * (1 - toggleCtrl.toggle.rate_percent / 100)).toLocaleString("en-PK")})`
+                    ? `Withholding PKR ${(totalCost * ((toggleCtrl.toggle?.rate_percent ?? 5) / 100)).toLocaleString("en-PK")} (Net: PKR ${(totalCost * (1 - (toggleCtrl.toggle?.rate_percent ?? 5) / 100)).toLocaleString("en-PK")})`
                     : "Toggle to apply statutory tax deduction upon vendor settlement"}
                 </p>
               </div>

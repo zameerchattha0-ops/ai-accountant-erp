@@ -651,7 +651,14 @@ def enrich_frontier_metadata(
                     except (ValueError, TypeError):
                         pass
             if not amt or amt <= 0:
-                amt = 150000.0  # sensible baseline simulation amount
+                m_nums = re.findall(r"\b(\d[\d,]{3,})\b", user_message or "")
+                if m_nums:
+                    try:
+                        amt = float(m_nums[0].replace(",", ""))
+                    except Exception:
+                        pass
+            if not amt or amt <= 0:
+                amt = 5000000.0 if scenario_type == "lease_vs_buy" else 150000.0
             sim_res = simulate_scenario(scenario_type=scenario_type, amount=amt)
             out["simulations"] = [sim_res.model_dump()]
         except Exception as _sim_exc:

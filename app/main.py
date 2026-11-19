@@ -699,16 +699,20 @@ async def _read_sessions_paged(
     offset = 0
     while len(rows) < limit:
         want = min(_AI_ACTIVITY_PAGE, limit - len(rows))
-        page = await fetch_many(
-            "ai_execution_sessions",
-            filters={
-                "organization_id": str(organization_id),
-                "user_id": str(user_id),
-            },
-            order="created_at.desc",
-            limit=want,
-            offset=offset,
-        )
+        try:
+            page = await fetch_many(
+                "ai_execution_sessions",
+                filters={
+                    "organization_id": str(organization_id),
+                    "user_id": str(user_id),
+                },
+                order="created_at.desc",
+                limit=want,
+                offset=offset,
+            )
+        except Exception as exc:
+            log.warning("main.read_sessions_failed", error=str(exc)[:200])
+            break
         rows.extend(
             row
             for row in page
@@ -851,15 +855,19 @@ async def latest_active_session(
     killed mid-flight) and are closed rather than returned: a dead run must
     never be re-attached, because nothing will ever finish it.
     """
-    sessions = await fetch_many(
-        "ai_execution_sessions",
-        filters={
-            "organization_id": str(auth.organization_id),
-            "user_id": str(auth.user_id),
-        },
-        order="created_at.desc",
-        limit=20,
-    )
+    try:
+        sessions = await fetch_many(
+            "ai_execution_sessions",
+            filters={
+                "organization_id": str(auth.organization_id),
+                "user_id": str(auth.user_id),
+            },
+            order="created_at.desc",
+            limit=20,
+        )
+    except Exception as exc:
+        log.warning("main.latest_active_session_failed", error=str(exc)[:200])
+        return None
     for s in sessions or []:
         status = str(s.get("status") or "").upper()
         if status not in _ACTIVE_RUN_STATUSES and status != "WAITING_FOR_USER":
@@ -1108,13 +1116,17 @@ async def get_session(
     auth: AuthContext = Depends(get_current_user),
 ):
     """Get a single execution session with details."""
-    session = await fetch_one(
-        "ai_execution_sessions",
-        filters={
-            "id": str(session_id),
-            "organization_id": str(auth.organization_id),
-        },
-    )
+    try:
+        session = await fetch_one(
+            "ai_execution_sessions",
+            filters={
+                "id": str(session_id),
+                "organization_id": str(auth.organization_id),
+            },
+        )
+    except Exception as exc:
+        log.warning("main.get_session_failed", error=str(exc)[:200])
+        session = None
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
