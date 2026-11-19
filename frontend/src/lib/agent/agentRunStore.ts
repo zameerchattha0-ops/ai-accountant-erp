@@ -443,20 +443,20 @@ export const agentRunStore = {
         createdAt: t.created_at || new Date().toISOString(),
         response:
           t.role === "assistant" &&
-          (t.living_draft ||
-            t.simulations ||
-            t.interactive_artifacts ||
-            t.status === "AWAITING_CLARIFICATION" ||
-            t.status === "AWAITING_CONFIRMATION")
+            (t.living_draft ||
+              t.simulations ||
+              t.interactive_artifacts ||
+              t.status === "AWAITING_CLARIFICATION" ||
+              t.status === "AWAITING_CONFIRMATION")
             ? ({
-                status: (t.status as ExecutionStatus) || ExecutionStatus.COMPLETED,
-                summary: t.content,
-                living_draft: t.living_draft as unknown as Record<string, unknown> | undefined,
-                simulations: t.simulations || undefined,
-                interactive_artifacts: t.interactive_artifacts || undefined,
-                requires_user_input: t.status === "AWAITING_CLARIFICATION",
-                confirmation_required: t.status === "AWAITING_CONFIRMATION",
-              } as unknown as AgentResponse)
+              status: (t.status as ExecutionStatus) || ExecutionStatus.COMPLETED,
+              summary: t.content,
+              living_draft: t.living_draft as unknown as Record<string, unknown> | undefined,
+              simulations: t.simulations || undefined,
+              interactive_artifacts: t.interactive_artifacts || undefined,
+              requires_user_input: t.status === "AWAITING_CLARIFICATION",
+              confirmation_required: t.status === "AWAITING_CONFIRMATION",
+            } as unknown as AgentResponse)
             : null,
       }));
 
