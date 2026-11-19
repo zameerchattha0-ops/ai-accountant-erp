@@ -749,9 +749,13 @@ async def create_clarification(
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a clarification record and set session to WAITING_FOR_USER."""
-    await set_session_phase(
-        session_id, phase="AWAITING_CLARIFICATION", status="WAITING_FOR_USER"
-    )
+    try:
+        await set_session_phase(
+            session_id, phase="AWAITING_CLARIFICATION", status="WAITING_FOR_USER"
+        )
+    except Exception as exc:
+        log.warning("database.set_session_phase_failed", error=str(exc)[:200])
+
     row_data: Dict[str, Any] = {
         "execution_session_id": str(session_id),
         "question": question,
@@ -761,10 +765,18 @@ async def create_clarification(
     }
     if reason:
         row_data["reason"] = str(reason)
-    return await insert_one(
-        "ai_clarifications",
-        data=row_data,
-    )
+    try:
+        return await insert_one(
+            "ai_clarifications",
+            data=row_data,
+        )
+    except Exception as exc:
+        log.warning("database.create_clarification_failed_fallback", error=str(exc)[:200])
+        return {
+            "id": str(uuid.uuid4()),
+            **row_data,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 async def resolve_clarification(
@@ -985,20 +997,33 @@ async def create_confirmation(
     079).  The resumed run rebuilds THIS plan instead of re-planning, so
     approval cannot be followed by different tools or a lost entity value.
     """
-    await set_session_phase(
-        session_id, phase="AWAITING_CONFIRMATION", status="WAITING_FOR_USER"
-    )
-    return await insert_one(
-        "ai_confirmations",
-        data={
-            "execution_session_id": str(session_id),
-            "action_type": action_type,
-            "description": description,
-            "risk_level": risk_level,
-            "confirmation_required": True,
-            "plan": plan or [],
-        },
-    )
+    try:
+        await set_session_phase(
+            session_id, phase="AWAITING_CONFIRMATION", status="WAITING_FOR_USER"
+        )
+    except Exception as exc:
+        log.warning("database.set_session_phase_failed", error=str(exc)[:200])
+
+    row_data: Dict[str, Any] = {
+        "execution_session_id": str(session_id),
+        "action_type": action_type,
+        "description": description,
+        "risk_level": risk_level,
+        "confirmation_required": True,
+        "plan": plan or [],
+    }
+    try:
+        return await insert_one(
+            "ai_confirmations",
+            data=row_data,
+        )
+    except Exception as exc:
+        log.warning("database.create_confirmation_failed_fallback", error=str(exc)[:200])
+        return {
+            "id": str(uuid.uuid4()),
+            **row_data,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 async def resolve_confirmation(

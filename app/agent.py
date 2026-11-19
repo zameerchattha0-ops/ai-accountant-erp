@@ -9888,13 +9888,27 @@ async def execute(
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
 
             _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else None
+            _frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _frontier = enrich_frontier_metadata(
+                    user_message=user_message,
+                    living_draft=_living_draft_dict,
+                    entities=execution_plan.extracted_entities,
+                    intent=execution_plan.intent,
+                )
+            except Exception as _f_exc:
+                log.warning("agent.enrich_frontier_clarification_failed", error=str(_f_exc)[:160])
+
+            _safe_question = _conv_q or (clarification.get("question", question) if isinstance(clarification, dict) else question)
+
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
 
                 execution_id=session_id,
 
-                question=_conv_q or clarification.get("question", question),
+                question=_safe_question,
 
                 required_information=_asked_fields,
 
@@ -9905,6 +9919,14 @@ async def execute(
                 requires_user_input=True,
 
                 living_draft=_living_draft_dict,
+
+                interactive_artifacts=_frontier.get("interactive_artifacts"),
+
+                simulations=_frontier.get("simulations"),
+
+                vendor_insights=_frontier.get("vendor_insights"),
+
+                next_best_actions=_frontier.get("next_best_actions"),
 
                 data=_resp_data,
 
@@ -12899,6 +12921,18 @@ async def execute(
             except Exception as _cld_err:
                 log.warning("agent.confirmation_living_draft_failed", error=str(_cld_err)[:160])
 
+            _conf_frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _conf_frontier = enrich_frontier_metadata(
+                    user_message=user_message,
+                    living_draft=_conf_ld,
+                    entities=execution_plan.extracted_entities,
+                    intent=execution_plan.intent,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CONFIRMATION,
@@ -12914,6 +12948,14 @@ async def execute(
                 risk_level="MEDIUM",
 
                 living_draft=_conf_ld,
+
+                interactive_artifacts=_conf_frontier.get("interactive_artifacts"),
+
+                simulations=_conf_frontier.get("simulations"),
+
+                vendor_insights=_conf_frontier.get("vendor_insights"),
+
+                next_best_actions=_conf_frontier.get("next_best_actions"),
 
                 data={"living_draft": _conf_ld} if _conf_ld else None,
 
