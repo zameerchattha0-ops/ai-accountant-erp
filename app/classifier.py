@@ -330,6 +330,12 @@ def rule_based_nature(
             return PREPAYMENT, "HIGH"
         return DEPOSIT_ADVANCE, "MEDIUM"
 
+    # 2b. Durable goods — tangible capital items (laptops, computers, machinery,
+    #     furniture, vehicles) must be checked before generic service keywords
+    #     (e.g. "laptops for development team" is equipment, not software development service).
+    if re.search(_DURABLE_GOODS, text, re.IGNORECASE):
+        return None, "LOW"  # durable ambiguity → business context / COA mapping or clarify
+
     # 3. Unambiguous operating-expense categories.
     for pattern, _label in _EXPENSE_RULES:
         if _hit(pattern):

@@ -16106,6 +16106,20 @@ async def resume_with_clarification(
         if answer:
             parts = [p.strip() for p in re.split(r"[,;\n]+", answer) if p.strip()]
             for part in parts:
+                m_life = re.search(r"(\d+)\s*(?:years?|yrs?)(?:\s*useful\s*life)?|\buseful\s*life\s*(?:of|:)?\s*(\d+)", part, re.IGNORECASE)
+                if m_life:
+                    val = int(m_life.group(1) or m_life.group(2))
+                    merged_entities["useful_life_years"] = val
+                    merged_entities["useful_life"] = val
+
+                m_party = re.search(r"\b(?:to|vendor|supplier|payee)\s+([A-Za-z0-9\s&.-]+)", part, re.IGNORECASE)
+                if m_party:
+                    raw_p = m_party.group(1).strip()
+                    raw_p = re.split(r"\b(?:via|using|through|with|for|bank)\b", raw_p, flags=re.IGNORECASE)[0].strip()
+                    if raw_p:
+                        merged_entities["supplier_name"] = raw_p
+                        merged_entities["vendor_name"] = raw_p
+
                 date_res = parse_transaction_date(part)
                 if date_res.ok:
                     merged_entities["transaction_date"] = date_res.iso_date
@@ -16516,6 +16530,50 @@ async def resume_with_clarification(
                         _pmt_args["wht_amount"] = float(merged_entities["wht_amount"])
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
+            elif intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET":
+                intent = "register_fixed_asset"
+                name = (
+                    merged_entities.get("asset_name")
+                    or merged_entities.get("item_description")
+                    or merged_entities.get("description")
+                    or merged_entities.get("name")
+                    or (session.get("user_request") if session else None)
+                    or "Fixed Asset"
+                )
+                cost = float(
+                    merged_entities.get("purchase_cost")
+                    or merged_entities.get("cost")
+                    or merged_entities.get("amount")
+                    or merged_entities.get("subtotal")
+                    or merged_entities.get("total")
+                    or 0.0
+                )
+                pm = str(merged_entities.get("payment_method") or merged_entities.get("payment_type") or "BANK").upper()
+                dt = (
+                    merged_entities.get("transaction_date")
+                    or merged_entities.get("date")
+                    or date.today().isoformat()
+                )
+                supp = merged_entities.get("supplier_name") or merged_entities.get("vendor_name") or merged_entities.get("payee_name")
+                life_raw = merged_entities.get("useful_life_years") or merged_entities.get("useful_life") or 3
+                try:
+                    life = int(float(str(life_raw).split()[0]))
+                except (ValueError, TypeError):
+                    life = 3
+
+                fa_args: Dict[str, Any] = {
+                    "name": str(name).strip(),
+                    "purchase_cost": cost,
+                    "payment_method": pm,
+                    "transaction_date": dt,
+                    "useful_life_years": life,
+                }
+                if supp:
+                    fa_args["supplier_name"] = str(supp).strip()
+                if merged_entities.get("bank_name"):
+                    fa_args["bank_name"] = str(merged_entities["bank_name"]).strip()
+                single_hop_call = ToolCall(tool_name="register_fixed_asset", arguments=fa_args)
+
             if single_hop_call is not None:
                 log.info(
                     "single_hop_clarification_resolution",
@@ -16651,6 +16709,17 @@ async def resume_with_clarification(
                         bal = float(tool_result.data.get("current_balance") or tool_result.data.get("balance") or 0.0)
                         cust_name = tool_result.data.get("customer_name") or tool_result.data.get("name") or cust_name
                     result_summary = f"### 📊 Customer Balance: **{cust_name}**\n\n* **Receivable Balance:** **Rs. {bal:,.2f}**\n* **Status:** {'Receivable due' if bal > 0 else 'Settled / No pending dues'}\n\n[View Customer Invoices in Sales →](/sales/invoices)"
+                elif intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset") and tool_result.success:
+                    aname = merged_entities.get("asset_name") or merged_entities.get("item_description") or "Fixed Asset"
+                    acost = float(merged_entities.get("purchase_cost") or merged_entities.get("cost") or merged_entities.get("amount") or 0.0)
+                    bank_used = merged_entities.get("bank_name") or "Bank"
+                    result_summary = (
+                        f"### 🏢 Fixed Asset Registered & Capitalized: **{aname}**\n\n"
+                        f"* **Capitalized Cost (IAS 16):** **Rs. {acost:,.2f}**\n"
+                        f"* **Useful Life:** **{merged_entities.get('useful_life_years', 3)} years** (Straight-line depreciation)\n"
+                        f"* **Accounting Entry:** Debit Computer Equipment / Fixed Asset Rs. {acost:,.2f}, Credit {bank_used} Rs. {acost:,.2f}\n\n"
+                        f"[View Fixed Assets Register →](/assets)"
+                    )
                 elif tool_result.success:
                     result_summary = f"Successfully completed {intent}."
                 else:

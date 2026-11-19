@@ -286,7 +286,7 @@ function ensureReattach() {
       reattachStarted = false; /* backend offline / not signed in */
       return;
     }
-    if (!info.found || !info.session) {
+    if (!info || !info.found || !info.session) {
       reattachStarted = false;
       return;
     }

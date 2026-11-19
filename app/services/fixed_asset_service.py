@@ -529,7 +529,14 @@ async def register_asset(
         supplier_name=supplier_name,
     )
     if supplier_name and not supplier:
-        raise ValueError(f"Supplier not found: {supplier_name}")
+        from app.services import supplier_service
+        try:
+            supplier = await supplier_service.create(
+                organization_id,
+                name=supplier_name.strip(),
+            )
+        except Exception:
+            raise ValueError(f"Supplier not found: {supplier_name}")
 
     # DEPRECIATION ACCOUNTS — resolved BEST-EFFORT at registration and stored
     # on the asset row.  Storing them is what makes the later depreciation

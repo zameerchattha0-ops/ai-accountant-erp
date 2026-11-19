@@ -333,27 +333,31 @@ async def ai_clarify(
     from app.agent import (  # lazy: heavy agent stack (serverless cold-start)
         resume_with_clarification,
     )
-    # c1f3faf regression (THE production 500): ``questionnaire_client=
-    # get_client()`` below evaluated an UNDEFINED name — Python raises
-    # NameError while building the keyword arguments, i.e. BEFORE
-    # resume_with_clarification runs.  The user's answer was therefore never
-    # recorded (clarification stayed WAITING_FOR_USER with user_response
-    # NULL) and the client saw only a bare "Internal Server Error" body.
     from app.ai_orchestrator import get_client
+    from app.models.schemas import ExecutionStatus
 
-    response = await resume_with_clarification(
-        session_id=answer.session_id,
-        user_answer=answer.answer,
-        user_id=auth.user_id,
-        organization_id=auth.organization_id,
-        auth=auth,
-        # FIELD-ROUTED ANSWERS from the fixed-format questionnaire: each
-        # entry names the field it fills, so a reworded (LLM-authored)
-        # question can never lose its answer.
-        structured_answers=answer.answers,
-        questionnaire_client=get_client(),
-    )
-    return response
+    try:
+        response = await resume_with_clarification(
+            session_id=answer.session_id,
+            user_answer=answer.answer,
+            user_id=auth.user_id,
+            organization_id=auth.organization_id,
+            auth=auth,
+            # FIELD-ROUTED ANSWERS from the fixed-format questionnaire: each
+            # entry names the field it fills, so a reworded (LLM-authored)
+            # question can never lose its answer.
+            structured_answers=answer.answers,
+            questionnaire_client=get_client(),
+        )
+        return response
+    except Exception as exc:
+        log.exception("main.clarify_failed", error=str(exc), session_id=str(answer.session_id))
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            execution_id=answer.session_id,
+            summary="An unexpected error occurred while processing your clarification. Please try again.",
+            error_message="An unexpected error occurred. Please try again.",
+        )
 
 
 @app.post("/api/ai/confirm", response_model=AgentResponse)
@@ -365,15 +369,25 @@ async def ai_confirm(
     from app.agent import (  # lazy: heavy agent stack (serverless cold-start)
         resume_with_confirmation,
     )
+    from app.models.schemas import ExecutionStatus
 
-    response = await resume_with_confirmation(
-        session_id=decision.session_id,
-        approved=decision.approved,
-        user_id=auth.user_id,
-        organization_id=auth.organization_id,
-        auth=auth,
-    )
-    return response
+    try:
+        response = await resume_with_confirmation(
+            session_id=decision.session_id,
+            approved=decision.approved,
+            user_id=auth.user_id,
+            organization_id=auth.organization_id,
+            auth=auth,
+        )
+        return response
+    except Exception as exc:
+        log.exception("main.confirm_failed", error=str(exc), session_id=str(decision.session_id))
+        return AgentResponse(
+            status=ExecutionStatus.FAILED,
+            execution_id=decision.session_id,
+            summary="An unexpected error occurred while processing your confirmation. Please try again.",
+            error_message="An unexpected error occurred. Please try again.",
+        )
 
 
 # ---------------------------------------------------------------------------
