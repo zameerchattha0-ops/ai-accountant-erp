@@ -7202,6 +7202,24 @@ async def execute(
         if conversation_id:
             _SESSION_TO_CID[str(session_id)] = str(conversation_id)
 
+        # Claude-style persistent thread history: when within an active conversation thread,
+        # load prior turns so LLM reasoning, entity extraction, and consultative advice
+        # retain full conversational context across separate execution sessions.
+        if conversation_id and not clarification_history:
+            try:
+                from app.database import get_conversation_turns
+                _past_turns = await get_conversation_turns(str(conversation_id), limit=10)
+                _past_turns = [t for t in _past_turns if t.get("session_id") != str(session_id)]
+                if _past_turns:
+                    for i in range(0, len(_past_turns) - 1, 2):
+                        if _past_turns[i].get("role") == "user" and _past_turns[i + 1].get("role") == "assistant":
+                            prior_qa.append({
+                                "question": _past_turns[i].get("content", ""),
+                                "answer": _past_turns[i + 1].get("content", ""),
+                            })
+            except Exception as _th_exc:
+                log.warning("agent.load_conversation_turns_failed", error=str(_th_exc)[:200])
+
         # P2-⑪: wall-clock start for this session → every step row gets
 
         # elapsed_ms (stamped synchronously in _log_step, before any spawn).

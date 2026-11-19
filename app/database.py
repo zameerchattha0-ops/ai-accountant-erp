@@ -1089,3 +1089,184 @@ async def create_execution_result(
     except Exception as exc:
         log.warning("database.create_result_failed_fallback", error=str(exc)[:200])
         return {"id": str(uuid.uuid4()), "status": status, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Persistent Conversation Threads (Claude-Style Multi-Turn Sessions)
+# ---------------------------------------------------------------------------
+async def get_conversation_turns(
+    conversation_id: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Return chronological conversation turns for a persistent conversation thread.
+
+    Each turn is structured as:
+      {
+        "id": str,
+        "role": "user" | "assistant",
+        "content": str,
+        "session_id": str,
+        "status": Optional[str],
+        "created_at": Optional[str],
+        "living_draft": Optional[Dict[str, Any]],
+        "simulations": Optional[List[Dict[str, Any]]],
+        "interactive_artifacts": Optional[List[Dict[str, Any]]],
+      }
+
+    Allows the frontend to render the complete Claude-style chat history,
+    and allows the agent to inject prior turns into LLM context.
+    """
+    if not conversation_id or not str(conversation_id).strip():
+        return []
+
+    cid = str(conversation_id).strip()
+    try:
+        sessions = await fetch_many(
+            "ai_execution_sessions",
+            filters={"conversation_id": cid},
+            order="created_at.asc",
+            limit=limit,
+        )
+        if not sessions:
+            return []
+
+        turns: List[Dict[str, Any]] = []
+        for s in sessions:
+            s_id = str(s.get("id") or "")
+            req_text = str(s.get("user_request") or "").strip()
+            created_at = s.get("created_at")
+
+            # User turn
+            if req_text:
+                turns.append({
+                    "id": f"usr-{s_id[:8]}" if s_id else str(uuid.uuid4()),
+                    "role": "user",
+                    "content": req_text,
+                    "session_id": s_id,
+                    "created_at": created_at,
+                })
+
+            # Assistant turn: fetch result or clarification
+            results = await fetch_many(
+                "ai_execution_results",
+                filters={"execution_session_id": s_id},
+                order="completed_at.desc",
+                limit=1,
+            )
+            asst_content = ""
+            living_draft = None
+            simulations = None
+            artifacts = None
+            asst_status = s.get("status")
+
+            if results and results[0]:
+                res = results[0]
+                asst_content = str(res.get("summary") or "").strip()
+                payload = res.get("result_payload") or {}
+                if isinstance(payload, dict):
+                    living_draft = payload.get("living_draft")
+                    simulations = payload.get("simulations")
+                    artifacts = payload.get("interactive_artifacts")
+                asst_status = res.get("status") or asst_status
+
+            # If no result yet, check if there's a pending clarification
+            if not asst_content and s.get("status") == "WAITING_FOR_USER":
+                clarifs = await fetch_many(
+                    "ai_clarifications",
+                    filters={"execution_session_id": s_id},
+                    order="created_at.desc",
+                    limit=1,
+                )
+                if clarifs and clarifs[0]:
+                    asst_content = str(clarifs[0].get("question") or "").strip()
+
+            if asst_content:
+                turns.append({
+                    "id": f"ast-{s_id[:8]}" if s_id else str(uuid.uuid4()),
+                    "role": "assistant",
+                    "content": asst_content,
+                    "session_id": s_id,
+                    "status": asst_status,
+                    "living_draft": living_draft,
+                    "simulations": simulations,
+                    "interactive_artifacts": artifacts,
+                    "created_at": created_at,
+                })
+        return turns
+    except Exception as exc:
+        log.warning("database.get_conversation_turns_failed", error=str(exc)[:200])
+        return []
+
+
+async def get_user_conversations(
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return summary list of user's persistent conversation threads.
+
+    Each thread contains:
+      {
+        "conversation_id": str,
+        "title": str,
+        "last_message": str,
+        "updated_at": str,
+        "turn_count": int,
+        "last_status": str,
+      }
+    """
+    try:
+        sessions = await fetch_many(
+            "ai_execution_sessions",
+            filters={
+                "organization_id": str(organization_id),
+                "user_id": str(user_id),
+            },
+            order="created_at.desc",
+            limit=200,
+        )
+        if not sessions:
+            return []
+
+        threads_map: Dict[str, Dict[str, Any]] = {}
+        for s in sessions:
+            cid = s.get("conversation_id")
+            if not cid:
+                continue
+            cid_str = str(cid).strip()
+            if not cid_str:
+                continue
+
+            req = str(s.get("user_request") or "").strip()
+            created_at = s.get("created_at") or ""
+            status = s.get("status") or "COMPLETED"
+
+            if cid_str not in threads_map:
+                title = req.replace("\n", " ")
+                if len(title) > 60:
+                    title = title[:57] + "..."
+                threads_map[cid_str] = {
+                    "conversation_id": cid_str,
+                    "title": title or "Conversation",
+                    "last_message": req,
+                    "updated_at": created_at,
+                    "turn_count": 1,
+                    "last_status": status,
+                }
+            else:
+                threads_map[cid_str]["turn_count"] += 1
+                if created_at > threads_map[cid_str]["updated_at"]:
+                    threads_map[cid_str]["updated_at"] = created_at
+                    threads_map[cid_str]["last_status"] = status
+                    threads_map[cid_str]["last_message"] = req
+
+        sorted_threads = sorted(
+            threads_map.values(),
+            key=lambda t: t.get("updated_at") or "",
+            reverse=True,
+        )
+        return sorted_threads[:limit]
+    except Exception as exc:
+        log.warning("database.get_user_conversations_failed", error=str(exc)[:200])
+        return []
+

@@ -9,11 +9,17 @@ import {
   Sparkles,
   Zap,
   MessageCircleQuestion,
+  History,
+  Plus,
+  User,
+  Bot,
+  RotateCcw,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import type {
   AttachmentRef,
   UserRequest,
+  LivingDraft,
 } from "@/lib/types/api";
 import {
   ALLOWED_UPLOAD_MIMES,
@@ -30,7 +36,7 @@ import AIActionCard from "./AIActionCard";
 import AIClarification from "./AIClarification";
 import AIConfirmation from "./AIConfirmation";
 import LivingDraftCard from "./LivingDraftCard";
-import type { LivingDraft } from "@/lib/types/api";
+import AIChatHistoryDrawer from "./AIChatHistoryDrawer";
 
 const PLACEHOLDERS = [
   "Ask anything or record a transaction (e.g. 'Cash purchase of Rs. 25,000')...",
@@ -69,7 +75,9 @@ export default function AICommandBox() {
   const [message, setMessage] = useState("");
   const [lastSubmittedText, setLastSubmittedText] = useState("");
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const run: AgentRunState = useSyncExternalStore(
     agentRunStore.subscribe,
@@ -85,12 +93,22 @@ export default function AICommandBox() {
     activeRequestId,
     reattached,
     stalledJobId,
+    messages,
+    conversationId,
+    conversationTitle,
   } = run;
 
   // Boot reattach watcher once per session
   useEffect(() => {
     agentRunStore.ensureReattach();
   }, []);
+
+  // Auto-scroll chat to bottom when new messages or chunks arrive
+  useEffect(() => {
+    if (messages.length > 0) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages.length, run.streamingText, response]);
 
   const isAwaitingClarification =
     response?.status === ExecutionStatus.AWAITING_CLARIFICATION &&
@@ -164,9 +182,221 @@ export default function AICommandBox() {
     agentRunStore.clearResponse();
   };
 
+  const handleNewChat = () => {
+    agentRunStore.newChat();
+    setMessage("");
+    setAttachments([]);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.focus();
+    }
+  };
+
+  const hasMessages = messages.length > 0;
+
   return (
     <div className="w-full max-w-4xl mx-auto space-y-3">
-      {/* Sleek, Compact Hero Input Bar */}
+      {/* Top Header / Thread Bar */}
+      <div className="flex items-center justify-between px-2 py-1 text-xs">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ai-50 border border-ai-200 text-ai-800 font-medium">
+            <Sparkles className="w-3.5 h-3.5 text-ai-600" />
+            <span className="truncate max-w-[220px] sm:max-w-xs font-semibold">
+              {conversationTitle || "AI Accountant Partner"}
+            </span>
+          </div>
+          {conversationId && (
+            <span className="hidden sm:inline-block text-[10px] text-text-muted font-mono bg-bg-muted px-2 py-0.5 rounded-md">
+              Thread Active
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setIsHistoryOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-muted border border-border-subtle transition-colors text-xs"
+            title="Open conversation sessions history"
+          >
+            <History className="w-3.5 h-3.5 text-ai-600" />
+            <span className="hidden sm:inline">Sessions</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleNewChat}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-bg-surface hover:bg-bg-muted text-text-secondary hover:text-text-primary border border-border-subtle shadow-3xs transition-colors text-xs"
+            title="Start fresh conversation"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>New Chat</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Conversation Stream (Claude-Style Multi-Turn Thread) */}
+      {hasMessages && (
+        <div className="rounded-2xl border border-border-default bg-bg-surface/80 backdrop-blur-xs shadow-md p-4 max-h-[65vh] md:max-h-[70vh] overflow-y-auto space-y-5 animate-in fade-in duration-200">
+          {messages.map((msg, index) => {
+            const isUser = msg.role === "user";
+            const isLatestAssistant = !isUser && index === messages.length - 1;
+            const msgResponse = msg.response || (isLatestAssistant ? response : null);
+            const livingDraft = msgResponse?.living_draft || (msgResponse?.data?.living_draft as LivingDraft);
+
+            return (
+              <div
+                key={msg.id || index}
+                className={cn(
+                  "flex gap-3 text-sm animate-in fade-in slide-in-from-bottom-1 duration-150",
+                  isUser ? "justify-end" : "justify-start"
+                )}
+              >
+                {!isUser && (
+                  <div className="w-7 h-7 rounded-full bg-ai-600 text-white flex items-center justify-center shrink-0 shadow-3xs mt-0.5">
+                    <Bot className="w-4 h-4" />
+                  </div>
+                )}
+
+                <div
+                  className={cn(
+                    "space-y-3 max-w-[90%] md:max-w-[85%]",
+                    isUser ? "flex flex-col items-end" : "flex-1"
+                  )}
+                >
+                  {/* Message Bubble */}
+                  <div
+                    className={cn(
+                      "px-4 py-2.5 rounded-2xl shadow-3xs leading-relaxed",
+                      isUser
+                        ? "bg-ai-600 text-white rounded-tr-xs"
+                        : "bg-bg-muted/70 text-text-primary border border-border-subtle rounded-tl-xs"
+                    )}
+                  >
+                    {msg.content ? (
+                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                    ) : msg.streaming && loading ? (
+                      <div className="flex items-center gap-2 text-text-muted py-0.5">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-ai-600" />
+                        <span className="text-xs">Analyzing accounting policies & records...</span>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {/* Assistant Interactive Cards & Live Draft (Rendered seamlessly in-flow) */}
+                  {!isUser && msgResponse && (
+                    <div className="space-y-3 w-full">
+                      {/* Real-time Living Draft Voucher Card (Pillar 2 / Decision 2A) */}
+                      {Boolean(livingDraft) && (
+                        <LivingDraftCard
+                          draft={livingDraft!}
+                          className="w-full shadow-xs"
+                          onAction={(actionType, payload) => {
+                            const actionId = (payload?.action_id as string) || actionType;
+                            if (actionId === "post_to_ledger" || actionId === "submit") {
+                              handleConfirm(true);
+                            } else if (actionId === "modify_terms") {
+                              textareaRef.current?.focus();
+                            } else if (actionId === "run_scenario") {
+                              handleSend("Simulate lease vs buy for this asset");
+                            } else if (actionType === "select_account" && payload?.account_name) {
+                              handleClarify(`Use account ${payload.account_code || ""} (${payload.account_name})`);
+                            } else if (actionType === "adjust_slider" && payload?.slider_value) {
+                              handleClarify(`Set useful life to ${payload.slider_value} years`);
+                            } else if (actionType === "toggle_wht") {
+                              handleClarify(payload?.is_enabled ? "Apply Section 153 WHT deduction" : "Do not deduct Section 153 WHT");
+                            }
+                          }}
+                        />
+                      )}
+
+                      {/* Clarification Round */}
+                      {msgResponse.status === ExecutionStatus.AWAITING_CLARIFICATION && (
+                        <AIClarification
+                          question={msgResponse.question || "I need a bit more information."}
+                          options={msgResponse.options}
+                          questionOptions={msgResponse.question_options}
+                          onAnswer={handleClarify}
+                          disabled={loading}
+                        />
+                      )}
+
+                      {/* Confirmation Round */}
+                      {msgResponse.status === ExecutionStatus.AWAITING_CONFIRMATION && (
+                        <AIConfirmation
+                          summary={msgResponse.summary || ""}
+                          riskLevel={msgResponse.risk_level}
+                          accountingImpact={msgResponse.accounting_impact}
+                          transactionDate={
+                            typeof msgResponse.data?.transaction_date === "string"
+                              ? msgResponse.data.transaction_date
+                              : undefined
+                          }
+                          dateDefaulted={Boolean(msgResponse.data?.date_defaulted)}
+                          onDecision={handleConfirm}
+                          disabled={loading}
+                        />
+                      )}
+
+                      {/* Completed Action Card */}
+                      {msgResponse.status === ExecutionStatus.COMPLETED && (
+                        <AIActionCard response={msgResponse} />
+                      )}
+
+                      {/* Rejected State */}
+                      {msgResponse.status === ExecutionStatus.REJECTED && (
+                        <div className="p-3.5 rounded-xl bg-bg-muted text-xs text-text-secondary space-y-1 border border-border-subtle">
+                          <p className="font-semibold text-text-primary">Action cancelled</p>
+                          <p className="text-text-muted">
+                            {msgResponse.summary || "The proposed transaction was rejected and nothing was posted."}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Failed State with One-Click Retry */}
+                      {msgResponse.status === ExecutionStatus.FAILED && (
+                        <div className="p-3.5 rounded-xl bg-error-50 text-xs text-error-700 space-y-2 border border-error-200">
+                          <div className="flex items-center justify-between">
+                            <p className="font-semibold text-error-800">Operation could not be completed</p>
+                            {Boolean(lastSubmittedText) && (
+                              <button
+                                type="button"
+                                onClick={() => handleSend(lastSubmittedText)}
+                                className="px-2.5 py-1 text-[11px] font-medium bg-white hover:bg-error-50 text-error-700 border border-error-200 rounded-lg shadow-2xs transition-colors flex items-center gap-1"
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                <span>Retry</span>
+                              </button>
+                            )}
+                          </div>
+                          <p className="text-error-600">
+                            {msgResponse.summary || "The operation could not be completed. Please try again."}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="text-[10px] text-text-muted font-mono px-1">
+                    {msg.createdAt
+                      ? new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                      : ""}
+                  </div>
+                </div>
+
+                {isUser && (
+                  <div className="w-7 h-7 rounded-full bg-bg-muted border border-border-default text-text-secondary flex items-center justify-center shrink-0 shadow-3xs mt-0.5">
+                    <User className="w-4 h-4" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <div ref={messagesEndRef} />
+        </div>
+      )}
+
+      {/* Hero / Command Input Box */}
       <div className={cn(
         "glass rounded-2xl p-1.5 shadow-md border transition-all bg-bg-surface",
         isAwaitingClarification
@@ -211,6 +441,8 @@ export default function AICommandBox() {
             placeholder={
               isAwaitingClarification
                 ? `Answering: "${clarificationSummary}" (or type answer here)...`
+                : hasMessages
+                ? "Ask a follow-up or give instruction (e.g. 'Use Meezan Bank', 'Simulate lease vs buy')..."
                 : PLACEHOLDERS[placeholderIdx]
             }
             rows={1}
@@ -292,7 +524,7 @@ export default function AICommandBox() {
               ) : (
                 <>
                   <Send className="w-3.5 h-3.5" />
-                  <span>Ask AI</span>
+                  <span>Send</span>
                 </>
               )}
             </button>
@@ -322,7 +554,7 @@ export default function AICommandBox() {
         )}
       </div>
 
-      {/* Quick Prompts Bar (Always Compact & Non-Intrusive) */}
+      {/* Quick Prompts Bar */}
       <div className="flex items-center justify-between gap-2 px-1 flex-wrap">
         <div className="flex items-center gap-1.5 flex-wrap">
           {QUICK_CHIPS.map((chip, idx) => (
@@ -371,8 +603,8 @@ export default function AICommandBox() {
         </div>
       )}
 
-      {/* Loading Progress (Compact Step Display) */}
-      {loading && (
+      {/* Loading Progress (Compact Step Display when no stream is in progress) */}
+      {loading && !hasMessages && (
         <div className="space-y-2">
           {reattached && (
             <p className="text-xs text-text-muted">
@@ -399,113 +631,12 @@ export default function AICommandBox() {
         </div>
       )}
 
-      {/* Response Card Section (Dismissible, self-contained, no nested command boxes) */}
-      {response && !loading && (
-        <div className="relative rounded-2xl bg-bg-surface border border-border-default shadow-lg p-1 overflow-hidden transition-all animate-in fade-in slide-in-from-top-2 duration-200">
-          {/* Header bar with Dismiss (X) button */}
-          <div className="flex items-center justify-between px-4 py-2 border-b border-border-subtle bg-bg-muted/40">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-3.5 h-3.5 text-ai-600" />
-              <span className="text-xs font-semibold text-text-primary">
-                AI Accountant Response
-              </span>
-            </div>
-            <button
-              onClick={handleDismissResult}
-              className="p-1 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-muted transition-colors"
-              title="Dismiss response (shows dashboard KPIs)"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-
-          {/* Body Content */}
-          <div className="p-4 max-h-[75vh] md:max-h-[85vh] overflow-y-auto space-y-4">
-            {/* Real-time Living Draft Voucher Card (Pillar 2 / Decision 2A) */}
-            {Boolean(response.living_draft || response.data?.living_draft) && (
-              <LivingDraftCard
-                draft={(response.living_draft || (response.data?.living_draft as LivingDraft))!}
-                className="mb-2"
-                onAction={(actionType, payload) => {
-                  const actionId = (payload?.action_id as string) || actionType;
-                  if (actionId === "post_to_ledger" || actionId === "submit") {
-                    handleConfirm(true);
-                  } else if (actionId === "modify_terms") {
-                    textareaRef.current?.focus();
-                  } else if (actionId === "run_scenario") {
-                    handleSend("Simulate lease vs buy for this asset");
-                  } else if (actionType === "select_account" && payload?.account_name) {
-                    handleClarify(`Use account ${payload.account_code || ""} (${payload.account_name})`);
-                  } else if (actionType === "adjust_slider" && payload?.slider_value) {
-                    handleClarify(`Set useful life to ${payload.slider_value} years`);
-                  } else if (actionType === "toggle_wht") {
-                    handleClarify(payload?.is_enabled ? "Apply Section 153 WHT deduction" : "Do not deduct Section 153 WHT");
-                  }
-                }}
-              />
-            )}
-
-            {response.status === ExecutionStatus.AWAITING_CLARIFICATION && (
-              <AIClarification
-                question={response.question || "I need a bit more information."}
-                options={response.options}
-                questionOptions={response.question_options}
-                onAnswer={handleClarify}
-                disabled={loading}
-              />
-            )}
-
-            {response.status === ExecutionStatus.AWAITING_CONFIRMATION && (
-              <AIConfirmation
-                summary={response.summary || ""}
-                riskLevel={response.risk_level}
-                accountingImpact={response.accounting_impact}
-                transactionDate={
-                  typeof response.data?.transaction_date === "string"
-                    ? response.data.transaction_date
-                    : undefined
-                }
-                dateDefaulted={Boolean(response.data?.date_defaulted)}
-                onDecision={handleConfirm}
-                disabled={loading}
-              />
-            )}
-
-            {response.status === ExecutionStatus.COMPLETED && (
-              <AIActionCard response={response} />
-            )}
-
-            {response.status === ExecutionStatus.REJECTED && (
-              <div className="p-4 rounded-xl bg-bg-muted text-xs text-text-secondary space-y-1">
-                <p className="font-semibold text-text-primary">Action cancelled</p>
-                <p className="text-text-muted">
-                  {response.summary || "The proposed transaction was rejected and nothing was posted."}
-                </p>
-              </div>
-            )}
-
-            {response.status === ExecutionStatus.FAILED && (
-              <div className="p-4 rounded-xl bg-error-50 text-xs text-error-700 space-y-2">
-                <div className="flex items-center justify-between">
-                  <p className="font-semibold text-error-800">Operation could not be completed</p>
-                  {Boolean(lastSubmittedText) && (
-                    <button
-                      type="button"
-                      onClick={() => handleSend(lastSubmittedText)}
-                      className="px-2.5 py-1 text-[11px] font-medium bg-white hover:bg-error-50 text-error-700 border border-error-200 rounded-lg shadow-2xs transition-colors"
-                    >
-                      Retry Request
-                    </button>
-                  )}
-                </div>
-                <p className="text-error-600">
-                  {response.summary || "The operation could not be completed. Please try again."}
-                </p>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      {/* Sessions History Drawer */}
+      <AIChatHistoryDrawer
+        isOpen={isHistoryOpen}
+        onClose={() => setIsHistoryOpen(false)}
+        run={run}
+      />
     </div>
   );
 }

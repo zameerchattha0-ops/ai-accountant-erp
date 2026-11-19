@@ -979,3 +979,37 @@ export async function purchaseOrderStatusUpdate(
 export async function cataloguePipeline(): Promise<{ pipeline: Record<string, unknown> }> {
   return fetchApi<{ pipeline: Record<string, unknown> }>("/api/catalogue/pipeline");
 }
+
+export interface ConversationSummary {
+  conversation_id: string;
+  title: string;
+  last_message: string;
+  updated_at: string;
+  turn_count: number;
+  last_status: string;
+}
+
+export interface ConversationTurn {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  session_id?: string;
+  status?: string;
+  created_at?: string;
+  living_draft?: Record<string, unknown> | null;
+  simulations?: Array<Record<string, unknown>> | null;
+  interactive_artifacts?: Array<Record<string, unknown>> | null;
+}
+
+export async function aiListConversations(): Promise<{ conversations: ConversationSummary[] }> {
+  return fetchApi<{ conversations: ConversationSummary[] }>("/api/ai/conversations");
+}
+
+export async function aiGetConversation(
+  conversationId: string
+): Promise<{ conversation_id: string; turns: ConversationTurn[] }> {
+  return fetchApi<{ conversation_id: string; turns: ConversationTurn[] }>(
+    `/api/ai/conversations/${encodeURIComponent(conversationId)}`
+  );
+}
+

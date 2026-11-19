@@ -24,6 +24,9 @@ import {
   aiExecuteStream,
   aiEnqueueJob,
   aiGetJob,
+  aiGetConversation,
+  aiListConversations,
+  type ConversationSummary,
   isApiErrorWithStatus,
   latestActiveSession,
   runBackgroundJob,
@@ -53,6 +56,10 @@ export interface ChatMessage {
 export interface AgentRunState {
   loading: boolean;
   activeRequestId: string | null;
+  conversationId: string | null;
+  conversationTitle: string | null;
+  threads: ConversationSummary[];
+  threadsLoading: boolean;
   liveSteps: AgentLiveStep[];
   streamingText: string;
   messages: ChatMessage[];
@@ -71,6 +78,10 @@ export interface AgentRunState {
 let state: AgentRunState = {
   loading: false,
   activeRequestId: null,
+  conversationId: null,
+  conversationTitle: null,
+  threads: [],
+  threadsLoading: false,
   liveSteps: [],
   streamingText: "",
   messages: [],
@@ -81,6 +92,7 @@ let state: AgentRunState = {
   stalledJobId: null,
   cancelling: false,
 };
+
 
 const listeners = new Set<() => void>();
 
@@ -129,7 +141,7 @@ function applyResponse(res: AgentResponse) {
       ...updatedMessages[lastIdx],
       streaming: false,
       response: res,
-      content: res.summary || updatedMessages[lastIdx].content || "Execution completed.",
+      content: res.summary || res.question || updatedMessages[lastIdx].content || "Execution completed.",
     };
   }
 
@@ -365,6 +377,8 @@ export const agentRunStore = {
 
   clearConversation: () => {
     set({
+      conversationId: null,
+      conversationTitle: null,
       messages: [],
       response: null,
       error: "",
@@ -376,11 +390,95 @@ export const agentRunStore = {
     });
   },
 
+  newChat: () => {
+    set({
+      conversationId: null,
+      conversationTitle: null,
+      messages: [],
+      response: null,
+      error: "",
+      notice: "",
+      streamingText: "",
+      liveSteps: [],
+      loading: false,
+      activeRequestId: null,
+    });
+  },
+
+  loadThreads: async () => {
+    set({ threadsLoading: true });
+    try {
+      const data = await aiListConversations();
+      set({ threads: data.conversations || [], threadsLoading: false });
+    } catch {
+      set({ threadsLoading: false });
+    }
+  },
+
+  switchConversation: async (conversationId: string) => {
+    if (state.loading) return;
+    set({
+      loading: true,
+      conversationId,
+      error: "",
+      notice: "",
+      response: null,
+      messages: [],
+    });
+    try {
+      const data = await aiGetConversation(conversationId);
+      const turns = data.turns || [];
+      const loadedMessages: ChatMessage[] = turns.map((t) => ({
+        id: t.id || requestId(),
+        role: t.role,
+        content: t.content,
+        createdAt: t.created_at || new Date().toISOString(),
+        response:
+          t.role === "assistant" &&
+          (t.living_draft ||
+            t.simulations ||
+            t.interactive_artifacts ||
+            t.status === "AWAITING_CLARIFICATION" ||
+            t.status === "AWAITING_CONFIRMATION")
+            ? ({
+                status: (t.status as ExecutionStatus) || ExecutionStatus.COMPLETED,
+                summary: t.content,
+                living_draft: t.living_draft as unknown as Record<string, unknown> | undefined,
+                simulations: t.simulations || undefined,
+                interactive_artifacts: t.interactive_artifacts || undefined,
+                requires_user_input: t.status === "AWAITING_CLARIFICATION",
+                confirmation_required: t.status === "AWAITING_CONFIRMATION",
+              } as unknown as AgentResponse)
+            : null,
+      }));
+
+      const lastAsst = [...loadedMessages]
+        .reverse()
+        .find((m) => m.role === "assistant" && m.response);
+      const title = data.turns?.[0]?.content?.slice(0, 48) || "Conversation";
+
+      set({
+        messages: loadedMessages,
+        response: lastAsst?.response || null,
+        conversationTitle: title,
+        loading: false,
+      });
+    } catch (err) {
+      set({
+        loading: false,
+        error: err instanceof Error ? err.message : "Failed to load conversation",
+      });
+    }
+  },
+
   /* Start a run. The promise chain lives in THIS module — sidebar
      navigation cannot abort, unmount or orphan it. */
   async startRun(request: UserRequest) {
     if (state.loading) return; // one run at a time
-    const rid = requestId();
+    const activeCid =
+      state.conversationId ||
+      request.conversation_id ||
+      `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const userMsg: ChatMessage = {
       id: requestId(),
       role: "user",
@@ -396,8 +494,14 @@ export const agentRunStore = {
       createdAt: new Date().toISOString(),
     };
 
+    const newTitle =
+      state.conversationTitle ||
+      request.message.slice(0, 48) + (request.message.length > 48 ? "..." : "");
+
     set({
       loading: true,
+      conversationId: activeCid,
+      conversationTitle: newTitle,
       response: null,
       error: "",
       notice: "",
@@ -407,18 +511,18 @@ export const agentRunStore = {
       streamingText: "",
       messages: [...state.messages, userMsg, assistantMsg],
       cancelling: false,
-      activeRequestId: rid,
+      activeRequestId: activeCid,
     });
     try {
       if (USE_BACKGROUND_RUNS) {
         try {
-          await runBackground({ ...request, conversation_id: rid });
+          await runBackground({ ...request, conversation_id: activeCid });
         } catch (jobErr) {
           if (!isApiErrorWithStatus(jobErr, 404)) throw jobErr;
-          await runForeground({ ...request, conversation_id: rid }); // older backend
+          await runForeground({ ...request, conversation_id: activeCid }); // older backend
         }
       } else {
-        await runForeground({ ...request, conversation_id: rid });
+        await runForeground({ ...request, conversation_id: activeCid });
       }
     } catch (err) {
       set({
@@ -433,6 +537,7 @@ export const agentRunStore = {
       set({ loading: false, activeRequestId: null, liveSteps: [] });
     }
   },
+
 
   async clarify(answer: string) {
     if (!state.response?.execution_id) return;

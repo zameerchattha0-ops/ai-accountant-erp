@@ -702,13 +702,17 @@ class ReasoningOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _render_history(history: Sequence[Dict[str, str]]) -> str:
+def _render_history(history: Sequence[Dict[str, Any]]) -> str:
     if not history:
         return "(none)"
     lines = []
-    for qa in history[-8:]:
-        lines.append(f"  Q: {qa.get('question', '')}")
-        lines.append(f"  A: {qa.get('answer', '')}")
+    for item in history[-10:]:
+        if "role" in item:
+            role = "User" if item.get("role") == "user" else "Assistant"
+            lines.append(f"  {role}: {item.get('content', '')}")
+        else:
+            lines.append(f"  Q: {item.get('question', '')}")
+            lines.append(f"  A: {item.get('answer', '')}")
     return "\n".join(lines)
 
 

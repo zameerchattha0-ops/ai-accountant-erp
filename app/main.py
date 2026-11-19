@@ -773,6 +773,37 @@ async def list_sessions(
     }
 
 
+@app.get("/api/ai/conversations")
+async def list_conversations(
+    limit: int = 50,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """List persistent conversation threads for the authenticated user (Claude-style)."""
+    from app.database import get_user_conversations
+    conversations = await get_user_conversations(
+        auth.organization_id,
+        auth.user_id,
+        limit=limit,
+    )
+    return {"conversations": conversations}
+
+
+@app.get("/api/ai/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str,
+    limit: int = 30,
+    auth: AuthContext = Depends(get_current_user),
+):
+    """Get the full chronological message history for a persistent conversation thread."""
+    from app.database import get_conversation_turns
+    turns = await get_conversation_turns(conversation_id=conversation_id, limit=limit)
+    return {
+        "conversation_id": conversation_id,
+        "turns": turns,
+    }
+
+
+
 # ---------------------------------------------------------------------------
 # RESUME-BY-CONVERSATION — the stale-run window
 # ---------------------------------------------------------------------------
