@@ -15541,23 +15541,22 @@ async def execute(
 
 
 
-def _session_is_owned(session: Optional[Dict[str, Any]], organization_id: uuid.UUID,
-
-                      user_id: uuid.UUID) -> bool:
-
+def _session_is_owned(
+    session: Optional[Dict[str, Any]],
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    role_code: str = "",
+) -> bool:
     """The session exists AND belongs to the caller's organisation and user."""
-
     if not session:
-
         return False
-
-    return (
-
-        str(session.get("organization_id") or "") == str(organization_id)
-
-        and str(session.get("user_id") or "") == str(user_id)
-
-    )
+    if str(session.get("organization_id") or "") != str(organization_id):
+        return False
+    if str(session.get("user_id") or "") == str(user_id):
+        return True
+    if str(role_code or "").upper() in ("OWNER", "ADMIN"):
+        return True
+    return False
 
 
 
@@ -15743,7 +15742,8 @@ async def resume_with_clarification(
 
     session = await fetch_one("ai_execution_sessions", filters={"id": str(session_id)})
 
-    if not _session_is_owned(session, organization_id, user_id):
+    _caller_role = auth.role_code if auth else (session.get("role") or "" if session else "")
+    if not _session_is_owned(session, organization_id, user_id, role_code=_caller_role):
 
         # Not found / not yours — the same response for both, so an
 
@@ -16927,7 +16927,8 @@ async def resume_with_confirmation(
 
     session = await fetch_one("ai_execution_sessions", filters={"id": str(session_id)})
 
-    if not _session_is_owned(session, organization_id, user_id):
+    _caller_role = auth.role_code if auth else (session.get("role") or "" if session else "")
+    if not _session_is_owned(session, organization_id, user_id, role_code=_caller_role):
 
         return AgentResponse(
 
