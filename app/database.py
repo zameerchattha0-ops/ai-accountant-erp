@@ -488,6 +488,19 @@ async def get_context_sources_for_intent(intent: str) -> Dict[str, Any]:
     return result
 
 
+def _safe_uuid(val: Any) -> Optional[str]:
+    """Deterministically convert any string or ID to a valid UUID string for Postgres."""
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return str(uuid.UUID(s))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, s))
+
+
 async def create_execution_session(
     *,
     organization_id: uuid.UUID,
@@ -501,6 +514,7 @@ async def create_execution_session(
     resolved from the active agent row in ``ai.agents`` (cached) — matching the
     real ``ai.execution_sessions`` columns.
     """
+    safe_conv_id = _safe_uuid(conversation_id)
     try:
         cp = await _get_control_plane_ids()
         return await insert_one(
@@ -511,7 +525,7 @@ async def create_execution_session(
                 "agent_id": cp["agent_id"],
                 "instruction_version_id": cp.get("instruction_version_id"),
                 "model_configuration_id": cp.get("model_configuration_id"),
-                "conversation_id": conversation_id,
+                "conversation_id": safe_conv_id,
                 "user_request": user_message,
                 "status": "PENDING",
                 "current_phase": "RECEIVED",
@@ -1120,13 +1134,21 @@ async def get_conversation_turns(
         return []
 
     cid = str(conversation_id).strip()
+    safe_cid = _safe_uuid(cid)
     try:
         sessions = await fetch_many(
             "ai_execution_sessions",
-            filters={"conversation_id": cid},
+            filters={"conversation_id": safe_cid},
             order="created_at.asc",
             limit=limit,
         )
+        if not sessions and safe_cid != cid:
+            sessions = await fetch_many(
+                "ai_execution_sessions",
+                filters={"conversation_id": cid},
+                order="created_at.asc",
+                limit=limit,
+            )
         if not sessions:
             return []
 

@@ -192,6 +192,18 @@ export interface LivingDraftCounterparty {
   ntn?: string;
 }
 
+export interface FinalizedFact {
+  label: string;
+  value: string;
+  verified: boolean;
+}
+
+export interface ReasoningStep {
+  title: string;
+  description: string;
+  status: "analyzing" | "completed" | "compliant" | "monitoring";
+}
+
 export interface LivingDraft {
   document_type: string;
   voucher_preview: VoucherLinePreview[];
@@ -206,6 +218,10 @@ export interface LivingDraft {
   compliance_notes: string[];
   status: string;
   missing_fields: string[];
+  progression_stage?: "fact_gathering" | "reasoning" | "ready_for_execution" | "posted";
+  finalized_facts?: FinalizedFact[];
+  reasoning_steps?: ReasoningStep[];
+  pending_requirements?: string[];
   /** Interactive in-chat artifact payload for UI sidebar/preview pane (Frontier Rec 1). */
   interactive_artifact?: ArtifactPayload;
 }

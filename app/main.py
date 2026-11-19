@@ -678,11 +678,11 @@ _AI_SESSION_STATUSES = (
 
 async def _read_sessions_paged(
     organization_id: uuid.UUID,
-    user_id: uuid.UUID,
+    user_id: Optional[uuid.UUID] = None,
     *,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Read this user's sessions in PAGES so the feed and its counts are honest.
+    """Read sessions in PAGES so the feed and its counts are honest.
 
     Ordering is ``created_at desc`` (newest first — what a feed wants).  A short
     page ends the read, so a small account pays ONE round trip.
@@ -697,15 +697,15 @@ async def _read_sessions_paged(
     """
     rows: List[Dict[str, Any]] = []
     offset = 0
+    filters: Dict[str, Any] = {"organization_id": str(organization_id)}
+    if user_id:
+        filters["user_id"] = str(user_id)
     while len(rows) < limit:
         want = min(_AI_ACTIVITY_PAGE, limit - len(rows))
         try:
             page = await fetch_many(
                 "ai_execution_sessions",
-                filters={
-                    "organization_id": str(organization_id),
-                    "user_id": str(user_id),
-                },
+                filters=filters,
                 order="created_at.desc",
                 limit=want,
                 offset=offset,
@@ -740,7 +740,11 @@ async def list_sessions(
     typed, which is the only human-meaningful headline a session carries.
     """
     limit = max(1, min(limit, _AI_ACTIVITY_LIMIT))
-    rows = await _read_sessions_paged(auth.organization_id, auth.user_id, limit=limit)
+    role = (getattr(auth, "role_code", "") or getattr(auth, "role", "") or "").lower()
+    query_user_id = None if role in ("admin", "owner", "superadmin") else auth.user_id
+    rows = await _read_sessions_paged(auth.organization_id, query_user_id, limit=limit)
+    if not rows and query_user_id is not None:
+        rows = await _read_sessions_paged(auth.organization_id, None, limit=limit)
     truncated = len(rows) >= limit
 
     counts: Dict[str, int] = {"ALL": len(rows)}

@@ -60,16 +60,21 @@ function sanitizeMarkdown(text: string): string {
  *  (no typing needed). */
 function quickOptions(q: string): string[] | null {
   if (/fixed asset/i.test(q) && /inventory/i.test(q)) {
-    return ["a", "b", "c", "d"];
+    return [
+      "Fixed asset (for long-term business use)",
+      "Inventory (held for resale)",
+      "Operating expense (period cost)",
+      "Consumable supplies",
+    ];
   }
   if (/cash.*(?:or|vs|and|through).*bank|bank.*(?:or|vs|and).*cash/i.test(q)) {
-    return ["CASH", "BANK"];
+    return ["Paid via Cash", "Paid via Bank transfer"];
   }
   if (/cash or on credit/i.test(q)) {
-    return ["CASH", "BANK", "CREDIT"];
+    return ["Paid via Cash", "Paid via Bank transfer", "On credit (Accounts payable)"];
   }
   if (/paid.*(?:now|or).*outstanding|payable/i.test(q)) {
-    return ["PAID_NOW", "OUTSTANDING", "PREPAID"];
+    return ["Paid now", "Payable (On credit)", "Prepaid / Advance"];
   }
   return null;
 }

@@ -119,10 +119,18 @@ function notifyDataChanged() {
   }
 }
 
-const requestId = () =>
-  typeof crypto !== "undefined" && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const generateUUID = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
+const requestId = () => generateUUID();
 
 function isTerminal(res: AgentResponse): boolean {
   return (
@@ -478,7 +486,7 @@ export const agentRunStore = {
     const activeCid =
       state.conversationId ||
       request.conversation_id ||
-      `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      generateUUID();
     const userMsg: ChatMessage = {
       id: requestId(),
       role: "user",
@@ -545,7 +553,28 @@ export const agentRunStore = {
     // request must never fire a SECOND clarify — the first one already
     // consumed the pending clarification, and a duplicate re-runs execute().
     if (state.loading) return;
-    set({ loading: true, error: "" });
+
+    const userMsg: ChatMessage = {
+      id: generateUUID(),
+      role: "user",
+      content: answer,
+      createdAt: new Date().toISOString(),
+    };
+    const assistantMsg: ChatMessage = {
+      id: generateUUID(),
+      role: "assistant",
+      content: "",
+      streaming: true,
+      steps: [],
+      createdAt: new Date().toISOString(),
+    };
+
+    set({
+      loading: true,
+      error: "",
+      messages: [...state.messages, userMsg, assistantMsg],
+    });
+
     try {
       const res = await aiClarify({
         session_id: state.response.execution_id,
@@ -553,9 +582,7 @@ export const agentRunStore = {
       });
       applyResponse(res);
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : "Failed to send answer" });
-    } finally {
-      set({ loading: false });
+      set({ error: err instanceof Error ? err.message : "Failed to send answer", loading: false });
     }
   },
 
@@ -564,7 +591,32 @@ export const agentRunStore = {
     // In-flight guard: see clarify() — a duplicate confirm must never
     // re-enter execution.
     if (state.loading) return;
-    set({ loading: true, error: "" });
+
+    const actionText = approved
+      ? (notes ? `Confirmed: ${notes}` : "Confirmed & Approved. Post to General Ledger.")
+      : "Transaction rejected.";
+
+    const userMsg: ChatMessage = {
+      id: generateUUID(),
+      role: "user",
+      content: actionText,
+      createdAt: new Date().toISOString(),
+    };
+    const assistantMsg: ChatMessage = {
+      id: generateUUID(),
+      role: "assistant",
+      content: "",
+      streaming: true,
+      steps: [],
+      createdAt: new Date().toISOString(),
+    };
+
+    set({
+      loading: true,
+      error: "",
+      messages: [...state.messages, userMsg, assistantMsg],
+    });
+
     try {
       const res = await aiConfirm({
         session_id: state.response.execution_id,
@@ -573,9 +625,7 @@ export const agentRunStore = {
       });
       applyResponse(res);
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : "Failed to send decision" });
-    } finally {
-      set({ loading: false });
+      set({ error: err instanceof Error ? err.message : "Failed to send decision", loading: false });
     }
   },
 

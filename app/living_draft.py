@@ -77,6 +77,20 @@ class LivingDraftLineItem(BaseModel):
     account_name: Optional[str] = None
 
 
+class FinalizedFact(BaseModel):
+    """Fact explicitly established and verified from user input."""
+    label: str
+    value: str
+    verified: bool = True
+
+
+class ReasoningStep(BaseModel):
+    """Accounting standard or policy principle being evaluated."""
+    title: str
+    description: str
+    status: str = "analyzing"  # analyzing | completed | compliant | monitoring
+
+
 class LivingDraft(BaseModel):
     """Authoritative real-time living draft voucher card preview."""
 
@@ -93,6 +107,10 @@ class LivingDraft(BaseModel):
     compliance_notes: List[str] = Field(default_factory=list)
     status: str = "drafting"  # drafting | awaiting_input | ready_for_confirmation | posted
     missing_fields: List[str] = Field(default_factory=list)
+    progression_stage: str = "fact_gathering"  # fact_gathering | reasoning | ready_for_execution | posted
+    finalized_facts: List[FinalizedFact] = Field(default_factory=list)
+    reasoning_steps: List[ReasoningStep] = Field(default_factory=list)
+    pending_requirements: List[str] = Field(default_factory=list)
     interactive_artifact: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -631,6 +649,106 @@ def build_living_draft(
 
     tx_date = ents.get("transaction_date") or ents.get("date") or ents.get("expense_date")
 
+    # 1. Finalized facts (strictly only facts confirmed from user inputs)
+    finalized_facts: List[FinalizedFact] = []
+    if total_amount and total_amount > 0:
+        curr = ents.get("currency", "PKR")
+        finalized_facts.append(FinalizedFact(
+            label="Transaction Amount",
+            value=f"{curr} {total_amount:,.2f}",
+        ))
+    if counterparty and counterparty.name:
+        role_label = f" ({counterparty.role.title()})" if counterparty.role else ""
+        finalized_facts.append(FinalizedFact(
+            label=f"Counterparty{role_label}",
+            value=counterparty.name,
+        ))
+    if channel:
+        b_label = f" via {bank_name}" if bank_name else ""
+        finalized_facts.append(FinalizedFact(
+            label="Settlement Method",
+            value=f"{channel.replace('_', ' ').title()}{b_label}",
+        ))
+    if tx_date:
+        finalized_facts.append(FinalizedFact(
+            label="Transaction Date",
+            value=str(tx_date),
+        ))
+    if line_items:
+        first_desc = line_items[0].description
+        if len(line_items) == 1:
+            finalized_facts.append(FinalizedFact(
+                label="Scope / Item",
+                value=f"{line_items[0].quantity:g}x {first_desc}",
+            ))
+        else:
+            finalized_facts.append(FinalizedFact(
+                label="Line Items",
+                value=f"{len(line_items)} items ({first_desc}, etc.)",
+            ))
+
+    # 2. Accounting reasoning steps
+    reasoning_steps: List[ReasoningStep] = []
+    if resolved_nature == "FIXED_ASSET" or "Asset" in document_type:
+        reasoning_steps.append(ReasoningStep(
+            title="IAS 16 Property, Plant & Equipment",
+            description="Evaluating capitalization criteria and useful life depreciation allocation.",
+            status="completed" if depreciation_schedule else "analyzing",
+        ))
+    elif any(w in (intent or "").lower() for w in ("sale", "invoice")):
+        reasoning_steps.append(ReasoningStep(
+            title="IFRS 15 Revenue Recognition",
+            description="Evaluating performance obligations and receivable recognition.",
+            status="completed" if not cleaned_missing else "analyzing",
+        ))
+    else:
+        reasoning_steps.append(ReasoningStep(
+            title="Double-Entry Accounting Treatment",
+            description="Analyzing period matching, expense recognition, and debit/credit ledger impact.",
+            status="completed" if not cleaned_missing else "analyzing",
+        ))
+
+    if total_amount and total_amount > 50000:
+        reasoning_steps.append(ReasoningStep(
+            title="Section 73 Statutory Cash Limit",
+            description="Statutory rule: transactions > PKR 50,000 must settle via banking channel to claim tax deduction.",
+            status="compliant" if channel in ("bank_transfer", "bank", "cheque") else ("analyzing" if not channel else "monitoring"),
+        ))
+
+    if resolved_nature in ("FIXED_ASSET", "OPERATING_EXPENSE") and total_amount and total_amount > 0:
+        reasoning_steps.append(ReasoningStep(
+            title="Section 153 Withholding Tax",
+            description="Evaluating statutory tax deduction applicability on vendor disbursement.",
+            status="completed" if ents.get("wht_status") else "analyzing",
+        ))
+
+    # 3. Pending requirements
+    pending_requirements: List[str] = []
+    if not channel:
+        pending_requirements.append("Payment settlement method (Cash, Bank Transfer, or On Credit / Accounts Payable)")
+    if not counterparty or not counterparty.name:
+        if "sale" in (intent or "").lower() or "invoice" in (intent or "").lower():
+            pending_requirements.append("Customer / Client identity")
+        elif "expense" not in (intent or "").lower() or channel == "credit":
+            pending_requirements.append("Vendor / Supplier identity")
+    if resolved_nature == "FIXED_ASSET" and not ents.get("useful_life_years") and not ents.get("useful_life"):
+        pending_requirements.append("Intended useful life (years) for straight-line depreciation (standard IT is 3 years)")
+
+    for field_name in cleaned_missing:
+        clean_field = field_name.replace("_", " ").title()
+        if not any(clean_field.lower() in p.lower() for p in pending_requirements):
+            pending_requirements.append(clean_field)
+
+    # 4. Progression stage
+    if session_phase in ("COMPLETED", "EXECUTING") or status == "posted":
+        progression_stage = "posted"
+    elif not pending_requirements and total_amount and total_amount > 0:
+        progression_stage = "ready_for_execution"
+    elif pending_requirements:
+        progression_stage = "fact_gathering"
+    else:
+        progression_stage = "reasoning"
+
     draft = LivingDraft(
         document_type=document_type,
         voucher_preview=voucher_preview,
@@ -645,6 +763,10 @@ def build_living_draft(
         compliance_notes=compliance_notes,
         status=status,
         missing_fields=cleaned_missing,
+        progression_stage=progression_stage,
+        finalized_facts=finalized_facts,
+        reasoning_steps=reasoning_steps,
+        pending_requirements=pending_requirements,
     )
     draft.attach_interactive_artifact()
     return draft
