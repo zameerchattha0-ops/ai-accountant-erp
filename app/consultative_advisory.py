@@ -119,18 +119,27 @@ def detect_consultative_query(user_message: str) -> Optional[str]:
     if not cleaned:
         return None
 
-    # Check if text contains question markers or consultative inquiry phrasing
+    # Declarative answers must never be misclassified as consultative questions
+    low = cleaned.lower()
+    if re.match(r"^\s*\d+\s*(?:years?|yrs?|saal)?\s*(?:straight\s*line|reducing\s*balance|none)?\s*$", low):
+        return None
+    if low in ("straight line", "reducing balance", "cash", "bank transfer", "credit", "yes", "no"):
+        return None
+
+    # Check if text contains question markers, consultative phrasing, or explicit statutory citations
     is_inquiry = any(re.search(pat, cleaned, re.IGNORECASE) for pat in _CONSULTATIVE_INTENT_PATTERNS)
+    has_explicit_statute = bool(re.search(r"\b(?:section\s*73|sec\s*73|21\(l\)|section\s*153|sec\s*153|ias\s*16|fbr\s*rate)\b", cleaned, re.IGNORECASE))
+
+    if not (is_inquiry or has_explicit_statute or cleaned.endswith("?")):
+        return None
 
     for topic, patterns in _TOPIC_REGEXES.items():
         for pat in patterns:
             if pat.search(cleaned):
-                # Strong match on statutory topics (even if user typed "Section 73 cash limit?")
                 return topic
 
     # Secondary check: if message ends with "?" and mentions statutory keywords
     if cleaned.endswith("?"):
-        low = cleaned.lower()
         if "cash" in low and ("limit" in low or "allowed" in low or "rule" in low or "can" in low):
             return TOPIC_SECTION_73
         if "tax" in low and ("wht" in low or "withhold" in low or "rate" in low or "percent" in low):

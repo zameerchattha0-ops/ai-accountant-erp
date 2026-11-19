@@ -93,14 +93,21 @@ class LivingDraft(BaseModel):
     compliance_notes: List[str] = Field(default_factory=list)
     status: str = "drafting"  # drafting | awaiting_input | ready_for_confirmation | posted
     missing_fields: List[str] = Field(default_factory=list)
+    interactive_artifact: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert living draft model to standard dictionary for JSON responses."""
         return self.model_dump()
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert LivingDraft to dictionary payload for API responses."""
-        return self.model_dump()
+    def attach_interactive_artifact(self) -> LivingDraft:
+        """Construct and attach interactive in-chat artifact controls."""
+        try:
+            from app.interactive_artifacts import build_interactive_artifact
+            art = build_interactive_artifact(self)
+            self.interactive_artifact = art.model_dump()
+        except Exception:
+            pass
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +631,7 @@ def build_living_draft(
 
     tx_date = ents.get("transaction_date") or ents.get("date") or ents.get("expense_date")
 
-    return LivingDraft(
+    draft = LivingDraft(
         document_type=document_type,
         voucher_preview=voucher_preview,
         counterparty=counterparty,
@@ -639,3 +646,5 @@ def build_living_draft(
         status=status,
         missing_fields=cleaned_missing,
     )
+    draft.attach_interactive_artifact()
+    return draft

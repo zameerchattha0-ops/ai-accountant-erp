@@ -154,6 +154,122 @@ export interface AgentResponse {
   confirmation_required: boolean;
   risk_level?: RiskLevel;
   data?: Record<string, unknown>;
+  /** Living draft voucher preview for real-time sidebar/preview pane (Pillar 2 / Decision 2A). */
+  living_draft?: LivingDraft;
+}
+
+export interface LivingDraftLineItem {
+  description: string;
+  quantity?: number;
+  unit_price?: number;
+  total_amount?: number;
+  account_name?: string;
+}
+
+export interface VoucherLinePreview {
+  account_name: string;
+  account_code?: string;
+  debit: number;
+  credit: number;
+  description?: string;
+}
+
+export interface DepreciationSchedulePreview {
+  useful_life_years: number;
+  method: string;
+  cost: number;
+  salvage_value: number;
+  depreciable_amount: number;
+  annual_depreciation: number;
+  monthly_depreciation: number;
+}
+
+export interface LivingDraftCounterparty {
+  name?: string;
+  role?: string;
+  tax_status?: string;
+  strn?: string;
+  ntn?: string;
+}
+
+export interface LivingDraft {
+  document_type: string;
+  voucher_preview: VoucherLinePreview[];
+  counterparty?: LivingDraftCounterparty;
+  line_items: LivingDraftLineItem[];
+  total_amount?: number;
+  currency?: string;
+  payment_channel?: string;
+  bank_name?: string;
+  transaction_date?: string;
+  depreciation_schedule?: DepreciationSchedulePreview;
+  compliance_notes: string[];
+  status: string;
+  missing_fields: string[];
+  /** Interactive in-chat artifact payload for UI sidebar/preview pane (Frontier Rec 1). */
+  interactive_artifact?: ArtifactPayload;
+}
+
+export interface AccountOption {
+  account_code: string;
+  account_name: string;
+  category: string;
+  description?: string;
+  is_selected: boolean;
+}
+
+export interface SliderConfig {
+  control_id: string;
+  min_value: number;
+  max_value: number;
+  step: number;
+  current_value: number;
+  unit: string;
+  reactive_target: string;
+  formula_hint?: string;
+  live_calculated_values?: Record<number, { annual: number; monthly: number }>;
+}
+
+export interface ToggleConfig {
+  control_id: string;
+  is_enabled: boolean;
+  label: string;
+  statutory_section?: string;
+  rate_percent: number;
+  applicable_category?: string;
+  gross_amount: number;
+  wht_deduction_amount: number;
+  net_payable_amount: number;
+  withholding_account_head?: string;
+}
+
+export interface ActionButton {
+  action_id: string;
+  label: string;
+  variant?: "primary" | "secondary" | "outline" | "danger";
+  enabled: boolean;
+  requires_confirmation?: boolean;
+  confirmation_message?: string;
+}
+
+export interface InteractiveControl {
+  control_id: string;
+  control_type: "account_pill_selector" | "depreciation_slider" | "wht_toggle" | "action_button_group";
+  label: string;
+  help_text?: string;
+  account_pills?: AccountOption[];
+  slider?: SliderConfig;
+  toggle?: ToggleConfig;
+  buttons?: ActionButton[];
+}
+
+export interface ArtifactPayload {
+  artifact_id: string;
+  artifact_type: string;
+  title: string;
+  version: number;
+  controls: InteractiveControl[];
+  recalculation_summary?: Record<string, unknown>;
 }
 
 /** Mirrors app/models/schemas.py QuestionOption — label shown, value sent. */

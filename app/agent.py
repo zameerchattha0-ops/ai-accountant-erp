@@ -9841,6 +9841,18 @@ async def execute(
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
 
             _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else None
+            _frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _frontier = enrich_frontier_metadata(
+                    user_message=user_message,
+                    living_draft=_living_draft_dict,
+                    entities=execution_plan.extracted_entities,
+                    intent=execution_plan.intent,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
@@ -9858,6 +9870,12 @@ async def execute(
                 requires_user_input=True,
 
                 living_draft=_living_draft_dict,
+
+                interactive_artifacts=_frontier.get("interactive_artifacts"),
+
+                simulations=_frontier.get("simulations"),
+
+                vendor_insights=_frontier.get("vendor_insights"),
 
                 data=_resp_data,
 
@@ -12852,6 +12870,17 @@ async def execute(
             except Exception as _cld_err:
                 log.warning("agent.confirmation_living_draft_failed", error=str(_cld_err)[:160])
 
+            _conf_frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _conf_frontier = enrich_frontier_metadata(
+                    living_draft=_conf_ld,
+                    entities=execution_plan.extracted_entities,
+                    intent=execution_plan.intent,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
 
                 status=ExecutionStatus.AWAITING_CONFIRMATION,
@@ -12867,6 +12896,12 @@ async def execute(
                 risk_level="MEDIUM",
 
                 living_draft=_conf_ld,
+
+                interactive_artifacts=_conf_frontier.get("interactive_artifacts"),
+
+                simulations=_conf_frontier.get("simulations"),
+
+                vendor_insights=_conf_frontier.get("vendor_insights"),
 
                 data={"living_draft": _conf_ld} if _conf_ld else None,
 
@@ -15785,6 +15820,18 @@ async def resume_with_clarification(
                 }),
             )
             await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+            _adv_frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _adv_frontier = enrich_frontier_metadata(
+                    user_message=answer,
+                    living_draft=_ld_dict,
+                    entities=_ents,
+                    intent=_intent,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -15795,6 +15842,9 @@ async def resume_with_clarification(
                 required_information=_missing,
                 requires_user_input=True,
                 living_draft=_ld_dict,
+                interactive_artifacts=_adv_frontier.get("interactive_artifacts"),
+                simulations=_adv_frontier.get("simulations"),
+                vendor_insights=_adv_frontier.get("vendor_insights"),
                 data={"living_draft": _ld_dict, "advisory": _advice.model_dump()},
             )
     except Exception as _c_err:
@@ -16154,6 +16204,18 @@ async def resume_with_clarification(
                 ),
                 _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION),
             )
+            _prog_frontier = {}
+            try:
+                from app.conversational_manager import enrich_frontier_metadata
+                _prog_frontier = enrich_frontier_metadata(
+                    user_message=answer,
+                    living_draft=_ld_dict,
+                    entities=merged_entities,
+                    intent=intent,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -16164,6 +16226,9 @@ async def resume_with_clarification(
                 required_information=[next_field],
                 requires_user_input=True,
                 living_draft=_ld_dict,
+                interactive_artifacts=_prog_frontier.get("interactive_artifacts"),
+                simulations=_prog_frontier.get("simulations"),
+                vendor_insights=_prog_frontier.get("vendor_insights"),
                 data={"living_draft": _ld_dict},
             )
 
@@ -16578,6 +16643,23 @@ async def resume_with_clarification(
                     if _completed_ld:
                         _data_payload["living_draft"] = _completed_ld
 
+                    _completed_frontier = {}
+                    try:
+                        from app.conversational_manager import enrich_frontier_metadata
+                        _completed_frontier = enrich_frontier_metadata(
+                            user_message=answer,
+                            living_draft=_completed_ld,
+                            entities=merged_entities,
+                            intent=intent,
+                            tool_result_data=tool_result.data if hasattr(tool_result, "data") else None,
+                            is_completed=True,
+                        )
+                    except Exception:
+                        pass
+
+                    if _completed_frontier.get("next_best_actions"):
+                        _data_payload["next_best_actions"] = _completed_frontier["next_best_actions"]
+
                     return AgentResponse(
                         status=final_status,
                         execution_id=session_id,
@@ -16585,6 +16667,10 @@ async def resume_with_clarification(
                         action=intent,
                         data=_data_payload,
                         living_draft=_completed_ld,
+                        interactive_artifacts=_completed_frontier.get("interactive_artifacts"),
+                        simulations=_completed_frontier.get("simulations"),
+                        vendor_insights=_completed_frontier.get("vendor_insights"),
+                        next_best_actions=_completed_frontier.get("next_best_actions"),
                         requires_user_input=False,
                         confirmation_required=False,
                         verification_status="VERIFIED",

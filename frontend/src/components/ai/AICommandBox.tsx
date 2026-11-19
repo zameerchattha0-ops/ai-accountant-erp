@@ -29,6 +29,8 @@ import AIProgress from "./AIProgress";
 import AIActionCard from "./AIActionCard";
 import AIClarification from "./AIClarification";
 import AIConfirmation from "./AIConfirmation";
+import LivingDraftCard from "./LivingDraftCard";
+import type { LivingDraft } from "@/lib/types/api";
 
 const PLACEHOLDERS = [
   "Ask anything or record a transaction (e.g. 'Cash purchase of Rs. 25,000')...",
@@ -414,6 +416,14 @@ export default function AICommandBox() {
 
           {/* Body Content */}
           <div className="p-4 max-h-[460px] overflow-y-auto space-y-4">
+            {/* Real-time Living Draft Voucher Card (Pillar 2 / Decision 2A) */}
+            {Boolean(response.living_draft || response.data?.living_draft) && (
+              <LivingDraftCard
+                draft={(response.living_draft || (response.data?.living_draft as LivingDraft))!}
+                className="mb-2"
+              />
+            )}
+
             {response.status === ExecutionStatus.AWAITING_CLARIFICATION && (
               <AIClarification
                 question={response.question || "I need a bit more information."}

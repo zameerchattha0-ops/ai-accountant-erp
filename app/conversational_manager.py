@@ -361,39 +361,15 @@ def expand_smart_default_answer(user_answer: str) -> Optional[Dict[str, Any]]:
     """Expand a quick chip or affirmative answer into a complete set of accounting fields."""
     ans = (user_answer or "").strip().lower()
 
-    # 1. 3-Year IT Equipment default
-    if any(k in ans for k in ("3-yr", "3 yr", "3 year", "3 years", "3-year", "accept 3-yr", "accept 3")):
+    # 1. Bank transfer / payment channel selection (check before generic 'recommended')
+    if any(k in ans for k in ("bank transfer", "online transfer", "wire", "crossed cheque")):
+        pm = "CHEQUE" if "cheque" in ans else "BANK"
         return {
-            "useful_life_years": "3",
-            "depreciation_method": "STRAIGHT_LINE",
-            "salvage_value": "0",
+            "payment_channel": "bank_transfer" if pm == "BANK" else "cheque",
+            "payment_method": pm,
         }
 
-    # 2. 5-Year Furniture/Vehicle default
-    if any(k in ans for k in ("5-yr", "5 yr", "5 year", "5 years", "5-year", "accept 5-yr", "accept 5")):
-        return {
-            "useful_life_years": "5",
-            "depreciation_method": "STRAIGHT_LINE",
-            "salvage_value": "0",
-        }
-
-    # 3. 10-Year default
-    if any(k in ans for k in ("10-yr", "10 yr", "10 year", "10 years", "10-year")):
-        return {
-            "useful_life_years": "10",
-            "depreciation_method": "STRAIGHT_LINE",
-            "salvage_value": "0",
-        }
-
-    # 4. General acceptance of defaults
-    if any(k in ans for k in ("accept defaults", "recommended", "standard default", "use default", "apply default", "yes, apply")):
-        return {
-            "useful_life_years": "3",
-            "depreciation_method": "STRAIGHT_LINE",
-            "salvage_value": "0",
-        }
-
-    # 5. Immediate expense selection
+    # 2. Immediate expense selection
     if any(k in ans for k in ("expense immediately", "treat as expense", "p&l expense", "operating expense")):
         return {
             "transaction_nature": "OPERATING_EXPENSE",
@@ -402,19 +378,43 @@ def expand_smart_default_answer(user_answer: str) -> Optional[Dict[str, Any]]:
             "depreciation_method": "NONE",
         }
 
-    # 6. Fixed asset capitalization acceptance
+    # 3. Fixed asset capitalization acceptance
     if any(k in ans for k in ("capitalize as fixed asset", "capitalize")):
         return {
             "transaction_nature": "FIXED_ASSET",
             "capitalization_decision": "CAPITALIZE",
         }
 
-    # 7. Bank transfer selection
-    if any(k in ans for k in ("bank transfer", "online transfer", "wire", "crossed cheque")):
-        pm = "CHEQUE" if "cheque" in ans else "BANK"
+    # 4. 3-Year IT Equipment default
+    if any(k in ans for k in ("3-yr", "3 yr", "3 year", "3 years", "3-year", "accept 3-yr", "accept 3")):
         return {
-            "payment_channel": "bank_transfer" if pm == "BANK" else "cheque",
-            "payment_method": pm,
+            "useful_life_years": "3",
+            "depreciation_method": "STRAIGHT_LINE",
+            "salvage_value": "0",
+        }
+
+    # 5. 5-Year Furniture/Vehicle default
+    if any(k in ans for k in ("5-yr", "5 yr", "5 year", "5 years", "5-year", "accept 5-yr", "accept 5")):
+        return {
+            "useful_life_years": "5",
+            "depreciation_method": "STRAIGHT_LINE",
+            "salvage_value": "0",
+        }
+
+    # 6. 10-Year default
+    if any(k in ans for k in ("10-yr", "10 yr", "10 year", "10 years", "10-year")):
+        return {
+            "useful_life_years": "10",
+            "depreciation_method": "STRAIGHT_LINE",
+            "salvage_value": "0",
+        }
+
+    # 7. General acceptance of defaults
+    if any(k in ans for k in ("accept defaults", "standard default", "use default", "apply default", "yes, apply", "recommended defaults")) or ans == "recommended":
+        return {
+            "useful_life_years": "3",
+            "depreciation_method": "STRAIGHT_LINE",
+            "salvage_value": "0",
         }
 
     return None
@@ -586,3 +586,164 @@ def compose_consultative_response_with_draft(
         parts.append(f"\n{next_question}")
 
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Frontier Modules Enrichment Bridge (DOC-CFO-2026-FRONTIER-V1)
+# ---------------------------------------------------------------------------
+
+def enrich_frontier_metadata(
+    *,
+    user_message: Optional[str] = None,
+    living_draft: Optional[Dict[str, Any]] = None,
+    entities: Optional[Dict[str, Any]] = None,
+    intent: Optional[str] = None,
+    tool_result_data: Optional[Dict[str, Any]] = None,
+    is_completed: bool = False,
+    historical_records: Optional[Sequence[Dict[str, Any]]] = None,
+    recent_transactions: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Enrich turn payload with the 4 frontier conversational modules (DOC-CFO-2026-FRONTIER-V1).
+
+    1. Interactive Artifacts (Pillar 1):
+       - Attaches tappable account pills, reactive depreciation sliders, Section 153 WHT toggle.
+    2. "What-If" Financial Simulation (Pillar 2):
+       - Evaluates Lease vs Buy (IFRS 16), Cash vs Bank (Section 73 ITO 2001), Capitalize vs Expense (IAS 16).
+    3. Episodic Memory & Vendor Fingerprinting (Pillar 3):
+       - Identifies vendor payment customs, 30-day ATL freshness check, and 72-hour duplicate/structuring hazards.
+    4. Post-Transaction "Next Best Action" (Pillar 4):
+       - Monitors budget burn headroom, statutory FBR filing calendars (14th/15th/18th), and cash runway impact.
+    """
+    out: Dict[str, Any] = {
+        "interactive_artifacts": None,
+        "simulations": None,
+        "vendor_insights": None,
+        "next_best_actions": None,
+    }
+    ents = dict(entities or {})
+    low_msg = (user_message or "").lower()
+
+    # 1. Interactive Artifacts
+    if living_draft:
+        art = living_draft.get("interactive_artifact")
+        if art:
+            out["interactive_artifacts"] = [art]
+
+    # 2. What-If Financial Simulation
+    scenario_type = None
+    if any(k in low_msg for k in ("lease vs buy", "lease or buy", "ifrs 16", "ifrs16", "rent vs buy")):
+        scenario_type = "lease_vs_buy"
+    elif any(k in low_msg for k in ("cash vs bank", "cash or bank", "section 73", "sec 73", "cash limit")):
+        scenario_type = "cash_vs_bank"
+    elif any(k in low_msg for k in ("capitalize vs expense", "capex vs opex", "capitalize or expense", "ias 16", "ias16")):
+        scenario_type = "capitalize_vs_expense"
+
+    if scenario_type:
+        try:
+            from app.financial_simulation import simulate_scenario
+
+            amt = None
+            for k in ("amount", "total_amount", "cost", "total"):
+                if ents.get(k):
+                    try:
+                        amt = float(str(ents[k]).replace(",", ""))
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if not amt or amt <= 0:
+                amt = 150000.0  # sensible baseline simulation amount
+            sim_res = simulate_scenario(scenario_type=scenario_type, amount=amt)
+            out["simulations"] = [sim_res.model_dump()]
+        except Exception as _sim_exc:
+            log.warning("frontier.simulation_failed", error=str(_sim_exc)[:160])
+
+    # 3. Episodic Memory & Vendor Fingerprinting Guard
+    v_name = (
+        ents.get("vendor_name")
+        or ents.get("supplier_name")
+        or ents.get("party_name")
+        or (ents.get("counterparty", {}).get("name") if isinstance(ents.get("counterparty"), dict) else None)
+    )
+    if v_name and isinstance(v_name, str) and v_name.strip():
+        try:
+            from app.vendor_memory_guard import lookup_vendor_fingerprint, check_duplicate_risk
+
+            amt = 0.0
+            for k in ("amount", "total_amount", "total"):
+                if ents.get(k):
+                    try:
+                        amt = float(str(ents[k]).replace(",", ""))
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            fp = lookup_vendor_fingerprint(
+                vendor_name=v_name,
+                historical_records=historical_records or (),
+            )
+            dup_res = check_duplicate_risk(
+                vendor_name=v_name,
+                amount=amt,
+                invoice_ref=ents.get("invoice_number") or ents.get("bill_number") or ents.get("invoice_ref"),
+                recent_transactions=recent_transactions or (),
+                payment_method=ents.get("payment_method") or ents.get("payment_channel"),
+            )
+            v_dict: Dict[str, Any] = {
+                "vendor_name": v_name,
+                "duplicate_scan": dup_res.model_dump(),
+            }
+            if fp:
+                v_dict["fingerprint"] = fp.model_dump()
+                v_dict["suggested_terms_prompt"] = fp.suggest_terms_prompt()
+            out["vendor_insights"] = v_dict
+        except Exception as _vg_exc:
+            log.warning("frontier.vendor_memory_failed", error=str(_vg_exc)[:160])
+
+    # 4. Post-Transaction Next Best Action & Virtual CFO
+    if is_completed:
+        try:
+            from app.next_best_action import generate_next_best_actions
+
+            amt = 0.0
+            for k in ("amount", "total_amount", "total"):
+                if ents.get(k):
+                    try:
+                        amt = float(str(ents[k]).replace(",", ""))
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if not amt and living_draft:
+                amt = float(living_draft.get("total_amount") or 0.0)
+
+            tx_lines = []
+            if living_draft and living_draft.get("voucher_preview"):
+                for l in living_draft["voucher_preview"]:
+                    if isinstance(l, dict):
+                        tx_lines.append(l)
+                    elif hasattr(l, "model_dump"):
+                        tx_lines.append(l.model_dump())
+
+            tx_payload = {
+                "intent": intent,
+                "total": amt,
+                "amount": amt,
+                "date": ents.get("transaction_date") or ents.get("date") or (living_draft.get("transaction_date") if living_draft else None),
+                "payment_channel": ents.get("payment_channel") or ents.get("payment_method") or (living_draft.get("payment_channel") if living_draft else None),
+                "bank_name": ents.get("bank_name") or (living_draft.get("bank_name") if living_draft else None),
+                "vendor_name": v_name,
+                "lines": tx_lines,
+                "is_capex": (
+                    ents.get("transaction_nature") == "FIXED_ASSET"
+                    or (living_draft.get("depreciation_schedule") is not None if living_draft else False)
+                ),
+            }
+
+            nba_res = generate_next_best_actions(
+                posted_transaction=tx_payload
+            )
+            out["next_best_actions"] = [item.model_dump() for item in nba_res.items]
+        except Exception as _nba_exc:
+            log.warning("frontier.next_best_action_failed", error=str(_nba_exc)[:160])
+
+    return out
+

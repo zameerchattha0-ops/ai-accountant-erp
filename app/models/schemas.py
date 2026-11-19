@@ -241,6 +241,11 @@ class AgentResponse(BaseModel):
     # LIVING DRAFT VOUCHER (Pillar 2 / Decision 2A): structured preview card
     # rendered in the frontend sidebar/preview pane while keeping foreground chat natural.
     living_draft: Optional[Dict[str, Any]] = None
+    # FRONTIER ADVISORY & INTERACTIVE MODULES (DOC-CFO-2026-FRONTIER-V1):
+    interactive_artifacts: Optional[List[Dict[str, Any]]] = None
+    simulations: Optional[List[Dict[str, Any]]] = None
+    next_best_actions: Optional[List[Dict[str, Any]]] = None
+    vendor_insights: Optional[Dict[str, Any]] = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -292,6 +297,11 @@ class ClarificationResponse(BaseModel):
     execution_id: uuid.UUID
     question: str
     required_information: List[str] = Field(default_factory=list)
+    living_draft: Optional[Dict[str, Any]] = None
+    interactive_artifacts: Optional[List[Dict[str, Any]]] = None
+    simulations: Optional[List[Dict[str, Any]]] = None
+    next_best_actions: Optional[List[Dict[str, Any]]] = None
+    vendor_insights: Optional[Dict[str, Any]] = None
 
 
 class ConfirmationResponse(BaseModel):
@@ -306,6 +316,11 @@ class ConfirmationResponse(BaseModel):
     # LIVING DRAFT VOUCHER (Pillar 2 / Decision 2A): structured preview card
     # rendered in the frontend sidebar/preview pane while keeping foreground chat natural.
     living_draft: Optional[Dict[str, Any]] = None
+    # FRONTIER ADVISORY & INTERACTIVE MODULES (DOC-CFO-2026-FRONTIER-V1):
+    interactive_artifacts: Optional[List[Dict[str, Any]]] = None
+    simulations: Optional[List[Dict[str, Any]]] = None
+    next_best_actions: Optional[List[Dict[str, Any]]] = None
+    vendor_insights: Optional[Dict[str, Any]] = None
 
 
 class ClarificationAnswer(BaseModel):
