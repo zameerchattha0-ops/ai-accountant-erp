@@ -935,3 +935,144 @@ def build_intent_progression(
         "missing_info": missing_desc,
     }
 
+
+async def synthesize_cumulative_dialogue_intent(
+    *,
+    user_request: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    current_entities: Optional[Dict[str, Any]] = None,
+    latest_question: str = "",
+    user_reply: str = "",
+    missing_fields: Optional[List[str]] = None,
+    client: Optional[Any] = None,
+    timeout: float = 8.0,
+) -> Dict[str, Any]:
+    """Synthesize user's clarification answer in full cumulative dialogue context with initial query.
+
+    Zero-Assumption Rule: Only record facts explicitly provided or confirmed by the user.
+    Analyzes Turn 0 (user request) + Turn 1 (question) + Turn 2 (answer) collectively.
+    """
+    import asyncio
+    import json
+    import re
+    from app.date_parser import parse_transaction_date
+
+    merged = dict(current_entities or {})
+    raw_reply = str(user_reply or "").strip()
+    if not raw_reply:
+        return {"entities": merged, "reasoning": "", "is_complete": False}
+
+    # 1. Deterministic extraction & corrections
+    corr = extract_conversational_corrections(raw_reply, merged)
+    if corr:
+        merged.update(corr)
+
+    sched = expand_standard_schedule_answers(raw_reply, merged)
+    if sched:
+        merged.update(sched)
+
+    # 2. LLM Cumulative Extraction if client available
+    llm_extracted: Dict[str, Any] = {}
+    if client is None:
+        try:
+            from app.ai_orchestrator import get_client
+            client = get_client()
+        except Exception:
+            client = None
+
+    if client is not None:
+        try:
+            formatted_history = []
+            for h in (history or []):
+                q = h.get("question") or h.get("field") or ""
+                a = h.get("answer") or ""
+                if q or a:
+                    formatted_history.append(f"Q: {q}\nA: {a}")
+            hist_str = "\n".join(formatted_history) if formatted_history else "None (First clarification round)"
+            ents_str = json.dumps(merged, default=str)
+            missing_str = ", ".join(missing_fields or [])
+
+            prompt = (
+                "You are an expert Chartered Accountant and ERP Intelligence Engine.\n"
+                "You are evaluating a multi-turn conversation where a user is recording an accounting entry.\n"
+                "CRITICAL ZERO-ASSUMPTION RULE: The user's query and answers are the ONLY source of truth. "
+                "Never assume or invent details. Combine all turns into a unified accounting understanding.\n\n"
+                f"INITIAL USER REQUEST:\n\"{user_request}\"\n\n"
+                f"PRIOR CONVERSATION TRANSCRIPT:\n{hist_str}\n\n"
+                f"CURRENTLY VERIFIED ENTITIES:\n{ents_str}\n\n"
+                f"LATEST QUESTION ASKED BY YOU:\n\"{latest_question}\"\n\n"
+                f"USER'S LATEST ANSWER:\n\"{raw_reply}\"\n\n"
+                f"FIELDS CURRENTLY NEEDED FOR TRUE ACCOUNTING TREATMENT:\n{missing_str}\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Analyze how the user's latest answer answers the question in the context of their initial query.\n"
+                "2. Extract updated entity fields (e.g., payment_method, bank_name, useful_life_years, depreciation_method, supplier_name, transaction_date).\n"
+                "3. Apply accounting standards: If useful life given, classify capex (IAS 16). If bank name mentioned, set payment_method='BANK' and bank_name.\n"
+                "4. Output STRICT JSON in this exact format (no markdown fences, no commentary):\n"
+                "{\n"
+                "  \"updated_entities\": {\"<field_name>\": \"<value>\"},\n"
+                "  \"reasoning\": \"<1-2 sentences on accounting and tax statutory treatment>\"\n"
+                "}"
+            )
+            raw_llm = await asyncio.wait_for(
+                client.generate_text_light(prompt=prompt),
+                timeout=timeout,
+            )
+            match = re.search(r"\{.*\}", str(raw_llm or ""), re.S)
+            if match:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict) and isinstance(parsed.get("updated_entities"), dict):
+                    llm_extracted = parsed["updated_entities"]
+        except Exception as exc:
+            log.warning("conversational_manager.cumulative_llm_failed", error=str(exc)[:200])
+
+    if llm_extracted:
+        for k, v in llm_extracted.items():
+            if v not in (None, "", "null"):
+                if k in ("useful_life_years", "useful_life"):
+                    try:
+                        merged["useful_life_years"] = int(v)
+                        merged["useful_life"] = int(v)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    merged[k] = v
+
+    # 3. Grounded Field Safeguards (ensuring bank names, dates, amounts are reliably mapped)
+    reply_up = raw_reply.upper()
+    for b_kw in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
+        if b_kw in reply_up:
+            merged["bank_name"] = b_kw.title()
+            merged["payment_method"] = "BANK"
+            merged["payment_type"] = "BANK"
+            break
+    if "CASH" in reply_up:
+        merged.setdefault("payment_method", "CASH")
+        merged.setdefault("payment_type", "CASH")
+    elif any(k in reply_up for k in ("CREDIT", "LATER", "PAYABLE", "ON CREDIT")):
+        merged["payment_method"] = "CREDIT"
+        merged["payment_type"] = "CREDIT"
+
+    # Date parsing check
+    dt_res = parse_transaction_date(raw_reply)
+    if dt_res.ok:
+        merged["transaction_date"] = dt_res.iso_date
+        merged["expense_date"] = dt_res.iso_date
+
+    # Useful life integer fallback
+    m_life = re.search(r"\b(\d+)\s*(?:years?|yrs?|saal)\b", raw_reply, re.IGNORECASE)
+    if m_life and not merged.get("useful_life_years"):
+        merged["useful_life_years"] = int(m_life.group(1))
+        merged["useful_life"] = int(m_life.group(1))
+
+    # WHT Exemption Certificate check
+    if any(k in raw_reply.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "0% wht", "zero tax", "no deduction")):
+        merged["wht_status"] = "EXEMPT"
+        merged["wht_decision"] = "EXEMPT"
+        merged["wht_exempt"] = True
+        merged["wht_rate_percent"] = 0.0
+
+    return {
+        "entities": merged,
+        "is_complete": not any(merged.get(f) in (None, "", []) for f in (missing_fields or [])),
+    }
+

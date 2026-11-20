@@ -16149,6 +16149,27 @@ async def resume_with_clarification(
 
         # Multi-field answer extraction for Turn 2 user response
         if answer:
+            try:
+                from app.conversational_manager import synthesize_cumulative_dialogue_intent
+                _latest_q = ""
+                for _h in reversed(history or []):
+                    if _h.get("question") and str(_h.get("question")) != str(_h.get("field")):
+                        _latest_q = str(_h.get("question"))
+                        break
+                _synth_res = await synthesize_cumulative_dialogue_intent(
+                    user_request=str(session.get("user_request") or ""),
+                    history=history,
+                    current_entities=merged_entities,
+                    latest_question=_latest_q,
+                    user_reply=answer,
+                    missing_fields=missing_fields,
+                    client=questionnaire_client,
+                )
+                if _synth_res and _synth_res.get("entities"):
+                    merged_entities.update(_synth_res["entities"])
+            except Exception as _synth_err:
+                log.warning("agent.cumulative_synthesis_fallback", error=str(_synth_err)[:200])
+
             parts = [p.strip() for p in re.split(r"[,;\n]+", answer) if p.strip()]
             for part in parts:
                 m_life = re.search(r"(\d+)\s*(?:years?|yrs?)(?:\s*useful\s*life)?|\buseful\s*life\s*(?:of|:)?\s*(\d+)", part, re.IGNORECASE)
