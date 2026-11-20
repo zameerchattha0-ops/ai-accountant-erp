@@ -77,7 +77,7 @@ export default function AICommandBox() {
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
 
   const run: AgentRunState = useSyncExternalStore(
     agentRunStore.subscribe,
@@ -103,10 +103,14 @@ export default function AICommandBox() {
     agentRunStore.ensureReattach();
   }, []);
 
-  // Auto-scroll chat to bottom when new messages or chunks arrive
+  // Auto-scroll chat to bottom inside its container (without scrolling the outer window/page)
   useEffect(() => {
-    if (messages.length > 0) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = chatContainerRef.current;
+    if (container && messages.length > 0) {
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: "smooth",
+      });
     }
   }, [messages.length, run.streamingText, response]);
 
@@ -237,7 +241,10 @@ export default function AICommandBox() {
 
       {/* Main Conversation Stream (Claude-Style Multi-Turn Thread) */}
       {hasMessages && (
-        <div className="rounded-2xl border border-border-default bg-bg-surface/80 backdrop-blur-xs shadow-md p-4 max-h-[65vh] md:max-h-[70vh] overflow-y-auto space-y-5 animate-in fade-in duration-200">
+        <div
+          ref={chatContainerRef}
+          className="rounded-2xl border border-border-default bg-bg-surface/80 backdrop-blur-xs shadow-md p-4 max-h-[65vh] md:max-h-[70vh] overflow-y-auto space-y-5 animate-in fade-in duration-200"
+        >
           {messages.map((msg, index) => {
             const isUser = msg.role === "user";
             const isLatestAssistant = !isUser && index === messages.length - 1;
@@ -392,7 +399,6 @@ export default function AICommandBox() {
               </div>
             );
           })}
-          <div ref={messagesEndRef} />
         </div>
       )}
 
