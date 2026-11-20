@@ -302,8 +302,8 @@ export default function AICommandBox() {
                   {/* Assistant Interactive Cards & Live Draft (Rendered seamlessly in-flow) */}
                   {!isUser && msgResponse && (
                     <div className="space-y-3 w-full">
-                      {/* Real-time Living Draft Voucher Card (Pillar 2 / Decision 2A) */}
-                      {Boolean(livingDraft) && (
+                      {/* Real-time Living Draft Voucher Card (only rendered when reviewing, never during clarification) */}
+                      {Boolean(livingDraft) && msgResponse.status !== ExecutionStatus.AWAITING_CLARIFICATION && (
                         <LivingDraftCard
                           draft={livingDraft!}
                           className="w-full shadow-xs"
