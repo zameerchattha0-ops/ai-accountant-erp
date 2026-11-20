@@ -246,6 +246,8 @@ class AgentResponse(BaseModel):
     simulations: Optional[List[Dict[str, Any]]] = None
     next_best_actions: Optional[List[Dict[str, Any]]] = None
     vendor_insights: Optional[Dict[str, Any]] = None
+    # LIVE INTENT PROGRESSION TRACKER:
+    intent_progression: Optional[Dict[str, Any]] = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -302,6 +304,8 @@ class ClarificationResponse(BaseModel):
     simulations: Optional[List[Dict[str, Any]]] = None
     next_best_actions: Optional[List[Dict[str, Any]]] = None
     vendor_insights: Optional[Dict[str, Any]] = None
+    # LIVE INTENT PROGRESSION TRACKER:
+    intent_progression: Optional[Dict[str, Any]] = None
 
 
 class ConfirmationResponse(BaseModel):
@@ -321,6 +325,8 @@ class ConfirmationResponse(BaseModel):
     simulations: Optional[List[Dict[str, Any]]] = None
     next_best_actions: Optional[List[Dict[str, Any]]] = None
     vendor_insights: Optional[Dict[str, Any]] = None
+    # LIVE INTENT PROGRESSION TRACKER:
+    intent_progression: Optional[Dict[str, Any]] = None
 
 
 class ClarificationAnswer(BaseModel):

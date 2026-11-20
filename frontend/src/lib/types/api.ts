@@ -132,6 +132,19 @@ export interface OnboardingAnswer {
 
 /* ---- Responses ---- */
 
+export interface VerifiedFact {
+  label: string;
+  value: string;
+}
+
+export interface IntentProgression {
+  intent?: string;
+  status: "clarifying" | "reviewing" | "completed";
+  verified_facts: VerifiedFact[];
+  active_reasoning: string;
+  missing_info?: string | null;
+}
+
 export interface AgentResponse {
   status: ExecutionStatus;
   execution_id?: string;
@@ -156,6 +169,8 @@ export interface AgentResponse {
   data?: Record<string, unknown>;
   /** Living draft voucher preview for real-time sidebar/preview pane (Pillar 2 / Decision 2A). */
   living_draft?: LivingDraft;
+  /** Live Intent Progression Tracker state (DOC-CFO-2026-PROGRESSION-V1) */
+  intent_progression?: IntentProgression;
 }
 
 export interface LivingDraftLineItem {

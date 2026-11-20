@@ -9905,7 +9905,6 @@ async def execute(
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
 
-            _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else None
             _frontier = {}
             try:
                 from app.conversational_manager import enrich_frontier_metadata
@@ -9917,6 +9916,10 @@ async def execute(
                 )
             except Exception as _f_exc:
                 log.warning("agent.enrich_frontier_clarification_failed", error=str(_f_exc)[:160])
+
+            _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else {}
+            if _frontier.get("intent_progression"):
+                _resp_data["intent_progression"] = _frontier["intent_progression"]
 
             _safe_question = _conv_q or (clarification.get("question", question) if isinstance(clarification, dict) else question)
 
@@ -9938,6 +9941,8 @@ async def execute(
 
                 living_draft=_living_draft_dict,
 
+                intent_progression=_frontier.get("intent_progression"),
+
                 interactive_artifacts=_frontier.get("interactive_artifacts"),
 
                 simulations=_frontier.get("simulations"),
@@ -9946,7 +9951,7 @@ async def execute(
 
                 next_best_actions=_frontier.get("next_best_actions"),
 
-                data=_resp_data,
+                data=_resp_data or None,
 
             )
 
@@ -12967,6 +12972,8 @@ async def execute(
 
                 living_draft=_conf_ld,
 
+                intent_progression=_conf_frontier.get("intent_progression"),
+
                 interactive_artifacts=_conf_frontier.get("interactive_artifacts"),
 
                 simulations=_conf_frontier.get("simulations"),
@@ -12975,7 +12982,10 @@ async def execute(
 
                 next_best_actions=_conf_frontier.get("next_best_actions"),
 
-                data={"living_draft": _conf_ld} if _conf_ld else None,
+                data={
+                    **({"living_draft": _conf_ld} if _conf_ld else {}),
+                    **({"intent_progression": _conf_frontier["intent_progression"]} if _conf_frontier.get("intent_progression") else {}),
+                } or None,
 
             )
 
@@ -15389,6 +15399,20 @@ async def execute(
 
 
 
+        _comp_prog = None
+        try:
+            from app.conversational_manager import build_intent_progression
+            _comp_prog = build_intent_progression(
+                intent=execution_plan.intent,
+                entities=execution_plan.extracted_entities,
+                missing_fields=[],
+                status="completed" if verified else "reviewing",
+            )
+            if _comp_prog and isinstance(response_data, dict):
+                response_data["intent_progression"] = _comp_prog
+        except Exception:
+            pass
+
         return AgentResponse(
 
             status=status,
@@ -15404,6 +15428,8 @@ async def execute(
             accounting_impact=accounting_impact if accounting_impact else None,
 
             verification_status="VERIFIED" if verified else "FAILED",
+
+            intent_progression=_comp_prog,
 
             data=response_data,
 
@@ -15892,6 +15918,20 @@ async def resume_with_clarification(
                 }),
             )
             await _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION)
+            _prog_consult = None
+            try:
+                from app.conversational_manager import build_intent_progression
+                _prog_consult = build_intent_progression(
+                    intent=_intent,
+                    entities=_ents,
+                    missing_fields=_missing,
+                    status="clarifying",
+                    custom_reasoning=_advice.advisory_markdown if hasattr(_advice, "advisory_markdown") else str(_advice),
+                    active_question=_composed_q,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -15902,7 +15942,12 @@ async def resume_with_clarification(
                 required_information=_missing,
                 requires_user_input=True,
                 living_draft=_ld_dict,
-                data={"living_draft": _ld_dict, "advisory": _advice.model_dump()},
+                intent_progression=_prog_consult,
+                data={
+                    "living_draft": _ld_dict,
+                    "advisory": _advice.model_dump(),
+                    **({"intent_progression": _prog_consult} if _prog_consult else {}),
+                },
             )
     except Exception as _c_err:
         log.warning("agent.consultative_intercept_failed", error=str(_c_err)[:200])
@@ -16275,6 +16320,19 @@ async def resume_with_clarification(
                 ),
                 _update_status(session_id, ExecutionStatus.AWAITING_CLARIFICATION),
             )
+            _prog_clar = None
+            try:
+                from app.conversational_manager import build_intent_progression
+                _prog_clar = build_intent_progression(
+                    intent=intent,
+                    entities=merged_entities,
+                    missing_fields=still_missing,
+                    status="clarifying",
+                    active_question=prog_q.question_text,
+                )
+            except Exception:
+                pass
+
             return AgentResponse(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
@@ -16285,7 +16343,11 @@ async def resume_with_clarification(
                 required_information=[next_field],
                 requires_user_input=True,
                 living_draft=_ld_dict,
-                data={"living_draft": _ld_dict},
+                intent_progression=_prog_clar,
+                data={
+                    "living_draft": _ld_dict,
+                    **({"intent_progression": _prog_clar} if _prog_clar else {}),
+                },
             )
 
         if not still_missing:
@@ -16750,9 +16812,24 @@ async def resume_with_clarification(
                     except Exception:
                         pass
 
-                    _data_payload = {"tool_name": single_hop_call.tool_name, "tool_result": tool_result.data}
-                    if _completed_ld:
-                        _data_payload["living_draft"] = _completed_ld
+                    _prog_done = None
+                    try:
+                        from app.conversational_manager import build_intent_progression
+                        _prog_done = build_intent_progression(
+                            intent=intent,
+                            entities=merged_entities,
+                            missing_fields=[],
+                            status="completed",
+                        )
+                    except Exception:
+                        pass
+
+                    _data_payload = {
+                        "tool_name": single_hop_call.tool_name,
+                        "tool_result": tool_result.data,
+                        **({"living_draft": _completed_ld} if _completed_ld else {}),
+                        **({"intent_progression": _prog_done} if _prog_done else {}),
+                    }
 
                     return AgentResponse(
                         status=final_status,
@@ -16761,6 +16838,7 @@ async def resume_with_clarification(
                         action=intent,
                         data=_data_payload,
                         living_draft=_completed_ld,
+                        intent_progression=_prog_done,
                         requires_user_input=False,
                         confirmation_required=False,
                         verification_status="VERIFIED",

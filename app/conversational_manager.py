@@ -619,9 +619,22 @@ def enrich_frontier_metadata(
         "simulations": None,
         "vendor_insights": None,
         "next_best_actions": None,
+        "intent_progression": None,
     }
     ents = dict(entities or {})
     low_msg = (user_message or "").lower()
+
+    # Live Intent Progression Synthesis
+    try:
+        prog_status = "completed" if is_completed else ("clarifying" if (living_draft and living_draft.get("missing_fields")) else "reviewing")
+        out["intent_progression"] = build_intent_progression(
+            intent=intent,
+            entities=ents,
+            missing_fields=living_draft.get("missing_fields") if living_draft else None,
+            status=prog_status,
+        )
+    except Exception as _prog_exc:
+        log.warning("frontier.intent_progression_failed", error=str(_prog_exc)[:160])
 
     # 1. Interactive Artifacts
     if living_draft:
@@ -753,4 +766,172 @@ def enrich_frontier_metadata(
             log.warning("frontier.next_best_action_failed", error=str(_nba_exc)[:160])
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Live Intent Progression Builder (DOC-CFO-2026-PROGRESSION-V1)
+# ---------------------------------------------------------------------------
+
+def build_intent_progression(
+    *,
+    intent: Optional[str] = None,
+    entities: Optional[Dict[str, Any]] = None,
+    missing_fields: Optional[Sequence[str]] = None,
+    status: str = "clarifying",
+    custom_reasoning: Optional[str] = None,
+    active_question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Construct a clean, live Intent Progression dictionary for UI tracking.
+
+    Returns a structured object showing verified facts, active LLM reasoning,
+    and missing details, replacing cluttered interactive voucher cards.
+    """
+    ents = dict(entities or {})
+    missing = [str(f).strip() for f in (missing_fields or []) if str(f).strip()]
+    facts: List[Dict[str, str]] = []
+
+    # 1. Counterparty
+    party = (
+        ents.get("counterparty")
+        or ents.get("supplier_name")
+        or ents.get("customer_name")
+        or ents.get("employee_name")
+        or ents.get("vendor_name")
+        or ents.get("party_name")
+    )
+    if isinstance(party, dict):
+        party_name = party.get("name")
+    else:
+        party_name = str(party).strip() if party else None
+    if party_name and party_name.lower() not in ("none", "null", ""):
+        low_i = (intent or "").lower()
+        party_role = "Vendor" if any(k in low_i for k in ("supplier", "purchase", "expense", "asset", "bill", "payable")) else ("Customer" if any(k in low_i for k in ("sale", "invoice", "receipt", "receivable")) else "Counterparty")
+        facts.append({"label": party_role, "value": party_name})
+
+    # 2. Total Amount
+    raw_amt = ents.get("amount") or ents.get("total_amount") or ents.get("cost")
+    if raw_amt not in (None, ""):
+        try:
+            amt_val = float(str(raw_amt).replace(",", "").strip())
+            curr = str(ents.get("currency") or "PKR").upper()
+            facts.append({"label": "Amount", "value": f"{curr} {amt_val:,.2f}"})
+        except (ValueError, TypeError):
+            facts.append({"label": "Amount", "value": str(raw_amt)})
+
+    # 3. Item / Description
+    item = ents.get("item_description") or ents.get("description") or ents.get("product_name") or ents.get("asset_name") or ents.get("service_name")
+    if item and str(item).strip().lower() not in ("none", "null", ""):
+        qty = ents.get("quantity")
+        qty_str = f" ({qty:g} units)" if isinstance(qty, (int, float)) and qty > 1 else ""
+        facts.append({"label": "Description", "value": f"{str(item).strip()}{qty_str}"})
+
+    # 4. Classification / Nature
+    nature = ents.get("transaction_nature")
+    if nature:
+        nature_str = str(nature).upper()
+        if "FIXED" in nature_str:
+            facts.append({"label": "Classification", "value": "Capital Asset (IAS 16)"})
+        elif "INVENTORY" in nature_str:
+            facts.append({"label": "Classification", "value": "Inventory for Resale"})
+        elif "EXPENSE" in nature_str or "OPERATING" in nature_str:
+            facts.append({"label": "Classification", "value": "Operating Expense (P&L)"})
+        elif "SERVICE" in nature_str:
+            facts.append({"label": "Classification", "value": "Services"})
+        else:
+            facts.append({"label": "Classification", "value": nature_str.replace("_", " ").title()})
+
+    # 5. Useful Life & Depreciation
+    life = ents.get("useful_life_years") or ents.get("useful_life")
+    if life not in (None, "", "NONE"):
+        method = str(ents.get("depreciation_method") or "Straight-Line").replace("_", " ").title()
+        facts.append({"label": "Useful Life", "value": f"{life} Years ({method})"})
+
+    # 6. Payment Channel & Bank
+    pm = ents.get("payment_channel") or ents.get("payment_method") or ents.get("payment_type")
+    bank = ents.get("bank_name")
+    if pm:
+        pm_str = str(pm).upper()
+        if "BANK" in pm_str or "TRANSFER" in pm_str:
+            val = "Bank Transfer" + (f" ({bank})" if bank else "")
+        elif "CASH" in pm_str:
+            val = "Cash in Hand"
+        elif "CREDIT" in pm_str or "PAYABLE" in pm_str:
+            val = "On Credit (Payable)"
+        elif "CHEQUE" in pm_str:
+            val = "Crossed Cheque" + (f" ({bank})" if bank else "")
+        else:
+            val = pm_str.replace("_", " ").title()
+        facts.append({"label": "Payment Method", "value": val})
+
+    # 7. Tax / WHT Treatment
+    wht_dec = ents.get("wht_decision") or ents.get("wht_status")
+    wht_rate = ents.get("wht_rate_percent")
+    if wht_dec:
+        if str(wht_dec).upper() == "EXEMPT" or ents.get("wht_exempt"):
+            facts.append({"label": "WHT Treatment", "value": "Exempt (Valid Certificate)"})
+        elif wht_rate is not None:
+            facts.append({"label": "WHT Treatment", "value": f"Section 153 Deduct ({wht_rate:g}%)"})
+        else:
+            facts.append({"label": "WHT Treatment", "value": "Section 153 Applicable"})
+
+    # 8. Transaction Date
+    tx_date = ents.get("transaction_date") or ents.get("expense_date")
+    if tx_date:
+        facts.append({"label": "Posting Date", "value": str(tx_date)})
+
+    # 9. Account Type (for setup / master data tasks)
+    acct_type = ents.get("account_type")
+    if acct_type:
+        facts.append({"label": "Account Type", "value": str(acct_type).upper()})
+
+    # Active Reasoning Synthesis
+    if custom_reasoning:
+        reasoning = custom_reasoning
+    elif status == "completed":
+        reasoning = "Transaction verified and successfully posted to the general ledger with balanced entries."
+    elif status == "reviewing" or not missing:
+        reasoning = "All statutory and accounting requirements verified. Ready for balanced double-entry voucher review."
+    else:
+        reasons: List[str] = []
+        if any(f in missing for f in ("transaction_nature", "transaction_intent")):
+            reasons.append("Determining capital expenditure (IAS 16) vs immediate operating expense.")
+        if any(f in missing for f in ("useful_life_years", "depreciation_method")):
+            reasons.append("Establishing IAS 16 asset useful life and depreciation policy.")
+        if any(f in missing for f in ("payment_channel", "payment_method")):
+            reasons.append("Checking Section 73 corporate banking channel compliance.")
+        if any(f in missing for f in ("wht_certificate", "wht_status", "sales_tax_status")):
+            reasons.append("Verifying FBR Section 153 withholding tax rate and ATL filer status.")
+        if any(f in missing for f in ("supplier_name", "customer_name", "counterparty")):
+            reasons.append("Identifying counterparty ledger for balanced party reconciliation.")
+        if any(f in missing for f in ("amount", "total_amount")):
+            reasons.append("Establishing total financial value for journal line balancing.")
+        if any(f in missing for f in ("transaction_date", "expense_date")):
+            reasons.append("Setting transaction posting date for period sequencing.")
+        reasoning = " ".join(reasons) if reasons else "Gathering required transaction parameters to ensure true accounting treatment."
+
+    # Missing Info summary
+    missing_desc: Optional[str] = None
+    if missing:
+        field_labels = {
+            "useful_life_years": "Useful Life (years)",
+            "transaction_nature": "Classification (Capex vs Opex)",
+            "payment_channel": "Payment Channel (Bank vs Cash)",
+            "payment_method": "Payment Method",
+            "supplier_name": "Supplier / Vendor Name",
+            "customer_name": "Customer Name",
+            "amount": "Total Amount",
+            "transaction_date": "Posting Date",
+            "account_type": "Account Type (Asset/Expense/etc.)",
+            "wht_certificate": "Withholding Tax Certificate Status",
+        }
+        human_missing = [field_labels.get(f, f.replace("_", " ").title()) for f in missing[:3]]
+        missing_desc = ", ".join(human_missing)
+
+    return {
+        "intent": intent or "record_transaction",
+        "status": status,
+        "verified_facts": facts,
+        "active_reasoning": reasoning,
+        "missing_info": missing_desc,
+    }
 

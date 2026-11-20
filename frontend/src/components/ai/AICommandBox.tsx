@@ -37,6 +37,8 @@ import AIClarification from "./AIClarification";
 import AIConfirmation from "./AIConfirmation";
 import LivingDraftCard from "./LivingDraftCard";
 import AIChatHistoryDrawer from "./AIChatHistoryDrawer";
+import IntentProgressionTracker from "./IntentProgressionTracker";
+import type { IntentProgression } from "@/lib/types/api";
 
 const PLACEHOLDERS = [
   "Ask anything or record a transaction (e.g. 'Cash purchase of Rs. 25,000')...",
@@ -120,6 +122,13 @@ export default function AICommandBox() {
   const clarificationSummary = isAwaitingClarification
     ? getClarificationSummary(response?.question)
     : "";
+
+  const latestAssistantMessage = [...messages].reverse().find((m) => m.role === "assistant");
+  const activeProgression: IntentProgression | undefined =
+    response?.intent_progression ||
+    (response?.data?.intent_progression as IntentProgression | undefined) ||
+    latestAssistantMessage?.response?.intent_progression ||
+    (latestAssistantMessage?.response?.data?.intent_progression as IntentProgression | undefined);
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -400,6 +409,11 @@ export default function AICommandBox() {
             );
           })}
         </div>
+      )}
+
+      {/* Live Intent Progression Tracker pinned directly above the command input bar */}
+      {activeProgression && (
+        <IntentProgressionTracker progression={activeProgression} className="animate-in fade-in slide-in-from-bottom-1 duration-200" />
       )}
 
       {/* Hero / Command Input Box */}
