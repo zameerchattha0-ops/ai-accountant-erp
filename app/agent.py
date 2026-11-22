@@ -16861,12 +16861,60 @@ async def resume_with_clarification(
                 elif (intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1)) and tool_result.success:
                     tot = float(merged_entities.get("amount") or 0.0)
                     n_lines = len(merged_entities.get("line_items") or [])
+
+                    # Phase 4 Dual-Registration: Capitalize any fixed assets into Fixed Asset Register
+                    capitalized_assets: List[str] = []
+                    j_entry_id = None
+                    if isinstance(tool_result.data, dict):
+                        j_entry_id = tool_result.data.get("journal_entry_id")
+                    elif isinstance(tool_result.result, dict):
+                        j_entry_id = tool_result.result.get("journal_entry_id")
+
+                    try:
+                        from app.services.fixed_asset_service import register_asset_from_split_line
+                        from app.conversational_manager import _match_asset_category
+                        raw_items = merged_entities.get("line_items") or []
+                        u_life = merged_entities.get("useful_life_years") or 3
+                        dep_m = merged_entities.get("depreciation_method") or "STRAIGHT_LINE"
+                        for ri in raw_items:
+                            if isinstance(ri, dict):
+                                d_desc = str(ri.get("description") or "")
+                                cat_m = _match_asset_category(d_desc)
+                                is_fa = (
+                                    str(ri.get("nature") or "").upper() == "FIXED_ASSET"
+                                    or "IAS 16" in str(ri.get("ifrs_standard") or "").upper()
+                                    or ri.get("is_fixed_asset")
+                                    or cat_m in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+                                    or str(ri.get("account_code") or "").startswith("15")
+                                )
+                                if is_fa:
+                                    fa_res = await register_asset_from_split_line(
+                                        organization_id=organization_id,
+                                        name=d_desc,
+                                        purchase_cost=float(ri.get("amount") or ri.get("line_total") or 0.0),
+                                        transaction_date=merged_entities.get("transaction_date") or "today",
+                                        journal_entry_id=uuid.UUID(str(j_entry_id)) if j_entry_id else None,
+                                        useful_life_years=int(u_life) if u_life else 3,
+                                        depreciation_method=str(dep_m),
+                                        account_code=ri.get("account_code"),
+                                        account_name=ri.get("account_name"),
+                                        created_by=user_id,
+                                    )
+                                    capitalized_assets.append(f"{d_desc} (PKR {float(ri.get('amount') or 0):,.2f})")
+                    except Exception as _fa_exc:
+                        log.warning("agent.compound_asset_registration_failed", error=str(_fa_exc)[:200])
+
+                    fa_summary = ""
+                    if capitalized_assets:
+                        fa_summary = f"* **Capitalized in Fixed Assets:** {', '.join(capitalized_assets)} ({u_life}-Year {str(dep_m).replace('_', ' ').title()})\n"
+
                     result_summary = (
                         f"### ✅ Multi-Entity Split Entry Posted (Compound Journal)\n\n"
                         f"* **Total Amount:** **Rs. {tot:,.2f}**\n"
                         f"* **Allocated Lines:** {n_lines} Segregated Items (IAS 16 / IAS 38 / Opex)\n"
-                        f"* **Status:** Posted to General Ledger\n\n"
-                        f"[View in General Ledger →](/accounting/journal)"
+                        f"{fa_summary}"
+                        f"* **Status:** Posted to General Ledger" + (" & Fixed Assets Register" if capitalized_assets else "") + "\n\n"
+                        f"[View in General Ledger →](/accounting/journal)" + (" | [View in Fixed Assets →](/accounting/fixed-assets)" if capitalized_assets else "")
                     )
                 elif tool_result.success:
                     result_summary = f"Successfully completed {intent}."

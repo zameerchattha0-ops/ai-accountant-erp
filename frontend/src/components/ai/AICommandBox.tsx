@@ -280,24 +280,26 @@ export default function AICommandBox() {
                     isUser ? "flex flex-col items-end" : "flex-1"
                   )}
                 >
-                  {/* Message Bubble */}
-                  <div
-                    className={cn(
-                      "px-4 py-2.5 rounded-2xl shadow-3xs leading-relaxed",
-                      isUser
-                        ? "bg-ai-600 text-white rounded-tr-xs"
-                        : "bg-bg-muted/70 text-text-primary border border-border-subtle rounded-tl-xs"
-                    )}
-                  >
-                    {msg.content ? (
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
-                    ) : msg.streaming && loading ? (
-                      <div className="flex items-center gap-2 text-text-muted py-0.5">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-ai-600" />
-                        <span className="text-xs">Analyzing accounting policies & records...</span>
-                      </div>
-                    ) : null}
-                  </div>
+                  {/* Message Bubble (suppressed for clarification cards to prevent duplicate question rendering) */}
+                  {(!msgResponse || msgResponse.status !== ExecutionStatus.AWAITING_CLARIFICATION) && (
+                    <div
+                      className={cn(
+                        "px-4 py-2.5 rounded-2xl shadow-3xs leading-relaxed",
+                        isUser
+                          ? "bg-ai-600 text-white rounded-tr-xs"
+                          : "bg-bg-muted/70 text-text-primary border border-border-subtle rounded-tl-xs"
+                      )}
+                    >
+                      {msg.content ? (
+                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                      ) : msg.streaming && loading ? (
+                        <div className="flex items-center gap-2 text-text-muted py-0.5">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-ai-600" />
+                          <span className="text-xs">Analyzing accounting policies & records...</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
 
                   {/* Assistant Interactive Cards & Live Draft (Rendered seamlessly in-flow) */}
                   {!isUser && msgResponse && (

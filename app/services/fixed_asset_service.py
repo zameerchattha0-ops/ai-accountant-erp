@@ -754,6 +754,131 @@ async def register_asset(
     }
 
 
+async def register_asset_from_split_line(
+    organization_id: uuid.UUID,
+    *,
+    name: str,
+    purchase_cost: float,
+    transaction_date: Optional[str] = None,
+    journal_entry_id: Optional[uuid.UUID] = None,
+    useful_life_years: Optional[int] = None,
+    depreciation_method: str = "STRAIGHT_LINE",
+    salvage_value: float = 0.0,
+    account_code: Optional[str] = None,
+    account_name: Optional[str] = None,
+    created_by: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """Register and capitalize a fixed asset originating from a multi-item compound split journal.
+
+    Links the newly created asset record and depreciation schedule to the already-posted
+    compound journal entry, avoiding duplicate journal postings.
+    """
+    cost = float(purchase_cost or 0)
+    if cost <= 0:
+        raise ValueError("Asset purchase cost must be positive.")
+
+    txn_date = transaction_date or date.today().isoformat()
+
+    # 1. Resolve PPE asset account
+    asset_account = None
+    if account_code or account_name:
+        asset_account = await _resolve_gl_account(
+            organization_id,
+            account_type="ASSET",
+            keywords=_ASSET_ACCOUNT_KEYWORDS,
+            explicit_name=account_name,
+            exclude_keywords=("accumulated depreciation",),
+            exclude_non_ppe=True,
+        )
+    if not asset_account:
+        asset_account = await _resolve_gl_account(
+            organization_id,
+            account_type="ASSET",
+            keywords=_ASSET_ACCOUNT_KEYWORDS,
+            exclude_keywords=("accumulated depreciation",),
+            exclude_non_ppe=True,
+        )
+
+    # 2. Resolve depreciation accounts
+    dep_expense_account = await _resolve_gl_account(
+        organization_id,
+        account_type="EXPENSE",
+        keywords=("depreciation",),
+    )
+    acc_dep_account = await _resolve_gl_account(
+        organization_id,
+        account_type="ASSET",
+        keywords=("accumulated depreciation",),
+    )
+
+    # 3. Create asset row in fixed_assets
+    asset = await repo.create_asset(
+        organization_id=organization_id,
+        name=name.strip(),
+        purchase_date=txn_date,
+        purchase_cost=cost,
+        salvage_value=float(salvage_value or 0),
+        useful_life_years=useful_life_years,
+        depreciation_method=depreciation_method,
+        gl_asset_account_id=uuid.UUID(asset_account["id"]) if asset_account else None,
+        gl_depreciation_expense_account_id=(
+            uuid.UUID(dep_expense_account["id"]) if dep_expense_account else None
+        ),
+        gl_accumulated_depreciation_account_id=(
+            uuid.UUID(acc_dep_account["id"]) if acc_dep_account else None
+        ),
+        description=f"Acquired via compound split: {name.strip()}",
+        created_by=created_by,
+    )
+
+    # 4. Tie to compound journal if provided
+    schedule_created = False
+    if journal_entry_id:
+        j_id = uuid.UUID(str(journal_entry_id))
+        await repo.update_asset_by_id(
+            uuid.UUID(asset["id"]),
+            fields={"purchase_journal_entry_id": j_id},
+        )
+        await repo.record_asset_transaction(
+            organization_id=organization_id,
+            asset_id=uuid.UUID(asset["id"]),
+            transaction_type="PURCHASE",
+            transaction_date=txn_date,
+            amount=cost,
+            journal_entry_id=j_id,
+            details={
+                "source": "compound_journal_split",
+                "useful_life_years": useful_life_years,
+                "depreciation_method": depreciation_method,
+            },
+        )
+        if useful_life_years is not None:
+            await repo.record_depreciation_schedule(
+                organization_id=organization_id,
+                asset_id=uuid.UUID(asset["id"]),
+                depreciation_date=txn_date,
+                opening_book_value=round(cost, 2),
+                depreciation_amount=0.0,
+                closing_book_value=round(cost, 2),
+                journal_entry_id=j_id,
+            )
+            schedule_created = True
+
+    log.info(
+        "fixed_asset.registered_from_split",
+        asset_id=asset["id"],
+        journal_entry_id=str(journal_entry_id) if journal_entry_id else None,
+        cost=cost,
+        schedule_created=schedule_created,
+    )
+    return {
+        **asset,
+        "asset_registered": True,
+        "schedule_created": schedule_created,
+        "asset_account": (asset_account or {}).get("name"),
+    }
+
+
 async def record_depreciation(
     organization_id: uuid.UUID,
     *,

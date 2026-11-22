@@ -132,15 +132,41 @@ def author_single_focused_question(
 ) -> ProgressiveQuestion:
     """Construct a conversational, high-leverage question with smart accounting defaults."""
     ents = dict(entities or {})
-    item_desc = str(
-        ents.get("item_description")
-        or ents.get("description")
-        or ents.get("asset_name")
-        or ents.get("product_name")
-        or "the item"
-    ).strip()
+    line_items = ents.get("line_items") or ents.get("disaggregated_items")
 
-    raw_amt = ents.get("amount") or ents.get("total_amount")
+    # In multi-entity split transactions, if asking about fixed asset depreciation or capitalization,
+    # isolate the specific asset line item rather than using the concatenated description of all lines!
+    asset_line = None
+    if isinstance(line_items, list) and len(line_items) > 1:
+        for li in line_items:
+            if isinstance(li, dict):
+                nature = str(li.get("nature") or "").upper()
+                std = str(li.get("ifrs_standard") or "").upper()
+                desc_li = str(li.get("description") or "").lower()
+                cat = _match_asset_category(desc_li)
+                if (
+                    nature == "FIXED_ASSET"
+                    or "IAS 16" in std
+                    or li.get("is_fixed_asset")
+                    or cat in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+                    or any(k in desc_li for k in ("laptop", "computer", "macbook", "server", "equipment", "vehicle", "car", "furniture"))
+                ):
+                    asset_line = li
+                    break
+
+    if asset_line and field_to_ask in ("useful_life_years", "depreciation_method", "salvage_value", "transaction_nature"):
+        item_desc = str(asset_line.get("description") or "the asset").strip()
+        raw_amt = asset_line.get("amount") or asset_line.get("line_total")
+    else:
+        item_desc = str(
+            ents.get("item_description")
+            or ents.get("description")
+            or ents.get("asset_name")
+            or ents.get("product_name")
+            or "the item"
+        ).strip()
+        raw_amt = ents.get("amount") or ents.get("total_amount")
+
     amt: Optional[float] = None
     if raw_amt is not None:
         try:
@@ -256,9 +282,10 @@ def author_single_focused_question(
     if field_to_ask in ("useful_life_years", "depreciation_method", "salvage_value"):
         category = _match_asset_category(item_desc)
 
+        amt_phrase = f" (Rs. {amt:,.0f})" if amt else ""
         if category == "IT_EQUIPMENT":
             q_text = (
-                f"For IT equipment like **{item_desc}**, standard accounting policy under IAS 16 recommends a "
+                f"For IT equipment like **{item_desc}**{amt_phrase}, standard accounting policy under IAS 16 recommends a "
                 "**3-year useful life** using straight-line depreciation (with zero residual value). "
                 "Would you like to apply this standard schedule?"
             )
@@ -467,7 +494,26 @@ def expand_standard_schedule_answers(
             }
         return None
 
-    desc = str(entities.get("item_description") or entities.get("description") or "office furniture")
+    line_items = entities.get("line_items") or entities.get("disaggregated_items")
+    desc = None
+    if isinstance(line_items, list) and len(line_items) > 1:
+        for li in line_items:
+            if isinstance(li, dict):
+                nature = str(li.get("nature") or "").upper()
+                std = str(li.get("ifrs_standard") or "").upper()
+                desc_li = str(li.get("description") or "").lower()
+                cat_li = _match_asset_category(desc_li)
+                if (
+                    nature == "FIXED_ASSET"
+                    or "IAS 16" in std
+                    or li.get("is_fixed_asset")
+                    or cat_li in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+                    or any(k in desc_li for k in ("laptop", "computer", "macbook", "server", "equipment", "vehicle", "car", "furniture"))
+                ):
+                    desc = li.get("description")
+                    break
+    if not desc:
+        desc = str(entities.get("item_description") or entities.get("description") or "office furniture")
     cat = _match_asset_category(desc)
     life = 3 if cat == "IT_EQUIPMENT" else (10 if cat == "MACHINERY" else 5)
     return {
@@ -851,7 +897,25 @@ def build_intent_progression(
 
     # 4. Classification / Nature
     nature = ents.get("transaction_nature")
-    if nature:
+    if isinstance(line_items, list) and len(line_items) > 1:
+        has_capex = any(
+            str(li.get("nature") or "").upper() == "FIXED_ASSET"
+            or "IAS 16" in str(li.get("ifrs_standard") or "").upper()
+            or li.get("is_fixed_asset")
+            for li in line_items if isinstance(li, dict)
+        )
+        has_opex = any(
+            str(li.get("nature") or "").upper() in ("OPEX", "EXPENSE")
+            or "IAS 1" in str(li.get("ifrs_standard") or "").upper()
+            for li in line_items if isinstance(li, dict)
+        )
+        if has_capex and has_opex:
+            facts.append({"label": "Classification", "value": "Multi-Entity Split (Opex + Capex)"})
+        elif has_capex:
+            facts.append({"label": "Classification", "value": "Capital Asset Acquisition (IAS 16)"})
+        else:
+            facts.append({"label": "Classification", "value": "Operating Expenses (P&L)"})
+    elif nature:
         nature_str = str(nature).upper()
         if "FIXED" in nature_str:
             facts.append({"label": "Classification", "value": "Capital Asset (IAS 16)"})
@@ -865,8 +929,11 @@ def build_intent_progression(
             facts.append({"label": "Classification", "value": nature_str.replace("_", " ").title()})
 
     # 5. Useful Life & Depreciation
+    # ZERO-ASSUMPTION RULE: If useful_life_years or depreciation_method is currently in missing_fields,
+    # it is unverified and MUST NOT be shown in verified_facts while clarifying!
+    is_clarifying_life = any(f in missing for f in ("useful_life_years", "depreciation_method"))
     life = ents.get("useful_life_years") or ents.get("useful_life")
-    if life not in (None, "", "NONE"):
+    if life not in (None, "", "NONE") and not is_clarifying_life:
         method = str(ents.get("depreciation_method") or "Straight-Line").replace("_", " ").title()
         facts.append({"label": "Useful Life", "value": f"{life} Years ({method})"})
 
