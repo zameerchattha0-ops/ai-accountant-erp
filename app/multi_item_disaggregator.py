@@ -66,15 +66,15 @@ _ACCOUNT_TAXONOMY = {
     "rent": {
         "category": "Rent",
         "nature": "OPERATING_EXPENSE",
-        "account_code": "6110",
-        "account_name": "Rent Expense",
+        "account_code": "6210",
+        "account_name": "Rent",
         "ifrs_standard": "IAS 1",
         "is_durable": False,
     },
     "utilities": {
         "category": "Utilities",
         "nature": "OPERATING_EXPENSE",
-        "account_code": "6120",
+        "account_code": "6220",
         "account_name": "Utilities",
         "ifrs_standard": "IAS 1",
         "is_durable": False,
@@ -247,14 +247,30 @@ class MultiItemDisaggregationResult(BaseModel):
         narration: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build compound journal entry dictionary adhering to double-entry balance."""
-        credit_account_code = "1020" if self.payment_method == "BANK_TRANSFER" else "1010"
-        credit_account_name = f"{self.bank_name or 'Bank Balances'}" if self.payment_method == "BANK_TRANSFER" else "Cash in Hand"
+        credit_account_code = "1010" if self.payment_method == "BANK_TRANSFER" else "1020"
+        credit_account_name = f"{self.bank_name or 'Bank'}" if self.payment_method == "BANK_TRANSFER" else "Cash in Hand"
 
         journal_lines: List[Dict[str, Any]] = []
         for item in self.line_items:
+            acc_c = item.account_code or "6140"
+            acc_n = item.account_name or item.category
+            if acc_c in ("6000", "6100", "6200"):
+                d_low = f"{item.description} {item.category}".lower()
+                if "rent" in d_low:
+                    acc_c = "6210"
+                    acc_n = "Rent"
+                elif any(k in d_low for k in ("utilit", "electric", "power", "water", "gas")):
+                    acc_c = "6220"
+                    acc_n = "Utilities"
+                elif "computer" in d_low or "laptop" in d_low:
+                    acc_c = "1520"
+                    acc_n = "Computer Equipment"
+                else:
+                    acc_c = "6140"
+                    acc_n = "Office Supplies & Consumables"
             journal_lines.append({
-                "account_code": item.account_code or "6100",
-                "account_name": item.account_name or item.category,
+                "account_code": acc_c,
+                "account_name": acc_n,
                 "debit": item.amount,
                 "credit": 0.0,
                 "description": item.description,
@@ -829,6 +845,20 @@ async def disaggregate_conversational_items(
                     cat = str(raw_i.get("category") or ("Computer Equipment" if "computer" in desc.lower() else "Office Supplies"))
                     acc_code = str(raw_i.get("account_code") or ("1520" if is_fa else "6140"))
                     acc_name = str(raw_i.get("account_name") or cat)
+                    if acc_code in ("6000", "6100", "6200"):
+                        d_low = f"{desc} {cat}".lower()
+                        if "rent" in d_low:
+                            acc_code = "6210"
+                            acc_name = "Rent"
+                        elif any(k in d_low for k in ("utilit", "electric", "power", "water", "gas")):
+                            acc_code = "6220"
+                            acc_name = "Utilities"
+                        elif "computer" in d_low or "laptop" in d_low:
+                            acc_code = "1520"
+                            acc_name = "Computer Equipment"
+                        else:
+                            acc_code = "6140"
+                            acc_name = "Office Supplies & Consumables"
                     ifrs_std = str(raw_i.get("ifrs_standard") or ("IAS 16" if is_fa else "IAS 1"))
 
                     item = DisaggregatedLineItem(
