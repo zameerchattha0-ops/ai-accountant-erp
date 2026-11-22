@@ -8933,6 +8933,19 @@ async def execute(
                         execution_plan.extracted_entities["line_items"] = [
                             ln.to_dict() for ln in _disagg_res.line_items
                         ]
+                        has_fa = any(
+                            ln.nature == "FIXED_ASSET"
+                            or "IAS 16" in str(ln.ifrs_standard or "")
+                            or any(k in ln.description.lower() for k in ("laptop", "computer", "vehicle", "furniture", "machinery", "equipment"))
+                            for ln in _disagg_res.line_items
+                        )
+                        if has_fa:
+                            execution_plan.transaction_nature = "COMPOUND"
+                            if execution_plan.prohibited_actions:
+                                execution_plan.prohibited_actions = [
+                                    p for p in execution_plan.prohibited_actions
+                                    if p.get("action") != "fixed_asset_capitalization"
+                                ]
                         if not execution_plan.extracted_entities.get("amount") or float(execution_plan.extracted_entities.get("amount") or 0) <= 0:
                             if _disagg_res.total_amount > 0:
                                 execution_plan.extracted_entities["amount"] = _disagg_res.total_amount
@@ -9896,7 +9909,8 @@ async def execute(
                         )
                     elif (
                         questionnaire_client is not None
-                        or any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value"))
+                        or any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value", "transaction_nature"))
+                        or bool(execution_plan.extracted_entities.get("line_items"))
                     ):
                         _conv_q = _prog_q
 
@@ -9917,11 +9931,24 @@ async def execute(
             except Exception as _f_exc:
                 log.warning("agent.enrich_frontier_clarification_failed", error=str(_f_exc)[:160])
 
-            _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else {}
-            if _frontier.get("intent_progression"):
-                _resp_data["intent_progression"] = _frontier["intent_progression"]
-
             _safe_question = _conv_q or (clarification.get("question", question) if isinstance(clarification, dict) else question)
+            _prog_state = _frontier.get("intent_progression")
+            if not _prog_state:
+                try:
+                    from app.conversational_manager import build_intent_progression
+                    _prog_state = build_intent_progression(
+                        intent=execution_plan.intent,
+                        entities=execution_plan.extracted_entities,
+                        missing_fields=list(_asked_fields),
+                        status="clarifying",
+                        active_question=_safe_question,
+                    )
+                except Exception:
+                    pass
+
+            _resp_data = {"living_draft": _living_draft_dict} if _living_draft_dict else {}
+            if _prog_state:
+                _resp_data["intent_progression"] = _prog_state
 
             return AgentResponse(
 
@@ -9941,7 +9968,7 @@ async def execute(
 
                 living_draft=_living_draft_dict,
 
-                intent_progression=_frontier.get("intent_progression"),
+                intent_progression=_prog_state,
 
                 interactive_artifacts=_frontier.get("interactive_artifacts"),
 

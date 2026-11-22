@@ -2290,13 +2290,26 @@ def build_event_profile(
                 ),
             ))
         if nature in ("OPERATING_EXPENSE", "CONSUMABLE"):
-            prohibited.append(ProhibitedAction(
-                action="fixed_asset_capitalization",
-                reason=(
-                    "an ordinary operating expense/consumable must NOT be "
-                    "capitalised as a fixed asset"
-                ),
-            ))
+            is_compound = intent in ("create_compound_journal", "split_transaction", "compound_journal")
+            has_capex = False
+            ents = getattr(classification, "extracted_entities", None) if classification else None
+            if isinstance(ents, dict):
+                raw_lines = ents.get("line_items") or ents.get("disaggregated_items") or []
+                if isinstance(raw_lines, list) and len(raw_lines) > 1:
+                    has_capex = any(
+                        str(li.get("nature") or "").upper() == "FIXED_ASSET"
+                        or "IAS 16" in str(li.get("ifrs_standard") or "").upper()
+                        or any(k in str(li.get("description") or "").lower() for k in ("laptop", "computer", "vehicle", "furniture", "machinery", "equipment"))
+                        for li in raw_lines if isinstance(li, dict)
+                    )
+            if not is_compound and not has_capex:
+                prohibited.append(ProhibitedAction(
+                    action="fixed_asset_capitalization",
+                    reason=(
+                        "an ordinary operating expense/consumable must NOT be "
+                        "capitalised as a fixed asset"
+                    ),
+                ))
         if nature == "FIXED_ASSET":
             prohibited.append(ProhibitedAction(
                 action="inventory_movement",
