@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, ExternalLink, BookOpen, Info, XCircle, RotateCcw } from "lucide-react";
 import type { AgentResponse } from "@/lib/types/api";
@@ -7,6 +8,7 @@ import { formatCurrency } from "@/lib/utils/currency";
 import { cn } from "@/lib/utils/cn";
 import { mdToDisplayText } from "@/lib/ai/markdown";
 import TaxComplianceCard from "@/components/ai/TaxComplianceCard";
+import { agentRunStore } from "@/lib/agent/agentRunStore";
 
 interface Props {
   response: AgentResponse;
@@ -106,6 +108,22 @@ export default function AIActionCard({ response }: Props) {
   const isVerified = verification === "VERIFIED";
   const isUnverified = verification === "UNVERIFIED";
   const target = detailsTarget(response);
+  const [undoing, setUndoing] = useState(false);
+
+  const handleUndo = async () => {
+    const jv = response.affected_entities?.find(
+      (e) => e.type?.toLowerCase() === "journal_entry" || String(e.id || "").startsWith("JV-")
+    );
+    const ref = jv?.id || response.execution_id;
+    setUndoing(true);
+    try {
+      await agentRunStore.startRun({
+        message: `Reverse journal entry ${ref}`,
+      });
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   return (
     <div className="bg-bg-surface rounded-2xl border border-border-subtle shadow-sm overflow-hidden">
@@ -360,7 +378,7 @@ export default function AIActionCard({ response }: Props) {
         )}
 
         {/* Action Links */}
-        <div className="flex gap-2 pt-1">
+        <div className="flex items-center gap-2 pt-1 flex-wrap">
           {target && (
             <Link
               href={target}
@@ -368,6 +386,18 @@ export default function AIActionCard({ response }: Props) {
             >
               <ExternalLink className="w-3 h-3" /> View Details
             </Link>
+          )}
+
+          {isVerified && response.action !== "reverse_journal" && (
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={undoing}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border-default bg-bg-surface hover:bg-warning-50 hover:border-warning-200 text-xs font-medium text-text-secondary hover:text-warning-700 transition-colors shadow-3xs disabled:opacity-50"
+            >
+              <RotateCcw className={cn("w-3 h-3 text-warning-600", undoing && "animate-spin")} />
+              <span>{undoing ? "Reversing Entry..." : "Undo / Reversal Voucher"}</span>
+            </button>
           )}
         </div>
       </div>
@@ -390,6 +420,9 @@ function actionLabel(action?: string): string {
     create_quotation: "Quotation Created",
     create_credit_note: "Credit Note Created",
     create_purchase_return: "Purchase Return Created",
+    reverse_journal: "Journal Reversed",
+    create_compound_journal: "Split Transaction Posted",
+    compound_journal: "Compound Journal Posted",
     generate_trial_balance: "Trial Balance",
     generate_balance_sheet: "Balance Sheet",
     generate_profit_loss: "Profit & Loss",

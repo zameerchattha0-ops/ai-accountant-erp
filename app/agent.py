@@ -16657,6 +16657,52 @@ async def resume_with_clarification(
                     fa_args["bank_name"] = str(merged_entities["bank_name"]).strip()
                 single_hop_call = ToolCall(tool_name="register_fixed_asset", arguments=fa_args)
 
+            elif intent in ("reverse_journal", "reversal") or merged_entities.get("is_reversal"):
+                entry_id = merged_entities.get("entry_id") or merged_entities.get("journal_entry_id")
+                if not entry_id and merged_entities.get("journal_number"):
+                    _j = await fetch_one("journal_entries", filters={"organization_id": str(organization_id), "entry_number": str(merged_entities["journal_number"])})
+                    if _j:
+                        entry_id = _j["id"]
+                if not entry_id:
+                    _j_recent = await fetch_many("journal_entries", filters={"organization_id": str(organization_id)}, order="created_at.desc", limit=1)
+                    if _j_recent:
+                        entry_id = _j_recent[0]["id"]
+                        merged_entities["journal_number"] = _j_recent[0].get("entry_number")
+                if entry_id:
+                    single_hop_call = ToolCall(tool_name="reverse_journal", arguments={
+                        "entry_id": str(entry_id),
+                        "reason": str(merged_entities.get("reason") or "User requested reversal"),
+                    })
+
+            elif intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
+                from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
+                raw_items = merged_entities.get("line_items") or []
+                d_items = []
+                for ri in raw_items:
+                    if isinstance(ri, dict):
+                        d_items.append(DisaggregatedLineItem(
+                            description=str(ri.get("description") or "Line Item"),
+                            amount=float(ri.get("amount") or ri.get("line_total") or 0.0),
+                            category=str(ri.get("category") or "General"),
+                            nature=str(ri.get("nature") or "OPEX"),
+                            ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
+                            account_code=ri.get("account_code"),
+                            account_name=ri.get("account_name"),
+                        ))
+                pm_comp = merged_entities.get("payment_method") or "BANK"
+                comp_res = MultiItemDisaggregationResult(
+                    line_items=d_items,
+                    total_amount=float(merged_entities.get("amount") or sum(it.amount for it in d_items)),
+                    payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
+                    bank_name=merged_entities.get("bank_name"),
+                    sum_line_amounts=sum(it.amount for it in d_items),
+                )
+                comp_dict = comp_res.to_compound_journal(
+                    transaction_date=merged_entities.get("transaction_date") or "today",
+                    narration=f"Disaggregated compound transaction: {len(d_items)} line items",
+                )
+                single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
+
             if single_hop_call is not None:
                 log.info(
                     "single_hop_clarification_resolution",
@@ -16802,6 +16848,25 @@ async def resume_with_clarification(
                         f"* **Useful Life:** **{merged_entities.get('useful_life_years', 3)} years** (Straight-line depreciation)\n"
                         f"* **Accounting Entry:** Debit Computer Equipment / Fixed Asset Rs. {acost:,.2f}, Credit {bank_used} Rs. {acost:,.2f}\n\n"
                         f"[View Fixed Assets Register →](/assets)"
+                    )
+                elif intent in ("reverse_journal", "reversal") and tool_result.success:
+                    j_num = merged_entities.get("journal_number") or "Entry"
+                    result_summary = (
+                        f"### 🔄 Journal Entry Successfully Reversed\n\n"
+                        f"* **Voucher Reversed:** `{j_num}`\n"
+                        f"* **Accounting Action:** Offsetting contra lines auto-posted to General Ledger\n"
+                        f"* **Status:** REVERSED in General Ledger\n\n"
+                        f"[View in General Ledger →](/accounting/journal)"
+                    )
+                elif (intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1)) and tool_result.success:
+                    tot = float(merged_entities.get("amount") or 0.0)
+                    n_lines = len(merged_entities.get("line_items") or [])
+                    result_summary = (
+                        f"### ✅ Multi-Entity Split Entry Posted (Compound Journal)\n\n"
+                        f"* **Total Amount:** **Rs. {tot:,.2f}**\n"
+                        f"* **Allocated Lines:** {n_lines} Segregated Items (IAS 16 / IAS 38 / Opex)\n"
+                        f"* **Status:** Posted to General Ledger\n\n"
+                        f"[View in General Ledger →](/accounting/journal)"
                     )
                 elif tool_result.success:
                     result_summary = f"Successfully completed {intent}."

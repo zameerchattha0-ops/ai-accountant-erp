@@ -808,6 +808,17 @@ def build_intent_progression(
         party_role = "Vendor" if any(k in low_i for k in ("supplier", "purchase", "expense", "asset", "bill", "payable")) else ("Customer" if any(k in low_i for k in ("sale", "invoice", "receipt", "receivable")) else "Counterparty")
         facts.append({"label": party_role, "value": party_name})
 
+    # 1b. Reversal Intent Action (Phase 4B)
+    if intent in ("reverse_journal", "reversal") or ents.get("is_reversal"):
+        facts.append({"label": "Action", "value": "Journal Reversal (Contra Entry)"})
+        v_num = ents.get("journal_number") or ents.get("voucher_number") or ents.get("entry_number") or ents.get("entry_id")
+        if v_num:
+            facts.append({"label": "Target Voucher", "value": str(v_num)})
+        if status == "completed":
+            custom_reasoning = f"Journal entry {v_num or ''} has been successfully reversed with offsetting contra entries in the General Ledger."
+        elif status == "reviewing":
+            custom_reasoning = f"Ready to post double-entry reversing voucher to nullify {v_num or 'target entry'} and restore balances."
+
     # 2. Total Amount
     raw_amt = ents.get("amount") or ents.get("total_amount") or ents.get("cost")
     if raw_amt not in (None, ""):
@@ -817,6 +828,19 @@ def build_intent_progression(
             facts.append({"label": "Amount", "value": f"{curr} {amt_val:,.2f}"})
         except (ValueError, TypeError):
             facts.append({"label": "Amount", "value": str(raw_amt)})
+
+    # 2b. Multi-Entity Split Lines (Phase 4A)
+    line_items = ents.get("line_items") or ents.get("disaggregated_items")
+    if isinstance(line_items, list) and len(line_items) > 1:
+        facts.append({"label": "Split Allocation", "value": f"{len(line_items)} Lines (Segregated)"})
+        for idx, li in enumerate(line_items[:4], start=1):
+            if isinstance(li, dict):
+                desc = li.get("description") or f"Item {idx}"
+                amt = li.get("amount") or li.get("line_total")
+                cat = li.get("ifrs_standard") or li.get("category") or li.get("nature") or ""
+                cat_str = f" [{cat}]" if cat else ""
+                if amt is not None:
+                    facts.append({"label": f"Line {idx}", "value": f"{desc}: Rs. {float(amt):,.2f}{cat_str}"})
 
     # 3. Item / Description
     item = ents.get("item_description") or ents.get("description") or ents.get("product_name") or ents.get("asset_name") or ents.get("service_name")
@@ -895,6 +919,8 @@ def build_intent_progression(
         reasons: List[str] = []
         if any(f in missing for f in ("transaction_nature", "transaction_intent")):
             reasons.append("Determining capital expenditure (IAS 16) vs immediate operating expense.")
+        if isinstance(ents.get("line_items"), list) and len(ents.get("line_items")) > 1:
+            reasons.append(f"Multi-Entity Split: Segregating {len(ents['line_items'])} line items across capital asset (IAS 16) and operating expenses for balanced compound journal posting.")
         if any(f in missing for f in ("useful_life_years", "depreciation_method")):
             reasons.append("Establishing IAS 16 asset useful life and depreciation policy.")
         if any(f in missing for f in ("payment_channel", "payment_method")):
@@ -959,19 +985,22 @@ async def synthesize_cumulative_dialogue_intent(
 
     merged = dict(current_entities or {})
     raw_reply = str(user_reply or "").strip()
-    if not raw_reply:
+    user_req = str(user_request or "").strip()
+    comb_text = f"{user_req} {raw_reply}".strip()
+    if not comb_text:
         return {"entities": merged, "reasoning": "", "is_complete": False}
 
-    # 1. Deterministic extraction & corrections
-    corr = extract_conversational_corrections(raw_reply, merged)
-    if corr:
-        merged.update(corr)
+    # 1. Deterministic extraction & corrections from user's latest reply
+    if raw_reply:
+        corr = extract_conversational_corrections(raw_reply, merged)
+        if corr:
+            merged.update(corr)
 
-    sched = expand_standard_schedule_answers(raw_reply, merged)
-    if sched:
-        merged.update(sched)
+        sched = expand_standard_schedule_answers(raw_reply, merged)
+        if sched:
+            merged.update(sched)
 
-    # 2. LLM Cumulative Extraction if client available
+    # 2. LLM Cumulative Extraction if client available and raw_reply provided
     llm_extracted: Dict[str, Any] = {}
     if client is None:
         try:
@@ -980,7 +1009,7 @@ async def synthesize_cumulative_dialogue_intent(
         except Exception:
             client = None
 
-    if client is not None:
+    if client is not None and raw_reply:
         try:
             formatted_history = []
             for h in (history or []):
@@ -1038,38 +1067,70 @@ async def synthesize_cumulative_dialogue_intent(
                     merged[k] = v
 
     # 3. Grounded Field Safeguards (ensuring bank names, dates, amounts are reliably mapped)
-    reply_up = raw_reply.upper()
+    text_to_scan = f"{raw_reply} {user_req}".strip()
+    scan_up = text_to_scan.upper()
     for b_kw in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
-        if b_kw in reply_up:
+        if b_kw in scan_up:
             merged["bank_name"] = b_kw.title()
             merged["payment_method"] = "BANK"
             merged["payment_type"] = "BANK"
             break
-    if "CASH" in reply_up:
+    if "CASH" in scan_up and not merged.get("payment_method"):
         merged.setdefault("payment_method", "CASH")
         merged.setdefault("payment_type", "CASH")
-    elif any(k in reply_up for k in ("CREDIT", "LATER", "PAYABLE", "ON CREDIT")):
+    elif any(k in scan_up for k in ("CREDIT", "LATER", "PAYABLE", "ON CREDIT")) and not merged.get("payment_method"):
         merged["payment_method"] = "CREDIT"
         merged["payment_type"] = "CREDIT"
 
     # Date parsing check
-    dt_res = parse_transaction_date(raw_reply)
-    if dt_res.ok:
-        merged["transaction_date"] = dt_res.iso_date
-        merged["expense_date"] = dt_res.iso_date
+    if raw_reply:
+        dt_res = parse_transaction_date(raw_reply)
+        if dt_res.ok:
+            merged["transaction_date"] = dt_res.iso_date
+            merged["expense_date"] = dt_res.iso_date
+    elif not merged.get("transaction_date"):
+        dt_res = parse_transaction_date(user_req)
+        if dt_res.ok:
+            merged["transaction_date"] = dt_res.iso_date
+            merged["expense_date"] = dt_res.iso_date
 
     # Useful life integer fallback
-    m_life = re.search(r"\b(\d+)\s*(?:years?|yrs?|saal)\b", raw_reply, re.IGNORECASE)
+    m_life = re.search(r"\b(\d+)\s*(?:years?|yrs?|saal)\b", text_to_scan, re.IGNORECASE)
     if m_life and not merged.get("useful_life_years"):
         merged["useful_life_years"] = int(m_life.group(1))
         merged["useful_life"] = int(m_life.group(1))
 
     # WHT Exemption Certificate check
-    if any(k in raw_reply.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "0% wht", "zero tax", "no deduction")):
+    if any(k in text_to_scan.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "0% wht", "zero tax", "no deduction")):
         merged["wht_status"] = "EXEMPT"
         merged["wht_decision"] = "EXEMPT"
         merged["wht_exempt"] = True
         merged["wht_rate_percent"] = 0.0
+
+    # Reversal / Undo detection (Phase 4B)
+    if any(k in text_to_scan.lower() for k in ("reverse", "reversal", "undo", "void journal", "cancel journal", "cancel entry")):
+        merged["is_reversal"] = True
+        merged["intent"] = "reverse_journal"
+        m_jv = re.search(r"\b(JV-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", text_to_scan, re.IGNORECASE)
+        if m_jv:
+            merged["journal_number"] = m_jv.group(1).upper()
+            merged["entry_id"] = m_jv.group(1)
+
+    # Multi-item split allocation (Phase 4A)
+    if any(k in comb_text.lower() for k in (":", " and bought ", " and paid ", " and rent ", " and software ", " and laptops ", " and electricity ")) and not merged.get("line_items"):
+        try:
+            from app.multi_item_disaggregator import disaggregate_conversational_items
+            disagg = await disaggregate_conversational_items(comb_text, entities=merged, client=client, timeout=timeout)
+            if disagg.is_composite and disagg.line_items:
+                merged["line_items"] = [item.to_dict() for item in disagg.line_items]
+                merged["total_amount"] = disagg.total_amount
+                merged["amount"] = disagg.total_amount
+                if disagg.payment_method:
+                    merged["payment_method"] = disagg.payment_method
+                if disagg.bank_name:
+                    merged["bank_name"] = disagg.bank_name
+        except Exception as exc:
+            log.warning("conversational_manager.disaggregate_failed", error=str(exc)[:200])
 
     return {
         "entities": merged,
