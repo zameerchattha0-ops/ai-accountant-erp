@@ -464,6 +464,11 @@ _STANDARD_SCHEDULE_AFFIRMATIVE = (
     "use standard",
     "adopt standard",
     "default",
+    "accept",
+    "accept 3-yr straight line (recommended)",
+    "accept 3-yr straight line",
+    "accept 5-yr straight line (recommended)",
+    "accept 5-yr straight line",
     "1",
     "(1)",
     "a",
@@ -476,6 +481,8 @@ def is_standard_schedule_acceptance(reply: str) -> bool:
     if not reply:
         return False
     norm = reply.strip().lower()
+    if any(k in norm for k in ("accept 3-yr", "accept 5-yr", "accept 3 yr", "accept 5 yr", "recommended", "standard schedule", "straight line")):
+        return True
     return any(norm == t or norm.startswith(t + " ") or norm.endswith(" " + t) or norm.startswith(t + ",") for t in _STANDARD_SCHEDULE_AFFIRMATIVE)
 
 
@@ -899,9 +906,11 @@ def build_intent_progression(
     nature = ents.get("transaction_nature")
     if isinstance(line_items, list) and len(line_items) > 1:
         has_capex = any(
-            str(li.get("nature") or "").upper() == "FIXED_ASSET"
+            str(li.get("nature") or "").upper() in ("FIXED_ASSET", "CAPEX")
             or "IAS 16" in str(li.get("ifrs_standard") or "").upper()
             or li.get("is_fixed_asset")
+            or _match_asset_category(str(li.get("description") or "")) in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+            or any(k in str(li.get("description") or "").lower() for k in ("laptop", "computer", "macbook", "server", "equipment", "vehicle", "furniture"))
             for li in line_items if isinstance(li, dict)
         )
         has_opex = any(
@@ -931,7 +940,11 @@ def build_intent_progression(
     # 5. Useful Life & Depreciation
     # ZERO-ASSUMPTION RULE: If useful_life_years or depreciation_method is currently in missing_fields,
     # it is unverified and MUST NOT be shown in verified_facts while clarifying!
-    is_clarifying_life = any(f in missing for f in ("useful_life_years", "depreciation_method"))
+    is_clarifying_life = (
+        status == "clarifying"
+        or any(f in missing for f in ("useful_life_years", "depreciation_method", "salvage_value", "policy"))
+        or any(k in (active_question or "").lower() for k in ("useful life", "depreciation", "schedule"))
+    )
     life = ents.get("useful_life_years") or ents.get("useful_life")
     if life not in (None, "", "NONE") and not is_clarifying_life:
         method = str(ents.get("depreciation_method") or "Straight-Line").replace("_", " ").title()

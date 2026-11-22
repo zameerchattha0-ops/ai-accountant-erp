@@ -259,6 +259,11 @@ export default function AICommandBox() {
             const isLatestAssistant = !isUser && index === messages.length - 1;
             const msgResponse = msg.response || (isLatestAssistant ? response : null);
             const livingDraft = msgResponse?.living_draft || (msgResponse?.data?.living_draft as LivingDraft);
+            const isClarifyingRound = !isUser && (
+              String(msgResponse?.status || "").toUpperCase() === "AWAITING_CLARIFICATION" ||
+              (isLatestAssistant && String(response?.status || "").toUpperCase() === "AWAITING_CLARIFICATION") ||
+              Boolean(msgResponse?.question && msg.content && msg.content.trim() === msgResponse.question.trim())
+            );
 
             return (
               <div
@@ -280,8 +285,8 @@ export default function AICommandBox() {
                     isUser ? "flex flex-col items-end" : "flex-1"
                   )}
                 >
-                  {/* Message Bubble (suppressed for clarification cards to prevent duplicate question rendering) */}
-                  {(!msgResponse || msgResponse.status !== ExecutionStatus.AWAITING_CLARIFICATION) && (
+                  {/* Message Bubble (strictly suppressed for clarification cards to prevent duplicate question rendering) */}
+                  {!isClarifyingRound && (
                     <div
                       className={cn(
                         "px-4 py-2.5 rounded-2xl shadow-3xs leading-relaxed",

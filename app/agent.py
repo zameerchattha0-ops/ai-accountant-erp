@@ -9914,7 +9914,7 @@ async def execute(
                     ):
                         _conv_q = _prog_q
 
-                    if _prog_chips and not question_options:
+                    if _prog_chips:
                         _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
@@ -9959,6 +9959,8 @@ async def execute(
                 question=_safe_question,
 
                 required_information=_asked_fields,
+
+                options=_prog_chips or None,
 
                 question_options=_conv_options or question_options,
 
@@ -16640,7 +16642,36 @@ async def resume_with_clarification(
                         _pmt_args["wht_amount"] = float(merged_entities["wht_amount"])
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
-            elif intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET":
+            elif intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
+                from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
+                raw_items = merged_entities.get("line_items") or []
+                d_items = []
+                for ri in raw_items:
+                    if isinstance(ri, dict):
+                        d_items.append(DisaggregatedLineItem(
+                            description=str(ri.get("description") or "Line Item"),
+                            amount=float(ri.get("amount") or ri.get("line_total") or 0.0),
+                            category=str(ri.get("category") or "General"),
+                            nature=str(ri.get("nature") or "OPEX"),
+                            ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
+                            account_code=ri.get("account_code"),
+                            account_name=ri.get("account_name"),
+                        ))
+                pm_comp = merged_entities.get("payment_method") or "BANK"
+                comp_res = MultiItemDisaggregationResult(
+                    line_items=d_items,
+                    total_amount=float(merged_entities.get("amount") or sum(it.amount for it in d_items)),
+                    payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
+                    bank_name=merged_entities.get("bank_name"),
+                    sum_line_amounts=sum(it.amount for it in d_items),
+                )
+                comp_dict = comp_res.to_compound_journal(
+                    transaction_date=merged_entities.get("transaction_date") or "today",
+                    narration=f"Disaggregated compound transaction: {len(d_items)} line items",
+                )
+                single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
+
+            elif (intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET") and not (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
                 intent = "register_fixed_asset"
                 name = (
                     merged_entities.get("asset_name")
@@ -16700,35 +16731,6 @@ async def resume_with_clarification(
                         "entry_id": str(entry_id),
                         "reason": str(merged_entities.get("reason") or "User requested reversal"),
                     })
-
-            elif intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
-                from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
-                raw_items = merged_entities.get("line_items") or []
-                d_items = []
-                for ri in raw_items:
-                    if isinstance(ri, dict):
-                        d_items.append(DisaggregatedLineItem(
-                            description=str(ri.get("description") or "Line Item"),
-                            amount=float(ri.get("amount") or ri.get("line_total") or 0.0),
-                            category=str(ri.get("category") or "General"),
-                            nature=str(ri.get("nature") or "OPEX"),
-                            ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
-                            account_code=ri.get("account_code"),
-                            account_name=ri.get("account_name"),
-                        ))
-                pm_comp = merged_entities.get("payment_method") or "BANK"
-                comp_res = MultiItemDisaggregationResult(
-                    line_items=d_items,
-                    total_amount=float(merged_entities.get("amount") or sum(it.amount for it in d_items)),
-                    payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
-                    bank_name=merged_entities.get("bank_name"),
-                    sum_line_amounts=sum(it.amount for it in d_items),
-                )
-                comp_dict = comp_res.to_compound_journal(
-                    transaction_date=merged_entities.get("transaction_date") or "today",
-                    narration=f"Disaggregated compound transaction: {len(d_items)} line items",
-                )
-                single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
 
             if single_hop_call is not None:
                 log.info(

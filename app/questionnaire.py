@@ -1211,9 +1211,9 @@ ACCOUNTING MODULE REASONING GUIDELINES:
    When NATURE is FIXED_ASSET or INTENT is register_fixed_asset (e.g. purchasing tables, chairs, laptops, equipment, vehicles):
    - EXPLAIN TREATMENT IN INTRO: State that because this item is for business operational use (not resale inventory), it is being capitalized under Fixed Assets (naming the specific ledger identified in SYSTEM_CONTEXT, e.g. '1510 Furniture & Fixtures').
    - USEFUL LIFE (useful_life_years): Ask how many years the business plans to use this asset. Provide realistic industry benchmarks in the question (e.g. furniture 5-10 yrs, computers 3-5 yrs, vehicles 5 yrs).
-     Options MUST include: [{"value": "5", "label": "5 Years"}, {"value": "10", "label": "10 Years"}, {"value": "NONE", "label": "No Depreciation Schedule (Cost Only)"}].
+     Options MUST include: [{"value": "3", "label": "Accept 3-Yr Straight Line (Recommended)"}, {"value": "5", "label": "5 Years Straight Line"}, {"value": "10", "label": "10 Years"}, {"value": "NONE", "label": "No Depreciation Schedule (Cost Only)"}].
    - DEPRECIATION METHOD (depreciation_method): Ask which depreciation method to apply.
-     Options MUST include: [{"value": "STRAIGHT_LINE", "label": "Straight Line (Equal Monthly)"}, {"value": "REDUCING_BALANCE", "label": "Reducing Balance (ITO 3rd Schedule)"}, {"value": "NONE", "label": "None for now"}].
+     Options MUST include: [{"value": "STRAIGHT_LINE", "label": "Accept 3-Yr Straight Line (Recommended)"}, {"value": "STRAIGHT_LINE_EQUAL", "label": "Straight Line (Equal Monthly)"}, {"value": "REDUCING_BALANCE", "label": "Reducing Balance (ITO 3rd Schedule)"}, {"value": "NONE", "label": "None for now"}].
    - SALVAGE VALUE (salvage_value): Ask for the estimated residual scrap value at the end of life (default is 0).
      Options: [{"value": "0", "label": "PKR 0 (Zero Scrap Value)"}].
    - SETTLEMENT (payment_type / payment_method): Emphasize Section 73 Income Tax Ordinance compliance (payments exceeding PKR 50,000 must be through banking channels for tax deductibility).
