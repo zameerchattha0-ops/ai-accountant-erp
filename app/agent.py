@@ -16660,14 +16660,14 @@ async def resume_with_clarification(
             elif intent in ("reverse_journal", "reversal") or merged_entities.get("is_reversal"):
                 entry_id = merged_entities.get("entry_id") or merged_entities.get("journal_entry_id")
                 if not entry_id and merged_entities.get("journal_number"):
-                    _j = await fetch_one("journal_entries", filters={"organization_id": str(organization_id), "entry_number": str(merged_entities["journal_number"])})
+                    _j = await fetch_one("journal_entries", filters={"organization_id": str(organization_id), "journal_number": str(merged_entities["journal_number"])})
                     if _j:
                         entry_id = _j["id"]
                 if not entry_id:
                     _j_recent = await fetch_many("journal_entries", filters={"organization_id": str(organization_id)}, order="created_at.desc", limit=1)
                     if _j_recent:
                         entry_id = _j_recent[0]["id"]
-                        merged_entities["journal_number"] = _j_recent[0].get("entry_number")
+                        merged_entities["journal_number"] = _j_recent[0].get("journal_number")
                 if entry_id:
                     single_hop_call = ToolCall(tool_name="reverse_journal", arguments={
                         "entry_id": str(entry_id),
