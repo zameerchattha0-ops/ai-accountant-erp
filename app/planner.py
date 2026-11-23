@@ -4133,6 +4133,20 @@ def _missing_fields(intent: str, entities: Dict[str, Any]) -> List[str]:
 
         missing.append("payment_type")
 
+    if intent in ("create_compound_journal", "split_transaction", "compound_journal"):
+        has_fa_line = any(
+            str(li.get("nature") or "").upper() == "FIXED_ASSET"
+            or "IAS 16" in str(li.get("ifrs_standard") or "").upper()
+            or any(k in str(li.get("description") or "").lower() for k in ("laptop", "computer", "vehicle", "furniture", "machinery", "equipment"))
+            for li in (entities.get("line_items") or [])
+            if isinstance(li, dict)
+        )
+        if has_fa_line and not entities.get("useful_life_years"):
+            missing.append("useful_life_years")
+            missing.append("depreciation_method")
+        if not entities.get("payment_method") and not entities.get("payment_channel"):
+            missing.append("payment_type")
+
     if intent == "create_project" and not entities.get("project_name"):
 
         # The project CODE is deliberately NOT asked: projects.project_code is
@@ -8132,6 +8146,8 @@ def _tools_for_intent(intent: str) -> List[str]:
         "record_sale": ["search_customer", "search_account", "create_invoice", "prepare_journal"],
 
         "register_fixed_asset": ["search_fixed_asset", "search_supplier", "search_account", "register_fixed_asset"],
+
+        "create_compound_journal": ["create_compound_journal", "register_fixed_asset", "search_account", "search_supplier", "prepare_journal", "post_journal"],
 
         "dispose_fixed_asset": ["search_fixed_asset", "search_account", "dispose_fixed_asset"],
 

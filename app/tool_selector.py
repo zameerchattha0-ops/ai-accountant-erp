@@ -95,6 +95,10 @@ _INTENT_TOOLS: dict[str, set[str]] = {
     "register_fixed_asset": {
         "register_fixed_asset", "prepare_journal", "post_journal",
     },
+    "create_compound_journal": {
+        "create_compound_journal",
+        "prepare_journal", "validate_journal", "post_journal",
+    },
     "dispose_fixed_asset": {
         "dispose_fixed_asset", "prepare_journal", "post_journal",
     },
@@ -184,6 +188,8 @@ def _lookups_for_intent(intent: str) -> Set[str]:
         lookups |= _TAX_LOOKUPS
     if "asset" in intent:
         lookups |= _ASSET_LOOKUPS | _ACCOUNT_LOOKUPS
+    if "compound" in intent or "split" in intent:
+        lookups |= _ACCOUNT_LOOKUPS | _ASSET_LOOKUPS | _BANK_LOOKUPS | _SUPPLIER_LOOKUPS
     if "payroll" in intent or "salary" in intent:
         # The roster (who is paid), the settlement account, leave policy, and
         # the salary / accrued-salaries ledgers are all needed to carry a run out.

@@ -84,6 +84,7 @@ TREATMENTS: FrozenSet[str] = frozenset(
         "REVENUE",
         "LIABILITY",
         "EQUITY",
+        "COMPOUND",
         "OTHER",
     }
 )
@@ -202,8 +203,9 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
         "financial_advisory", "financial_analysis", "health_check",
         "cash_flow_analysis", "expense_analysis", "tax_advisory",
         # §12.8 expressibility repair — model-only, no planner routing yet
-        # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment).
+        # (see MODEL_ONLY_INTENTS; coverage for reversal/correction/adjustment/compound).
         "reverse_journal", "record_correction", "record_adjustment", "update_document_status",
+        "create_compound_journal",
     }
 )
 
@@ -220,7 +222,7 @@ CANONICAL_INTENTS: FrozenSet[str] = frozenset(
 #: change (Wave A freeze, ``fc01502``).  Wiring them into
 #: ``planner._INTENT_PATTERNS`` / ``_tools_for_intent`` is Wave B/D work.
 MODEL_ONLY_INTENTS: FrozenSet[str] = frozenset(
-    {"reverse_journal", "record_correction", "record_adjustment"}
+    {"reverse_journal", "record_correction", "record_adjustment", "create_compound_journal"}
 )
 
 

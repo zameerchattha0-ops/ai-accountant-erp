@@ -896,11 +896,12 @@ def build_intent_progression(
                     facts.append({"label": f"Line {idx}", "value": f"{desc}: Rs. {float(amt):,.2f}{cat_str}"})
 
     # 3. Item / Description
-    item = ents.get("item_description") or ents.get("description") or ents.get("product_name") or ents.get("asset_name") or ents.get("service_name")
-    if item and str(item).strip().lower() not in ("none", "null", ""):
-        qty = ents.get("quantity")
-        qty_str = f" ({qty:g} units)" if isinstance(qty, (int, float)) and qty > 1 else ""
-        facts.append({"label": "Description", "value": f"{str(item).strip()}{qty_str}"})
+    if not (isinstance(line_items, list) and len(line_items) > 1):
+        item = ents.get("item_description") or ents.get("description") or ents.get("product_name") or ents.get("asset_name") or ents.get("service_name")
+        if item and str(item).strip().lower() not in ("none", "null", ""):
+            qty = ents.get("quantity")
+            qty_str = f" ({qty:g} units)" if isinstance(qty, (int, float)) and qty > 1 else ""
+            facts.append({"label": "Description", "value": f"{str(item).strip()}{qty_str}"})
 
     # 4. Classification / Nature
     nature = ents.get("transaction_nature")
@@ -914,8 +915,9 @@ def build_intent_progression(
             for li in line_items if isinstance(li, dict)
         )
         has_opex = any(
-            str(li.get("nature") or "").upper() in ("OPEX", "EXPENSE")
+            str(li.get("nature") or "").upper() in ("OPEX", "EXPENSE", "OPERATING_EXPENSE")
             or "IAS 1" in str(li.get("ifrs_standard") or "").upper()
+            or any(k in str(li.get("description") or "").lower() for k in ("rent", "bill", "electricity", "utilit", "office", "expense", "fee"))
             for li in line_items if isinstance(li, dict)
         )
         if has_capex and has_opex:

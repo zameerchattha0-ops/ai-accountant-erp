@@ -7491,6 +7491,20 @@ async def execute(
         _settings = _get_settings()
 
         _preliminary = _preliminary_extraction(user_message)
+        _early_disagg = None
+        if getattr(_settings, "multi_item_disaggregator_enabled", True):
+            try:
+                from app.multi_item_disaggregator import disaggregate_conversational_items
+                _early_disagg = await disaggregate_conversational_items(user_message, entities=_preliminary)
+                if _early_disagg and _early_disagg.is_composite and _early_disagg.line_items:
+                    _preliminary["line_items"] = [ln.to_dict() for ln in _early_disagg.line_items]
+                    _preliminary["is_composite"] = True
+                    _preliminary["provisional_intent_hint"] = "create_compound_journal"
+                    _preliminary["transaction_nature"] = "COMPOUND"
+                    if _preliminary.get("literals"):
+                        _preliminary["literals"]["line_items"] = _preliminary["line_items"]
+            except Exception as _e_disagg_err:
+                log.warning("agent.early_disaggregation_failed", error=str(_e_disagg_err)[:200])
 
         # ---- PER-BUSINESS CONTEXT (one live read-set per turn) -----------
 
@@ -8166,11 +8180,13 @@ async def execute(
             or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
         )
 
+        _is_composite_txn = bool((_preliminary or {}).get("is_composite") or (_early_disagg and _early_disagg.is_composite))
         if (
             getattr(_settings, "accounting_reasoning_enabled", False)
             and not _split_batch_now(user_message)
             and approved_tool_calls is None
             and not _is_operational
+            and not _is_composite_txn
         ):
 
             # The model may only propose names from the TRUSTED registry, so it
@@ -8826,6 +8842,8 @@ async def execute(
 
         _decision = getattr(_reasoning, "decision", None) or {}
         _model_intent = str(_decision.get("intent") or "").strip().lower()
+        if _early_disagg and _early_disagg.is_composite and _early_disagg.line_items:
+            _model_intent = "create_compound_journal"
 
         if not confirmed_intent and _model_intent and is_canonical_intent(_model_intent):
             execution_plan.intent = _model_intent
@@ -8925,10 +8943,13 @@ async def execute(
             if not execution_plan.extracted_entities.get("line_items"):
                 try:
                     from app.multi_item_disaggregator import disaggregate_conversational_items
-                    _disagg_res = await disaggregate_conversational_items(
-                        user_message,
-                        entities=execution_plan.extracted_entities,
-                    )
+                    if _early_disagg and _early_disagg.is_composite:
+                        _disagg_res = _early_disagg
+                    else:
+                        _disagg_res = await disaggregate_conversational_items(
+                            user_message,
+                            entities=execution_plan.extracted_entities,
+                        )
                     if _disagg_res.is_composite and _disagg_res.line_items:
                         _reasoning_calls = None
                         execution_plan.extracted_entities["line_items"] = [

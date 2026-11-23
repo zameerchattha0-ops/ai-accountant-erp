@@ -252,22 +252,22 @@ class MultiItemDisaggregationResult(BaseModel):
 
         journal_lines: List[Dict[str, Any]] = []
         for item in self.line_items:
-            acc_c = item.account_code or "6140"
+            acc_c = item.account_code
             acc_n = item.account_name or item.category
-            if acc_c in ("6000", "6100", "6200"):
-                d_low = f"{item.description} {item.category}".lower()
+            d_low = f"{item.description} {item.category}".lower()
+            if not acc_c or acc_c in ("6000", "6100", "6140", "6200"):
                 if "rent" in d_low:
                     acc_c = "6210"
                     acc_n = "Rent"
                 elif any(k in d_low for k in ("utilit", "electric", "power", "water", "gas")):
                     acc_c = "6220"
                     acc_n = "Utilities"
-                elif "computer" in d_low or "laptop" in d_low:
-                    acc_c = "1520"
+                elif "computer" in d_low or "laptop" in d_low or item.nature == "FIXED_ASSET" or "IAS 16" in str(item.ifrs_standard or ""):
+                    acc_c = "1500"
                     acc_n = "Computer Equipment"
                 else:
-                    acc_c = "6140"
-                    acc_n = "Office Supplies & Consumables"
+                    acc_c = acc_c or "6140"
+                    acc_n = acc_n or "Office Supplies & Consumables"
             journal_lines.append({
                 "account_code": acc_c,
                 "account_name": acc_n,
