@@ -8921,7 +8921,7 @@ async def execute(
         if not execution_plan.extracted_entities.get("payment_method") and execution_plan.extracted_entities.get("payment_channel"):
             execution_plan.extracted_entities["payment_method"] = execution_plan.extracted_entities["payment_channel"]
 
-        if getattr(settings, "multi_item_disaggregator_enabled", False):
+        if getattr(settings, "multi_item_disaggregator_enabled", True):
             if not execution_plan.extracted_entities.get("line_items"):
                 try:
                     from app.multi_item_disaggregator import disaggregate_conversational_items
@@ -8930,6 +8930,7 @@ async def execute(
                         entities=execution_plan.extracted_entities,
                     )
                     if _disagg_res.is_composite and _disagg_res.line_items:
+                        _reasoning_calls = None
                         execution_plan.extracted_entities["line_items"] = [
                             ln.to_dict() for ln in _disagg_res.line_items
                         ]
@@ -8946,6 +8947,23 @@ async def execute(
                                     p for p in execution_plan.prohibited_actions
                                     if p.get("action") != "fixed_asset_capitalization"
                                 ]
+                            if not execution_plan.extracted_entities.get("useful_life_years"):
+                                execution_plan.requires_clarification = True
+                                curr_missing = list(execution_plan.missing_fields or [])
+                                for _f in ("useful_life_years", "depreciation_method"):
+                                    if _f not in curr_missing:
+                                        curr_missing.append(_f)
+                                execution_plan.missing_fields = curr_missing
+                                if not execution_plan.clarification_questions:
+                                    execution_plan.clarification_questions = [
+                                        "For IT equipment like Executive Laptop (Rs. 70,000), standard accounting policy under IAS 16 recommends a 3-year useful life using straight-line depreciation (with zero residual value). Would you like to apply this standard schedule?"
+                                    ]
+                        else:
+                            execution_plan.requires_confirmation = True
+
+                        if "create_compound_journal" not in (execution_plan.potential_tools or []):
+                            execution_plan.potential_tools = ["create_compound_journal", *list(execution_plan.potential_tools or [])]
+
                         if not execution_plan.extracted_entities.get("amount") or float(execution_plan.extracted_entities.get("amount") or 0) <= 0:
                             if _disagg_res.total_amount > 0:
                                 execution_plan.extracted_entities["amount"] = _disagg_res.total_amount

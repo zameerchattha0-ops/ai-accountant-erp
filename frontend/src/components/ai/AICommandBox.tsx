@@ -264,6 +264,13 @@ export default function AICommandBox() {
               (isLatestAssistant && String(response?.status || "").toUpperCase() === "AWAITING_CLARIFICATION") ||
               Boolean(msgResponse?.question && msg.content && msg.content.trim() === msgResponse.question.trim())
             );
+            const isDuplicateCompletedBubble = !isUser && Boolean(
+              msgResponse?.status === ExecutionStatus.COMPLETED &&
+              msgResponse?.summary &&
+              msg.content &&
+              (msg.content.trim() === msgResponse.summary.trim() || msgResponse.summary.trim().includes(msg.content.trim()))
+            );
+            const shouldSuppressBubble = isClarifyingRound || isDuplicateCompletedBubble;
 
             return (
               <div
@@ -285,8 +292,8 @@ export default function AICommandBox() {
                     isUser ? "flex flex-col items-end" : "flex-1"
                   )}
                 >
-                  {/* Message Bubble (strictly suppressed for clarification cards to prevent duplicate question rendering) */}
-                  {!isClarifyingRound && (
+                  {/* Message Bubble (strictly suppressed for clarification cards and action cards to prevent duplicate text) */}
+                  {!shouldSuppressBubble && (
                     <div
                       className={cn(
                         "px-4 py-2.5 rounded-2xl shadow-3xs leading-relaxed",
