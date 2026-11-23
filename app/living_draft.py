@@ -236,7 +236,9 @@ def _extract_line_items(entities: Dict[str, Any], default_amount: Optional[float
                 desc = str(item.get("description") or item.get("name") or "Item").strip()
                 qty = float(item.get("quantity") or 1.0)
                 unit_price = float(item.get("unit_price") or 0.0)
-                tot = float(item.get("total_amount") or (qty * unit_price))
+                tot = float(item.get("amount") or item.get("total_amount") or item.get("line_total") or (qty * unit_price))
+                if unit_price == 0.0 and tot > 0 and qty > 0:
+                    unit_price = round(tot / qty, 2)
                 if tot == 0.0 and default_amount and len(raw_items) == 1:
                     tot = default_amount
                     unit_price = tot / qty if qty else tot
@@ -274,6 +276,13 @@ def _determine_document_type(intent: str, nature: Optional[str], channel: Option
     """Determine the standard accounting document voucher title."""
     intent_low = (intent or "").lower()
     nature_up = (nature or "").upper()
+
+    if "compound" in intent_low or "split" in intent_low or nature_up == "COMPOUND":
+        if channel == "cash":
+            return "Cash Payment Voucher (Compound Split Journal)"
+        elif channel in ("bank_transfer", "bank", "cheque"):
+            return "Bank Payment Voucher (Compound Split Journal)"
+        return "Compound Split Payment Voucher"
 
     if nature_up == "FIXED_ASSET" or any(w in intent_low for w in ("fixed_asset", "capital_asset", "depreciation")):
         if channel == "cash":
@@ -343,7 +352,7 @@ def _generate_voucher_preview(
     # Settlement Account (Credit side for expenses/purchases, Debit side for sales/receipts)
     if channel == "cash":
         settlement_account = "1000 - Cash on Hand"
-    elif channel in ("bank_transfer", "cheque"):
+    elif channel in ("bank_transfer", "cheque", "bank"):
         settlement_account = f"1010 - {bank_name or 'Bank Account'} (Current)"
     elif channel == "credit":
         if "sale" in document_type.lower() or "invoice" in document_type.lower():
@@ -352,6 +361,41 @@ def _generate_voucher_preview(
             settlement_account = f"2000 - Accounts Payable ({c_name or 'Supplier'})"
     else:
         settlement_account = "[Pending Settlement Method]"
+
+    # 0. MULTI-ITEM COMPOUND SPLIT VOUCHER (Phase 4)
+    raw_splits = entities.get("line_items") or entities.get("disaggregated_items")
+    if (isinstance(raw_splits, list) and len(raw_splits) > 1) or "compound" in document_type.lower():
+        if isinstance(raw_splits, list) and len(raw_splits) > 1:
+            for item in raw_splits:
+                if isinstance(item, dict):
+                    i_desc = str(item.get("description") or "Item").strip()
+                    i_amt = float(item.get("amount") or item.get("line_total") or item.get("total_amount") or 0.0)
+                    code = str(item.get("account_code") or "").strip()
+                    name = str(item.get("account_name") or item.get("category") or "Expense").strip()
+                    if not code or code in ("6000", "6100", "6200"):
+                        low_i = i_desc.lower()
+                        if "rent" in low_i:
+                            code, name = "6210", "Rent"
+                        elif any(k in low_i for k in ("utilit", "electric", "power", "water", "gas")):
+                            code, name = "6220", "Utilities"
+                        elif any(k in low_i for k in ("laptop", "computer")):
+                            code, name = "1500", "Computer Equipment"
+                        else:
+                            code, name = "6140", "Office Supplies & Consumables"
+                    account_title = f"{code} - {name}"
+                    lines.append(VoucherLinePreview(
+                        account_name=account_title,
+                        debit=i_amt,
+                        credit=0.0,
+                        description=f"{i_desc}: Rs. {i_amt:,.2f}",
+                    ))
+            lines.append(VoucherLinePreview(
+                account_name=settlement_account,
+                debit=0.0,
+                credit=total_amount,
+                description=f"Compound settlement via {channel or 'bank_transfer'}",
+            ))
+            return lines
 
     item_desc = line_items[0].description if line_items else "Transaction item"
 
@@ -729,7 +773,7 @@ def build_living_draft(
     if not counterparty or not counterparty.name:
         if "sale" in (intent or "").lower() or "invoice" in (intent or "").lower():
             pending_requirements.append("Customer / Client identity")
-        elif "expense" not in (intent or "").lower() or channel == "credit":
+        elif ("expense" not in (intent or "").lower() and "compound" not in (intent or "").lower() and "split" not in (intent or "").lower() and not bool(ents.get("line_items"))) or channel == "credit":
             pending_requirements.append("Vendor / Supplier identity")
     if resolved_nature == "FIXED_ASSET" and not ents.get("useful_life_years") and not ents.get("useful_life"):
         pending_requirements.append("Intended useful life (years) for straight-line depreciation (standard IT is 3 years)")

@@ -171,6 +171,10 @@ _FAST_PATH_INTENTS = {
 
     "register_fixed_asset",     # R5: resolved fixed-asset acquisition
 
+    "create_compound_journal",  # Phase 4A: multi-item compound journal fast path
+
+    "reverse_journal",          # Phase 4B: one-click journal reversal
+
     # 2026-10-19 (stage-0 return lanes): the return documents get the same
 
     # deterministic treatment — the LLM continuation round had rebuilt
@@ -2984,6 +2988,51 @@ async def _deterministic_mutation_calls(
 
         return _fixed_asset_fast_path_call(entities)
 
+    if execution_plan.intent == "create_compound_journal":
+        from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
+        raw_items = entities.get("line_items") or []
+        d_items = []
+        for ri in raw_items:
+            if isinstance(ri, dict):
+                d_items.append(DisaggregatedLineItem(
+                    description=str(ri.get("description") or "Line Item"),
+                    amount=float(ri.get("amount") or ri.get("line_total") or ri.get("total_amount") or 0.0),
+                    category=str(ri.get("category") or "General"),
+                    nature=str(ri.get("nature") or "OPEX"),
+                    ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
+                    account_code=ri.get("account_code"),
+                    account_name=ri.get("account_name"),
+                ))
+        pm_comp = entities.get("payment_method") or "BANK"
+        comp_res = MultiItemDisaggregationResult(
+            line_items=d_items,
+            total_amount=float(entities.get("amount") or sum(it.amount for it in d_items)),
+            payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
+            bank_name=entities.get("bank_name"),
+            sum_line_amounts=sum(it.amount for it in d_items),
+        )
+        comp_dict = comp_res.to_compound_journal(
+            transaction_date=entities.get("transaction_date") or "today",
+            narration=f"Disaggregated compound transaction: {len(d_items)} line items",
+        )
+        return [ToolCall(tool_name="create_compound_journal", arguments=comp_dict)]
+
+    if execution_plan.intent in ("reverse_journal", "reversal") or entities.get("is_reversal"):
+        entry_id = entities.get("entry_id") or entities.get("journal_entry_id")
+        if not entry_id and entities.get("journal_number"):
+            _j = await fetch_one("journal_entries", filters={"organization_id": str(organization_id), "journal_number": str(entities["journal_number"])})
+            if _j:
+                entry_id = _j["id"]
+        if not entry_id:
+            _j_recent = await fetch_many("journal_entries", filters={"organization_id": str(organization_id)}, order="created_at.desc", limit=1)
+            if _j_recent:
+                entry_id = _j_recent[0]["id"]
+        if entry_id:
+            return [ToolCall(tool_name="reverse_journal", arguments={
+                "entry_id": str(entry_id),
+                "reason": str(entities.get("reason") or "User requested reversal"),
+            })]
+
     if execution_plan.intent == "create_credit_note":
 
         # 2026-10-19: the customer-return fast path (party + amount + date
@@ -4900,6 +4949,11 @@ async def _depreciation_policy_gate(
 
     try:
 
+        _dep_snap = json.dumps({
+            "intent": str(getattr(execution_plan, "intent", "") or "register_fixed_asset"),
+            "extracted_entities": ents,
+            "missing_fields": list(missing),
+        })
         clar = await create_clarification(
 
             session_id=session_id,
@@ -4907,6 +4961,8 @@ async def _depreciation_policy_gate(
             question=question,
 
             required_fields=list(missing),
+
+            reason=_dep_snap,
 
         )
 
@@ -11506,10 +11562,59 @@ async def execute(
             _q_payload = _parsed_q.to_payload() if _parsed_q else None
             _req_fields = _parsed_q.fields() if _parsed_q else execution_plan.missing_fields
 
+            # Enrich with Claude-style progressive question, suggestion chips & intent tracker
+            _chips = []
+            _living_draft_dict = None
+            _prog_state = None
+            try:
+                from app.conversational_manager import (
+                    format_claude_style_progressive_question,
+                    build_intent_progression,
+                )
+                from app.living_draft import build_living_draft
+                _prog_q, _prog_chips, _prog_opts = format_claude_style_progressive_question(
+                    intent=execution_plan.intent,
+                    missing_fields=list(_req_fields or []),
+                    entities=execution_plan.extracted_entities,
+                    nature=execution_plan.transaction_nature or execution_plan.extracted_entities.get("transaction_nature"),
+                )
+                if _prog_q:
+                    _q_text = _prog_q
+                if _prog_chips:
+                    _chips = _prog_chips
+                    _q_opts = [[{"value": c, "label": c} for c in _prog_chips]]
+
+                _ld_obj = build_living_draft(
+                    intent=execution_plan.intent,
+                    entities=execution_plan.extracted_entities,
+                    missing_fields=list(_req_fields or []),
+                    nature=execution_plan.transaction_nature or execution_plan.extracted_entities.get("transaction_nature"),
+                )
+                _living_draft_dict = _ld_obj.to_dict() if hasattr(_ld_obj, "to_dict") else dict(_ld_obj)
+
+                _prog_state = build_intent_progression(
+                    intent=execution_plan.intent,
+                    entities=execution_plan.extracted_entities,
+                    missing_fields=list(_req_fields or []),
+                    status="clarifying",
+                    active_question=_q_text,
+                )
+            except Exception as _en_exc:
+                log.warning("agent.model_clarification_enrichment_failed", error=str(_en_exc)[:200])
+
+            _snap = json.dumps({
+                "intent": execution_plan.intent,
+                "extracted_entities": execution_plan.extracted_entities,
+                "missing_fields": list(_req_fields or []),
+                "requires_confirmation": getattr(execution_plan, "requires_confirmation", False),
+            })
+
             await create_clarification(
                 session_id=session_id,
                 question=_q_text,
                 required_fields=_req_fields,
+                options=_chips,
+                reason=_snap,
             )
             await _log_step(session_id, "AWAITING_CLARIFICATION", {
                 "source": "model",
@@ -11520,32 +11625,17 @@ async def execute(
                 status=ExecutionStatus.AWAITING_CLARIFICATION,
                 execution_id=session_id,
                 question=_q_text,
+                options=_chips,
                 question_options=_q_opts,
                 questionnaire=_q_payload,
                 required_information=_req_fields,
                 requires_user_input=True,
-            )
-
-            await _log_step(session_id, "AWAITING_CLARIFICATION", {
-
-                "source": "model",
-
-                "question": _usable_question(llm_text)[:500],
-
-            })
-
-            return AgentResponse(
-
-                status=ExecutionStatus.AWAITING_CLARIFICATION,
-
-                execution_id=session_id,
-
-                question=_usable_question(llm_text),
-
-                required_information=execution_plan.missing_fields,
-
-                requires_user_input=True,
-
+                living_draft=_living_draft_dict,
+                intent_progression=_prog_state,
+                data={
+                    **({"living_draft": _living_draft_dict} if _living_draft_dict else {}),
+                    **({"intent_progression": _prog_state} if _prog_state else {}),
+                },
             )
 
 

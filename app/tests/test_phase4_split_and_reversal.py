@@ -224,3 +224,47 @@ def test_zero_assumption_rule_omits_useful_life_during_clarification():
     # Useful Life must NOT be in verified facts while clarifying!
     assert "Useful Life" not in fact_labels
 
+
+def test_living_draft_compound_split_voucher_preview():
+    """Verify Living Draft creates a 4-line double-entry preview for multi-entity split."""
+    from app.living_draft import build_living_draft
+
+    entities = {
+        "amount": 250000.0,
+        "payment_method": "BANK_TRANSFER",
+        "bank_name": "Meezan Bank",
+        "line_items": [
+            {"description": "Office rent", "amount": 150000.0, "account_code": "6210", "account_name": "Rent"},
+            {"description": "Electricity bill", "amount": 30000.0, "account_code": "6220", "account_name": "Utilities"},
+            {"description": "Executive laptop", "amount": 70000.0, "account_code": "1500", "account_name": "Computer Equipment"},
+        ],
+    }
+
+    draft = build_living_draft(
+        intent="create_compound_journal",
+        entities=entities,
+        missing_fields=[],
+        nature="COMPOUND",
+    )
+
+    assert "Compound Split" in draft.document_type
+    assert len(draft.voucher_preview) == 4
+
+    debits = [ln for ln in draft.voucher_preview if ln.debit > 0]
+    credits = [ln for ln in draft.voucher_preview if ln.credit > 0]
+
+    assert len(debits) == 3
+    assert len(credits) == 1
+
+    assert debits[0].debit == 150000.0
+    assert "Rent" in debits[0].account_name
+    assert debits[1].debit == 30000.0
+    assert "Utilities" in debits[1].account_name
+    assert debits[2].debit == 70000.0
+    assert "Computer Equipment" in debits[2].account_name
+
+    assert credits[0].credit == 250000.0
+    assert "Meezan Bank" in credits[0].account_name
+    assert sum(d.debit for d in debits) == sum(c.credit for c in credits)
+
+
