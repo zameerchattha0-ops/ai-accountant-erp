@@ -114,7 +114,8 @@ async def parse_packed_reply_to_endpoints(
 
     # Progressive Standard Schedule & Quick Decline Fast-Paths
     from app.conversational_manager import is_standard_schedule_acceptance
-    if is_standard_schedule_acceptance(cleaned_reply):
+    is_multi_reply = any(sep in cleaned_reply for sep in (",", "\n", ";")) or bool(re.search(r"\b(?:paid|bank|transfer|cash|rs|pkr|\d{3,})\b", cleaned_reply, re.IGNORECASE))
+    if not is_multi_reply and is_standard_schedule_acceptance(cleaned_reply):
         dep_fields = [f for f in ("useful_life_years", "depreciation_method", "salvage_value") if f in allowed_set]
         if dep_fields:
             res: Dict[str, str] = {}

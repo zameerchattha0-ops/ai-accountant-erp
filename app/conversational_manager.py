@@ -481,7 +481,13 @@ def is_standard_schedule_acceptance(reply: str) -> bool:
     if not reply:
         return False
     norm = reply.strip().lower()
-    if any(k in norm for k in ("accept 3-yr", "accept 5-yr", "accept 3 yr", "accept 5 yr", "recommended", "standard schedule", "straight line")):
+    if any(k in norm for k in (
+        "accept 3-yr", "accept 5-yr", "accept 3 yr", "accept 5 yr",
+        "accept 3-year", "accept 5-year", "recommended", "standard schedule",
+        "straight line (equal monthly)", "accept straight line",
+    )):
+        return True
+    if norm in ("straight line", "straight-line", "straightline"):
         return True
     return any(norm == t or norm.startswith(t + " ") or norm.endswith(" " + t) or norm.startswith(t + ",") for t in _STANDARD_SCHEDULE_AFFIRMATIVE)
 
