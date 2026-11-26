@@ -268,3 +268,140 @@ def test_living_draft_compound_split_voucher_preview():
     assert sum(d.debit for d in debits) == sum(c.credit for c in credits)
 
 
+def test_build_compound_journal_from_unit_price_only_items():
+    """Verify unit_price-only line_items (from STRUCTURED_EXTRACTION) compute exact debits & ISO date."""
+    import re
+    from app.multi_item_disaggregator import build_compound_journal_from_entities
+
+    entities = {
+        "amount": 250000.0,
+        "payment_method": "BANK",
+        "bank_name": "Meezan Bank",
+        "transaction_date": "today",
+        "line_items": [
+            {"description": "Office rent", "quantity": 1.0, "unit_price": 150000.0},
+            {"description": "Electricity bill", "quantity": 1.0, "unit_price": 30000.0},
+            {"description": "Executive laptop", "quantity": 1.0, "unit_price": 70000.0},
+        ],
+    }
+
+    payload = build_compound_journal_from_entities(entities)
+    assert payload["balanced"] is True
+    assert payload["total_debit"] == 250000.0
+    assert payload["total_credit"] == 250000.0
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", payload["transaction_date"] or "")
+    debits = [l for l in payload["lines"] if l["debit"] > 0]
+    credits = [l for l in payload["lines"] if l["credit"] > 0]
+    assert [d["debit"] for d in debits] == [150000.0, 30000.0, 70000.0]
+    assert credits[0]["credit"] == 250000.0
+
+
+@pytest.mark.asyncio
+async def test_record_compound_journal_resolves_semantic_coa_conflict():
+    """Verify record_compound_journal avoids cross-org code collisions (1520 Vehicle vs Computer)."""
+    import uuid
+    from unittest.mock import AsyncMock, patch
+    from app.accounting_engine import record_compound_journal
+
+    org_id = uuid.uuid4()
+    entry_id = uuid.uuid4()
+    acc_rent = {"id": uuid.uuid4(), "code": "6151", "name": "Rent Expense", "account_type": "EXPENSE", "is_active": True}
+    acc_util = {"id": uuid.uuid4(), "code": "6140", "name": "Utilities", "account_type": "EXPENSE", "is_active": True}
+    acc_comp = {"id": uuid.uuid4(), "code": "1500", "name": "Computer Equipment", "account_type": "ASSET", "is_active": True}
+    acc_veh = {"id": uuid.uuid4(), "code": "1520", "name": "Vehicle - Car", "account_type": "ASSET", "is_active": True}
+    acc_bank = {"id": uuid.uuid4(), "code": "1010", "name": "Bank", "account_type": "ASSET", "is_active": True}
+
+    by_code = {"1520": acc_veh, "1010": acc_bank, "1500": acc_comp, "6151": acc_rent, "6140": acc_util}
+    by_name = {"Rent": acc_rent, "Utilities": acc_util, "Computer & IT Equipment": acc_comp}
+
+    async def fake_by_code(_org, *, code):
+        return by_code.get(code)
+
+    async def fake_resolve(_org, *, account_name=None, **_kw):
+        return by_name.get(account_name)
+
+    captured_lines = []
+
+    async def fake_prepare(**kw):
+        captured_lines.extend(kw["lines"])
+        assert kw["transaction_date"] != "today"
+        return {"entry": {"id": str(entry_id), "journal_number": "JV-TEST-01"}}
+
+    lines = [
+        {"account_code": "6210", "account_name": "Rent", "debit": 150000.0, "credit": 0.0, "description": "Office rent"},
+        {"account_code": "6220", "account_name": "Utilities", "debit": 30000.0, "credit": 0.0, "description": "Electricity bill"},
+        {"account_code": "1520", "account_name": "Computer & IT Equipment", "debit": 70000.0, "credit": 0.0, "description": "Executive laptop"},
+        {"account_code": "1010", "account_name": "Meezan Bank", "debit": 0.0, "credit": 250000.0, "description": "Settlement"},
+    ]
+
+    with patch("app.accounting_engine._grouping_account_ids", AsyncMock(return_value=set())), \
+         patch("app.repositories.account_repository.get_account_by_code", side_effect=fake_by_code), \
+         patch("app.services.accounting_service.resolve_account", side_effect=fake_resolve), \
+         patch("app.services.accounting_service.prepare_journal", side_effect=fake_prepare), \
+         patch("app.services.accounting_service.validate_journal", AsyncMock(return_value={"valid": True})), \
+         patch("app.services.accounting_service.post_journal", AsyncMock(return_value={"status": "POSTED"})):
+        res = await record_compound_journal(
+            organization_id=org_id,
+            transaction_date="today",
+            description="Split compound",
+            lines=lines,
+        )
+
+    assert res["success"] is True
+    assert captured_lines[0]["account_id"] == str(acc_rent["id"])
+    assert captured_lines[1]["account_id"] == str(acc_util["id"])
+    # Crucial: must pick Computer Equipment, NEVER Vehicle - Car!
+    assert captured_lines[2]["account_id"] == str(acc_comp["id"])
+    assert captured_lines[3]["account_id"] == str(acc_bank["id"])
+
+
+@pytest.mark.asyncio
+async def test_register_asset_from_split_line_multi_ppe_and_today_date():
+    """Verify register_asset_from_split_line passes explicit_id and selects Computer Equipment at 70k/3yr."""
+    import re
+    import uuid
+    from unittest.mock import AsyncMock, patch
+    from app.services.fixed_asset_service import register_asset_from_split_line
+
+    org_id = uuid.uuid4()
+    entry_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    comp_id = uuid.uuid4()
+
+    coa = [
+        {"id": str(comp_id), "code": "1500", "name": "Computer Equipment", "account_type": "ASSET", "is_active": True},
+        {"id": str(uuid.uuid4()), "code": "1502", "name": "Furniture & Fixtures", "account_type": "ASSET", "is_active": True},
+        {"id": str(uuid.uuid4()), "code": "1520", "name": "Vehicle - Car", "account_type": "ASSET", "is_active": True},
+    ]
+
+    created_payload = {}
+
+    async def fake_create_asset(**kw):
+        created_payload.update(kw)
+        return {"id": str(asset_id), "name": kw["name"], "purchase_cost": kw["purchase_cost"]}
+
+    with patch("app.repositories.account_repository.get_chart_of_accounts", AsyncMock(return_value=coa)), \
+         patch("app.repositories.fixed_asset_repository.create_asset", side_effect=fake_create_asset), \
+         patch("app.repositories.fixed_asset_repository.update_asset_by_id", AsyncMock(return_value={})), \
+         patch("app.repositories.fixed_asset_repository.record_asset_transaction", AsyncMock(return_value={})), \
+         patch("app.repositories.fixed_asset_repository.record_depreciation_schedule", AsyncMock(return_value={})):
+        res = await register_asset_from_split_line(
+            organization_id=org_id,
+            name="Executive laptop",
+            purchase_cost=70000.0,
+            transaction_date="today",
+            journal_entry_id=entry_id,
+            useful_life_years=3,
+            depreciation_method="STRAIGHT_LINE",
+            account_code="1520",
+            account_name="Computer & IT Equipment",
+        )
+
+    assert res["asset_registered"] is True
+    assert created_payload["purchase_cost"] == 70000.0
+    assert created_payload["useful_life_years"] == 3
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", created_payload["purchase_date"])
+    assert str(created_payload["gl_asset_account_id"]) == str(comp_id)
+
+
+

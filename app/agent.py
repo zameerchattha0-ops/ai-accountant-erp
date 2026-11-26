@@ -2989,33 +2989,11 @@ async def _deterministic_mutation_calls(
         return _fixed_asset_fast_path_call(entities)
 
     if execution_plan.intent == "create_compound_journal":
-        from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
-        raw_items = entities.get("line_items") or []
-        d_items = []
-        for ri in raw_items:
-            if isinstance(ri, dict):
-                d_items.append(DisaggregatedLineItem(
-                    description=str(ri.get("description") or "Line Item"),
-                    amount=float(ri.get("amount") or ri.get("line_total") or ri.get("total_amount") or 0.0),
-                    category=str(ri.get("category") or "General"),
-                    nature=str(ri.get("nature") or "OPEX"),
-                    ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
-                    account_code=ri.get("account_code"),
-                    account_name=ri.get("account_name"),
-                ))
-        pm_comp = entities.get("payment_method") or "BANK"
-        comp_res = MultiItemDisaggregationResult(
-            line_items=d_items,
-            total_amount=float(entities.get("amount") or sum(it.amount for it in d_items)),
-            payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
-            bank_name=entities.get("bank_name"),
-            sum_line_amounts=sum(it.amount for it in d_items),
-        )
-        comp_dict = comp_res.to_compound_journal(
-            transaction_date=entities.get("transaction_date") or "today",
-            narration=f"Disaggregated compound transaction: {len(d_items)} line items",
-        )
-        return [ToolCall(tool_name="create_compound_journal", arguments=comp_dict)]
+        from app.multi_item_disaggregator import build_compound_journal_from_entities
+        return [ToolCall(
+            tool_name="create_compound_journal",
+            arguments=build_compound_journal_from_entities(entities),
+        )]
 
     if execution_plan.intent in ("reverse_journal", "reversal") or entities.get("is_reversal"):
         entry_id = entities.get("entry_id") or entities.get("journal_entry_id")
@@ -3404,6 +3382,10 @@ async def _deterministic_mutation_calls(
     return [ToolCall(tool_name="create_purchase_bill", arguments=params)]
 
 from app.models.schemas import (
+
+    AccountingImpactLine,
+
+    AffectedEntity,
 
     AgentContext,
 
@@ -8996,7 +8978,19 @@ async def execute(
             execution_plan.extracted_entities["payment_method"] = execution_plan.extracted_entities["payment_channel"]
 
         if getattr(settings, "multi_item_disaggregator_enabled", True):
-            if not execution_plan.extracted_entities.get("line_items"):
+            _existing_li = execution_plan.extracted_entities.get("line_items")
+            _li_needs_enrichment = not _existing_li or (
+                isinstance(_existing_li, list)
+                and len(_existing_li) > 1
+                and any(
+                    not isinstance(it, dict)
+                    or not it.get("nature")
+                    or not it.get("account_code")
+                    or it.get("amount") in (None, 0, 0.0)
+                    for it in _existing_li
+                )
+            )
+            if _li_needs_enrichment:
                 try:
                     from app.multi_item_disaggregator import disaggregate_conversational_items
                     if _early_disagg and _early_disagg.is_composite:
@@ -9915,48 +9909,6 @@ async def execute(
 
             })
 
-            _clar_snap = json.dumps({
-                "intent": execution_plan.intent,
-                "extracted_entities": execution_plan.extracted_entities,
-                "missing_fields": list(_asked_fields or execution_plan.missing_fields or []),
-                "requires_confirmation": getattr(execution_plan, "requires_confirmation", False),
-            })
-            clarification = await create_clarification(
-
-                session_id=session_id,
-
-                question=question,
-
-                required_fields=_asked_fields,
-
-                reason=_clar_snap,
-
-            )
-
-            # TRAIL (clarification.v1): the parking EVENT itself — planner
-
-            # questionnaires previously returned without ever logging an
-
-            # AWAITING marker, so per-source rates had no denominator here.
-
-            await _log_step(
-
-                session_id,
-
-                "AWAITING_CLARIFICATION",
-
-                _clarification_telemetry(
-
-                    "planner_questionnaire",
-
-                    required_fields=list(_asked_fields),
-
-                    question=question[:500],
-
-                ),
-
-            )
-
             # Pillar 2 / Decision 2A: Living Draft Voucher Card in Sidebar/Preview Pane
             _living_draft_dict = None
             if getattr(settings, "living_draft_enabled", True):
@@ -9978,6 +9930,7 @@ async def execute(
             # Pillar 1 & 3: Consultative Advisory & Progressive Single-Turn Dialogue Pacing
             _conv_q = question
             _conv_options = question_options
+            _prog_chips: List[str] = []
             if getattr(settings, "conversational_partner_enabled", True):
                 try:
                     from app.consultative_advisory import get_consultative_advice, is_consultative_query
@@ -10013,6 +9966,33 @@ async def execute(
                         _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
+
+            _clar_snap = json.dumps({
+                "intent": execution_plan.intent,
+                "extracted_entities": execution_plan.extracted_entities,
+                "missing_fields": list(_asked_fields or execution_plan.missing_fields or []),
+                "requires_confirmation": getattr(execution_plan, "requires_confirmation", False),
+            })
+            clarification = await create_clarification(
+                session_id=session_id,
+                question=_conv_q or question,
+                required_fields=_asked_fields,
+                options=_prog_chips or None,
+                reason=_clar_snap,
+            )
+
+            # TRAIL (clarification.v1): the parking EVENT itself — planner
+            # questionnaires previously returned without ever logging an
+            # AWAITING marker, so per-source rates had no denominator here.
+            await _log_step(
+                session_id,
+                "AWAITING_CLARIFICATION",
+                _clarification_telemetry(
+                    "planner_questionnaire",
+                    required_fields=list(_asked_fields),
+                    question=(_conv_q or question)[:500],
+                ),
+            )
 
             _frontier = {}
             try:
@@ -16772,32 +16752,8 @@ async def resume_with_clarification(
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             elif intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
-                from app.multi_item_disaggregator import MultiItemDisaggregationResult, DisaggregatedLineItem
-                raw_items = merged_entities.get("line_items") or []
-                d_items = []
-                for ri in raw_items:
-                    if isinstance(ri, dict):
-                        d_items.append(DisaggregatedLineItem(
-                            description=str(ri.get("description") or "Line Item"),
-                            amount=float(ri.get("amount") or ri.get("line_total") or 0.0),
-                            category=str(ri.get("category") or "General"),
-                            nature=str(ri.get("nature") or "OPEX"),
-                            ifrs_standard=str(ri.get("ifrs_standard") or "IAS 1"),
-                            account_code=ri.get("account_code"),
-                            account_name=ri.get("account_name"),
-                        ))
-                pm_comp = merged_entities.get("payment_method") or "BANK"
-                comp_res = MultiItemDisaggregationResult(
-                    line_items=d_items,
-                    total_amount=float(merged_entities.get("amount") or sum(it.amount for it in d_items)),
-                    payment_method="BANK_TRANSFER" if "BANK" in str(pm_comp).upper() else "CASH",
-                    bank_name=merged_entities.get("bank_name"),
-                    sum_line_amounts=sum(it.amount for it in d_items),
-                )
-                comp_dict = comp_res.to_compound_journal(
-                    transaction_date=merged_entities.get("transaction_date") or "today",
-                    narration=f"Disaggregated compound transaction: {len(d_items)} line items",
-                )
+                from app.multi_item_disaggregator import build_compound_journal_from_entities
+                comp_dict = build_compound_journal_from_entities(merged_entities)
                 single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
 
             elif (intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET") and not (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
@@ -17017,16 +16973,16 @@ async def resume_with_clarification(
                         f"[View in General Ledger →](/accounting/journal)"
                     )
                 elif (intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1)) and tool_result.success:
+                    from app.multi_item_disaggregator import extract_line_item_amount
+                    from app.date_parser import coerce_iso_date
+
                     tot = float(merged_entities.get("amount") or 0.0)
                     n_lines = len(merged_entities.get("line_items") or [])
 
                     # Phase 4 Dual-Registration: Capitalize any fixed assets into Fixed Asset Register
                     capitalized_assets: List[str] = []
-                    j_entry_id = None
-                    if isinstance(tool_result.data, dict):
-                        j_entry_id = tool_result.data.get("journal_entry_id")
-                    elif isinstance(tool_result.result, dict):
-                        j_entry_id = tool_result.result.get("journal_entry_id")
+                    j_entry_id = tool_result.data.get("journal_entry_id") if isinstance(tool_result.data, dict) else None
+                    entry_num = tool_result.data.get("entry_number") if isinstance(tool_result.data, dict) else None
 
                     try:
                         from app.services.fixed_asset_service import register_asset_from_split_line
@@ -17034,9 +16990,11 @@ async def resume_with_clarification(
                         raw_items = merged_entities.get("line_items") or []
                         u_life = merged_entities.get("useful_life_years") or 3
                         dep_m = merged_entities.get("depreciation_method") or "STRAIGHT_LINE"
+                        iso_dt = coerce_iso_date(merged_entities.get("transaction_date"))
                         for ri in raw_items:
                             if isinstance(ri, dict):
                                 d_desc = str(ri.get("description") or "")
+                                line_amt = extract_line_item_amount(ri)
                                 cat_m = _match_asset_category(d_desc)
                                 is_fa = (
                                     str(ri.get("nature") or "").upper() == "FIXED_ASSET"
@@ -17045,12 +17003,12 @@ async def resume_with_clarification(
                                     or cat_m in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
                                     or str(ri.get("account_code") or "").startswith("15")
                                 )
-                                if is_fa:
-                                    fa_res = await register_asset_from_split_line(
+                                if is_fa and line_amt > 0:
+                                    await register_asset_from_split_line(
                                         organization_id=organization_id,
                                         name=d_desc,
-                                        purchase_cost=float(ri.get("amount") or ri.get("line_total") or 0.0),
-                                        transaction_date=merged_entities.get("transaction_date") or "today",
+                                        purchase_cost=line_amt,
+                                        transaction_date=iso_dt,
                                         journal_entry_id=uuid.UUID(str(j_entry_id)) if j_entry_id else None,
                                         useful_life_years=int(u_life) if u_life else 3,
                                         depreciation_method=str(dep_m),
@@ -17058,7 +17016,7 @@ async def resume_with_clarification(
                                         account_name=ri.get("account_name"),
                                         created_by=user_id,
                                     )
-                                    capitalized_assets.append(f"{d_desc} (PKR {float(ri.get('amount') or 0):,.2f})")
+                                    capitalized_assets.append(f"{d_desc} (PKR {line_amt:,.2f})")
                     except Exception as _fa_exc:
                         log.warning("agent.compound_asset_registration_failed", error=str(_fa_exc)[:200])
 
@@ -17066,8 +17024,10 @@ async def resume_with_clarification(
                     if capitalized_assets:
                         fa_summary = f"* **Capitalized in Fixed Assets:** {', '.join(capitalized_assets)} ({u_life}-Year {str(dep_m).replace('_', ' ').title()})\n"
 
+                    entry_ref_str = f"* **Journal Entry:** `{entry_num}`\n" if entry_num else ""
                     result_summary = (
                         f"### ✅ Multi-Entity Split Entry Posted (Compound Journal)\n\n"
+                        f"{entry_ref_str}"
                         f"* **Total Amount:** **Rs. {tot:,.2f}**\n"
                         f"* **Allocated Lines:** {n_lines} Segregated Items (IAS 16 / IAS 38 / Opex)\n"
                         f"{fa_summary}"
@@ -17116,9 +17076,34 @@ async def resume_with_clarification(
                     except Exception:
                         pass
 
+                    _aff_entities: List[AffectedEntity] = []
+                    _acc_impact: List[AccountingImpactLine] = []
+                    if isinstance(tool_result.data, dict) and tool_result.data.get("journal_entry_id"):
+                        _aff_entities.append(AffectedEntity(
+                            type="journal_entry",
+                            action="posted",
+                            id=str(tool_result.data["journal_entry_id"]),
+                            number=tool_result.data.get("entry_number"),
+                            name=tool_result.data.get("entry_number") or "Compound Journal",
+                            total=float(tool_result.data.get("total_debit") or merged_entities.get("amount") or 0.0),
+                        ))
+                    if single_hop_call.tool_name == "create_compound_journal":
+                        for _jl in (single_hop_call.arguments.get("lines") or []):
+                            if isinstance(_jl, dict):
+                                _d = float(_jl.get("debit") or 0.0)
+                                _c = float(_jl.get("credit") or 0.0)
+                                _acc_label = f"{_jl.get('account_code') or ''} - {_jl.get('account_name') or 'Account'}".strip(" -")
+                                _acc_impact.append(AccountingImpactLine(
+                                    account=_acc_label,
+                                    debit=_d if _d > 0 else None,
+                                    credit=_c if _c > 0 else None,
+                                    description=_jl.get("description"),
+                                ))
+
                     _data_payload = {
                         "tool_name": single_hop_call.tool_name,
                         "tool_result": tool_result.data,
+                        "transaction_date": merged_entities.get("transaction_date"),
                         **({"living_draft": _completed_ld} if _completed_ld else {}),
                         **({"intent_progression": _prog_done} if _prog_done else {}),
                     }
@@ -17128,6 +17113,8 @@ async def resume_with_clarification(
                         execution_id=session_id,
                         summary=result_summary,
                         action=intent,
+                        affected_entities=_aff_entities or None,
+                        accounting_impact=_acc_impact or None,
                         data=_data_payload,
                         living_draft=_completed_ld,
                         intent_progression=_prog_done,

@@ -349,3 +349,15 @@ def resolve_relative_date_text(
                 return named
     return None
 
+
+def coerce_iso_date(
+    raw: Optional[str], *, fallback_today: bool = True
+) -> Optional[str]:
+    """Normalize a date string (including 'today'/'yesterday') to ISO YYYY-MM-DD."""
+    if raw:
+        parsed = parse_transaction_date(str(raw).strip())
+        if parsed.ok and parsed.iso_date:
+            return parsed.iso_date
+    return date.today().isoformat() if fallback_today else None
+
+

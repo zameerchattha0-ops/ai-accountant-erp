@@ -773,19 +773,34 @@ async def register_asset_from_split_line(
     Links the newly created asset record and depreciation schedule to the already-posted
     compound journal entry, avoiding duplicate journal postings.
     """
+    from app.date_parser import coerce_iso_date
+
     cost = float(purchase_cost or 0)
     if cost <= 0:
         raise ValueError("Asset purchase cost must be positive.")
 
-    txn_date = transaction_date or date.today().isoformat()
+    txn_date = coerce_iso_date(transaction_date) or date.today().isoformat()
 
-    # 1. Resolve PPE asset account
+    # 1. Resolve PPE asset account (use category keywords so multi-PPE orgs stay unambiguous)
+    low_hint = f"{name} {account_name or ''}".lower()
+    if any(k in low_hint for k in ("laptop", "computer", "macbook", "server", "it ")):
+        targeted_kw = ("computer", "laptop", "it equipment")
+    elif any(k in low_hint for k in ("furniture", "fixture", "desk", "chair", "table")):
+        targeted_kw = ("furniture", "fixture")
+    elif any(k in low_hint for k in ("vehicle", "car", "van", "truck", "bike", "motor")):
+        targeted_kw = ("vehicle", "motor")
+    elif any(k in low_hint for k in ("machinery", "plant", "generator", "machine")):
+        targeted_kw = ("machinery", "plant", "generator")
+    else:
+        targeted_kw = _ASSET_ACCOUNT_KEYWORDS
+
     asset_account = None
-    if account_code or account_name:
+    if account_name:
         asset_account = await _resolve_gl_account(
             organization_id,
             account_type="ASSET",
-            keywords=_ASSET_ACCOUNT_KEYWORDS,
+            keywords=targeted_kw,
+            explicit_id=None,
             explicit_name=account_name,
             exclude_keywords=("accumulated depreciation",),
             exclude_non_ppe=True,
@@ -794,7 +809,17 @@ async def register_asset_from_split_line(
         asset_account = await _resolve_gl_account(
             organization_id,
             account_type="ASSET",
+            keywords=targeted_kw,
+            explicit_id=None,
+            exclude_keywords=("accumulated depreciation",),
+            exclude_non_ppe=True,
+        )
+    if not asset_account:
+        asset_account = await _resolve_gl_account(
+            organization_id,
+            account_type="ASSET",
             keywords=_ASSET_ACCOUNT_KEYWORDS,
+            explicit_id=None,
             exclude_keywords=("accumulated depreciation",),
             exclude_non_ppe=True,
         )
@@ -804,11 +829,13 @@ async def register_asset_from_split_line(
         organization_id,
         account_type="EXPENSE",
         keywords=("depreciation",),
+        explicit_id=None,
     )
     acc_dep_account = await _resolve_gl_account(
         organization_id,
         account_type="ASSET",
         keywords=("accumulated depreciation",),
+        explicit_id=None,
     )
 
     # 3. Create asset row in fixed_assets

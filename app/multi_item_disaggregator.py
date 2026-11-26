@@ -481,6 +481,80 @@ def _classify_nature_and_category(
     return t["category"], t["nature"], False, False, t["account_code"], t["account_name"], t["ifrs_standard"]
 
 
+def extract_line_item_amount(item: Dict[str, Any]) -> float:
+    """Resolve line item monetary total across schema variants (amount / line_total / unit_price*qty)."""
+    for key in ("amount", "line_total", "total_amount"):
+        val = item.get(key)
+        if val is not None:
+            try:
+                num = float(str(val).replace(",", "").strip())
+                if num > 0:
+                    return num
+            except (ValueError, TypeError):
+                continue
+    try:
+        qty = float(item.get("quantity") or 1.0)
+        up = float(str(item.get("unit_price") or 0.0).replace(",", "").strip())
+        if up > 0:
+            return round(qty * up, 2)
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
+
+def build_compound_journal_from_entities(entities: Dict[str, Any]) -> Dict[str, Any]:
+    """Build compound journal arguments from entity dict containing disaggregated line_items."""
+    from app.date_parser import coerce_iso_date
+
+    raw_items = entities.get("line_items") or []
+    d_items: List[DisaggregatedLineItem] = []
+    for ri in raw_items:
+        if isinstance(ri, dict):
+            desc = str(ri.get("description") or ri.get("name") or "Line Item").strip()
+            amt = extract_line_item_amount(ri)
+            qty = float(ri.get("quantity") or 1.0)
+            cat, nat, is_fa, _, def_code, def_name, def_ifrs = _classify_nature_and_category(
+                description=desc,
+                amount=amt,
+                quantity=qty,
+            )
+            d_items.append(DisaggregatedLineItem(
+                description=desc,
+                amount=amt,
+                quantity=qty,
+                unit_price=float(ri.get("unit_price") or (amt / qty if qty > 0 else amt)),
+                category=str(ri.get("category") or cat),
+                nature=str(ri.get("nature") or nat),
+                is_fixed_asset=bool(ri.get("is_fixed_asset", is_fa)),
+                ifrs_standard=str(ri.get("ifrs_standard") or def_ifrs),
+                account_code=ri.get("account_code") or def_code,
+                account_name=ri.get("account_name") or def_name,
+            ))
+
+    pm_comp = str(entities.get("payment_method") or entities.get("payment_channel") or "BANK").upper()
+    sum_lines = round(sum(it.amount for it in d_items), 2)
+    try:
+        total_amt = float(str(entities.get("amount") or sum_lines).replace(",", "").strip())
+    except (ValueError, TypeError):
+        total_amt = sum_lines
+    if total_amt <= 0 or abs(total_amt - sum_lines) > 0.01:
+        total_amt = sum_lines if sum_lines > 0 else total_amt
+
+    comp_res = MultiItemDisaggregationResult(
+        line_items=d_items,
+        total_amount=total_amt,
+        payment_method="BANK_TRANSFER" if ("BANK" in pm_comp or "TRANSFER" in pm_comp) else "CASH",
+        bank_name=entities.get("bank_name"),
+        sum_line_amounts=sum_lines,
+        is_balanced=abs(total_amt - sum_lines) < 0.01,
+    )
+    iso_dt = coerce_iso_date(entities.get("transaction_date") or entities.get("date"))
+    return comp_res.to_compound_journal(
+        transaction_date=iso_dt,
+        narration=f"Disaggregated compound transaction: {len(d_items)} line items",
+    )
+
+
 def _format_description(raw_desc: str) -> str:
     """Normalize description string to clean sentence case."""
     clean = raw_desc.strip()

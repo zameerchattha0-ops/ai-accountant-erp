@@ -70,6 +70,8 @@ const ACTION_ROUTES: Record<string, string> = {
   record_receipt: "/receipts",
   record_bank_transfer: "/banking",
   register_fixed_asset: "/accounting/journal",
+  create_compound_journal: "/accounting/journal",
+  reverse_journal: "/accounting/journal",
   dispose_fixed_asset: "/accounting/journal",
   record_asset_depreciation: "/accounting/journal",
   generate_trial_balance: "/accounting/trial-balance",

@@ -365,23 +365,25 @@ def _generate_voucher_preview(
     # 0. MULTI-ITEM COMPOUND SPLIT VOUCHER (Phase 4)
     raw_splits = entities.get("line_items") or entities.get("disaggregated_items")
     if (isinstance(raw_splits, list) and len(raw_splits) > 1) or "compound" in document_type.lower():
+        from app.multi_item_disaggregator import extract_line_item_amount
+
         if isinstance(raw_splits, list) and len(raw_splits) > 1:
             for item in raw_splits:
                 if isinstance(item, dict):
                     i_desc = str(item.get("description") or "Item").strip()
-                    i_amt = float(item.get("amount") or item.get("line_total") or item.get("total_amount") or 0.0)
+                    i_amt = extract_line_item_amount(item)
                     code = str(item.get("account_code") or "").strip()
                     name = str(item.get("account_name") or item.get("category") or "Expense").strip()
+                    low_i = f"{i_desc} {name}".lower()
                     if not code or code in ("6000", "6100", "6200"):
-                        low_i = i_desc.lower()
                         if "rent" in low_i:
-                            code, name = "6210", "Rent"
+                            code, name = "6151", "Rent Expense"
                         elif any(k in low_i for k in ("utilit", "electric", "power", "water", "gas")):
-                            code, name = "6220", "Utilities"
+                            code, name = "6140", "Utilities"
                         elif any(k in low_i for k in ("laptop", "computer")):
                             code, name = "1500", "Computer Equipment"
                         else:
-                            code, name = "6140", "Office Supplies & Consumables"
+                            code, name = "6130", "Office Supplies"
                     account_title = f"{code} - {name}"
                     lines.append(VoucherLinePreview(
                         account_name=account_title,
@@ -651,7 +653,10 @@ def build_living_draft(
 
     counterparty = _extract_counterparty(intent, ents)
     line_items = _extract_line_items(ents, default_amount=total_amount)
-    document_type = _determine_document_type(intent, resolved_nature, channel)
+    if len(line_items) > 1 and resolved_nature.upper() not in ("COMPOUND",):
+        document_type = _determine_document_type("create_compound_journal", "COMPOUND", channel)
+    else:
+        document_type = _determine_document_type(intent, resolved_nature, channel)
 
     voucher_preview = _generate_voucher_preview(
         document_type=document_type,

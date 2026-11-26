@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
@@ -627,10 +627,99 @@ async def record_bank_transfer(
     )
 
 
+_CONTRA_OR_MISMATCH_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("computer", ("computer", "laptop", "macbook", "server", "it equipment")),
+    ("vehicle", ("vehicle", "car", "van", "truck", "motor")),
+    ("furniture", ("furniture", "fixture", "chair", "desk", "table")),
+    ("machinery", ("machinery", "plant", "generator")),
+    ("rent", ("rent",)),
+    ("utilities", ("utilit", "electric", "power", "water", "gas")),
+    ("supplies", ("suppl", "stationery", "consumable")),
+    ("bank", ("bank",)),
+    ("cash", ("cash",)),
+)
+
+
+def _account_category_tag(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    if "accumulated depreciation" in low:
+        return "accumulated_depreciation"
+    for tag, keywords in _CONTRA_OR_MISMATCH_CATEGORIES:
+        if any(k in low for k in keywords):
+            return tag
+    return None
+
+
+def _is_semantic_account_mismatch(
+    candidate_name: str, expected_name: str, line_desc: str
+) -> bool:
+    """Return True only when a code-resolved COA name clearly contradicts the target category."""
+    cand_tag = _account_category_tag(candidate_name)
+    target_tag = _account_category_tag(f"{expected_name} {line_desc}")
+    if cand_tag == "accumulated_depreciation" and target_tag != "accumulated_depreciation":
+        return True
+    if cand_tag and target_tag and cand_tag != target_tag:
+        return True
+    return False
+
+
+async def _resolve_compound_line_account(
+    organization_id: uuid.UUID,
+    *,
+    raw_acc_id: Any,
+    code: str,
+    name: str,
+    line_desc: str,
+    group_ids: set,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a compound journal line account without falling prey to cross-org code collisions."""
+    acc: Optional[Dict[str, Any]] = None
+    if raw_acc_id:
+        try:
+            acc = await a_repo.get_account(organization_id, account_id=uuid.UUID(str(raw_acc_id)))
+            if acc:
+                return acc
+        except Exception:
+            acc = None
+
+    code_candidate: Optional[Dict[str, Any]] = None
+    if code:
+        code_candidate = await a_repo.get_account_by_code(organization_id, code=code)
+        if code_candidate:
+            if code_candidate.get("id") in group_ids or code_candidate.get("is_active") is False:
+                return code_candidate
+            if not name or not _is_semantic_account_mismatch(
+                str(code_candidate.get("name") or ""), name, line_desc
+            ):
+                return code_candidate
+
+    if name:
+        resolved = await accounting_service.resolve_account(organization_id, account_name=name)
+        if resolved and resolved.get("id") not in group_ids and not _is_semantic_account_mismatch(
+            str(resolved.get("name") or ""), name, line_desc
+        ):
+            return resolved
+
+    target_tag = _account_category_tag(f"{name} {line_desc}")
+    if target_tag:
+        kw_tuple = next((kws for tag, kws in _CONTRA_OR_MISMATCH_CATEGORIES if tag == target_tag), ())
+        chart = await a_repo.get_chart_of_accounts(organization_id, is_active=True, limit=500)
+        for cand in chart or []:
+            if cand.get("id") in group_ids:
+                continue
+            cname = str(cand.get("name") or "")
+            if "accumulated depreciation" in cname.lower():
+                continue
+            if any(k in cname.lower() for k in kw_tuple):
+                return cand
+
+    return code_candidate
+
+
 async def record_compound_journal(
     *,
     organization_id: uuid.UUID,
-    transaction_date: str,
+    transaction_date: Optional[str],
     description: str,
     lines: List[Dict[str, Any]],
     entry_type: str = "MANUAL",
@@ -645,9 +734,12 @@ async def record_compound_journal(
     - Each line must resolve to a valid, active, non-grouping GL account.
     - Line amounts must be non-negative and mutually exclusive (debit > 0 xor credit > 0).
     """
+    from app.date_parser import coerce_iso_date
+
     if not lines or not isinstance(lines, list) or len(lines) < 2:
         raise ValueError("A compound journal entry requires at least 2 lines.")
 
+    iso_txn_date = coerce_iso_date(transaction_date) or ""
     group_ids = await _grouping_account_ids(organization_id)
     validated_lines: List[Dict[str, Any]] = []
 
@@ -668,23 +760,19 @@ async def record_compound_journal(
         if debit == 0 and credit == 0:
             raise ValueError(f"Line #{idx} must have either debit > 0 or credit > 0")
 
-        acc: Optional[Dict[str, Any]] = None
         raw_acc_id = line.get("account_id")
         code = str(line.get("account_code") or line.get("code") or "").strip()
         name = str(line.get("account_name") or line.get("name") or "").strip()
+        line_desc = str(line.get("description") or description).strip()
 
-        if raw_acc_id:
-            try:
-                acc_uuid = uuid.UUID(str(raw_acc_id))
-                acc = await a_repo.get_account(organization_id, account_id=acc_uuid)
-            except Exception:
-                acc = None
-
-        if not acc and code:
-            acc = await a_repo.get_account_by_code(organization_id, code=code)
-
-        if not acc and name:
-            acc = await accounting_service.resolve_account(organization_id, account_name=name)
+        acc = await _resolve_compound_line_account(
+            organization_id,
+            raw_acc_id=raw_acc_id,
+            code=code,
+            name=name,
+            line_desc=line_desc,
+            group_ids=group_ids,
+        )
 
         if not acc:
             identifier = raw_acc_id or code or name or f"line #{idx}"
@@ -696,7 +784,6 @@ async def record_compound_journal(
         if acc.get("id") in group_ids:
             raise ValueError(f"Account '{acc.get('name')}' ({acc.get('code')}) is a grouping heading, not a postable account.")
 
-        line_desc = str(line.get("description") or description).strip()
         cust_id = line.get("customer_id") or line.get("party_id")
         supp_id = line.get("supplier_id")
         proj_id = line.get("project_id")
@@ -723,7 +810,7 @@ async def record_compound_journal(
 
     prepared = await accounting_service.prepare_journal(
         organization_id=organization_id,
-        transaction_date=transaction_date,
+        transaction_date=iso_txn_date,
         description=description,
         lines=validated_lines,
         source_type=entry_type or "MANUAL",
@@ -738,7 +825,7 @@ async def record_compound_journal(
         "success": True,
         "journal_entry_id": str(entry_id),
         "entry_number": entry_row.get("journal_number") or posted.get("entry_number") or entry_row.get("entry_number"),
-        "transaction_date": transaction_date,
+        "transaction_date": iso_txn_date,
         "total_debit": total_debit,
         "total_credit": total_credit,
         "lines_count": len(validated_lines),
