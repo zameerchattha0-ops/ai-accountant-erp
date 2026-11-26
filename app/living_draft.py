@@ -529,12 +529,34 @@ def _build_depreciation_schedule(
     total_amount: Optional[float],
     entities: Dict[str, Any],
 ) -> Optional[DepreciationSchedulePreview]:
-    """Construct depreciation schedule preview if transaction is a fixed asset."""
+    """Construct depreciation schedule preview if transaction contains a fixed asset."""
     nature_up = (nature or "").upper()
-    if nature_up != "FIXED_ASSET":
+    fa_cost: Optional[float] = None
+    raw_splits = entities.get("line_items") or entities.get("disaggregated_items") or []
+    if isinstance(raw_splits, list) and len(raw_splits) > 1:
+        from app.multi_item_disaggregator import extract_line_item_amount
+        from app.conversational_manager import _match_asset_category
+
+        fa_sum = 0.0
+        for ri in raw_splits:
+            if isinstance(ri, dict):
+                desc = str(ri.get("description") or "")
+                is_fa = (
+                    str(ri.get("nature") or "").upper() == "FIXED_ASSET"
+                    or "IAS 16" in str(ri.get("ifrs_standard") or "").upper()
+                    or bool(ri.get("is_fixed_asset"))
+                    or _match_asset_category(desc) in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+                    or str(ri.get("account_code") or "").startswith("15")
+                )
+                if is_fa:
+                    fa_sum += extract_line_item_amount(ri)
+        if fa_sum > 0:
+            fa_cost = round(fa_sum, 2)
+
+    if nature_up != "FIXED_ASSET" and not fa_cost:
         return None
 
-    cost = total_amount or 0.0
+    cost = fa_cost or total_amount or 0.0
     if cost <= 0:
         return None
 

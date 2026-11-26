@@ -188,6 +188,7 @@ class DisaggregatedLineItem(BaseModel):
     nature: str
     is_fixed_asset: bool = False
     is_inventory: bool = False
+    account_id: Optional[str] = None
     account_code: Optional[str] = None
     account_name: Optional[str] = None
     ifrs_standard: Optional[str] = None
@@ -204,7 +205,7 @@ class DisaggregatedLineItem(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
-        return {
+        out: Dict[str, Any] = {
             "description": self.description,
             "amount": self.amount,
             "quantity": self.quantity,
@@ -218,6 +219,9 @@ class DisaggregatedLineItem(BaseModel):
             "account_name": self.account_name,
             "ifrs_standard": self.ifrs_standard,
         }
+        if self.account_id:
+            out["account_id"] = self.account_id
+        return out
 
 
 class MultiItemDisaggregationResult(BaseModel):
@@ -255,7 +259,7 @@ class MultiItemDisaggregationResult(BaseModel):
             acc_c = item.account_code
             acc_n = item.account_name or item.category
             d_low = f"{item.description} {item.category}".lower()
-            if not acc_c or acc_c in ("6000", "6100", "6140", "6200"):
+            if not item.account_id and (not acc_c or acc_c in ("6000", "6100", "6140", "6200")):
                 if "rent" in d_low:
                     acc_c = "6210"
                     acc_n = "Rent"
@@ -268,13 +272,16 @@ class MultiItemDisaggregationResult(BaseModel):
                 else:
                     acc_c = acc_c or "6140"
                     acc_n = acc_n or "Office Supplies & Consumables"
-            journal_lines.append({
+            line_payload: Dict[str, Any] = {
                 "account_code": acc_c,
                 "account_name": acc_n,
                 "debit": item.amount,
                 "credit": 0.0,
                 "description": item.description,
-            })
+            }
+            if item.account_id:
+                line_payload["account_id"] = item.account_id
+            journal_lines.append(line_payload)
 
         # Balancing credit leg
         journal_lines.append({
@@ -507,6 +514,13 @@ def build_compound_journal_from_entities(entities: Dict[str, Any]) -> Dict[str, 
     from app.date_parser import coerce_iso_date
 
     raw_items = entities.get("line_items") or []
+    if isinstance(raw_items, str):
+        try:
+            raw_items = json.loads(raw_items)
+        except Exception:
+            raw_items = []
+    if not isinstance(raw_items, list):
+        raw_items = []
     d_items: List[DisaggregatedLineItem] = []
     for ri in raw_items:
         if isinstance(ri, dict):
@@ -527,6 +541,7 @@ def build_compound_journal_from_entities(entities: Dict[str, Any]) -> Dict[str, 
                 nature=str(ri.get("nature") or nat),
                 is_fixed_asset=bool(ri.get("is_fixed_asset", is_fa)),
                 ifrs_standard=str(ri.get("ifrs_standard") or def_ifrs),
+                account_id=str(ri["account_id"]) if ri.get("account_id") else None,
                 account_code=ri.get("account_code") or def_code,
                 account_name=ri.get("account_name") or def_name,
             ))
@@ -553,6 +568,46 @@ def build_compound_journal_from_entities(entities: Dict[str, Any]) -> Dict[str, 
         transaction_date=iso_dt,
         narration=f"Disaggregated compound transaction: {len(d_items)} line items",
     )
+
+
+async def resolve_compound_lines_to_org_coa(
+    organization_id: Any,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Resolve line_items / journal lines onto the organization's live active COA accounts."""
+    if not items or not isinstance(items, list):
+        return items
+    try:
+        import uuid as _uuid
+        from app.accounting_engine import _grouping_account_ids, _resolve_compound_line_account
+
+        org_uuid = organization_id if isinstance(organization_id, _uuid.UUID) else _uuid.UUID(str(organization_id))
+        group_ids = await _grouping_account_ids(org_uuid)
+        enriched: List[Dict[str, Any]] = []
+        for row in items:
+            if not isinstance(row, dict):
+                enriched.append(row)
+                continue
+            copy_row = dict(row)
+            acc = await _resolve_compound_line_account(
+                org_uuid,
+                raw_acc_id=copy_row.get("account_id"),
+                code=str(copy_row.get("account_code") or "").strip(),
+                name=str(copy_row.get("account_name") or copy_row.get("category") or "").strip(),
+                line_desc=str(copy_row.get("description") or "").strip(),
+                group_ids=group_ids,
+            )
+            if acc and acc.get("id") and acc.get("id") not in group_ids and acc.get("is_active") is not False:
+                copy_row["account_id"] = str(acc["id"])
+                if acc.get("code"):
+                    copy_row["account_code"] = str(acc["code"])
+                if acc.get("name"):
+                    copy_row["account_name"] = str(acc["name"])
+            enriched.append(copy_row)
+        return enriched
+    except Exception as exc:
+        log.debug("multi_item_disaggregator.coa_enrich_skipped", error=str(exc)[:120])
+        return items
 
 
 def _format_description(raw_desc: str) -> str:

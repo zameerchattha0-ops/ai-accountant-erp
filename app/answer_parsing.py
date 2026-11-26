@@ -113,18 +113,24 @@ async def parse_packed_reply_to_endpoints(
         return None
 
     # Progressive Standard Schedule & Quick Decline Fast-Paths
-    from app.conversational_manager import is_standard_schedule_acceptance
+    from app.conversational_manager import is_standard_schedule_acceptance, expand_smart_default_answer
     is_multi_reply = any(sep in cleaned_reply for sep in (",", "\n", ";")) or bool(re.search(r"\b(?:paid|bank|transfer|cash|rs|pkr|\d{3,})\b", cleaned_reply, re.IGNORECASE))
     if not is_multi_reply and is_standard_schedule_acceptance(cleaned_reply):
         dep_fields = [f for f in ("useful_life_years", "depreciation_method", "salvage_value") if f in allowed_set]
         if dep_fields:
+            smart = expand_smart_default_answer(cleaned_reply) or {}
             res: Dict[str, str] = {}
             if "useful_life_years" in allowed_set:
-                res["useful_life_years"] = "5"
+                if smart.get("useful_life_years"):
+                    res["useful_life_years"] = str(smart["useful_life_years"])
+                else:
+                    m_yr = re.search(r"\b(\d+)[-\s]*(?:yr|yrs|year|years|saal)\b", cleaned_reply, re.IGNORECASE)
+                    if m_yr:
+                        res["useful_life_years"] = m_yr.group(1)
             if "depreciation_method" in allowed_set:
-                res["depreciation_method"] = "STRAIGHT_LINE"
+                res["depreciation_method"] = str(smart.get("depreciation_method") or "STRAIGHT_LINE")
             if "salvage_value" in allowed_set:
-                res["salvage_value"] = "0"
+                res["salvage_value"] = str(smart.get("salvage_value") or "0")
             return res
 
     if any(k in cleaned_reply.lower() for k in ("decline depreciation", "no depreciation", "cost only", "skip depreciation")):

@@ -595,10 +595,13 @@ def collect_account_refs(tool_calls: Optional[Sequence[Any]]) -> List[str]:
                 for line in value:
                     if not isinstance(line, dict):
                         continue
+                    if _UUID_RE.match(str(line.get("account_id") or "")):
+                        continue
                     for lkey in ("account", "account_name", "account_code"):
                         ref = _ref_value(line.get(lkey))
                         if ref:
                             refs.append(ref)
+                            break
     # order-preserving unique
     seen: set = set()
     ordered: List[str] = []

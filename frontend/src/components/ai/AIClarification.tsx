@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import { MessageCircleQuestion, ArrowRight, CornerDownLeft } from "lucide-react";
 import { legacyChipOptions } from "@/lib/ai/clarification";
+import { mdToDisplayText } from "@/lib/ai/markdown";
 import type { QuestionOption } from "@/lib/types/api";
 
 interface Props {
@@ -71,7 +72,7 @@ export default function AIClarification({
 
       {/* Conversational Question Text */}
       <div className="text-sm text-text-primary leading-relaxed whitespace-pre-wrap font-normal">
-        {question}
+        {mdToDisplayText(question)}
       </div>
 
       {/* Suggested Quick Options (Tappable Pills) */}

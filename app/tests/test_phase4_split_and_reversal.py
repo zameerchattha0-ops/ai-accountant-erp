@@ -404,4 +404,234 @@ async def test_register_asset_from_split_line_multi_ppe_and_today_date():
     assert str(created_payload["gl_asset_account_id"]) == str(comp_id)
 
 
+@pytest.mark.asyncio
+async def test_parse_packed_reply_accept_3yr_chip_never_overwrites_with_5():
+    """Verify 'Accept 3-Yr Straight Line (Recommended)' preserves useful_life_years == '3'."""
+    from app.answer_parsing import parse_packed_reply_to_endpoints
+
+    parsed = await parse_packed_reply_to_endpoints(
+        question_text="For IT equipment like Executive laptop, apply 3-year straight-line?",
+        user_reply="Accept 3-Yr Straight Line (Recommended)",
+        allowed_endpoints=["useful_life_years", "depreciation_method"],
+    )
+    assert parsed is not None
+    assert parsed.get("useful_life_years") == "3"
+    assert parsed.get("depreciation_method") == "STRAIGHT_LINE"
+
+
+def test_living_draft_depreciation_schedule_uses_split_asset_cost_not_total():
+    """Verify compound Living Draft depreciation_schedule uses 70k laptop cost, not 250k total."""
+    from app.living_draft import build_living_draft
+
+    entities = {
+        "amount": 250000.0,
+        "payment_method": "BANK",
+        "bank_name": "Meezan Bank",
+        "useful_life_years": 3,
+        "depreciation_method": "STRAIGHT_LINE",
+        "line_items": [
+            {"description": "Office rent", "amount": 150000.0, "nature": "OPERATING_EXPENSE", "account_code": "6151", "account_name": "Rent Expense"},
+            {"description": "Electricity bill", "amount": 30000.0, "nature": "OPERATING_EXPENSE", "account_code": "6140", "account_name": "Utilities"},
+            {"description": "Executive laptop", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True, "account_code": "1500", "account_name": "Computer Equipment", "ifrs_standard": "IAS 16"},
+        ],
+    }
+
+    draft = build_living_draft(
+        intent="create_compound_journal",
+        entities=entities,
+        missing_fields=[],
+        nature="COMPOUND",
+    )
+    assert draft.depreciation_schedule is not None
+    assert draft.depreciation_schedule.useful_life_years == 3
+    assert draft.depreciation_schedule.cost == 70000.0
+    assert draft.depreciation_schedule.annual_depreciation == round(70000.0 / 3, 2)
+
+
+def test_collect_account_refs_skips_resolved_uuid_lines():
+    """Verify collect_account_refs skips compound lines already resolved by account_id UUID."""
+    import uuid
+    from app.models.schemas import ToolCall
+    from app.account_resolution import collect_account_refs
+
+    tc = ToolCall(
+        tool_name="create_compound_journal",
+        arguments={
+            "lines": [
+                {"account_id": str(uuid.uuid4()), "account_code": "6151", "account_name": "Rent Expense", "debit": 150000.0, "credit": 0.0},
+                {"account_id": str(uuid.uuid4()), "account_code": "1010", "account_name": "Bank", "debit": 0.0, "credit": 150000.0},
+            ]
+        },
+    )
+    assert collect_account_refs([tc]) == []
+
+
+@pytest.mark.asyncio
+async def test_resume_with_clarification_compound_turn2_executes_single_hop_and_registers_70k_3yr(monkeypatch):
+    """End-to-end Turn-2 regression: Accept 3-Yr chip -> single-hop 4-line COA split & 70k/3yr asset."""
+    import uuid
+    import app.agent as agent_mod
+    import app.database as db_mod
+    import app.tool_router as router_mod
+    import app.repositories.account_repository as acct_repo
+    import app.services.fixed_asset_service as fa_svc
+    from app.models.schemas import ToolResult, ExecutionStatus
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    sess_id = uuid.uuid4()
+    je_id = uuid.uuid4()
+
+    zameer_coa = [
+        {"id": str(uuid.uuid4()), "code": "1010", "name": "Bank", "account_type": "ASSET", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "1020", "name": "Cash", "account_type": "ASSET", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "1500", "name": "Computer Equipment", "account_type": "ASSET", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "1520", "name": "Vehicle - Car", "account_type": "ASSET", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "6130", "name": "Office Supplies", "account_type": "EXPENSE", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "6140", "name": "Utilities", "account_type": "EXPENSE", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "6151", "name": "Rent Expense", "account_type": "EXPENSE", "is_active": True, "is_group": False},
+    ]
+
+    snapshot = {
+        "intent": "create_compound_journal",
+        "extracted_entities": {
+            "amount": 250000.0,
+            "payment_method": "BANK",
+            "bank_name": "Meezan Bank",
+            "transaction_date": "2026-11-26",
+            "description": "Office Rent / Electricity Bill / Executive Laptop",
+            "transaction_nature": "COMPOUND",
+            "line_items": [
+                {"description": "Office Rent", "amount": 150000.0, "category": "Rent", "nature": "OPEX", "ifrs_standard": "IAS 1"},
+                {"description": "Electricity Bill", "amount": 30000.0, "category": "Utilities", "nature": "OPEX", "ifrs_standard": "IAS 1"},
+                {"description": "Executive Laptop", "amount": 70000.0, "category": "Computer Equipment", "nature": "CAPEX", "ifrs_standard": "IAS 16", "is_fixed_asset": True},
+            ],
+        },
+        "missing_fields": ["useful_life_years", "depreciation_method"],
+    }
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return {
+                "id": str(sess_id),
+                "organization_id": str(org_id),
+                "user_id": str(user_id),
+                "role": "OWNER",
+                "status": "AWAITING_CLARIFICATION",
+                "user_request": "Paid 250,000 today: 150,000 for office rent, 30,000 electricity bill, and bought an executive laptop for 70,000 via Meezan Bank",
+            }
+        return None
+
+    async def fake_resolve_and_fetch_clarifications(*, session_id, user_response):
+        history = [
+            {
+                "question": "For Executive Laptop (Rs. 70,000), confirm useful life and depreciation method.",
+                "answer": user_response,
+                "required_information": ["useful_life_years", "depreciation_method"],
+            }
+        ]
+        return None, history, snapshot
+
+    async def fake_noop(*args, **kwargs):
+        return None
+
+    async def fake_get_coa(organization_id, *args, **kwargs):
+        return zameer_coa
+
+    async def fake_get_by_code(organization_id, *, code=None, **kwargs):
+        for acc in zameer_coa:
+            if acc["code"] == str(code):
+                return acc
+        return None
+
+    async def fake_search_accounts(organization_id, *, query="", **kwargs):
+        q = str(query or "").lower()
+        return [
+            acc for acc in zameer_coa
+            if q in acc["name"].lower() or q in acc["code"].lower()
+        ]
+
+    async def fake_get_grouping_ids(organization_id):
+        return set()
+
+    captured_tool_calls = []
+    async def fake_route_tool_call(tool_call, **kwargs):
+        captured_tool_calls.append(tool_call)
+        return ToolResult(
+            success=True,
+            tool_name=tool_call.tool_name,
+            data={
+                "journal_entry_id": str(je_id),
+                "entry_number": "JV-TEST-0103",
+                "total_debit": 250000.0,
+                "total_credit": 250000.0,
+                "status": "POSTED",
+            },
+        )
+
+    captured_assets = []
+    async def fake_register_asset_from_split_line(**kwargs):
+        captured_assets.append(kwargs)
+        return {
+            "id": str(uuid.uuid4()),
+            "asset_number": "AST-TEST-0013",
+            "name": kwargs.get("name"),
+            "purchase_cost": kwargs.get("purchase_cost"),
+            "useful_life_years": kwargs.get("useful_life_years"),
+            "depreciation_method": kwargs.get("depreciation_method"),
+        }
+
+    import app.ai_orchestrator as ai_orch
+
+    async def fake_generate_text_light(*args, **kwargs):
+        return None
+
+    async def forbid_execute(*args, **kwargs):
+        raise AssertionError("resume_with_clarification fell back to execute() instead of single-hop")
+
+    monkeypatch.setattr(ai_orch.AIOrchestrator, "generate_text_light", fake_generate_text_light)
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_noop)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_noop)
+    monkeypatch.setattr(agent_mod, "execute", forbid_execute)
+    monkeypatch.setattr(db_mod, "resolve_and_fetch_clarifications", fake_resolve_and_fetch_clarifications)
+    monkeypatch.setattr(acct_repo, "get_chart_of_accounts", fake_get_coa)
+    monkeypatch.setattr(acct_repo, "get_account_by_code", fake_get_by_code)
+    monkeypatch.setattr(acct_repo, "search_accounts", fake_search_accounts)
+    monkeypatch.setattr(acct_repo, "get_grouping_account_ids", fake_get_grouping_ids)
+    monkeypatch.setattr(router_mod, "route_tool_call", fake_route_tool_call)
+    monkeypatch.setattr(fa_svc, "register_asset_from_split_line", fake_register_asset_from_split_line)
+
+    resp = await agent_mod.resume_with_clarification(
+        session_id=sess_id,
+        user_answer="Accept 3-Yr Straight Line (Recommended)",
+        user_id=user_id,
+        organization_id=org_id,
+    )
+
+    assert resp.status == ExecutionStatus.COMPLETED
+    assert len(captured_tool_calls) == 1
+    tc = captured_tool_calls[0]
+    assert tc.tool_name == "create_compound_journal"
+    lines = tc.arguments["lines"]
+    assert len(lines) == 4
+    codes = {ln["account_code"] for ln in lines}
+    assert codes == {"6151", "6140", "1500", "1010"}
+    assert "1520" not in codes
+    assert sum(ln["debit"] for ln in lines) == pytest.approx(250000.0)
+    assert sum(ln["credit"] for ln in lines) == pytest.approx(250000.0)
+
+    assert len(captured_assets) == 1
+    assert captured_assets[0]["name"] == "Executive Laptop"
+    assert float(captured_assets[0]["purchase_cost"]) == pytest.approx(70000.0)
+    assert int(captured_assets[0]["useful_life_years"]) == 3
+
+    assert resp.living_draft is not None
+    dep = resp.living_draft.get("depreciation_schedule") or {}
+    assert dep.get("useful_life_years") == 3
+    assert float(dep.get("cost") or 0.0) == pytest.approx(70000.0)
+
+
+
+
 

@@ -2989,10 +2989,18 @@ async def _deterministic_mutation_calls(
         return _fixed_asset_fast_path_call(entities)
 
     if execution_plan.intent == "create_compound_journal":
-        from app.multi_item_disaggregator import build_compound_journal_from_entities
+        from app.multi_item_disaggregator import (
+            build_compound_journal_from_entities,
+            resolve_compound_lines_to_org_coa,
+        )
+        comp_args = build_compound_journal_from_entities(entities)
+        if comp_args.get("lines"):
+            comp_args["lines"] = await resolve_compound_lines_to_org_coa(
+                organization_id, comp_args["lines"]
+            )
         return [ToolCall(
             tool_name="create_compound_journal",
-            arguments=build_compound_journal_from_entities(entities),
+            arguments=comp_args,
         )]
 
     if execution_plan.intent in ("reverse_journal", "reversal") or entities.get("is_reversal"):
@@ -9013,6 +9021,7 @@ async def execute(
                         )
                         if has_fa:
                             execution_plan.transaction_nature = "COMPOUND"
+                            execution_plan.extracted_entities["transaction_nature"] = "COMPOUND"
                             if execution_plan.prohibited_actions:
                                 execution_plan.prohibited_actions = [
                                     p for p in execution_plan.prohibited_actions
@@ -9045,6 +9054,15 @@ async def execute(
                             execution_plan.extracted_entities["bank_name"] = _disagg_res.bank_name
                 except Exception as _exc:  # noqa: BLE001
                     log.warning("agent.multi_item_disaggregation_failed", error=str(_exc)[:200])
+
+            if isinstance(execution_plan.extracted_entities.get("line_items"), list) and len(execution_plan.extracted_entities["line_items"]) > 1:
+                try:
+                    from app.multi_item_disaggregator import resolve_compound_lines_to_org_coa
+                    execution_plan.extracted_entities["line_items"] = await resolve_compound_lines_to_org_coa(
+                        organization_id, execution_plan.extracted_entities["line_items"]
+                    )
+                except Exception:
+                    pass
 
         await _resolve_open_document_reference(organization_id, execution_plan.extracted_entities)
 
@@ -16178,7 +16196,25 @@ async def resume_with_clarification(
                         _existing_li = _h['answer']
                         break
             _multi_reply_text = str(parsed_endpoints.get('line_items') or parsed_endpoints.get('amount') or answer).strip()
-            if _existing_li or any(_w in _multi_reply_text.lower() for _w in [' each', ' total', ' and ', ' chairs', ' tables', ' units', ' pcs', ' per ']):
+            _existing_has_prices = (
+                isinstance(_existing_li, list)
+                and len(_existing_li) > 0
+                and all(
+                    isinstance(_it, dict)
+                    and (_it.get('amount') or _it.get('line_total') or _it.get('unit_price'))
+                    for _it in _existing_li
+                )
+            )
+            _dep_only_reply = any(
+                k in answer.lower()
+                for k in ('straight line', 'reducing balance', 'useful life', 'no depreciation', 'expense immediately', 'salvage', 'residual')
+            ) and not any(k in _multi_reply_text.lower() for k in (' each', ' total', ' per ', ' chairs', ' tables', ' units', ' pcs'))
+            _wants_line_price_parse = (
+                ('line_items' in parsed_endpoints or 'amount' in parsed_endpoints)
+                or (bool(_existing_li) and not _existing_has_prices and not _dep_only_reply)
+                or (not _existing_li and any(_w in _multi_reply_text.lower() for _w in [' each', ' total', ' and ', ' chairs', ' tables', ' units', ' pcs', ' per ']))
+            )
+            if _wants_line_price_parse:
                 _parsed_multi = await parse_line_items_reply_with_llm(
                     user_reply=_multi_reply_text,
                     existing_items=_existing_li,
@@ -16283,7 +16319,19 @@ async def resume_with_clarification(
             f_name = h.get("field")
             f_ans = h.get("answer")
             if f_name and f_ans not in (None, ""):
-                merged_entities[str(f_name).strip()] = f_ans
+                f_key = str(f_name).strip()
+                if f_key == "line_items" and isinstance(f_ans, str):
+                    try:
+                        parsed_li = json.loads(f_ans)
+                        if isinstance(parsed_li, list):
+                            existing_li = merged_entities.get("line_items")
+                            if isinstance(existing_li, list) and len(existing_li) == len(parsed_li):
+                                f_ans = [{**ex, **nw} if isinstance(ex, dict) and isinstance(nw, dict) else nw for ex, nw in zip(existing_li, parsed_li)]
+                            else:
+                                f_ans = parsed_li
+                    except Exception:
+                        pass
+                merged_entities[f_key] = f_ans
 
         # Multi-field answer extraction for Turn 2 user response
         if answer:
@@ -16310,7 +16358,7 @@ async def resume_with_clarification(
 
             parts = [p.strip() for p in re.split(r"[,;\n]+", answer) if p.strip()]
             for part in parts:
-                m_life = re.search(r"(\d+)\s*(?:years?|yrs?)(?:\s*useful\s*life)?|\buseful\s*life\s*(?:of|:)?\s*(\d+)", part, re.IGNORECASE)
+                m_life = re.search(r"(\d+)[-\s]*(?:years?|yrs?|yr)(?:\s*useful\s*life)?|\buseful\s*life\s*(?:of|:)?\s*(\d+)", part, re.IGNORECASE)
                 if m_life:
                     val = int(m_life.group(1) or m_life.group(2))
                     merged_entities["useful_life_years"] = val
@@ -16752,8 +16800,19 @@ async def resume_with_clarification(
                     single_hop_call = ToolCall(tool_name="record_supplier_payment", arguments=_pmt_args)
 
             elif intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
-                from app.multi_item_disaggregator import build_compound_journal_from_entities
+                from app.multi_item_disaggregator import (
+                    build_compound_journal_from_entities,
+                    resolve_compound_lines_to_org_coa,
+                )
+                if isinstance(merged_entities.get("line_items"), list):
+                    merged_entities["line_items"] = await resolve_compound_lines_to_org_coa(
+                        organization_id, merged_entities["line_items"]
+                    )
                 comp_dict = build_compound_journal_from_entities(merged_entities)
+                if comp_dict.get("lines"):
+                    comp_dict["lines"] = await resolve_compound_lines_to_org_coa(
+                        organization_id, comp_dict["lines"]
+                    )
                 single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
 
             elif (intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET") and not (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
@@ -17054,10 +17113,15 @@ async def resume_with_clarification(
                     _completed_ld = None
                     try:
                         from app.living_draft import build_living_draft
+                        _c_nature = "COMPOUND" if (
+                            intent in ("create_compound_journal", "split_transaction", "compound_journal")
+                            or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1)
+                        ) else merged_entities.get("transaction_nature")
                         _c_ld_obj = build_living_draft(
                             intent=intent,
                             entities=merged_entities,
                             missing_fields=[],
+                            nature=_c_nature,
                             session_phase="COMPLETED",
                         )
                         _completed_ld = _c_ld_obj.to_dict()
