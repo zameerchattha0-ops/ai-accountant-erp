@@ -26,6 +26,8 @@ function renderLine(line: string): string {
     out = cells.join("  ");
   }
 
+  // Markdown links [label](url) -> label (run before italic so underscores in URLs are untouched).
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
   // Bold **text** / __text__ -> text (kept for the emphasis pass).
   out = out.replace(/\*\*(.+?)\*\*/g, "$1").replace(/__(.+?)__/g, "$1");
   // Inline code `text` -> text (drop the ticks the user was seeing).

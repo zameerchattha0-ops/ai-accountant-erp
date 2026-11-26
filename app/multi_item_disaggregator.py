@@ -589,13 +589,27 @@ async def resolve_compound_lines_to_org_coa(
                 enriched.append(row)
                 continue
             copy_row = dict(row)
+            nat = str(copy_row.get("nature") or "").upper()
+            ifrs = str(copy_row.get("ifrs_standard") or "").upper()
+            row_code = str(copy_row.get("account_code") or "").strip()
+            exp_type: Optional[str] = None
+            if nat == "OPEX" or row_code.startswith(("5", "6")):
+                exp_type = "EXPENSE"
+            elif nat in ("CAPEX", "FIXED_ASSET") or copy_row.get("is_fixed_asset") or "IAS 16" in ifrs or row_code.startswith("1"):
+                exp_type = "ASSET"
+            elif row_code.startswith("2"):
+                exp_type = "LIABILITY"
+            elif row_code.startswith("4"):
+                exp_type = "REVENUE"
+
             acc = await _resolve_compound_line_account(
                 org_uuid,
                 raw_acc_id=copy_row.get("account_id"),
-                code=str(copy_row.get("account_code") or "").strip(),
+                code=row_code,
                 name=str(copy_row.get("account_name") or copy_row.get("category") or "").strip(),
                 line_desc=str(copy_row.get("description") or "").strip(),
                 group_ids=group_ids,
+                expected_type=exp_type,
             )
             if acc and acc.get("id") and acc.get("id") not in group_ids and acc.get("is_active") is not False:
                 copy_row["account_id"] = str(acc["id"])

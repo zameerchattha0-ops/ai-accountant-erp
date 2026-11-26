@@ -53,4 +53,10 @@ describe("mdToDisplayText", () => {
     expect(mdToDisplayText(null)).toBe("");
     expect(mdToDisplayText(undefined)).toBe("");
   });
+
+  it("strips markdown link syntax while preserving link labels", () => {
+    expect(
+      mdToDisplayText("[View in General Ledger →](/accounting/journal) | [View in Fixed Assets →](/accounting/fixed-assets)")
+    ).toBe("View in General Ledger →  View in Fixed Assets →");
+  });
 });

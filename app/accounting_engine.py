@@ -628,10 +628,10 @@ async def record_bank_transfer(
 
 
 _CONTRA_OR_MISMATCH_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("computer", ("computer", "laptop", "macbook", "server", "it equipment")),
+    ("computer", ("comput", "laptop", "macbook", "server", "it equipment")),
     ("vehicle", ("vehicle", "car", "van", "truck", "motor")),
-    ("furniture", ("furniture", "fixture", "chair", "desk", "table")),
-    ("machinery", ("machinery", "plant", "generator")),
+    ("furniture", ("furnitur", "fixture", "chair", "desk", "table")),
+    ("machinery", ("machiner", "plant", "generator")),
     ("rent", ("rent",)),
     ("utilities", ("utilit", "electric", "power", "water", "gas")),
     ("supplies", ("suppl", "stationery", "consumable")),
@@ -639,13 +639,23 @@ _CONTRA_OR_MISMATCH_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("cash", ("cash",)),
 )
 
+_PREFIX_CATEGORY_STEMS = {"comput", "furnitur", "machiner", "utilit", "electric", "suppl"}
+
+
+def _keyword_matches_word_boundary(low: str, keyword: str) -> bool:
+    if keyword in _PREFIX_CATEGORY_STEMS:
+        return bool(re.search(rf"\b{re.escape(keyword)}", low))
+    if " " in keyword:
+        return bool(re.search(rf"\b{re.escape(keyword)}\b", low))
+    return bool(re.search(rf"\b{re.escape(keyword)}s?\b", low))
+
 
 def _account_category_tag(text: str) -> Optional[str]:
     low = (text or "").lower()
     if "accumulated depreciation" in low:
         return "accumulated_depreciation"
     for tag, keywords in _CONTRA_OR_MISMATCH_CATEGORIES:
-        if any(k in low for k in keywords):
+        if any(_keyword_matches_word_boundary(low, k) for k in keywords):
             return tag
     return None
 
@@ -663,6 +673,26 @@ def _is_semantic_account_mismatch(
     return False
 
 
+def _infer_expected_account_type(code: str, name: str, line_desc: str) -> Optional[str]:
+    c = (code or "").strip()
+    if c.startswith(("5", "6")):
+        return "EXPENSE"
+    if c.startswith("1"):
+        return "ASSET"
+    if c.startswith("2"):
+        return "LIABILITY"
+    if c.startswith("3"):
+        return "EQUITY"
+    if c.startswith("4"):
+        return "REVENUE"
+    tag = _account_category_tag(f"{name} {line_desc}")
+    if tag in ("rent", "utilities", "supplies"):
+        return "EXPENSE"
+    if tag in ("computer", "vehicle", "furniture", "machinery", "bank", "cash"):
+        return "ASSET"
+    return None
+
+
 async def _resolve_compound_line_account(
     organization_id: uuid.UUID,
     *,
@@ -671,8 +701,9 @@ async def _resolve_compound_line_account(
     name: str,
     line_desc: str,
     group_ids: set,
+    expected_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Resolve a compound journal line account without falling prey to cross-org code collisions."""
+    """Resolve a compound journal line account without falling prey to cross-org code or substring collisions."""
     acc: Optional[Dict[str, Any]] = None
     if raw_acc_id:
         try:
@@ -682,21 +713,35 @@ async def _resolve_compound_line_account(
         except Exception:
             acc = None
 
+    req_type = (expected_type or _infer_expected_account_type(code, name, line_desc) or "").strip().upper() or None
+
+    def _type_conflicts(cand: Dict[str, Any]) -> bool:
+        ctype = str(cand.get("account_type") or "").strip().upper()
+        return bool(req_type and ctype and ctype != req_type)
+
     code_candidate: Optional[Dict[str, Any]] = None
     if code:
         code_candidate = await a_repo.get_account_by_code(organization_id, code=code)
         if code_candidate:
             if code_candidate.get("id") in group_ids or code_candidate.get("is_active") is False:
                 return code_candidate
-            if not name or not _is_semantic_account_mismatch(
-                str(code_candidate.get("name") or ""), name, line_desc
+            if not _type_conflicts(code_candidate) and (
+                not name
+                or not _is_semantic_account_mismatch(
+                    str(code_candidate.get("name") or ""), name, line_desc
+                )
             ):
                 return code_candidate
 
     if name:
-        resolved = await accounting_service.resolve_account(organization_id, account_name=name)
-        if resolved and resolved.get("id") not in group_ids and not _is_semantic_account_mismatch(
-            str(resolved.get("name") or ""), name, line_desc
+        resolved = await accounting_service.resolve_account(
+            organization_id, account_name=name, required_type=req_type
+        )
+        if (
+            resolved
+            and resolved.get("id") not in group_ids
+            and not _type_conflicts(resolved)
+            and not _is_semantic_account_mismatch(str(resolved.get("name") or ""), name, line_desc)
         ):
             return resolved
 
@@ -705,12 +750,12 @@ async def _resolve_compound_line_account(
         kw_tuple = next((kws for tag, kws in _CONTRA_OR_MISMATCH_CATEGORIES if tag == target_tag), ())
         chart = await a_repo.get_chart_of_accounts(organization_id, is_active=True, limit=500)
         for cand in chart or []:
-            if cand.get("id") in group_ids:
+            if cand.get("id") in group_ids or _type_conflicts(cand):
                 continue
             cname = str(cand.get("name") or "")
             if "accumulated depreciation" in cname.lower():
                 continue
-            if any(k in cname.lower() for k in kw_tuple):
+            if any(_keyword_matches_word_boundary(cname.lower(), k) for k in kw_tuple):
                 return cand
 
     return code_candidate

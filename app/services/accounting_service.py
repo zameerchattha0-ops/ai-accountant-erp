@@ -133,19 +133,35 @@ async def resolve_account(
         return acc
 
     if account_name:
+        import re
+
         results = await a_repo.search_accounts(
-            organization_id, query=account_name, limit=20 if target_type else 5
+            organization_id, query=account_name, limit=25
         )
         if target_type:
             results = [r for r in results if str(r.get("account_type", "")).upper() == target_type]
 
-        # Return exact match if found
+        q_low = account_name.lower().strip()
+        # 1. Exact case-insensitive name match
         for r in results:
-            if r.get("name", "").lower().strip() == account_name.lower().strip():
+            if r.get("name", "").lower().strip() == q_low:
                 return r
 
         if exact_only:
             return None
+
+        # 2. Whole-word boundary match (prevents "Rent" matching "curRENT Portion...")
+        tokens = [t for t in re.findall(r"[a-z0-9]{2,}", q_low) if t not in ("expense", "account")]
+        if tokens:
+            for r in results:
+                rname = r.get("name", "").lower()
+                if all(re.search(rf"\b{re.escape(tok)}", rname) for tok in tokens):
+                    return r
+            # Single-word token overlap if multi-word query had extras (e.g. "Rent Payable")
+            for r in results:
+                rname = r.get("name", "").lower()
+                if any(re.search(rf"\b{re.escape(tok)}\b", rname) for tok in tokens):
+                    return r
 
         return results[0] if results else None
     return None

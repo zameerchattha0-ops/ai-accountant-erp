@@ -225,7 +225,11 @@ def _build_depreciation_slider(draft: LivingDraft) -> Optional[InteractiveContro
     if not is_asset:
         return None
 
-    cost = draft.total_amount or 0.0
+    cost = (
+        draft.depreciation_schedule.cost
+        if draft.depreciation_schedule and getattr(draft.depreciation_schedule, "cost", None)
+        else (draft.total_amount or 0.0)
+    )
     salvage = draft.depreciation_schedule.salvage_value if draft.depreciation_schedule else 0.0
     depreciable = max(0.0, cost - salvage)
 

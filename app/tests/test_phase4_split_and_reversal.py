@@ -487,6 +487,7 @@ async def test_resume_with_clarification_compound_turn2_executes_single_hop_and_
         {"id": str(uuid.uuid4()), "code": "1020", "name": "Cash", "account_type": "ASSET", "is_active": True, "is_group": False},
         {"id": str(uuid.uuid4()), "code": "1500", "name": "Computer Equipment", "account_type": "ASSET", "is_active": True, "is_group": False},
         {"id": str(uuid.uuid4()), "code": "1520", "name": "Vehicle - Car", "account_type": "ASSET", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "2140", "name": "Current Portion of Long-Term Loan", "account_type": "LIABILITY", "is_active": True, "is_group": False},
         {"id": str(uuid.uuid4()), "code": "6130", "name": "Office Supplies", "account_type": "EXPENSE", "is_active": True, "is_group": False},
         {"id": str(uuid.uuid4()), "code": "6140", "name": "Utilities", "account_type": "EXPENSE", "is_active": True, "is_group": False},
         {"id": str(uuid.uuid4()), "code": "6151", "name": "Rent Expense", "account_type": "EXPENSE", "is_active": True, "is_group": False},
@@ -630,6 +631,60 @@ async def test_resume_with_clarification_compound_turn2_executes_single_hop_and_
     dep = resp.living_draft.get("depreciation_schedule") or {}
     assert dep.get("useful_life_years") == 3
     assert float(dep.get("cost") or 0.0) == pytest.approx(70000.0)
+
+
+@pytest.mark.asyncio
+async def test_rent_substring_never_resolves_to_current_liability_2140(monkeypatch):
+    """Ensure 'Rent' never matches 'Current Portion of Long-Term Loan' (2140) and slider uses 70k."""
+    import uuid
+    import app.repositories.account_repository as acct_repo
+    from app.services import accounting_service
+    from app.accounting_engine import _account_category_tag, _is_semantic_account_mismatch
+    from app.living_draft import build_living_draft
+    from app.interactive_artifacts import _build_depreciation_slider
+
+    org_id = uuid.uuid4()
+    coa = [
+        {"id": str(uuid.uuid4()), "code": "2140", "name": "Current Portion of Long-Term Loan", "account_type": "LIABILITY", "is_active": True, "is_group": False},
+        {"id": str(uuid.uuid4()), "code": "6151", "name": "Rent Expense", "account_type": "EXPENSE", "is_active": True, "is_group": False},
+    ]
+
+    async def fake_search_accounts(organization_id, *, query="", limit=25, **kwargs):
+        q = str(query or "").lower()
+        return [a for a in coa if q in a["name"].lower() or q in a["code"].lower()][:limit]
+
+    monkeypatch.setattr(acct_repo, "search_accounts", fake_search_accounts)
+
+    assert _account_category_tag("Current Portion of Long-Term Loan") is None
+    assert _is_semantic_account_mismatch("Current Portion of Long-Term Loan", "Rent Expense", "Office Rent") is False
+    resolved = await accounting_service.resolve_account(org_id, account_name="Rent")
+    assert resolved is not None
+    assert resolved["code"] == "6151"
+    assert resolved["account_type"] == "EXPENSE"
+
+    ld = build_living_draft(
+        intent="create_compound_journal",
+        entities={
+            "amount": 250000.0,
+            "payment_method": "BANK",
+            "bank_name": "Meezan Bank",
+            "useful_life_years": 3,
+            "depreciation_method": "STRAIGHT_LINE",
+            "line_items": [
+                {"description": "Office Rent", "amount": 150000.0, "category": "Rent", "nature": "OPEX"},
+                {"description": "Electricity Bill", "amount": 30000.0, "category": "Utilities", "nature": "OPEX"},
+                {"description": "Executive Laptop", "amount": 70000.0, "category": "Computer Equipment", "nature": "CAPEX", "is_fixed_asset": True},
+            ],
+        },
+        missing_fields=[],
+        nature="COMPOUND",
+        session_phase="COMPLETED",
+    )
+    slider_ctrl = _build_depreciation_slider(ld)
+    assert slider_ctrl is not None and slider_ctrl.slider is not None
+    assert slider_ctrl.slider.live_calculated_values[1]["annual"] == pytest.approx(70000.0)
+    assert slider_ctrl.slider.live_calculated_values[3]["annual"] == pytest.approx(23333.33)
+
 
 
 

@@ -181,14 +181,12 @@ export default function AIActionCard({ response }: Props) {
             )}
           </div>
           {response.summary && (
-            /* R3.4a cousin: the analytics card's summary is authored as
-               Markdown (`**`, backticks, `_`, pipe tables) but this <p> has no
-               markdown engine — the raw markers were reaching the user
-               ("**Loss: …**").  Render the known subset to clean text; plain
-               summaries pass through untouched. */
-            <p className="text-xs text-text-secondary mt-0.5 whitespace-pre-line">
-              {mdToDisplayText(response.summary)}
-            </p>
+            /* R3.4a cousin: render backend markdown cleanly to text while turning
+               internal route links like [View in Fixed Assets →](/accounting/fixed-assets)
+               into clickable Next.js Links rather than leaking raw Markdown syntax. */
+            <div className="text-xs text-text-secondary mt-0.5 space-y-1">
+              {renderSummaryWithLinks(response.summary)}
+            </div>
           )}
         </div>
       </div>
@@ -405,6 +403,50 @@ export default function AIActionCard({ response }: Props) {
       </div>
     </div>
   );
+}
+
+function renderSummaryWithLinks(summary: string) {
+  const linkTokenRe = /(\[[^\]]+\]\(\/[a-zA-Z0-9/_-]+\))/g;
+  const linkExtractRe = /^\[([^\]]+)\]\((\/[a-zA-Z0-9/_-]+)\)$/;
+
+  return summary
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line, lineIdx) => {
+      const trimmed = line.trim();
+      if (!trimmed) return null;
+      const parts = trimmed.split(linkTokenRe);
+      const hasLinks = parts.some((p) => linkExtractRe.test(p));
+      if (!hasLinks) {
+        const cleaned = mdToDisplayText(trimmed);
+        return cleaned ? (
+          <p key={lineIdx} className="whitespace-pre-line">
+            {cleaned}
+          </p>
+        ) : null;
+      }
+      return (
+        <div key={lineIdx} className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-0.5">
+          {parts.map((part, partIdx) => {
+            const m = part.match(linkExtractRe);
+            if (m) {
+              return (
+                <Link
+                  key={partIdx}
+                  href={m[2]}
+                  className="inline-flex items-center gap-1 text-ai-600 hover:underline font-medium"
+                >
+                  {m[1]}
+                </Link>
+              );
+            }
+            const cleanedText = mdToDisplayText(part.replace(/^\s*\|\s*|\s*\|\s*$/g, ""));
+            return cleanedText ? <span key={partIdx}>{cleanedText}</span> : null;
+          })}
+        </div>
+      );
+    })
+    .filter(Boolean);
 }
 
 function actionLabel(action?: string): string {
