@@ -69,8 +69,10 @@ function getClarificationSummary(rawQuestion?: string): string {
 }
 
 export default function AICommandBox() {
+  const [hasMounted, setHasMounted] = useState(false);
   const [placeholderIdx, setPlaceholderIdx] = useState(0);
   useEffect(() => {
+    setHasMounted(true);
     setPlaceholderIdx(Math.floor(Math.random() * PLACEHOLDERS.length));
   }, []);
 
@@ -408,7 +410,7 @@ export default function AICommandBox() {
                   )}
 
                   <div className="text-[10px] text-text-muted font-mono px-1">
-                    {msg.createdAt
+                    {hasMounted && msg.createdAt
                       ? new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
                       : ""}
                   </div>
@@ -486,11 +488,15 @@ export default function AICommandBox() {
           {/* Model indicator & Action Controls */}
           <div className="flex items-center gap-1.5 shrink-0 self-center">
             <label
+              htmlFor="ai-command-file"
               className="p-2 rounded-xl text-text-muted hover:text-text-secondary hover:bg-bg-muted cursor-pointer transition-colors"
               title="Attach invoice image or receipt"
             >
               <Paperclip className="w-4 h-4" />
               <input
+                id="ai-command-file"
+                name="ai-command-file"
+                aria-label="Attach invoice image or receipt"
                 type="file"
                 className="hidden"
                 multiple

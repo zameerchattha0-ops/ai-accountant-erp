@@ -111,6 +111,8 @@ export default function CommandMenu() {
         <div className="flex items-center gap-2 px-4 border-b border-border-subtle">
           <Search className="w-4 h-4 text-text-muted shrink-0" />
           <input
+            id="command-menu-search"
+            name="command-menu-search"
             ref={inputRef}
             className="w-full bg-transparent py-3.5 text-sm text-text-primary placeholder:text-text-muted focus:outline-none"
             placeholder="Jump to a page…"

@@ -396,11 +396,41 @@ export default function JournalPage() {
     setActionError(null);
     const supabase = createClient();
     const { data: { user } } = await supabase.auth.getUser();
-    const { error: revError } = await supabase.rpc("reverse_journal_entry", {
+    const { data: reversalId, error: revError } = await supabase.rpc("reverse_journal_entry", {
       p_entry_id: entryId,
       p_reason: "Reversed from Journal page",
       p_reversed_by: user?.id ?? null,
     });
+    const orgId = org?.organization_id;
+    if (!revError && orgId) {
+      // Keep linked un-depreciated fixed assets synchronized with reversed purchase journals.
+      const { data: linkedAssets } = await supabase
+        .from("fixed_assets")
+        .select("id,name,description,purchase_cost,status,accumulated_depreciation")
+        .eq("organization_id", orgId)
+        .eq("purchase_journal_entry_id", entryId)
+        .eq("status", "ACTIVE");
+      const todayIso = new Date().toISOString().slice(0, 10);
+      for (const fa of linkedAssets || []) {
+        if (Number(fa.accumulated_depreciation || 0) > 0) continue;
+        const baseDesc = String(fa.description || fa.name || "").trim();
+        const nextDesc = baseDesc.includes("[Purchase Journal Reversed]")
+          ? baseDesc
+          : `${baseDesc} [Purchase Journal Reversed]`.trim();
+        await supabase
+          .from("fixed_assets")
+          .update({
+            status: "WRITTEN_OFF",
+            disposal_date: todayIso,
+            disposal_amount: 0,
+            ...(reversalId ? { disposal_journal_entry_id: String(reversalId) } : {}),
+            description: nextDesc,
+          })
+          .eq("id", fa.id)
+          .eq("organization_id", orgId);
+      }
+      window.dispatchEvent(new Event("erp:data-changed"));
+    }
     setReversingId(null);
     if (revError) setActionError(revError.message);
     else {
@@ -433,7 +463,12 @@ export default function JournalPage() {
       />
 
       <div className="flex flex-wrap items-center gap-3 no-print">
-        <select className={`${inputCls} max-w-44`} value={statusFilter}
+        <select
+          id="journal-status-filter"
+          name="journal-status-filter"
+          aria-label="Filter journal entries by status"
+          className={`${inputCls} max-w-44`}
+          value={statusFilter}
           onChange={(e) => { setStatusFilter(e.target.value); setPage(0); }}>
           {["ALL", "DRAFT", "VALIDATED", "POSTED", "REVERSED", "VOIDED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
@@ -442,6 +477,9 @@ export default function JournalPage() {
         <div className="relative w-full sm:w-auto">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
           <input
+            id="journal-search"
+            name="journal-search"
+            aria-label="Search journal entries"
             className={`${inputCls} w-full sm:w-64 pl-9`}
             placeholder="Search number, description, source…"
             value={search}

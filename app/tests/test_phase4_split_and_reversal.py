@@ -1056,6 +1056,174 @@ async def test_treatment_review_preserves_compound_journal_lines_without_false_c
     assert rev.ok is True
 
 
+@pytest.mark.asyncio
+async def test_compound_split_preserves_quantity_and_plurality_for_2_office_desks():
+    """'70,000 for 2 office desks' preserves '2 Office Desks' in disaggregator, journal, draft, and asset."""
+    from app.living_draft import build_living_draft
+    from app.multi_item_disaggregator import disaggregate_conversational_items, format_item_with_quantity
+
+    assert format_item_with_quantity("Office Desk", 2.0) == "2 Office Desks"
+    assert format_item_with_quantity("Executive Laptop", 1.0) == "Executive Laptop"
+    assert format_item_with_quantity("workstation tables", 5.0) == "5 workstation tables"
+
+    msg = "Paid 95,000 today: 25,000 for internet bill and 70,000 for 2 office desks via Meezan Bank"
+    res = await disaggregate_conversational_items(msg, {})
+    assert len(res.line_items) == 2
+    assert res.fixed_asset_registrations_needed
+    assert res.fixed_asset_registrations_needed[0]["asset_name"].lower().startswith("2 ")
+
+    journal = res.to_compound_journal(transaction_date="2026-11-28")
+    descs = [ln.get("description", "").lower() for ln in journal["lines"]]
+    assert any("2 " in d and "desk" in d for d in descs)
+
+    ld = build_living_draft(
+        intent="create_compound_journal",
+        entities={
+            "amount": 95000.0,
+            "payment_method": "BANK",
+            "line_items": [
+                {"description": "Internet Bill", "amount": 25000.0, "quantity": 1.0, "nature": "OPERATING_EXPENSE"},
+                {"description": "Office Desk", "amount": 70000.0, "quantity": 2.0, "nature": "FIXED_ASSET"},
+            ],
+        },
+        missing_fields=[],
+        nature="COMPOUND",
+    )
+    assert any("2 Office Desks" in (vp.description or "") for vp in ld.voucher_preview)
+
+
+@pytest.mark.asyncio
+async def test_reverse_journal_synchronizes_linked_undepr_fixed_assets(monkeypatch):
+    """Reversing a purchase journal retires linked 0-depreciation ACTIVE assets (WRITTEN_OFF) without touching depreciated ones."""
+    import uuid
+    import app.services.accounting_service as acct_svc
+    import app.repositories.journal_repository as j_repo
+    import app.repositories.fixed_asset_repository as fa_repo
+    import app.database as db_mod
+
+    org_id = uuid.uuid4()
+    entry_id = uuid.uuid4()
+    rev_id = uuid.uuid4()
+    undepr_asset_id = uuid.uuid4()
+    depr_asset_id = uuid.uuid4()
+
+    async def fake_reverse_rpc(**kwargs):
+        return {"success": True, "result": str(rev_id)}
+
+    async def fake_fetch_many(table, filters=None, **kwargs):
+        if table == "fixed_assets" and filters and filters.get("purchase_journal_entry_id") == str(entry_id):
+            return [
+                {
+                    "id": str(undepr_asset_id),
+                    "organization_id": str(org_id),
+                    "name": "2 Office Desks",
+                    "description": "Acquired via compound split: 2 Office Desks",
+                    "purchase_cost": 70000.0,
+                    "accumulated_depreciation": 0.0,
+                    "status": "ACTIVE",
+                },
+                {
+                    "id": str(depr_asset_id),
+                    "organization_id": str(org_id),
+                    "name": "Existing Laptop",
+                    "purchase_cost": 100000.0,
+                    "accumulated_depreciation": 5000.0,
+                    "status": "ACTIVE",
+                },
+            ]
+        return []
+
+    updated = []
+    txns = []
+
+    async def fake_update_asset(row_id, *, fields):
+        updated.append((row_id, fields))
+        return {"id": str(row_id), **fields}
+
+    async def fake_record_txn(**kwargs):
+        txns.append(kwargs)
+        return {"id": str(uuid.uuid4())}
+
+    monkeypatch.setattr(j_repo, "reverse_journal_entry", fake_reverse_rpc)
+    monkeypatch.setattr(db_mod, "fetch_many", fake_fetch_many)
+    monkeypatch.setattr(fa_repo, "update_asset_by_id", fake_update_asset)
+    monkeypatch.setattr(fa_repo, "record_asset_transaction", fake_record_txn)
+
+    out = await acct_svc.reverse_journal(entry_id=entry_id, reason="Duplicate posting", reversal_date="2026-11-28")
+    assert out["success"] is True
+    assert len(updated) == 1
+    assert updated[0][0] == undepr_asset_id
+    assert updated[0][1]["status"] == "WRITTEN_OFF"
+    assert "[Purchase Journal Reversed]" in updated[0][1]["description"]
+    assert len(txns) == 1
+    assert txns[0]["transaction_type"] == "WRITE_OFF"
+    assert txns[0]["journal_entry_id"] == rev_id
+
+
+@pytest.mark.asyncio
+async def test_single_hop_runs_treatment_review_gate(monkeypatch):
+    """Single-hop clarification execution runs treatment review before mutating."""
+    import uuid
+    import app.agent as agent_mod
+    import app.treatment_review as tr_mod
+    from app.models.schemas import ToolCall, ExecutionStatus
+
+    steps = []
+    clars = []
+
+    async def fake_log(sid, st, data):
+        steps.append((st, data))
+
+    async def fake_clar(**kwargs):
+        clars.append(kwargs)
+        return kwargs
+
+    async def fake_status(sid, st):
+        return None
+
+    async def fake_review(**kwargs):
+        return tr_mod.TreatmentReview(
+            ran=True,
+            ok=False,
+            blocked=True,
+            question="Contradiction flagged before single-hop execution.",
+            flags=[{"kind": "amount_vs_plan", "why": "Test contradiction"}],
+            audit={"stage": "treatment_review", "llm": "flagged", "flags": 1},
+        )
+
+    monkeypatch.setattr(tr_mod, "review_plan_treatment", fake_review)
+
+    blocked = await agent_mod._single_hop_treatment_review_gate(
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        intent="create_compound_journal",
+        entities={"amount": 95000.0},
+        single_hop_call=ToolCall(tool_name="create_compound_journal", arguments={"lines": []}),
+        create_clarification_fn=fake_clar,
+        update_status_fn=fake_status,
+        log_step_fn=fake_log,
+    )
+    assert blocked is not None
+    assert blocked.status == ExecutionStatus.AWAITING_CLARIFICATION
+    assert clars and "Contradiction flagged" in clars[0]["question"]
+    assert any(st == "TREATMENT_REVIEW" for st, _ in steps)
+
+
+def test_extracted_agent_submodules_keep_agent_exports_intact():
+    """Verify agent.py cleanly re-exports extracted compound and post-execution helpers."""
+    import app.agent as agent_mod
+    import app.agent_compound as comp_mod
+    import app.agent_post_execution as post_mod
+
+    assert agent_mod._register_compound_split_fixed_assets is comp_mod.register_compound_split_fixed_assets
+    assert agent_mod._format_compound_journal_summary is comp_mod.format_compound_journal_summary
+    assert agent_mod._single_hop_treatment_review_gate is comp_mod.single_hop_treatment_review_gate
+    assert agent_mod._document_integrity_violations is post_mod.document_integrity_violations
+    assert agent_mod._build_batch_breakdown is post_mod.build_batch_breakdown
+    assert agent_mod._execution_failure_summary is post_mod.execution_failure_summary
+
+
+
 
 
 

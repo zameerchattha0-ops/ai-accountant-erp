@@ -263,7 +263,7 @@ class MultiItemDisaggregationResult(BaseModel):
                 if "rent" in d_low:
                     acc_c = "6210"
                     acc_n = "Rent"
-                elif any(k in d_low for k in ("utilit", "electric", "power", "water", "gas")):
+                elif any(k in d_low for k in ("utilit", "electric", "power", "water", "gas", "internet", "broadband", "wifi", "telecom")):
                     acc_c = "6220"
                     acc_n = "Utilities"
                 elif "computer" in d_low or "laptop" in d_low or item.nature == "FIXED_ASSET" or "IAS 16" in str(item.ifrs_standard or ""):
@@ -277,7 +277,7 @@ class MultiItemDisaggregationResult(BaseModel):
                 "account_name": acc_n,
                 "debit": item.amount,
                 "credit": 0.0,
-                "description": item.description,
+                "description": format_item_with_quantity(item.description, item.quantity),
             }
             if item.account_id:
                 line_payload["account_id"] = item.account_id
@@ -654,6 +654,33 @@ def _format_description(raw_desc: str) -> str:
     return clean[0].upper() + clean[1:]
 
 
+def format_item_with_quantity(description: str, quantity: Any = 1.0) -> str:
+    """Preserve unit count & plural noun when quantity > 1 (e.g. 2 + 'Office Desk' -> '2 Office Desks')."""
+    clean = str(description or "").strip()
+    if not clean:
+        return "Item"
+    try:
+        qty = float(quantity) if quantity not in (None, "") else 1.0
+    except (ValueError, TypeError):
+        qty = 1.0
+    if qty <= 1.0:
+        return clean
+    if re.match(r"^\d", clean):
+        return clean
+    q_str = str(int(qty)) if qty.is_integer() else f"{qty:g}"
+    words = clean.split()
+    last = words[-1]
+    low = last.lower()
+    if re.fullmatch(r"[A-Za-z]+", last) and not low.endswith("s"):
+        if low.endswith(("ch", "sh", "x", "z")) or (low.endswith("o") and low not in ("photo", "piano")):
+            words[-1] = last + "es"
+        elif low.endswith("y") and len(low) > 1 and low[-2] not in "aeiou":
+            words[-1] = last[:-1] + "ies"
+        else:
+            words[-1] = last + "s"
+    return f"{q_str} {' '.join(words)}"
+
+
 def _parse_single_segment(segment: str) -> Optional[Tuple[str, float, float]]:
     """Parse an item segment string into (description, amount, quantity)."""
     seg = segment.strip()
@@ -811,7 +838,7 @@ def _disaggregate_deterministic(
 
         if is_fa and amount >= CAPITALIZATION_SINGLE_ITEM_THRESHOLD:
             fixed_asset_registrations.append({
-                "asset_name": formatted_desc,
+                "asset_name": format_item_with_quantity(formatted_desc, qty),
                 "cost": amount,
                 "asset_class": category,
                 "account_code": acc_code,
@@ -847,7 +874,7 @@ def _disaggregate_deterministic(
             line_items.append(item)
             if is_fa and amount >= CAPITALIZATION_SINGLE_ITEM_THRESHOLD:
                 fixed_asset_registrations.append({
-                    "asset_name": formatted_desc,
+                    "asset_name": format_item_with_quantity(formatted_desc, qty),
                     "cost": amount,
                     "asset_class": category,
                     "account_code": acc_code,
@@ -1042,7 +1069,7 @@ async def disaggregate_conversational_items(
 
                     if is_fa and amt >= CAPITALIZATION_SINGLE_ITEM_THRESHOLD:
                         fixed_asset_registrations.append({
-                            "asset_name": desc,
+                            "asset_name": format_item_with_quantity(desc, qty),
                             "cost": amt,
                             "asset_class": cat,
                             "account_code": acc_code,

@@ -365,12 +365,18 @@ def _generate_voucher_preview(
     # 0. MULTI-ITEM COMPOUND SPLIT VOUCHER (Phase 4)
     raw_splits = entities.get("line_items") or entities.get("disaggregated_items")
     if (isinstance(raw_splits, list) and len(raw_splits) > 1) or "compound" in document_type.lower():
-        from app.multi_item_disaggregator import extract_line_item_amount
+        from app.multi_item_disaggregator import (
+            extract_line_item_amount,
+            format_item_with_quantity,
+        )
 
         if isinstance(raw_splits, list) and len(raw_splits) > 1:
             for item in raw_splits:
                 if isinstance(item, dict):
-                    i_desc = str(item.get("description") or "Item").strip()
+                    i_desc = format_item_with_quantity(
+                        str(item.get("description") or "Item").strip(),
+                        item.get("quantity"),
+                    )
                     i_amt = extract_line_item_amount(item)
                     code = str(item.get("account_code") or "").strip()
                     name = str(item.get("account_name") or item.get("category") or "Expense").strip()
@@ -378,7 +384,7 @@ def _generate_voucher_preview(
                     if not code or code in ("6000", "6100", "6200"):
                         if "rent" in low_i:
                             code, name = "6151", "Rent Expense"
-                        elif any(k in low_i for k in ("utilit", "electric", "power", "water", "gas")):
+                        elif any(k in low_i for k in ("utilit", "electric", "power", "water", "gas", "internet", "broadband", "wifi", "telecom")):
                             code, name = "6140", "Utilities"
                         elif any(k in low_i for k in ("laptop", "computer")):
                             code, name = "1500", "Computer Equipment"

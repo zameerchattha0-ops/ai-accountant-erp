@@ -93,11 +93,106 @@ async def post_journal(*, entry_id: uuid.UUID) -> Dict[str, Any]:
     return await j_repo.post_journal_entry(entry_id=entry_id)
 
 
+async def _sync_reversed_linked_fixed_assets(
+    *,
+    entry_id: uuid.UUID,
+    reversal_id: Optional[uuid.UUID],
+    reversal_date: Optional[str],
+    reason: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Retire un-depreciated ACTIVE fixed assets whose purchase journal was reversed."""
+    from datetime import date
+    from app.database import fetch_many
+    from app.repositories import fixed_asset_repository as fa_repo
+
+    try:
+        linked = await fetch_many(
+            "fixed_assets",
+            filters={"purchase_journal_entry_id": str(entry_id)},
+            limit=100,
+        )
+    except Exception:
+        return []
+
+    if not isinstance(linked, list) or not linked:
+        return []
+
+    rev_date_iso = str(reversal_date or date.today().isoformat())[:10]
+    synced: List[Dict[str, Any]] = []
+    for asset in linked:
+        if not isinstance(asset, dict):
+            continue
+        if str(asset.get("status") or "").upper() != "ACTIVE":
+            continue
+        if float(asset.get("accumulated_depreciation") or 0.0) > 0:
+            continue
+        try:
+            asset_uuid = uuid.UUID(str(asset["id"]))
+            org_uuid = uuid.UUID(str(asset["organization_id"]))
+            base_desc = str(asset.get("description") or asset.get("name") or "").strip()
+            new_desc = (
+                base_desc
+                if "[Purchase Journal Reversed]" in base_desc
+                else f"{base_desc} [Purchase Journal Reversed]".strip()
+            )
+            update_fields: Dict[str, Any] = {
+                "status": "WRITTEN_OFF",
+                "disposal_date": rev_date_iso,
+                "disposal_amount": 0.0,
+                "description": new_desc,
+            }
+            if reversal_id:
+                update_fields["disposal_journal_entry_id"] = reversal_id
+            await fa_repo.update_asset_by_id(asset_uuid, fields=update_fields)
+            await fa_repo.record_asset_transaction(
+                organization_id=org_uuid,
+                asset_id=asset_uuid,
+                transaction_type="WRITE_OFF",
+                transaction_date=rev_date_iso,
+                amount=float(asset.get("purchase_cost") or 0.0),
+                journal_entry_id=reversal_id,
+                details={
+                    "source": "journal_reversal",
+                    "reversed_journal_entry_id": str(entry_id),
+                    "reason": reason or "Journal Reversed",
+                },
+            )
+            synced.append({"id": str(asset_uuid), "name": asset.get("name"), "status": "WRITTEN_OFF"})
+        except Exception as exc:  # noqa: BLE001 - reversal itself already succeeded in DB
+            log.warning("accounting.reverse_asset_sync_failed", error=str(exc)[:160])
+    return synced
+
+
 async def reverse_journal(
-    *, entry_id: uuid.UUID, reason: Optional[str] = None
+    *,
+    entry_id: uuid.UUID,
+    reason: Optional[str] = None,
+    reversal_date: Optional[str] = None,
+    reversed_by: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
-    """Reverse a POSTED journal entry."""
-    return await j_repo.reverse_journal_entry(entry_id=entry_id, reason=reason)
+    """Reverse a POSTED journal entry and synchronize linked un-depreciated fixed assets."""
+    rev_res = await j_repo.reverse_journal_entry(
+        entry_id=entry_id,
+        reason=reason,
+        reversal_date=reversal_date,
+        reversed_by=reversed_by,
+    )
+    raw_rev_id = rev_res.get("result") if isinstance(rev_res, dict) else None
+    rev_uuid: Optional[uuid.UUID] = None
+    if isinstance(raw_rev_id, str) and raw_rev_id.strip():
+        try:
+            rev_uuid = uuid.UUID(raw_rev_id.strip())
+        except ValueError:
+            rev_uuid = None
+    reversed_assets = await _sync_reversed_linked_fixed_assets(
+        entry_id=entry_id,
+        reversal_id=rev_uuid,
+        reversal_date=reversal_date,
+        reason=reason,
+    )
+    if isinstance(rev_res, dict) and reversed_assets:
+        return {**rev_res, "reversed_assets": reversed_assets}
+    return rev_res
 
 
 async def get_entry(
