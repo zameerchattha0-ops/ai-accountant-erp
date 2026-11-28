@@ -152,6 +152,11 @@ export function buildBillDoc(b: Record<string, unknown>, items: Record<string, u
     lineTotal: Number(it.line_total ?? 0),
   }));
   const paid = Number(b.amount_paid ?? 0);
+  const chainParts = [
+    b.source_grn_number,
+    b.source_po_number,
+    b.source_rfq_number,
+  ].filter(Boolean) as string[];
   return {
     title: "Purchase Bill",
     docNumber: String(b.bill_number ?? "-"),
@@ -163,6 +168,9 @@ export function buildBillDoc(b: Record<string, unknown>, items: Record<string, u
       { label: "Bill date", value: fmtDate((b.bill_date as string) ?? null) },
       { label: "Due date", value: fmtDate((b.due_date as string) ?? null) },
       { label: "Amount due", value: fmtNum(Math.max(0, Number(b.total ?? 0) - paid)) },
+      ...(chainParts.length > 0
+        ? [{ label: "Procurement Chain", value: chainParts.join(" ← ") }]
+        : []),
     ],
     items: lines,
     itemsTitle: "Purchased items",

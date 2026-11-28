@@ -14,15 +14,21 @@ export default function IntentProgressionTracker({ progression, className }: Pro
     return null;
   }
 
-  const { status, verified_facts, active_reasoning, missing_info } = progression;
+  const { status, verified_facts, active_reasoning, missing_info, intent } = progression;
 
   const isCompleted = status === "completed";
   const isReviewing = status === "reviewing";
   const isClarifying = status === "clarifying" || (!isCompleted && !isReviewing);
+  const isNonPostingOrder = [
+    "create_purchase_order",
+    "update_purchase_order_status",
+    "create_quotation",
+    "create_sales_order",
+  ].includes((intent ?? "").toLowerCase());
 
   const statusBadge = isCompleted
     ? {
-        label: "Posted & Reconciled",
+        label: isNonPostingOrder ? "Order Recorded" : "Posted & Reconciled",
         className: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800",
         icon: Check,
       }

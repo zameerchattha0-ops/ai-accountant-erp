@@ -46,6 +46,9 @@ const addDays = (dateStr: string, days: number) => {
 
 type BillRow = PurchaseBill & {
   supplier?: { name?: string } | { name?: string }[] | null;
+  source_grn_number?: string | null;
+  source_po_number?: string | null;
+  source_rfq_number?: string | null;
 };
 type AccountOption = Pick<Account, "id" | "code" | "name" | "account_type" | "parent_account_id">;
 
@@ -94,7 +97,7 @@ export default function PurchaseBillsPage() {
       let query = supabase
         .from("purchase_bills")
         .select(
-          "id, bill_number, supplier_id, supplier_invoice_ref, status, bill_date, total, amount_paid, currency_code, created_at, supplier:suppliers(name)",
+          "id, bill_number, supplier_id, supplier_invoice_ref, source_order_id, source_rfq_id, source_po_id, source_grn_id, status, bill_date, total, amount_paid, currency_code, created_at, supplier:suppliers(name)",
           { count: "exact" }
         )
         .eq("organization_id", org.organization_id)
@@ -112,9 +115,46 @@ export default function PurchaseBillsPage() {
       if (expr) query = query.or(expr);
       const { data, error: dbError, count: total } = await query;
       if (dbError) throw dbError;
-      return { rows: (data ?? []) as unknown as BillRow[], count: total ?? null };
+
+      const rawBills = (data ?? []) as unknown as BillRow[];
+      const linkedOrderIds = Array.from(
+        new Set(
+          rawBills.flatMap((b) =>
+            [b.source_order_id, b.source_grn_id, b.source_po_id, b.source_rfq_id].filter(
+              (x): x is string => Boolean(x)
+            )
+          )
+        )
+      );
+      const orderNumById = new Map<string, string>();
+      if (linkedOrderIds.length > 0) {
+        const { data: poRefs } = await supabase
+          .from("purchase_orders")
+          .select("id, po_number")
+          .eq("organization_id", org.organization_id)
+          .in("id", linkedOrderIds)
+          .abortSignal(signal);
+        for (const r of (poRefs ?? []) as { id: string; po_number: string }[]) {
+          orderNumById.set(r.id, r.po_number);
+        }
+      }
+
+      const enriched = rawBills.map((b) => ({
+        ...b,
+        source_grn_number: b.source_grn_id ? orderNumById.get(b.source_grn_id) ?? null : null,
+        source_po_number: b.source_po_id ? orderNumById.get(b.source_po_id) ?? null : null,
+        source_rfq_number: b.source_rfq_id ? orderNumById.get(b.source_rfq_id) ?? null : null,
+      }));
+      return { rows: enriched, count: total ?? null };
     },
   });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get("search");
+    if (q) setSearch(q);
+  }, [setSearch]);
 
   const shownError = error ?? actionError;
   const afterMutation = () => {
@@ -233,6 +273,8 @@ export default function PurchaseBillsPage() {
         <div className="relative flex-1 max-w-sm">
           <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
           <input
+            id="purchase-bills-search"
+            name="purchase-bills-search"
             className={`${inputCls} pl-9`}
             placeholder="Search by number or supplier…"
             value={search}
@@ -240,9 +282,14 @@ export default function PurchaseBillsPage() {
             aria-label="Search purchase bills"
           />
         </div>
-        <select className={`${inputCls} max-w-40`} value={statusFilter}
+        <select
+          id="purchase-bills-status"
+          name="purchase-bills-status"
+          className={`${inputCls} max-w-40`}
+          value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
-          aria-label="Filter by status">
+          aria-label="Filter by status"
+        >
           {["ALL", "DRAFT", "OPEN", "PARTIALLY_PAID", "PAID", "OVERDUE", "VOIDED"].map((s) => (
             <option key={s} value={s}>{s === "ALL" ? "All statuses" : s}</option>
           ))}
@@ -265,7 +312,7 @@ export default function PurchaseBillsPage() {
               <tr className="text-left text-[11px] uppercase tracking-wide text-text-muted border-b border-border-subtle">
                 <th className="px-4 py-3 font-medium">Number</th>
                 <th className="px-4 py-3 font-medium">Supplier</th>
-                <th className="px-4 py-3 font-medium">Ref</th>
+                <th className="px-4 py-3 font-medium">Ref / Traceability</th>
                 <th className="px-4 py-3 font-medium">Date</th>
                 <th className="px-4 py-3 font-medium text-right">Total</th>
                 <th className="px-4 py-3 font-medium text-right">Balance</th>
@@ -279,6 +326,18 @@ export default function PurchaseBillsPage() {
                   ? bill.supplier[0]?.name
                   : bill.supplier?.name;
                 const balance = bill.total - bill.amount_paid;
+                const chainLinks = [
+                  bill.source_grn_number
+                    ? { label: bill.source_grn_number, tab: "RECEIVED" }
+                    : null,
+                  bill.source_po_number
+                    ? { label: bill.source_po_number, tab: "ORDERED" }
+                    : null,
+                  bill.source_rfq_number
+                    ? { label: bill.source_rfq_number, tab: "RFQ" }
+                    : null,
+                ].filter((x): x is { label: string; tab: string } => Boolean(x));
+
                 return (
                   <tr key={bill.id} className="border-b border-border-subtle/60 last:border-0 hover:bg-bg-muted/50 transition-colors">
                     <td className="px-4 py-3">
@@ -290,7 +349,24 @@ export default function PurchaseBillsPage() {
                       </Link>
                     </td>
                     <td className="px-4 py-3 text-text-primary">{supplierName ?? "-"}</td>
-                    <td className="px-4 py-3 text-text-secondary">{bill.supplier_invoice_ref ?? "-"}</td>
+                    <td className="px-4 py-3 text-text-secondary">
+                      <div>{bill.supplier_invoice_ref ?? "-"}</div>
+                      {chainLinks.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1 mt-0.5 text-[10.5px] text-text-muted">
+                          {chainLinks.map((lnk, idx) => (
+                            <span key={`${lnk.tab}-${lnk.label}`} className="inline-flex items-center gap-1">
+                              {idx > 0 && <span>←</span>}
+                              <Link
+                                href={`/purchases/orders?tab=${lnk.tab}&doc=${encodeURIComponent(lnk.label)}`}
+                                className="font-mono text-ai-600 hover:underline"
+                              >
+                                {lnk.label}
+                              </Link>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-text-secondary tabular-nums">{bill.bill_date}</td>
                     <td className="px-4 py-3 text-right text-text-primary tabular-nums font-medium">
                       {formatCurrency(bill.total, bill.currency_code)}
@@ -365,18 +441,18 @@ export default function PurchaseBillsPage() {
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="text-xs font-medium text-text-secondary">Bill date</label>
-                <input type="date" className={`${inputCls} mt-1.5`} value={form.bill_date}
+                <label htmlFor="bill-date" className="text-xs font-medium text-text-secondary">Bill date</label>
+                <input id="bill-date" name="bill_date" type="date" className={`${inputCls} mt-1.5`} value={form.bill_date}
                   onChange={(e) => setForm({ ...form, bill_date: e.target.value })} />
               </div>
               <div>
-                <label className="text-xs font-medium text-text-secondary">Terms</label>
-                <input type="number" min={0} className={`${inputCls} mt-1.5`} value={form.payment_terms_days}
+                <label htmlFor="bill-terms" className="text-xs font-medium text-text-secondary">Terms</label>
+                <input id="bill-terms" name="payment_terms_days" type="number" min={0} className={`${inputCls} mt-1.5`} value={form.payment_terms_days}
                   onChange={(e) => setForm({ ...form, payment_terms_days: e.target.value })} />
               </div>
               <div>
-                <label className="text-xs font-medium text-text-secondary">Supplier ref</label>
-                <input className={`${inputCls} mt-1.5`} value={form.supplier_invoice_ref}
+                <label htmlFor="bill-supplier-ref" className="text-xs font-medium text-text-secondary">Supplier ref</label>
+                <input id="bill-supplier-ref" name="supplier_invoice_ref" className={`${inputCls} mt-1.5`} value={form.supplier_invoice_ref}
                   onChange={(e) => setForm({ ...form, supplier_invoice_ref: e.target.value })}
                   placeholder="Their inv #" />
               </div>
@@ -396,7 +472,7 @@ export default function PurchaseBillsPage() {
             <div className="space-y-2">
               {form.lines.map((line, i) => (
                 <div key={i} className="grid grid-cols-12 gap-2 items-center">
-                  <input className={`${inputCls} col-span-5`} placeholder="Description"
+                  <input id={`bill-line-desc-${i}`} name={`bill_line_desc_${i}`} aria-label={`Line ${i + 1} description`} className={`${inputCls} col-span-5`} placeholder="Description"
                     value={line.description}
                     onChange={(e) => setLine(i, { description: e.target.value })} />
                   <AccountCombobox
@@ -417,10 +493,10 @@ export default function PurchaseBillsPage() {
                       )
                     }
                   />
-                  <input className={`${inputCls} col-span-1 text-right`} type="number" min="0" step="any" placeholder="Qty"
+                  <input id={`bill-line-qty-${i}`} name={`bill_line_qty_${i}`} aria-label={`Line ${i + 1} quantity`} className={`${inputCls} col-span-1 text-right`} type="number" min="0" step="any" placeholder="Qty"
                     value={line.quantity}
                     onChange={(e) => setLine(i, { quantity: e.target.value })} />
-                  <input className={`${inputCls} col-span-2 text-right`} type="number" min="0" step="any" placeholder="Price"
+                  <input id={`bill-line-price-${i}`} name={`bill_line_price_${i}`} aria-label={`Line ${i + 1} unit price`} className={`${inputCls} col-span-2 text-right`} type="number" min="0" step="any" placeholder="Price"
                     value={line.unit_price}
                     onChange={(e) => setLine(i, { unit_price: e.target.value })} />
                   <button
@@ -437,8 +513,8 @@ export default function PurchaseBillsPage() {
           </div>
 
           <div>
-            <label className="text-xs font-medium text-text-secondary">Notes</label>
-            <textarea className={`${inputCls} mt-1.5 min-h-16 resize-y`} value={form.notes}
+            <label htmlFor="bill-notes" className="text-xs font-medium text-text-secondary">Notes</label>
+            <textarea id="bill-notes" name="notes" className={`${inputCls} mt-1.5 min-h-16 resize-y`} value={form.notes}
               onChange={(e) => setForm({ ...form, notes: e.target.value })} />
           </div>
 

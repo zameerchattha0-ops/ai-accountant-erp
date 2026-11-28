@@ -919,10 +919,24 @@ export interface PurchaseOrderItem {
   line_total?: number;
 }
 
+export interface PurchaseOrderChainNode {
+  id: string;
+  doc_number: string;
+  stage: "RFQ" | "ORDERED" | "RECEIVED" | "BILLED";
+  status: string;
+  record_type: "ORDER" | "BILL";
+  order_date?: string | null;
+  total: number;
+  is_current?: boolean;
+}
+
 export interface PurchaseOrder {
   id: string;
   organization_id: string;
   po_number: string;
+  record_type?: "ORDER" | "BILL";
+  bill_id?: string | null;
+  bill_status?: string | null;
   supplier_id?: string | null;
   supplier_name?: string;
   supplier_email?: string;
@@ -936,6 +950,24 @@ export interface PurchaseOrder {
   total: number;
   notes?: string | null;
   terms?: string | null;
+  parent_order_id?: string | null;
+  source_rfq_id?: string | null;
+  source_po_id?: string | null;
+  source_grn_id?: string | null;
+  source_order_id?: string | null;
+  parent_po_number?: string | null;
+  source_rfq_number?: string | null;
+  source_po_number?: string | null;
+  source_grn_number?: string | null;
+  promoted_to_order_id?: string | null;
+  promoted_to_po_number?: string | null;
+  promoted_to_status?: string | null;
+  promoted_to_bill_id?: string | null;
+  promoted_to_bill_number?: string | null;
+  promoted_to_bill_status?: string | null;
+  promoted_at?: string | null;
+  is_promoted?: boolean;
+  chain?: PurchaseOrderChainNode[];
   items?: PurchaseOrderItem[];
   created_at: string;
   updated_at: string;

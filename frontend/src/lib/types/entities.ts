@@ -145,6 +145,10 @@ export interface PurchaseBill {
   amount_paid: number;
   notes: string | null;
   journal_entry_id: string | null;
+  source_order_id?: string | null;
+  source_rfq_id?: string | null;
+  source_po_id?: string | null;
+  source_grn_id?: string | null;
   paid_at: string | null;
   voided_at: string | null;
   created_at: string;

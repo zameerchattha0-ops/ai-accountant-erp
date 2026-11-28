@@ -35,6 +35,10 @@ async def create_purchase_bill(
     supplier_invoice_ref: Optional[str] = None,
     notes: Optional[str] = None,
     items: Optional[List[Dict[str, Any]]] = None,
+    source_order_id: Optional[uuid.UUID] = None,
+    source_rfq_id: Optional[uuid.UUID] = None,
+    source_po_id: Optional[uuid.UUID] = None,
+    source_grn_id: Optional[uuid.UUID] = None,
     created_by: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """Create a purchase bill after verifying the supplier exists.
@@ -87,6 +91,10 @@ async def create_purchase_bill(
         "payment_terms_days": payment_terms_days,
         "supplier_invoice_ref": supplier_invoice_ref,
         "notes": notes,
+        "source_order_id": str(source_order_id) if source_order_id else None,
+        "source_rfq_id": str(source_rfq_id) if source_rfq_id else None,
+        "source_po_id": str(source_po_id) if source_po_id else None,
+        "source_grn_id": str(source_grn_id) if source_grn_id else None,
         "created_by": str(created_by) if created_by else None,
     }
     items_payload = [

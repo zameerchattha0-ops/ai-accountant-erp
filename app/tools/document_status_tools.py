@@ -263,21 +263,39 @@ async def update_document_status(
             elif norm_target == "ACCEPTED" and norm_type == "quotation":
                 upd_data["accepted_at"] = now_iso
 
+            # Route purchase_order promotions through purchase_order_service so stage
+            # documents (RFQ -> PO -> GRN -> Purchase Bill) are preserved with full links.
+            if norm_type == "purchase_order":
+                from app.services import purchase_order_service
+                result_doc = await purchase_order_service.transition_order_status(
+                    organization_id,
+                    order_id=uuid.UUID(str(doc["id"])),
+                    new_status=norm_target,
+                    auto_receive_stock=True,
+                    auto_create_bill=(norm_target == "BILLED"),
+                )
+                promoted_ref = (
+                    (result_doc.get("created_bill") or {}).get("bill_number")
+                    or result_doc.get("po_number")
+                    or doc_ref
+                )
+                party_name = await _resolve_party_name(organization_id, norm_type, doc)
+                updated_docs.append({
+                    "id": str(result_doc.get("id") or doc["id"]),
+                    "reference": f"{doc_ref} -> {promoted_ref}" if promoted_ref != doc_ref else doc_ref,
+                    "previous_status": curr_status,
+                    "new_status": norm_target,
+                    "total": float(result_doc.get("total") or doc.get("total") or 0.0),
+                    "party_name": party_name,
+                    "url": f"{base_url}#{promoted_ref}",
+                })
+                continue
+
             await update_one(
                 table_name,
                 data=upd_data,
                 filters={"id": str(doc["id"]), "organization_id": str(organization_id)},
             )
-
-            # PO service transition for stock receipts
-            if norm_type == "purchase_order" and norm_target == "RECEIVED":
-                from app.services import purchase_order_service
-                try:
-                    await purchase_order_service.transition_order_status(
-                        organization_id, order_id=uuid.UUID(str(doc["id"])), new_status="RECEIVED"
-                    )
-                except Exception as po_err:
-                    log.warning("po_transition_warn", error=str(po_err))
 
             party_name = await _resolve_party_name(organization_id, norm_type, doc)
             updated_docs.append({

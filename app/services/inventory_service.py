@@ -434,10 +434,14 @@ async def get_stock_pipeline(
         po_rows = await fetch_many(
             "purchase_orders",
             filters={"organization_id": str(organization_id)},
-            select="id,status",
+            select="id,status,promoted_to_order_id",
             limit=1000,
         )
-        po_status_by_id = {str(r["id"]): str(r.get("status") or "").upper() for r in po_rows}
+        po_status_by_id = {
+            str(r["id"]): str(r.get("status") or "").upper()
+            for r in po_rows
+            if not r.get("promoted_to_order_id")
+        }
         if po_status_by_id:
             items_rows = await fetch_many(
                 "purchase_order_items",

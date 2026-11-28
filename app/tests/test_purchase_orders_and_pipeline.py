@@ -19,63 +19,111 @@ from app.tools.document_status_tools import update_document_status
 async def test_create_and_transition_purchase_order():
     org_id = uuid.uuid4()
     supplier_id = uuid.uuid4()
-    order_id = uuid.uuid4()
+    rfq_id = uuid.uuid4()
+    po_id = uuid.uuid4()
+    grn_id = uuid.uuid4()
     prod_id = uuid.uuid4()
 
-    mock_order = {
-        "id": str(order_id),
+    items = [
+        {
+            "product_id": str(prod_id),
+            "description": "Office Chairs",
+            "quantity": 5.0,
+            "unit_price": 10000.0,
+            "tax_amount": 0.0,
+            "line_total": 50000.0,
+        }
+    ]
+    rfq_row = {
+        "id": str(rfq_id),
         "organization_id": str(org_id),
         "po_number": "RFQ-000001",
         "supplier_id": str(supplier_id),
         "status": "RFQ",
         "order_date": "2026-10-28",
         "total": 50000.0,
-        "items": [
-            {
-                "product_id": str(prod_id),
-                "description": "Office Chairs",
-                "quantity": 5.0,
-                "unit_price": 10000.0,
-                "tax_amount": 0.0,
-                "line_total": 50000.0,
-            }
-        ],
+        "items": items,
+    }
+    po_row = {
+        "id": str(po_id),
+        "organization_id": str(org_id),
+        "po_number": "PO-000001",
+        "supplier_id": str(supplier_id),
+        "status": "ORDERED",
+        "order_date": "2026-10-28",
+        "total": 50000.0,
+        "parent_order_id": str(rfq_id),
+        "source_rfq_id": str(rfq_id),
+        "items": items,
+    }
+    grn_row = {
+        "id": str(grn_id),
+        "organization_id": str(org_id),
+        "po_number": "GRN-000001",
+        "supplier_id": str(supplier_id),
+        "status": "RECEIVED",
+        "order_date": "2026-10-28",
+        "total": 50000.0,
+        "parent_order_id": str(po_id),
+        "source_rfq_id": str(rfq_id),
+        "source_po_id": str(po_id),
+        "items": items,
     }
 
+    by_id = {str(rfq_id): rfq_row, str(po_id): po_row, str(grn_id): grn_row}
+
+    async def fake_create_po(**kw):
+        st = str(kw.get("status") or "RFQ").upper()
+        if st == "RFQ":
+            return rfq_row
+        if st == "ORDERED":
+            return po_row
+        return grn_row
+
+    async def fake_get_po(oid, *, order_id):
+        return by_id.get(str(order_id))
+
     with patch("app.services.supplier_service.get", new=AsyncMock(return_value={"id": str(supplier_id), "name": "Apex Supplies"})), \
-         patch("app.repositories.purchase_order_repository.create_purchase_order", new=AsyncMock(return_value=mock_order)), \
-         patch("app.repositories.purchase_order_repository.get_purchase_order", new=AsyncMock(return_value=mock_order)), \
-         patch("app.repositories.purchase_order_repository.get_purchase_order_items", new=AsyncMock(return_value=mock_order["items"])), \
-         patch("app.repositories.purchase_order_repository.update_purchase_order_status", new=AsyncMock(return_value={"status": "ORDERED"})), \
-         patch("app.services.inventory_service.receive_stock", new=AsyncMock(return_value={"id": str(uuid.uuid4())})):
+         patch("app.repositories.purchase_order_repository.create_purchase_order", side_effect=fake_create_po), \
+         patch("app.repositories.purchase_order_repository.get_purchase_order", side_effect=fake_get_po), \
+         patch("app.repositories.purchase_order_repository.get_purchase_order_items", new=AsyncMock(return_value=items)), \
+         patch("app.repositories.purchase_order_repository.mark_purchase_order_promoted", new=AsyncMock(return_value={"promoted_at": "now"})) as mock_promote, \
+         patch("app.services.purchase_order_service.fetch_many", new=AsyncMock(return_value=[])), \
+         patch("app.services.inventory_service.receive_stock", new=AsyncMock(return_value={"id": str(uuid.uuid4())})) as mock_recv:
 
         # 1. Create RFQ
         created = await purchase_order_service.create_order(
             organization_id=org_id,
             supplier_id=supplier_id,
-            items=mock_order["items"],
+            items=items,
             status="RFQ",
         )
         assert created["status"] == "RFQ"
         assert created["po_number"] == "RFQ-000001"
 
-        # 2. Transition RFQ -> ORDERED (Vendor Confirmed PO)
+        # 2. Transition RFQ -> ORDERED: preserves RFQ and mints PO-000001
         ordered = await purchase_order_service.transition_order_status(
             organization_id=org_id,
-            order_id=order_id,
+            order_id=rfq_id,
             new_status="ORDERED",
         )
-        assert ordered is not None
+        assert ordered["po_number"] == "PO-000001"
+        assert ordered["status"] == "ORDERED"
+        assert ordered["promoted_from"]["po_number"] == "RFQ-000001"
+        assert rfq_row["status"] == "RFQ"
 
-        # 3. Transition ORDERED -> RECEIVED (GRN - Goods Arrived in Warehouse)
-        mock_order["status"] = "ORDERED"
+        # 3. Transition ORDERED -> RECEIVED: preserves PO-000001 and mints GRN-000001
         received = await purchase_order_service.transition_order_status(
             organization_id=org_id,
-            order_id=order_id,
+            order_id=po_id,
             new_status="RECEIVED",
             auto_receive_stock=True,
         )
-        assert received is not None
+        assert received["po_number"] == "GRN-000001"
+        assert received["status"] == "RECEIVED"
+        assert received["promoted_from"]["po_number"] == "PO-000001"
+        assert mock_promote.await_count == 2
+        mock_recv.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -245,5 +293,158 @@ async def test_create_po_with_item_qty_price_fast_path():
     assert calls[0].arguments["product_name"] == "OFFICE CHAIRS"
     assert calls[0].arguments["quantity"] == 5.0
     assert calls[0].arguments["unit_price"] == 15000.0
+
+
+@pytest.mark.asyncio
+async def test_full_procurement_stage_chain_rfq_po_grn_bill():
+    """Verify full 4-stage preservation and backward traceability: PUR -> GRN -> PO -> RFQ."""
+    from app.repositories import purchase_order_repository as po_repo
+
+    org_id = uuid.uuid4()
+    supp_id = uuid.uuid4()
+    rfq_id = uuid.uuid4()
+    po_id = uuid.uuid4()
+    grn_id = uuid.uuid4()
+    bill_id = uuid.uuid4()
+
+    orders_store = {}
+    items_store = {}
+    bills_store = {}
+    counters = {"RFQ": 0, "PO": 0, "GRN": 0, "PUR": 0}
+
+    async def fake_generate_po_number(oid, prefix="PO", *, doc_type=None):
+        counters[prefix] += 1
+        return f"{prefix}-{counters[prefix]:06d}"
+
+    async def fake_insert_one(table, *, data):
+        if table == "purchase_orders":
+            oid = {
+                "RFQ": str(rfq_id),
+                "ORDERED": str(po_id),
+                "RECEIVED": str(grn_id),
+            }[data["status"]]
+            row = {"id": oid, **data, "created_at": f"2026-11-29T00:0{counters.get(data['status'], 0)}:00Z"}
+            orders_store[oid] = row
+            items_store[oid] = []
+            return dict(row)
+        if table == "purchase_order_items":
+            row = {"id": str(uuid.uuid4()), **data}
+            items_store[str(data["purchase_order_id"])].append(row)
+            return row
+        return {"id": str(uuid.uuid4()), **data}
+
+    async def fake_update_one(table, *, row_id, data, organization_id=None, filters=None):
+        if table == "purchase_orders" and str(row_id) in orders_store:
+            orders_store[str(row_id)].update(data)
+            return dict(orders_store[str(row_id)])
+        return {}
+
+    async def fake_fetch_one(table, *, filters=None, select="*"):
+        if table == "purchase_orders":
+            return dict(orders_store[str(filters["id"])]) if str(filters.get("id")) in orders_store else None
+        if table == "purchase_bills":
+            return dict(bills_store[str(filters["id"])]) if str(filters.get("id")) in bills_store else None
+        return None
+
+    async def fake_fetch_many(table, *, filters=None, select="*", order=None, limit=50):
+        if table == "purchase_orders":
+            return [dict(v) for v in orders_store.values()]
+        if table == "purchase_order_items":
+            return list(items_store.get(str((filters or {}).get("purchase_order_id")), []))
+        if table == "purchase_bills":
+            return [dict(v) for v in bills_store.values()]
+        if table == "purchase_bill_items":
+            return []
+        if table == "suppliers":
+            return [{"id": str(supp_id), "name": "Tech Depot", "email": "", "phone": ""}]
+        return []
+
+    async def fake_create_purchase_bill(**kw):
+        counters["PUR"] += 1
+        bill = {
+            "id": str(bill_id),
+            "organization_id": str(org_id),
+            "bill_number": f"PUR-{counters['PUR']:06d}",
+            "supplier_id": str(kw["supplier_id"]),
+            "status": "DRAFT",
+            "bill_date": kw["bill_date"],
+            "subtotal": 25000.0,
+            "tax_total": 0.0,
+            "total": 25000.0,
+            "source_order_id": str(kw["source_order_id"]) if kw.get("source_order_id") else None,
+            "source_grn_id": str(kw["source_grn_id"]) if kw.get("source_grn_id") else None,
+            "source_po_id": str(kw["source_po_id"]) if kw.get("source_po_id") else None,
+            "source_rfq_id": str(kw["source_rfq_id"]) if kw.get("source_rfq_id") else None,
+            "created_at": "2026-11-29T00:05:00Z",
+        }
+        bills_store[str(bill_id)] = bill
+        return bill
+
+    with patch("app.repositories.purchase_order_repository.generate_po_number", side_effect=fake_generate_po_number), \
+         patch("app.repositories.purchase_order_repository.insert_one", side_effect=fake_insert_one), \
+         patch("app.repositories.purchase_order_repository.update_one", side_effect=fake_update_one), \
+         patch("app.repositories.purchase_order_repository.fetch_one", side_effect=fake_fetch_one), \
+         patch("app.repositories.purchase_order_repository.fetch_many", side_effect=fake_fetch_many), \
+         patch("app.services.purchase_order_service.fetch_many", side_effect=fake_fetch_many), \
+         patch("app.services.purchase_order_service.fetch_one", side_effect=fake_fetch_one), \
+         patch("app.services.supplier_service.get", new=AsyncMock(return_value={"id": str(supp_id), "name": "Tech Depot"})), \
+         patch("app.services.inventory_service.receive_stock", new=AsyncMock(return_value={"id": str(uuid.uuid4())})), \
+         patch("app.services.purchase_service.create_purchase_bill", side_effect=fake_create_purchase_bill):
+
+        rfq = await purchase_order_service.create_order(
+            organization_id=org_id,
+            supplier_id=supp_id,
+            items=[{"description": "Network Switch", "quantity": 1, "unit_price": 25000.0}],
+            status="RFQ",
+        )
+        assert rfq["po_number"] == "RFQ-000001"
+
+        po = await purchase_order_service.transition_order_status(
+            org_id, order_id=rfq_id, new_status="ORDERED"
+        )
+        assert po["po_number"] == "PO-000001"
+        assert orders_store[str(rfq_id)]["status"] == "RFQ"
+        assert orders_store[str(rfq_id)]["promoted_to_order_id"] == str(po_id)
+
+        grn = await purchase_order_service.transition_order_status(
+            org_id, order_id=po_id, new_status="RECEIVED", auto_receive_stock=True
+        )
+        assert grn["po_number"] == "GRN-000001"
+        assert orders_store[str(po_id)]["status"] == "ORDERED"
+        assert orders_store[str(po_id)]["promoted_to_order_id"] == str(grn_id)
+        assert grn["source_rfq_number"] == "RFQ-000001"
+        assert grn["source_po_number"] == "PO-000001"
+
+        billed = await purchase_order_service.transition_order_status(
+            org_id, order_id=grn_id, new_status="BILLED", auto_create_bill=True
+        )
+        assert billed["po_number"] == "PUR-000001"
+        assert billed["status"] == "BILLED"
+        assert orders_store[str(grn_id)]["status"] == "RECEIVED"
+        assert orders_store[str(grn_id)]["promoted_to_bill_id"] == str(bill_id)
+        assert [c["doc_number"] for c in billed["chain"]] == [
+            "RFQ-000001",
+            "PO-000001",
+            "GRN-000001",
+            "PUR-000001",
+        ]
+        # Verify stock pipeline skips promoted RFQ and PO rows once GRN received them
+        all_rows = await purchase_order_service.list_orders(org_id, status="ALL")
+        assert {r["po_number"] for r in all_rows} == {"RFQ-000001", "PO-000001", "GRN-000001", "PUR-000001"}
+
+
+def test_intent_progression_non_posting_purchase_order_copy():
+    """Commercial PO/RFQ workflow must label non-posting status cleanly, never claim GL posting."""
+    from app.conversational_manager import build_intent_progression
+
+    prog = build_intent_progression(
+        intent="create_purchase_order",
+        entities={"supplier_name": "Tech Depot", "amount": 25000.0, "item_description": "network switch"},
+        missing_fields=[],
+        status="completed",
+    )
+    assert "non-posting" in prog["active_reasoning"].lower()
+    assert "successfully posted to the general ledger" not in prog["active_reasoning"].lower()
+
 
 
