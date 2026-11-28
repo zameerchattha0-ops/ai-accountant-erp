@@ -1207,7 +1207,7 @@ async def synthesize_cumulative_dialogue_intent(
     # 4. Grounded Field Safeguards (fallback when LLM didn't emit explicit fields)
     text_to_scan = f"{raw_reply} {user_req}".strip()
     scan_up = text_to_scan.upper()
-    if not merged.get("bank_name"):
+    if "bank_name" not in llm_extracted:
         for b_kw in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
             if b_kw in scan_up:
                 merged["bank_name"] = b_kw.title()
@@ -1221,6 +1221,8 @@ async def synthesize_cumulative_dialogue_intent(
     elif any(k in scan_up for k in ("CREDIT", "LATER", "PAYABLE", "ON CREDIT")) and not merged.get("payment_method"):
         merged["payment_method"] = "CREDIT"
         merged["payment_type"] = "CREDIT"
+    if merged.get("payment_method") and not merged.get("payment_type"):
+        merged["payment_type"] = merged["payment_method"]
 
     # Date parsing check
     if raw_reply and "transaction_date" not in llm_extracted:
@@ -1287,6 +1289,7 @@ async def synthesize_cumulative_dialogue_intent(
 
     return {
         "entities": merged,
+        "llm_keys": sorted(llm_extracted.keys()),
         "reasoning": llm_reasoning,
         "next_action": llm_next_action or "PROCEED",
         "resolved_intent": llm_resolved_intent or merged.get("intent"),
