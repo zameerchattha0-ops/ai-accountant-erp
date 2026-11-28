@@ -35,6 +35,10 @@ _CONTRADICTION_KEYS = frozenset(
     {"nature_vs_plan", "settlement_vs_plan", "amount_vs_plan", "tax_vs_plan", "other"}
 )
 
+_COMMERCIAL_ORDER_TOOLS = frozenset(
+    {"create_purchase_order", "create_sales_order", "create_quotation"}
+)
+
 _INSTRUCTION = (
     "You are an accounting treatment REVIEWER. You receive CONFIRMED FACTS "
     "and a CANONICAL PLAN (tool calls about to execute). Output STRICT JSON: "
@@ -52,7 +56,11 @@ _INSTRUCTION = (
     "Compound split journal tools (create_compound_journal) split multi-item or "
     "mixed Opex/Capex transactions across balanced GL debit/credit 'lines' and "
     "do not carry 'transaction_nature', 'items', or top-level 'amount'; treat "
-    "balanced GL 'lines' matching the confirmed 'line_items' and total as consistent."
+    "balanced GL 'lines' matching the confirmed 'line_items' and total as consistent. "
+    "Commercial order and quotation tools (create_purchase_order, create_sales_order, "
+    "create_quotation) are non-posting workflow documents (no GL journal, Fixed Asset "
+    "registration, depreciation, or immediate payment settlement is posted yet); treat "
+    "matching party, item/product_name, quantity, and unit_price/amount/items as consistent."
 )
 
 
@@ -160,6 +168,62 @@ def _budget_treatment_prompt(
     return f"{instruction_text}\n\n{payload_json}"
 
 
+def _to_pos_float(raw: Any) -> Optional[float]:
+    if raw in (None, "", 0):
+        return None
+    try:
+        val = float(raw)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _synthesize_document_items(
+    call_args: Dict[str, Any],
+    facts: Dict[str, Any],
+    tool_name: str,
+) -> None:
+    """Ensure return and non-posting order tools expose structured item/amount fields."""
+    is_commercial = tool_name in _COMMERCIAL_ORDER_TOOLS
+    if not is_commercial and tool_name not in ("create_credit_note", "create_purchase_return"):
+        return
+    if is_commercial:
+        call_args.pop("transaction_nature", None)
+    desc = (
+        call_args.get("product_name")
+        or call_args.get("item_name")
+        or call_args.get("description")
+        or call_args.get("item_description")
+        or facts.get("item_description")
+    )
+    qty_f = _to_pos_float(call_args.get("quantity") or facts.get("quantity")) or 1.0
+    up_f = _to_pos_float(call_args.get("unit_price") or call_args.get("price"))
+    amt_f = _to_pos_float(call_args.get("amount") or call_args.get("total"))
+    if amt_f is None and up_f is not None and is_commercial:
+        amt_f = round(up_f * qty_f, 2)
+    if amt_f is None:
+        amt_f = _to_pos_float(facts.get("amount"))
+    if up_f is None and amt_f is not None:
+        up_f = round(amt_f / qty_f, 2)
+    if is_commercial:
+        if up_f is not None and "unit_price" not in call_args:
+            call_args["unit_price"] = up_f
+        if amt_f is not None and "amount" not in call_args:
+            call_args["amount"] = amt_f
+    if call_args.get("items"):
+        return
+    if desc or (qty_f != 1.0 if not is_commercial else (up_f is not None or amt_f is not None)):
+        default_desc = "Order item" if is_commercial else "Item return"
+        row: Dict[str, Any] = {
+            "description": str(desc or default_desc).strip(),
+            "quantity": qty_f,
+            "unit_price": up_f,
+        }
+        if is_commercial and amt_f is not None:
+            row["amount"] = amt_f
+        call_args["items"] = [row]
+
+
 def _extract_facts_and_plan(
     *,
     intent: str,
@@ -171,6 +235,10 @@ def _extract_facts_and_plan(
     has_compound_call = any(
         getattr(c, "tool_name", "") == "create_compound_journal" for c in (calls or [])
     )
+    has_commercial_order_call = any(
+        getattr(c, "tool_name", "") in _COMMERCIAL_ORDER_TOOLS for c in (calls or [])
+    )
+    is_commercial_order = intent in _COMMERCIAL_ORDER_TOOLS or has_commercial_order_call
     has_split_lines = (
         has_compound_call
         or intent in ("create_compound_journal", "split_transaction", "compound_journal")
@@ -179,6 +247,11 @@ def _extract_facts_and_plan(
     nature = str(getattr(classification, "transaction_nature", "") or "")
     if has_split_lines:
         nature = "COMPOUND"
+    elif is_commercial_order:
+        is_po = intent == "create_purchase_order" or any(
+            getattr(c, "tool_name", "") == "create_purchase_order" for c in (calls or [])
+        )
+        nature = "PROCUREMENT_ORDER" if is_po else "COMMERCIAL_ORDER"
     elif intent in ("record_sale", "record_cash_sale", "create_invoice", "create_sale_invoice", "record_receipt") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
         nature = "INVENTORY" if (entities.get("item_description") or entities.get("quantity")) else "REVENUE"
     source = str(getattr(classification, "source", "") or "")
@@ -196,11 +269,16 @@ def _extract_facts_and_plan(
                         comp_descs.append(str(row["description"]).strip())
         if comp_descs:
             item_desc = ", ".join(comp_descs)
+    payment_method_fact = entities.get("payment_method")
+    if is_commercial_order and not any(
+        (getattr(c, "arguments", None) or {}).get("payment_method") for c in (calls or [])
+    ):
+        payment_method_fact = None
     facts = {
         "intent": intent,
         "transaction_nature": nature or None,
         "nature_source": source or None,
-        "payment_method": entities.get("payment_method"),
+        "payment_method": payment_method_fact,
         "party": entities.get("supplier_name") or entities.get("customer_name"),
         "item_description": item_desc,
         "quantity": entities.get("quantity") or entities.get("item_quantity"),
@@ -223,33 +301,14 @@ def _extract_facts_and_plan(
                 "subtotal", "amount", "tax_total", "tax_code", "notes", "bill_date",
                 "transaction_date", "currency_code", "entry_type",
                 "quantity", "description", "item_description", "reason",
+                "product_name", "item_name", "unit_price", "price", "status",
+                "order_date", "quotation_date", "valid_until",
                 "credit_note_date", "return_date", "customer_id", "supplier_id",
                 "customer_name", "supplier_name", "invoice_id", "bill_id",
                 "useful_life_years", "depreciation_method",
             )
         }
-        # For return tools (credit notes & purchase returns), if items array is not
-        # materialized yet, preserve/synthesize the item line from description/quantity
-        # so the treatment reviewer can see the line item substance.
-        if tool_name in ("create_credit_note", "create_purchase_return") and not call_args.get("items"):
-            desc = call_args.get("description") or call_args.get("item_description") or facts.get("item_description")
-            qty = call_args.get("quantity") or facts.get("quantity")
-            amt = call_args.get("amount") or facts.get("amount")
-            if desc or qty:
-                try:
-                    qty_f = float(qty) if qty not in (None, "", 0) else 1.0
-                except (ValueError, TypeError):
-                    qty_f = 1.0
-                try:
-                    amt_f = float(amt) if amt not in (None, "", 0) else None
-                except (ValueError, TypeError):
-                    amt_f = None
-                unit_price = round(amt_f / qty_f, 2) if (amt_f and qty_f) else amt_f
-                call_args["items"] = [{
-                    "description": str(desc or "Item return").strip(),
-                    "quantity": qty_f,
-                    "unit_price": unit_price,
-                }]
+        _synthesize_document_items(call_args, facts, tool_name)
         extracted_plan.append({
             "tool": tool_name,
             "arguments": call_args,

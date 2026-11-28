@@ -1243,6 +1243,90 @@ def test_diverted_purchase_order_living_draft_skips_fixed_asset_depreciation():
     assert not any("useful life" in p.lower() for p in ld.pending_requirements)
 
 
+@pytest.mark.asyncio
+async def test_treatment_review_preserves_purchase_order_items_and_non_posting_nature(monkeypatch):
+    """Stage 15 preserves PO product_name/unit_price/items and avoids stale FIXED_ASSET or settlement flags."""
+    from types import SimpleNamespace
+    import uuid
+    import json
+    from app.agent import ToolCall
+    from app.treatment_review import _extract_facts_and_plan, review_plan_treatment
+
+    calls = [
+        ToolCall(
+            tool_name="create_purchase_order",
+            arguments={
+                "supplier_name": "Tech Depot",
+                "status": "RFQ",
+                "product_name": "Laser printer",
+                "quantity": 1.0,
+                "unit_price": 45000.0,
+                "transaction_nature": "FIXED_ASSET",
+            },
+        )
+    ]
+    classification = SimpleNamespace(transaction_nature="FIXED_ASSET", source="ITEM_MAPPING")
+    entities = {
+        "supplier_name": "Tech Depot",
+        "item_description": "Laser printer",
+        "amount": 45000.0,
+        "quantity": 1,
+        "payment_method": "CASH",
+    }
+
+    facts, plan = _extract_facts_and_plan(
+        intent="create_purchase_order",
+        classification=classification,
+        entities=entities,
+        calls=calls,
+    )
+    assert facts["transaction_nature"] == "PROCUREMENT_ORDER"
+    assert facts["payment_method"] is None
+    assert len(plan) == 1
+    args = plan[0]["arguments"]
+    assert args["supplier_name"] == "Tech Depot"
+    assert args["product_name"] == "Laser printer"
+    assert args["unit_price"] == 45000.0
+    assert args["amount"] == 45000.0
+    assert "transaction_nature" not in args
+    assert args["items"] == [
+        {
+            "description": "Laser printer",
+            "quantity": 1.0,
+            "unit_price": 45000.0,
+            "amount": 45000.0,
+        }
+    ]
+
+    captured_prompts = []
+
+    class _FakeClient:
+        async def generate_text_light(self, *, prompt: str) -> str:
+            captured_prompts.append(prompt)
+            return json.dumps({"contradictions": [], "missing_material_facts": []})
+
+    monkeypatch.setattr(
+        "app.config.get_settings",
+        lambda: SimpleNamespace(treatment_review_enabled=True, treatment_review_timeout=5.0),
+    )
+    review = await review_plan_treatment(
+        organization_id=uuid.uuid4(),
+        intent="create_purchase_order",
+        classification=classification,
+        entities=entities,
+        calls=calls,
+        client=_FakeClient(),
+    )
+    assert review.ran is True
+    assert review.ok is True
+    assert review.blocked is False
+    assert review.flags == []
+    assert captured_prompts and '"PROCUREMENT_ORDER"' in captured_prompts[0]
+    assert '"Laser printer"' in captured_prompts[0]
+    assert '45000.0' in captured_prompts[0]
+
+
+
 
 
 
