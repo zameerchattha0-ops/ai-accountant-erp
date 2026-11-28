@@ -325,6 +325,27 @@ class MultiItemDisaggregationResult(BaseModel):
         }
 
 
+_COMPOUND_JOURNAL_TOOL_KEYS = (
+    "transaction_date",
+    "description",
+    "lines",
+    "entry_type",
+    "currency_code",
+    "user_id",
+)
+
+
+def sanitize_compound_journal_tool_args(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter a compound journal dict to parameters accepted by create_compound_journal."""
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        k: v
+        for k, v in payload.items()
+        if k in _COMPOUND_JOURNAL_TOOL_KEYS and v is not None
+    }
+
+
 # ---------------------------------------------------------------------------
 # Numerical & Text Parsing Helpers
 # ---------------------------------------------------------------------------

@@ -633,7 +633,7 @@ _CONTRA_OR_MISMATCH_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("furniture", ("furnitur", "fixture", "chair", "desk", "table")),
     ("machinery", ("machiner", "plant", "generator")),
     ("rent", ("rent",)),
-    ("utilities", ("utilit", "electric", "power", "water", "gas")),
+    ("utilities", ("utilit", "electric", "power", "water", "gas", "internet", "broadband", "wifi", "fiber", "telecom")),
     ("supplies", ("suppl", "stationery", "consumable")),
     ("bank", ("bank",)),
     ("cash", ("cash",)),
@@ -722,16 +722,20 @@ async def _resolve_compound_line_account(
     code_candidate: Optional[Dict[str, Any]] = None
     if code:
         code_candidate = await a_repo.get_account_by_code(organization_id, code=code)
-        if code_candidate:
-            if code_candidate.get("id") in group_ids or code_candidate.get("is_active") is False:
-                return code_candidate
-            if not _type_conflicts(code_candidate) and (
+        if (
+            code_candidate
+            and code_candidate.get("id") not in group_ids
+            and not code_candidate.get("is_group")
+            and code_candidate.get("is_active") is not False
+            and not _type_conflicts(code_candidate)
+            and (
                 not name
                 or not _is_semantic_account_mismatch(
                     str(code_candidate.get("name") or ""), name, line_desc
                 )
-            ):
-                return code_candidate
+            )
+        ):
+            return code_candidate
 
     if name:
         resolved = await accounting_service.resolve_account(
@@ -740,6 +744,8 @@ async def _resolve_compound_line_account(
         if (
             resolved
             and resolved.get("id") not in group_ids
+            and not resolved.get("is_group")
+            and resolved.get("is_active") is not False
             and not _type_conflicts(resolved)
             and not _is_semantic_account_mismatch(str(resolved.get("name") or ""), name, line_desc)
         ):
@@ -750,7 +756,12 @@ async def _resolve_compound_line_account(
         kw_tuple = next((kws for tag, kws in _CONTRA_OR_MISMATCH_CATEGORIES if tag == target_tag), ())
         chart = await a_repo.get_chart_of_accounts(organization_id, is_active=True, limit=500)
         for cand in chart or []:
-            if cand.get("id") in group_ids or _type_conflicts(cand):
+            if (
+                cand.get("id") in group_ids
+                or cand.get("is_group")
+                or cand.get("is_active") is False
+                or _type_conflicts(cand)
+            ):
                 continue
             cname = str(cand.get("name") or "")
             if "accumulated depreciation" in cname.lower():

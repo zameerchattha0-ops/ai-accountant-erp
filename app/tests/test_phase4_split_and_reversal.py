@@ -821,6 +821,171 @@ async def test_resume_with_clarification_supports_flexible_llm_diversion_and_can
     assert len(execute_calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_compound_journal_tool_args_strip_summary_fields_and_pass_contract(monkeypatch):
+    """_deterministic_mutation_calls must omit total_debit/total_credit/balanced per create_compound_journal contract."""
+    import uuid
+    import app.agent as agent_mod
+    from app.planner import ExecutionPlan
+    from app.tools import tool_contracts
+    import app.multi_item_disaggregator as disagg_mod
+
+    async def fake_resolve_coa(org_id, lines):
+        return lines
+
+    monkeypatch.setattr(disagg_mod, "resolve_compound_lines_to_org_coa", fake_resolve_coa)
+
+    plan = ExecutionPlan(
+        intent="create_compound_journal",
+        extracted_entities={
+            "amount": 95000.0,
+            "payment_method": "BANK",
+            "bank_name": "Meezan",
+            "transaction_date": "2026-11-28",
+            "line_items": [
+                {"description": "internet bill", "amount": 25000.0, "nature": "OPERATING_EXPENSE", "account_code": "6140", "account_name": "Utilities"},
+                {"description": "2 office desks", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True, "account_code": "1502", "account_name": "Furniture & Fixtures"},
+            ],
+        },
+        missing_fields=[],
+    )
+    calls = await agent_mod._deterministic_mutation_calls(
+        organization_id=uuid.uuid4(),
+        execution_plan=plan,
+        classification=None,
+    )
+    assert len(calls) == 1
+    tc = calls[0]
+    assert tc.tool_name == "create_compound_journal"
+    accepted = set(tool_contracts()["create_compound_journal"]["accepted"])
+    assert set(tc.arguments.keys()) <= accepted
+    assert "total_debit" not in tc.arguments
+    assert "total_credit" not in tc.arguments
+    assert "balanced" not in tc.arguments
+
+
+@pytest.mark.asyncio
+async def test_resolve_compound_line_account_skips_group_6150_for_utilities_internet(monkeypatch):
+    """When code 6150 points to a grouping heading (is_group=True), fall through to leaf 6140 Utilities."""
+    import uuid
+    import app.accounting_engine as eng
+    from app.repositories import account_repository as a_repo
+    from app.services import accounting_service as acct_svc
+
+    org_id = uuid.uuid4()
+    group_id = uuid.uuid4()
+    leaf_utilities_id = uuid.uuid4()
+
+    group_6150 = {"id": group_id, "code": "6150", "name": "Operating Expenses", "account_type": "EXPENSE", "is_active": True, "is_group": True}
+    leaf_6140 = {"id": leaf_utilities_id, "code": "6140", "name": "Utilities", "account_type": "EXPENSE", "is_active": True, "is_group": False}
+
+    async def fake_by_code(oid, code=None):
+        return group_6150 if code == "6150" else None
+
+    async def fake_resolve(oid, account_name=None, required_type=None):
+        if account_name and "utilit" in account_name.lower():
+            return leaf_6140
+        return None
+
+    async def fake_coa(oid, is_active=True, limit=500):
+        return [group_6150, leaf_6140]
+
+    monkeypatch.setattr(a_repo, "get_account_by_code", fake_by_code)
+    monkeypatch.setattr(acct_svc, "resolve_account", fake_resolve)
+    monkeypatch.setattr(a_repo, "get_chart_of_accounts", fake_coa)
+
+    resolved = await eng._resolve_compound_line_account(
+        org_id,
+        raw_acc_id=None,
+        code="6150",
+        name="Utilities",
+        line_desc="internet bill",
+        group_ids={group_id},
+        expected_type="EXPENSE",
+    )
+    assert resolved is not None
+    assert resolved["code"] == "6140"
+    assert resolved["id"] == leaf_utilities_id
+
+
+@pytest.mark.asyncio
+async def test_split_fixed_asset_dual_registration_uses_furniture_5yr_and_satisfies_goal(monkeypatch):
+    """Compound fixed-asset split for furniture registers asset at 5-Yr Straight Line and passes goal finalisation."""
+    import uuid
+    import app.agent as agent_mod
+    import app.services.fixed_asset_service as fa_svc
+    from app.reasoning import evaluate_goal_finalisation
+    from app.conversational_manager import format_claude_style_progressive_question
+
+    q_text, chips, _ = format_claude_style_progressive_question(
+        intent="create_compound_journal",
+        missing_fields=["useful_life_years", "depreciation_method"],
+        entities={
+            "line_items": [
+                {"description": "internet bill", "amount": 25000.0, "nature": "OPERATING_EXPENSE"},
+                {"description": "2 office desks", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True},
+            ]
+        },
+    )
+    assert "Accept 5-Yr Straight Line (Recommended)" in chips
+    assert "Accept 3-Yr Straight Line (Recommended)" not in chips
+
+    captured = []
+
+    async def fake_reg(**kwargs):
+        captured.append(kwargs)
+        return {"id": uuid.uuid4(), "asset_number": "FA-0042", "name": kwargs["name"]}
+
+    monkeypatch.setattr(fa_svc, "register_asset_from_split_line", fake_reg)
+
+    je_id = uuid.uuid4()
+    cap_assets, extra_ents, applied_life, dep_m = await agent_mod._register_compound_split_fixed_assets(
+        organization_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        entities={
+            "transaction_date": "2026-11-28",
+            "line_items": [
+                {"description": "internet bill", "amount": 25000.0, "nature": "OPERATING_EXPENSE", "account_code": "6140"},
+                {"description": "2 office desks", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True, "account_code": "1502"},
+            ],
+        },
+        tool_results=[
+            agent_mod.ToolResult(
+                tool_name="create_compound_journal",
+                success=True,
+                data={"journal_entry_id": str(je_id), "entry_number": "JV-2026-0099", "total_debit": 95000.0},
+            )
+        ],
+    )
+    assert len(captured) == 1
+    assert captured[0]["useful_life_years"] == 5
+    assert captured[0]["purchase_cost"] == 70000.0
+    assert applied_life == 5
+    assert len(cap_assets) == 1
+    assert len(extra_ents) == 1 and extra_ents[0].type == "fixed_asset"
+
+    verdict = evaluate_goal_finalisation(
+        intent="create_compound_journal",
+        entities={
+            "line_items": [
+                {"description": "internet bill", "amount": 25000.0, "nature": "OPERATING_EXPENSE"},
+                {"description": "2 office desks", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True},
+            ]
+        },
+        successful_tools=["create_compound_journal"],
+        affected_entities=[{"type": "journal_entry", "id": str(je_id)}, extra_ents[0].model_dump()],
+        accounting_impact=[
+            {"account": "6140 - Utilities", "debit": 25000.0, "credit": 0.0},
+            {"account": "1502 - Furniture & Fixtures", "debit": 70000.0, "credit": 0.0},
+            {"account": "1010 - Bank", "debit": 0.0, "credit": 95000.0},
+        ],
+        capitalized_assets_count=len(cap_assets),
+    )
+    assert verdict["goal_achieved"] is True
+    assert "split_fixed_asset_registered" in verdict["verified_subgoals"]
+
+
+
 
 
 

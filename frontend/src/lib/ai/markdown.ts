@@ -32,8 +32,10 @@ function renderLine(line: string): string {
   out = out.replace(/\*\*(.+?)\*\*/g, "$1").replace(/__(.+?)__/g, "$1");
   // Inline code `text` -> text (drop the ticks the user was seeing).
   out = out.replace(/`([^`]+)`/g, "$1");
-  // Italic _text_ / *text_ -> text.
-  out = out.replace(/_(.+?)_/g, "$1").replace(/\*([^*]+)\*/g, "$1");
+  // Italic _text_ / *text* -> text (preserve snake_case identifiers like create_compound_journal).
+  out = out
+    .replace(/(^|[^a-zA-Z0-9])_([^_\n]+?)_(?=[^a-zA-Z0-9]|$)/g, "$1$2")
+    .replace(/\*([^*]+)\*/g, "$1");
   // Leading heading hashes, e.g. "## Total" -> "Total".
   out = out.replace(/^#{1,6}\s+/, "");
   // List bullets "- item" / "* item" -> "item" (leading marker only).

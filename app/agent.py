@@ -2845,6 +2845,148 @@ async def _purchase_return_fast_path_call(
     return [ToolCall(tool_name="create_purchase_return", arguments=args)]
 
 
+async def _register_compound_split_fixed_assets(
+    *,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID,
+    entities: Dict[str, Any],
+    tool_results: Sequence[ToolResult],
+    tool_calls: Sequence[ToolCall] = (),
+) -> Tuple[List[str], List[AffectedEntity], int, str]:
+    """Dual-register IAS 16 fixed-asset split lines after a successful compound journal."""
+    comp_tr = next(
+        (
+            tr
+            for tr in (tool_results or [])
+            if tr.success and tr.tool_name == "create_compound_journal" and isinstance(tr.data, dict)
+        ),
+        None,
+    )
+    if comp_tr is None:
+        return [], [], 0, "STRAIGHT_LINE"
+
+    from app.multi_item_disaggregator import extract_line_item_amount
+    from app.date_parser import coerce_iso_date
+    from app.services.fixed_asset_service import register_asset_from_split_line
+    from app.conversational_manager import _match_asset_category
+
+    j_entry_id = comp_tr.data.get("journal_entry_id")
+    raw_items: List[Dict[str, Any]] = list(
+        entities.get("line_items") or entities.get("disaggregated_items") or []
+    )
+    if not raw_items:
+        for tc in tool_calls or ():
+            if tc.tool_name == "create_compound_journal" and isinstance(tc.arguments, dict):
+                raw_items = [
+                    row
+                    for row in (tc.arguments.get("lines") or [])
+                    if isinstance(row, dict) and float(row.get("debit") or 0.0) > 0
+                ]
+                if raw_items:
+                    break
+
+    u_life_explicit = entities.get("useful_life_years") or entities.get("useful_life")
+    dep_m = str(entities.get("depreciation_method") or "STRAIGHT_LINE")
+    iso_dt = coerce_iso_date(entities.get("transaction_date"))
+    applied_life = 0
+    capitalized_assets: List[str] = []
+    extra_entities: List[AffectedEntity] = []
+
+    try:
+        for ri in raw_items:
+            if not isinstance(ri, dict):
+                continue
+            d_desc = str(ri.get("description") or "").strip()
+            line_amt = extract_line_item_amount(ri) or float(ri.get("debit") or 0.0)
+            cat_m = _match_asset_category(d_desc)
+            is_fa = (
+                str(ri.get("nature") or "").upper() == "FIXED_ASSET"
+                or "IAS 16" in str(ri.get("ifrs_standard") or "").upper()
+                or ri.get("is_fixed_asset")
+                or cat_m in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
+                or str(ri.get("account_code") or "").startswith("15")
+            )
+            if not (is_fa and line_amt > 0):
+                continue
+            if u_life_explicit:
+                try:
+                    item_life = int(float(str(u_life_explicit).split()[0]))
+                except (ValueError, TypeError):
+                    item_life = 3 if cat_m == "IT_EQUIPMENT" else (10 if cat_m == "MACHINERY" else 5)
+            else:
+                item_life = 3 if cat_m == "IT_EQUIPMENT" else (10 if cat_m == "MACHINERY" else 5)
+            applied_life = item_life
+            reg = await register_asset_from_split_line(
+                organization_id=organization_id,
+                name=d_desc or "Fixed Asset",
+                purchase_cost=line_amt,
+                transaction_date=iso_dt,
+                journal_entry_id=uuid.UUID(str(j_entry_id)) if j_entry_id else None,
+                useful_life_years=item_life,
+                depreciation_method=dep_m,
+                account_code=ri.get("account_code"),
+                account_name=ri.get("account_name"),
+                created_by=user_id,
+            )
+            capitalized_assets.append(f"{d_desc} (PKR {line_amt:,.2f})")
+            reg_dict = reg if isinstance(reg, dict) else {}
+            extra_entities.append(AffectedEntity(
+                type="fixed_asset",
+                action="created",
+                id=str(reg_dict["id"]) if reg_dict.get("id") else None,
+                number=reg_dict.get("asset_number"),
+                name=d_desc or "Fixed Asset",
+                total=line_amt,
+            ))
+    except Exception as _fa_exc:
+        log.warning("agent.compound_asset_registration_failed", error=str(_fa_exc)[:200])
+
+    return capitalized_assets, extra_entities, (applied_life or 3), dep_m
+
+
+def _format_compound_journal_summary(
+    *,
+    tool_result_data: Any,
+    entities: Dict[str, Any],
+    capitalized_assets: Sequence[str],
+    useful_life_years: int,
+    depreciation_method: str,
+) -> str:
+    """Format canonical completion summary for a posted split compound journal."""
+    data_dict = tool_result_data if isinstance(tool_result_data, dict) else {}
+    tot = float(
+        data_dict.get("total_debit")
+        or entities.get("amount")
+        or 0.0
+    )
+    n_lines = len(
+        entities.get("line_items")
+        or entities.get("disaggregated_items")
+        or data_dict.get("lines")
+        or []
+    )
+    entry_num = data_dict.get("entry_number")
+    fa_summary = ""
+    if capitalized_assets:
+        fa_summary = (
+            f"* **Capitalized in Fixed Assets:** {', '.join(capitalized_assets)} "
+            f"({useful_life_years}-Year {str(depreciation_method).replace('_', ' ').title()})\n"
+        )
+    entry_ref_str = f"* **Journal Entry:** `{entry_num}`\n" if entry_num else ""
+    return (
+        f"### ✅ Multi-Entity Split Entry Posted (Compound Journal)\n\n"
+        f"{entry_ref_str}"
+        f"* **Total Amount:** **Rs. {tot:,.2f}**\n"
+        f"* **Allocated Lines:** {n_lines} Segregated Items (IAS 16 / IAS 38 / Opex)\n"
+        f"{fa_summary}"
+        f"* **Status:** Posted to General Ledger"
+        + (" & Fixed Assets Register" if capitalized_assets else "")
+        + "\n\n"
+        f"[View in General Ledger →](/accounting/journal)"
+        + (" | [View in Fixed Assets →](/accounting/fixed-assets)" if capitalized_assets else "")
+    )
+
+
 
 
 
@@ -2992,6 +3134,7 @@ async def _deterministic_mutation_calls(
         from app.multi_item_disaggregator import (
             build_compound_journal_from_entities,
             resolve_compound_lines_to_org_coa,
+            sanitize_compound_journal_tool_args,
         )
         comp_args = build_compound_journal_from_entities(entities)
         if comp_args.get("lines"):
@@ -3000,7 +3143,7 @@ async def _deterministic_mutation_calls(
             )
         return [ToolCall(
             tool_name="create_compound_journal",
-            arguments=comp_args,
+            arguments=sanitize_compound_journal_tool_args(comp_args),
         )]
 
     if execution_plan.intent in ("reverse_journal", "reversal") or entities.get("is_reversal"):
@@ -10023,11 +10166,25 @@ async def execute(
                     ):
                         _conv_q = _prog_q
 
-                    if _prog_chips and (not _conv_options or not _has_llm_authored_q):
+                    _sync_schedule_pacing = bool(
+                        _prog_chips
+                        and (
+                            any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value"))
+                            or bool(execution_plan.extracted_entities.get("line_items"))
+                            or not _has_llm_authored_q
+                            or not _conv_options
+                        )
+                    )
+                    if _sync_schedule_pacing:
                         _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
 
+            _clar_chips = (
+                _prog_chips
+                if (_sync_schedule_pacing or not (_conv_options or question_options))
+                else None
+            )
             _clar_snap = json.dumps({
                 "intent": execution_plan.intent,
                 "extracted_entities": execution_plan.extracted_entities,
@@ -10038,7 +10195,7 @@ async def execute(
                 session_id=session_id,
                 question=_conv_q or question,
                 required_fields=_asked_fields,
-                options=_prog_chips or None,
+                options=_clar_chips,
                 reason=_clar_snap,
             )
 
@@ -10096,7 +10253,7 @@ async def execute(
 
                 required_information=_asked_fields,
 
-                options=_prog_chips or None,
+                options=_clar_chips,
 
                 question_options=_conv_options or question_options,
 
@@ -15367,7 +15524,27 @@ async def execute(
 
         # ---- PHASE 9: GOAL DECISION FINALISATION & COMPLETED -------------
 
+        _comp_cap_assets: List[str] = []
+        _comp_asset_entities: List[AffectedEntity] = []
+        _comp_life = 3
+        _comp_dep = "STRAIGHT_LINE"
+        if verified:
+            (
+                _comp_cap_assets,
+                _comp_asset_entities,
+                _comp_life,
+                _comp_dep,
+            ) = await _register_compound_split_fixed_assets(
+                organization_id=organization_id,
+                user_id=user_id,
+                entities=execution_plan.extracted_entities or {},
+                tool_results=tool_results,
+                tool_calls=tool_calls,
+            )
+
         affected = build_affected_entities(tool_results)
+        if _comp_asset_entities:
+            affected.extend(e.model_dump() for e in _comp_asset_entities)
 
         accounting_impact = await build_accounting_impact(
 
@@ -15386,6 +15563,7 @@ async def execute(
             failed_tools=[tr.tool_name for tr in failed_results],
             affected_entities=affected,
             accounting_impact=accounting_impact,
+            capitalized_assets_count=len(_comp_cap_assets),
         )
 
         await _log_step(session_id, "GOAL_FINALIZATION", _goal_verdict)
@@ -15467,7 +15645,20 @@ async def execute(
 
 
 
-        result_summary = _clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Operation completed."
+        _comp_ok_tr = next(
+            (tr for tr in successful_results if tr.tool_name == "create_compound_journal"),
+            None,
+        )
+        if verified and _comp_ok_tr is not None:
+            result_summary = _format_compound_journal_summary(
+                tool_result_data=_comp_ok_tr.data,
+                entities=execution_plan.extracted_entities or {},
+                capitalized_assets=_comp_cap_assets,
+                useful_life_years=_comp_life,
+                depreciation_method=_comp_dep,
+            )
+        else:
+            result_summary = _clean_user_facing_text(llm_text) or execution_plan.expected_outcome or "Operation completed."
 
         if is_operational_task(execution_plan.intent) and successful_results:
             primary_data = getattr(successful_results[-1], "data", {}) or {}
@@ -16898,6 +17089,7 @@ async def resume_with_clarification(
                 from app.multi_item_disaggregator import (
                     build_compound_journal_from_entities,
                     resolve_compound_lines_to_org_coa,
+                    sanitize_compound_journal_tool_args,
                 )
                 if isinstance(merged_entities.get("line_items"), list):
                     merged_entities["line_items"] = await resolve_compound_lines_to_org_coa(
@@ -16908,7 +17100,10 @@ async def resume_with_clarification(
                     comp_dict["lines"] = await resolve_compound_lines_to_org_coa(
                         organization_id, comp_dict["lines"]
                     )
-                single_hop_call = ToolCall(tool_name="create_compound_journal", arguments=comp_dict)
+                single_hop_call = ToolCall(
+                    tool_name="create_compound_journal",
+                    arguments=sanitize_compound_journal_tool_args(comp_dict),
+                )
 
             elif (intent in ("register_fixed_asset", "fixed_asset", "capitalize_asset", "record_asset", "purchase_fixed_asset") or merged_entities.get("transaction_nature") == "FIXED_ASSET") and not (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1):
                 intent = "register_fixed_asset"
@@ -17127,66 +17322,20 @@ async def resume_with_clarification(
                         f"[View in General Ledger →](/accounting/journal)"
                     )
                 elif (intent in ("create_compound_journal", "split_transaction", "compound_journal") or (isinstance(merged_entities.get("line_items"), list) and len(merged_entities["line_items"]) > 1)) and tool_result.success:
-                    from app.multi_item_disaggregator import extract_line_item_amount
-                    from app.date_parser import coerce_iso_date
-
-                    tot = float(merged_entities.get("amount") or 0.0)
-                    n_lines = len(merged_entities.get("line_items") or [])
-
-                    # Phase 4 Dual-Registration: Capitalize any fixed assets into Fixed Asset Register
-                    capitalized_assets: List[str] = []
-                    j_entry_id = tool_result.data.get("journal_entry_id") if isinstance(tool_result.data, dict) else None
-                    entry_num = tool_result.data.get("entry_number") if isinstance(tool_result.data, dict) else None
-
-                    try:
-                        from app.services.fixed_asset_service import register_asset_from_split_line
-                        from app.conversational_manager import _match_asset_category
-                        raw_items = merged_entities.get("line_items") or []
-                        u_life = merged_entities.get("useful_life_years") or 3
-                        dep_m = merged_entities.get("depreciation_method") or "STRAIGHT_LINE"
-                        iso_dt = coerce_iso_date(merged_entities.get("transaction_date"))
-                        for ri in raw_items:
-                            if isinstance(ri, dict):
-                                d_desc = str(ri.get("description") or "")
-                                line_amt = extract_line_item_amount(ri)
-                                cat_m = _match_asset_category(d_desc)
-                                is_fa = (
-                                    str(ri.get("nature") or "").upper() == "FIXED_ASSET"
-                                    or "IAS 16" in str(ri.get("ifrs_standard") or "").upper()
-                                    or ri.get("is_fixed_asset")
-                                    or cat_m in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
-                                    or str(ri.get("account_code") or "").startswith("15")
-                                )
-                                if is_fa and line_amt > 0:
-                                    await register_asset_from_split_line(
-                                        organization_id=organization_id,
-                                        name=d_desc,
-                                        purchase_cost=line_amt,
-                                        transaction_date=iso_dt,
-                                        journal_entry_id=uuid.UUID(str(j_entry_id)) if j_entry_id else None,
-                                        useful_life_years=int(u_life) if u_life else 3,
-                                        depreciation_method=str(dep_m),
-                                        account_code=ri.get("account_code"),
-                                        account_name=ri.get("account_name"),
-                                        created_by=user_id,
-                                    )
-                                    capitalized_assets.append(f"{d_desc} (PKR {line_amt:,.2f})")
-                    except Exception as _fa_exc:
-                        log.warning("agent.compound_asset_registration_failed", error=str(_fa_exc)[:200])
-
-                    fa_summary = ""
-                    if capitalized_assets:
-                        fa_summary = f"* **Capitalized in Fixed Assets:** {', '.join(capitalized_assets)} ({u_life}-Year {str(dep_m).replace('_', ' ').title()})\n"
-
-                    entry_ref_str = f"* **Journal Entry:** `{entry_num}`\n" if entry_num else ""
-                    result_summary = (
-                        f"### ✅ Multi-Entity Split Entry Posted (Compound Journal)\n\n"
-                        f"{entry_ref_str}"
-                        f"* **Total Amount:** **Rs. {tot:,.2f}**\n"
-                        f"* **Allocated Lines:** {n_lines} Segregated Items (IAS 16 / IAS 38 / Opex)\n"
-                        f"{fa_summary}"
-                        f"* **Status:** Posted to General Ledger" + (" & Fixed Assets Register" if capitalized_assets else "") + "\n\n"
-                        f"[View in General Ledger →](/accounting/journal)" + (" | [View in Fixed Assets →](/accounting/fixed-assets)" if capitalized_assets else "")
+                    _sh_cap_assets, _sh_extra_assets, _sh_life, _sh_dep = await _register_compound_split_fixed_assets(
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        entities=merged_entities,
+                        tool_results=[tool_result],
+                        tool_calls=[single_hop_call],
+                    )
+                    capitalized_assets = _sh_cap_assets
+                    result_summary = _format_compound_journal_summary(
+                        tool_result_data=tool_result.data,
+                        entities=merged_entities,
+                        capitalized_assets=_sh_cap_assets,
+                        useful_life_years=_sh_life,
+                        depreciation_method=_sh_dep,
                     )
                 elif tool_result.success:
                     result_summary = f"Successfully completed {intent}."
@@ -17246,6 +17395,8 @@ async def resume_with_clarification(
                             name=tool_result.data.get("entry_number") or "Compound Journal",
                             total=float(tool_result.data.get("total_debit") or merged_entities.get("amount") or 0.0),
                         ))
+                    if "_sh_extra_assets" in locals() and _sh_extra_assets:
+                        _aff_entities.extend(_sh_extra_assets)
                     if single_hop_call.tool_name == "create_compound_journal":
                         for _jl in (single_hop_call.arguments.get("lines") or []):
                             if isinstance(_jl, dict):
@@ -17260,7 +17411,7 @@ async def resume_with_clarification(
                                 ))
 
                     from app.reasoning import evaluate_goal_finalisation as _eval_goal_sh
-                    _cap_count = len(capitalized_assets) if "capitalized_assets" in locals() else 0
+                    _cap_count = len(_sh_cap_assets) if "_sh_cap_assets" in locals() else 0
                     _sh_goal_verdict = _eval_goal_sh(
                         intent=intent,
                         entities=merged_entities,
@@ -17549,13 +17700,19 @@ async def resume_with_confirmation(
 
     if isinstance(snapshot, list) and snapshot:
 
+        from app.multi_item_disaggregator import sanitize_compound_journal_tool_args
+
         calls = [
 
             ToolCall(
 
                 tool_name=str(entry["tool_name"]),
 
-                arguments=dict(entry.get("arguments") or {}),
+                arguments=(
+                    sanitize_compound_journal_tool_args(dict(entry.get("arguments") or {}))
+                    if str(entry["tool_name"]) == "create_compound_journal"
+                    else dict(entry.get("arguments") or {})
+                ),
 
             )
 

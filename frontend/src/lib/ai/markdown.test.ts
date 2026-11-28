@@ -54,6 +54,12 @@ describe("mdToDisplayText", () => {
     expect(mdToDisplayText(undefined)).toBe("");
   });
 
+  it("preserves underscores inside snake_case identifiers", () => {
+    expect(
+      mdToDisplayText("create_compound_journal: 'total_debit', 'total_credit' _only_")
+    ).toBe("create_compound_journal: 'total_debit', 'total_credit' only");
+  });
+
   it("strips markdown link syntax while preserving link labels", () => {
     expect(
       mdToDisplayText("[View in General Ledger →](/accounting/journal) | [View in Fixed Assets →](/accounting/fixed-assets)")

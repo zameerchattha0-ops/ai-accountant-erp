@@ -306,9 +306,18 @@ def generate_consultative_advisory(
             "- **Straight Line**: Equal expense recognized every month across the useful life (Cost − Salvage) ÷ Life.\n"
             "- **Reducing Balance**: Higher depreciation in initial years, applying a constant % to the opening Book Value."
         )
-        rec = "Straight-line depreciation over 3 years is standard for computers; 5 years for furniture."
+        from app.conversational_manager import _match_asset_category
+        _cat = _match_asset_category(str(item_desc or ""))
+        if _cat in ("FURNITURE", "VEHICLE"):
+            rec = "Straight-line depreciation over 5 years is standard for office furniture and vehicles."
+            chips = ["Accept 5-Yr Straight Line (Recommended)", "10 Years Straight Line", "3 Years Straight Line", "No Depreciation"]
+        elif _cat == "MACHINERY":
+            rec = "Straight-line depreciation over 10 years is standard for plant and heavy machinery."
+            chips = ["Accept 10-Yr Straight Line (Recommended)", "5 Years Straight Line", "No Depreciation"]
+        else:
+            rec = "Straight-line depreciation over 3 years is standard for computers; 5 years for furniture."
+            chips = ["Accept 3-Yr Straight Line (Recommended)", "5 Years Straight Line", "10 Years Straight Line", "No Depreciation"]
         bridge = f"Returning to your draft for **{item_desc}**: Would you like to apply the standard straight-line schedule?"
-        chips = ["Accept 3-Yr Straight Line (Recommended)", "5 Years Straight Line", "10 Years Straight Line", "No Depreciation"]
 
         return ConsultativeAdvisoryResult(
             topic=topic,
