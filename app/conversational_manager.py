@@ -1078,18 +1078,26 @@ async def synthesize_cumulative_dialogue_intent(
     if not comb_text:
         return {"entities": merged, "reasoning": "", "is_complete": False}
 
-    # 1. Deterministic extraction & corrections from user's latest reply
-    if raw_reply:
-        corr = extract_conversational_corrections(raw_reply, merged)
-        if corr:
-            merged.update(corr)
+    # 1. Early cancel / explicit diversion intent signals from user's latest reply
+    raw_low = raw_reply.lower()
+    _cancel_phrases = (
+        "cancel this", "cancel it", "never mind", "nevermind", "forget it",
+        "abort", "stop this", "do not record", "don't record", "dont record",
+    )
+    if raw_low in ("cancel", "stop", "abort") or any(p in raw_low for p in _cancel_phrases):
+        return {
+            "entities": merged,
+            "is_complete": False,
+            "next_action": "CANCEL",
+            "reasoning": "User cancelled the pending transaction before posting.",
+        }
 
-        sched = expand_standard_schedule_answers(raw_reply, merged)
-        if sched:
-            merged.update(sched)
-
-    # 2. LLM Cumulative Extraction if client available and raw_reply provided
+    # 2. LLM Cumulative Synthesis (Primary Semantic Authority — flexible diversion & goal check)
     llm_extracted: Dict[str, Any] = {}
+    llm_next_action: Optional[str] = None
+    llm_resolved_intent: Optional[str] = None
+    llm_reasoning: str = ""
+    llm_diversion_reason: Optional[str] = None
     if client is None:
         try:
             from app.ai_orchestrator import get_client
@@ -1110,24 +1118,33 @@ async def synthesize_cumulative_dialogue_intent(
             missing_str = ", ".join(missing_fields or [])
 
             prompt = (
-                "You are an expert Chartered Accountant and ERP Intelligence Engine.\n"
-                "You are evaluating a multi-turn conversation where a user is recording an accounting entry.\n"
-                "CRITICAL ZERO-ASSUMPTION RULE: The user's query and answers are the ONLY source of truth. "
-                "Never assume or invent details. Combine all turns into a unified accounting understanding.\n\n"
+                "You are an expert Chartered Accountant and Autonomous ERP Reasoning Engine.\n"
+                "You are evaluating a live multi-turn accounting conversation. Do NOT follow blind fixed steps —\n"
+                "reason over authenticity and the user's FINAL GOAL, with full flexibility to proceed, ask,\n"
+                "or DIVERT to a different ERP workflow if the user changed direction or asked something new.\n"
+                "CRITICAL ZERO-ASSUMPTION RULE: The user's request, confirmed records, and answers are the ONLY\n"
+                "source of truth. Never fabricate amounts, dates, or policy choices.\n\n"
                 f"INITIAL USER REQUEST:\n\"{user_request}\"\n\n"
                 f"PRIOR CONVERSATION TRANSCRIPT:\n{hist_str}\n\n"
                 f"CURRENTLY VERIFIED ENTITIES:\n{ents_str}\n\n"
                 f"LATEST QUESTION ASKED BY YOU:\n\"{latest_question}\"\n\n"
-                f"USER'S LATEST ANSWER:\n\"{raw_reply}\"\n\n"
-                f"FIELDS CURRENTLY NEEDED FOR TRUE ACCOUNTING TREATMENT:\n{missing_str}\n\n"
+                f"USER'S LATEST MESSAGE / ANSWER:\n\"{raw_reply}\"\n\n"
+                f"FIELDS PREVIOUSLY THOUGHT MISSING:\n{missing_str}\n\n"
                 "INSTRUCTIONS:\n"
-                "1. Analyze how the user's latest answer answers the question in the context of their initial query.\n"
-                "2. Extract updated entity fields (e.g., payment_method, bank_name, useful_life_years, depreciation_method, supplier_name, transaction_date).\n"
-                "3. Apply accounting standards: If useful life given, classify capex (IAS 16). If bank name mentioned, set payment_method='BANK' and bank_name.\n"
-                "4. Output STRICT JSON in this exact format (no markdown fences, no commentary):\n"
+                "1. Decide the authentic next step based on the user's message & final goal:\n"
+                "   - PROCEED: the message supplies/confirms details needed to continue/finalize the transaction.\n"
+                "   - ASK_CLARIFICATION: an essential accounting ambiguity still remains.\n"
+                "   - DIVERT: the user changed the goal/workflow (e.g., switched from expense to purchase order/invoice/fixed asset,\n"
+                "     changed line items structurally, asked to inspect balances/ledger first, or asked to reverse an entry).\n"
+                "   - CANCEL: the user explicitly wants to stop or discard the pending action.\n"
+                "2. Extract any updated entity fields (e.g., payment_method, bank_name, useful_life_years, depreciation_method, supplier_name, transaction_date, transaction_nature).\n"
+                "3. Output STRICT JSON ONLY matching:\n"
                 "{\n"
+                "  \"next_action\": \"PROCEED|ASK_CLARIFICATION|DIVERT|CANCEL\",\n"
+                "  \"resolved_intent\": \"<canonical intent or null>\",\n"
+                "  \"diversion_reason\": \"<why diverting or null>\",\n"
                 "  \"updated_entities\": {\"<field_name>\": \"<value>\"},\n"
-                "  \"reasoning\": \"<1-2 sentences on accounting and tax statutory treatment>\"\n"
+                "  \"reasoning\": \"<1-2 sentences on authentic accounting treatment & goal readiness>\"\n"
                 "}"
             )
             raw_llm = await asyncio.wait_for(
@@ -1137,11 +1154,22 @@ async def synthesize_cumulative_dialogue_intent(
             match = re.search(r"\{.*\}", str(raw_llm or ""), re.S)
             if match:
                 parsed = json.loads(match.group(0))
-                if isinstance(parsed, dict) and isinstance(parsed.get("updated_entities"), dict):
-                    llm_extracted = parsed["updated_entities"]
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("updated_entities"), dict):
+                        llm_extracted = parsed["updated_entities"]
+                    raw_na = str(parsed.get("next_action") or "").strip().upper()
+                    if raw_na in ("PROCEED", "ASK_CLARIFICATION", "DIVERT", "CANCEL"):
+                        llm_next_action = raw_na
+                    if parsed.get("resolved_intent"):
+                        llm_resolved_intent = str(parsed["resolved_intent"]).strip()
+                    if parsed.get("reasoning"):
+                        llm_reasoning = str(parsed["reasoning"]).strip()
+                    if parsed.get("diversion_reason"):
+                        llm_diversion_reason = str(parsed["diversion_reason"]).strip()
         except Exception as exc:
             log.warning("conversational_manager.cumulative_llm_failed", error=str(exc)[:200])
 
+    # Apply LLM-extracted entities first so regex heuristics act strictly as fallback/gap-fillers
     if llm_extracted:
         for k, v in llm_extracted.items():
             if v not in (None, "", "null"):
@@ -1154,24 +1182,42 @@ async def synthesize_cumulative_dialogue_intent(
                 else:
                     merged[k] = v
 
-    # 3. Grounded Field Safeguards (ensuring bank names, dates, amounts are reliably mapped)
+    # 3. Deterministic extraction & corrections ONLY for gaps not explicitly authored by LLM
+    if raw_reply:
+        corr = extract_conversational_corrections(raw_reply, merged)
+        if corr:
+            for ck, cv in corr.items():
+                if ck not in llm_extracted or llm_extracted.get(ck) in (None, "", "null"):
+                    merged[ck] = cv
+
+        sched = expand_standard_schedule_answers(raw_reply, merged)
+        if sched:
+            for sk, sv in sched.items():
+                if sk not in llm_extracted or llm_extracted.get(sk) in (None, "", "null"):
+                    merged[sk] = sv
+
+    # 4. Grounded Field Safeguards (fallback when LLM didn't emit explicit fields)
     text_to_scan = f"{raw_reply} {user_req}".strip()
     scan_up = text_to_scan.upper()
-    for b_kw in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
-        if b_kw in scan_up:
-            merged["bank_name"] = b_kw.title()
-            merged["payment_method"] = "BANK"
-            merged["payment_type"] = "BANK"
-            break
+    if "bank_name" not in llm_extracted:
+        for b_kw in ("MEEZAN", "HBL", "MCB", "UBL", "ALFALAH", "ALLIED", "STANDARD CHARTERED", "ASKARI", "FAYSAL", "SONERI", "BANK ISLAMI"):
+            if b_kw in scan_up:
+                merged["bank_name"] = b_kw.title()
+                if "payment_method" not in llm_extracted:
+                    merged["payment_method"] = "BANK"
+                    merged["payment_type"] = "BANK"
+                break
     if "CASH" in scan_up and not merged.get("payment_method"):
         merged.setdefault("payment_method", "CASH")
         merged.setdefault("payment_type", "CASH")
     elif any(k in scan_up for k in ("CREDIT", "LATER", "PAYABLE", "ON CREDIT")) and not merged.get("payment_method"):
         merged["payment_method"] = "CREDIT"
         merged["payment_type"] = "CREDIT"
+    if merged.get("payment_method") and not merged.get("payment_type"):
+        merged["payment_type"] = merged["payment_method"]
 
     # Date parsing check
-    if raw_reply:
+    if raw_reply and "transaction_date" not in llm_extracted:
         dt_res = parse_transaction_date(raw_reply)
         if dt_res.ok:
             merged["transaction_date"] = dt_res.iso_date
@@ -1189,7 +1235,7 @@ async def synthesize_cumulative_dialogue_intent(
         merged["useful_life"] = int(m_life.group(1))
 
     # WHT Exemption Certificate check
-    if any(k in text_to_scan.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "0% wht", "zero tax", "no deduction")):
+    if not merged.get("wht_status") and any(k in text_to_scan.lower() for k in ("exemption certificate", "certificate provided", "exempt", "has certificate", "0% wht", "zero tax", "no deduction")):
         merged["wht_status"] = "EXEMPT"
         merged["wht_decision"] = "EXEMPT"
         merged["wht_exempt"] = True
@@ -1199,6 +1245,7 @@ async def synthesize_cumulative_dialogue_intent(
     if any(k in text_to_scan.lower() for k in ("reverse", "reversal", "undo", "void journal", "cancel journal", "cancel entry")):
         merged["is_reversal"] = True
         merged["intent"] = "reverse_journal"
+        llm_resolved_intent = llm_resolved_intent or "reverse_journal"
         m_jv = re.search(r"\b(JV-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", text_to_scan, re.IGNORECASE)
         if m_jv:
             merged["journal_number"] = m_jv.group(1).upper()
@@ -1220,8 +1267,25 @@ async def synthesize_cumulative_dialogue_intent(
         except Exception as exc:
             log.warning("conversational_manager.disaggregate_failed", error=str(exc)[:200])
 
+    # Explicit diversion triggers when user pivots workflow or requests lookup in free text
+    if not llm_next_action and raw_reply:
+        _pivot_cues = (
+            "instead make", "actually make", "switch to", "change to purchase order",
+            "create a purchase order", "make it a bill", "check balance", "show balance",
+            "check our", "show our", "trial balance", "profit and loss", "balance sheet",
+            "skip the ", "remove the ", "only record", "split between", "split it",
+        )
+        if any(cue in raw_low for cue in _pivot_cues):
+            llm_next_action = "DIVERT"
+            llm_diversion_reason = "User requested a workflow or scope change."
+
     return {
         "entities": merged,
+        "llm_keys": sorted(llm_extracted.keys()),
+        "reasoning": llm_reasoning,
+        "next_action": llm_next_action or "PROCEED",
+        "resolved_intent": llm_resolved_intent or merged.get("intent"),
+        "diversion_reason": llm_diversion_reason,
         "is_complete": not any(merged.get(f) in (None, "", []) for f in (missing_fields or [])),
     }
 

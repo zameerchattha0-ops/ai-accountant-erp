@@ -686,6 +686,142 @@ async def test_rent_substring_never_resolves_to_current_liability_2140(monkeypat
     assert slider_ctrl.slider.live_calculated_values[3]["annual"] == pytest.approx(23333.33)
 
 
+def test_agent_contains_no_hardcoded_test_laptop_question_or_setattr_override():
+    """Verify agent.py has no hardcoded test-case strings or secret setattr intent overrides."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "agent.py").read_text(encoding="utf-8")
+    assert "For IT equipment like Executive Laptop (Rs. 70,000)" not in src
+    assert 'setattr(execution_plan, "intent"' not in src
+
+
+def test_evaluate_goal_finalisation_authenticates_split_and_asset_subgoals():
+    """Goal finalisation requires BOTH compound journal AND split fixed asset registration."""
+    from app.reasoning import evaluate_goal_finalisation
+
+    entities = {
+        "line_items": [
+            {"description": "Office Rent", "amount": 150000.0, "nature": "OPEX"},
+            {"description": "Server Rack", "amount": 120000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True},
+        ]
+    }
+    impact = [
+        {"account": "6151 - Rent Expense", "debit": 150000.0, "credit": 0.0},
+        {"account": "1500 - Computer Equipment", "debit": 120000.0, "credit": 0.0},
+        {"account": "1010 - Bank", "debit": 0.0, "credit": 270000.0},
+    ]
+
+    incomplete = evaluate_goal_finalisation(
+        intent="create_compound_journal",
+        entities=entities,
+        successful_tools=["create_compound_journal"],
+        affected_entities=[{"type": "journal_entry", "id": "je-1"}],
+        accounting_impact=impact,
+        capitalized_assets_count=0,
+    )
+    assert incomplete["goal_achieved"] is False
+    assert "split_fixed_asset_registered" in incomplete["missing_subgoals"]
+
+    complete = evaluate_goal_finalisation(
+        intent="create_compound_journal",
+        entities=entities,
+        successful_tools=["create_compound_journal"],
+        affected_entities=[{"type": "journal_entry", "id": "je-1"}],
+        accounting_impact=impact,
+        capitalized_assets_count=1,
+    )
+    assert complete["goal_achieved"] is True
+    assert "compound_journal_posted" in complete["verified_subgoals"]
+    assert "split_fixed_asset_registered" in complete["verified_subgoals"]
+
+
+@pytest.mark.asyncio
+async def test_resume_with_clarification_supports_flexible_llm_diversion_and_cancel(monkeypatch):
+    """LLM can freely divert mid-clarification or cancel honestly without rigid single-hop trapping."""
+    import uuid
+    import json
+    import app.agent as agent_mod
+    import app.database as db_mod
+    import app.ai_orchestrator as ai_orch
+    from app.models.schemas import AgentResponse, ExecutionStatus
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    sess_id = uuid.uuid4()
+
+    snapshot = {
+        "intent": "record_expense",
+        "extracted_entities": {"amount": 80000.0, "description": "Office Desks"},
+        "missing_fields": ["payment_method"],
+    }
+
+    async def fake_fetch_one(table, filters=None, select="*"):
+        if table == "ai_execution_sessions":
+            return {
+                "id": str(sess_id),
+                "organization_id": str(org_id),
+                "user_id": str(user_id),
+                "role": "OWNER",
+                "status": "AWAITING_CLARIFICATION",
+                "user_request": "Bought 2 office desks for 80,000",
+            }
+        return None
+
+    async def fake_resolve_and_fetch(*, session_id, user_response):
+        return None, [{"question": "How did you pay?", "answer": user_response, "required_information": ["payment_method"]}], snapshot
+
+    async def fake_noop(*args, **kwargs):
+        return None
+
+    execute_calls = []
+
+    async def fake_execute(**kwargs):
+        execute_calls.append(kwargs)
+        return AgentResponse(
+            status=ExecutionStatus.AWAITING_CONFIRMATION,
+            execution_id=sess_id,
+            action="create_purchase_order",
+            summary="Diverted to Purchase Order flow.",
+            confirmation_required=True,
+        )
+
+    async def fake_divert_llm(*args, **kwargs):
+        return json.dumps({
+            "next_action": "DIVERT",
+            "resolved_intent": "create_purchase_order",
+            "diversion_reason": "User switched from direct expense to creating a purchase order.",
+            "updated_entities": {"supplier_name": "Metro Furniture"},
+            "reasoning": "Diverting to purchase order workflow per user instruction.",
+        })
+
+    monkeypatch.setattr(agent_mod, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_mod, "_update_status", fake_noop)
+    monkeypatch.setattr(agent_mod, "_log_step", fake_noop)
+    monkeypatch.setattr(agent_mod, "execute", fake_execute)
+    monkeypatch.setattr(db_mod, "resolve_and_fetch_clarifications", fake_resolve_and_fetch)
+    monkeypatch.setattr(ai_orch.AIOrchestrator, "generate_text_light", fake_divert_llm)
+
+    resp_divert = await agent_mod.resume_with_clarification(
+        session_id=sess_id,
+        user_answer="Actually make it a purchase order to Metro Furniture instead",
+        user_id=user_id,
+        organization_id=org_id,
+    )
+    assert len(execute_calls) == 1
+    assert resp_divert.action == "create_purchase_order"
+
+    # Cancellation returns ExecutionStatus.CANCELLED without calling execute()
+    resp_cancel = await agent_mod.resume_with_clarification(
+        session_id=sess_id,
+        user_answer="Cancel this, do not record",
+        user_id=user_id,
+        organization_id=org_id,
+    )
+    assert resp_cancel.status == ExecutionStatus.CANCELLED
+    assert len(execute_calls) == 1
+
+
+
 
 
 

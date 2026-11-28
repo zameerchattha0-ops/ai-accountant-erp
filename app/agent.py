@@ -7404,11 +7404,19 @@ async def execute(
 
         await _update_status(session_id, ExecutionStatus.INTERPRETING)
 
-        # ---- FAST-PATH: CONSULTATIVE STATUTORY & WHAT-IF SIMULATION INQUIRIES --
-        if getattr(settings, "conversational_partner_enabled", True) and not attachments:
+        # ---- CONSULTATIVE STATUTORY & WHAT-IF INQUIRY FLOOR ----------------
+        # Only fast-path purely general textbook/policy questions when no LLM router/reasoning
+        # is handling the turn (and no transactional posting cues appear in the message).
+        if (
+            getattr(settings, "conversational_partner_enabled", True)
+            and not attachments
+            and not getattr(settings, "accounting_reasoning_enabled", False)
+            and not getattr(settings, "llm_router_enabled", True)
+        ):
             try:
                 from app.consultative_advisory import detect_consultative_query, generate_consultative_advisory
-                _consult_topic = detect_consultative_query(user_message)
+                _has_txn_action = bool(re.search(r"\b(?:paid|bought|purchased|sold|record|post|create|issued)\b", user_message, re.I))
+                _consult_topic = None if _has_txn_action else detect_consultative_query(user_message)
                 if _consult_topic:
                     _advice = generate_consultative_advisory(
                         topic=_consult_topic,
@@ -8215,24 +8223,29 @@ async def execute(
             "list_suppliers", "list_employees", "get_chart_of_accounts",
             "get_recurring_templates", "get_inventory_status",
         })
+        _PURE_SETUP_INTENTS = frozenset({
+            "create_account", "get_chart_of_accounts", "create_customer",
+            "create_supplier", "create_product", "create_service",
+            "create_bank_account", "create_employee", "create_project",
+            "create_recurring_template",
+        })
+        _has_commercial_value = bool(
+            (_preliminary or {}).get("amount")
+            or (_preliminary or {}).get("line_items")
+            or (_preliminary or {}).get("is_composite")
+        )
+        # Skip LLM reasoning ONLY for trivial pure read-only lookups or pure master-data setup
+        # with no commercial amounts/splits (never exclude commercial bank/composite transactions).
         _is_operational = (
-            _prov_hint in (
-                "create_account", "get_chart_of_accounts", "create_customer",
-                "create_supplier", "create_product", "create_service",
-                "create_bank_account", "create_employee", "create_project",
-                "create_recurring_template"
-            )
-            or _prov_hint in _READ_ONLY_LOOKUPS
-            or any(k in (_preliminary or {}) for k in ("account_name", "product_name", "bank_name", "employee_name"))
+            _prov_hint in _READ_ONLY_LOOKUPS
+            or (_prov_hint in _PURE_SETUP_INTENTS and not _has_commercial_value)
         )
 
-        _is_composite_txn = bool((_preliminary or {}).get("is_composite") or (_early_disagg and _early_disagg.is_composite))
         if (
             getattr(_settings, "accounting_reasoning_enabled", False)
             and not _split_batch_now(user_message)
             and approved_tool_calls is None
             and not _is_operational
-            and not _is_composite_txn
         ):
 
             # The model may only propose names from the TRUSTED registry, so it
@@ -8888,7 +8901,8 @@ async def execute(
 
         _decision = getattr(_reasoning, "decision", None) or {}
         _model_intent = str(_decision.get("intent") or "").strip().lower()
-        if _early_disagg and _early_disagg.is_composite and _early_disagg.line_items:
+        _generic_single_intents = {"", "record_expense", "expense", "create_expense", "record_purchase", "record_cash_purchase", "record_credit_purchase"}
+        if _early_disagg and _early_disagg.is_composite and _early_disagg.line_items and _model_intent in _generic_single_intents:
             _model_intent = "create_compound_journal"
 
         if not confirmed_intent and _model_intent and is_canonical_intent(_model_intent):
@@ -9009,14 +9023,21 @@ async def execute(
                             entities=execution_plan.extracted_entities,
                         )
                     if _disagg_res.is_composite and _disagg_res.line_items:
-                        _reasoning_calls = None
+                        from app.conversational_manager import (
+                            _match_asset_category,
+                            format_claude_style_progressive_question,
+                        )
+                        if _reasoning_calls:
+                            _r_tools = {tc.tool_name for tc in _reasoning_calls}
+                            if not (_r_tools & {"create_compound_journal", "create_invoice", "create_purchase_bill", "create_purchase_order", "record_supplier_payment", "record_customer_receipt"}):
+                                _reasoning_calls = None
                         execution_plan.extracted_entities["line_items"] = [
                             ln.to_dict() for ln in _disagg_res.line_items
                         ]
                         has_fa = any(
                             ln.nature == "FIXED_ASSET"
                             or "IAS 16" in str(ln.ifrs_standard or "")
-                            or any(k in ln.description.lower() for k in ("laptop", "computer", "vehicle", "furniture", "machinery", "equipment"))
+                            or _match_asset_category(ln.description) in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
                             for ln in _disagg_res.line_items
                         )
                         if has_fa:
@@ -9035,9 +9056,13 @@ async def execute(
                                         curr_missing.append(_f)
                                 execution_plan.missing_fields = curr_missing
                                 if not execution_plan.clarification_questions:
-                                    execution_plan.clarification_questions = [
-                                        "For IT equipment like Executive Laptop (Rs. 70,000), standard accounting policy under IAS 16 recommends a 3-year useful life using straight-line depreciation (with zero residual value). Would you like to apply this standard schedule?"
-                                    ]
+                                    _dyn_q, _, _ = format_claude_style_progressive_question(
+                                        intent=execution_plan.intent,
+                                        missing_fields=curr_missing,
+                                        entities=execution_plan.extracted_entities,
+                                        nature="FIXED_ASSET",
+                                    )
+                                    execution_plan.clarification_questions = [_dyn_q]
                         else:
                             execution_plan.requires_confirmation = True
 
@@ -9546,14 +9571,21 @@ async def execute(
                         execution_plan.extracted_entities["transaction_nature"] = _nature_res.nature
                         if _nature_res.nature == "FIXED_ASSET":
                             execution_plan.extracted_entities["capitalization_threshold_met"] = _nature_res.is_capitalized
-                            if execution_plan.intent in (
-                                "record_purchase",
-                                "record_cash_purchase",
-                                "record_credit_purchase",
-                                "create_purchase_bill",
-                                "record_expense",
+                            if (
+                                not _model_intent
+                                and execution_plan.intent != "create_compound_journal"
+                                and not (isinstance(execution_plan.extracted_entities.get("line_items"), list) and len(execution_plan.extracted_entities["line_items"]) > 1)
+                                and execution_plan.intent in (
+                                    "record_purchase",
+                                    "record_cash_purchase",
+                                    "record_credit_purchase",
+                                    "create_purchase_bill",
+                                    "record_expense",
+                                )
                             ):
-                                setattr(execution_plan, "intent", "register_fixed_asset")
+                                if "register_fixed_asset" not in (execution_plan.potential_tools or []):
+                                    execution_plan.potential_tools = ["register_fixed_asset", *list(execution_plan.potential_tools or [])]
+                                excluded_tools.discard("register_fixed_asset")
                 except Exception as _exc:  # noqa: BLE001
                     log.warning("agent.contextual_nature_failed", error=str(_exc)[:200])
 
@@ -9642,14 +9674,21 @@ async def execute(
             _nature_str = str(_nature_val).upper()
             execution_plan.extracted_entities["transaction_nature"] = _nature_str
             if _nature_str == "FIXED_ASSET":
-                if execution_plan.intent in (
-                    "record_purchase",
-                    "record_cash_purchase",
-                    "record_credit_purchase",
-                    "create_purchase_bill",
-                    "record_expense",
+                if (
+                    not _model_intent
+                    and execution_plan.intent != "create_compound_journal"
+                    and not (isinstance(execution_plan.extracted_entities.get("line_items"), list) and len(execution_plan.extracted_entities["line_items"]) > 1)
+                    and execution_plan.intent in (
+                        "record_purchase",
+                        "record_cash_purchase",
+                        "record_credit_purchase",
+                        "create_purchase_bill",
+                        "record_expense",
+                    )
                 ):
-                    setattr(execution_plan, "intent", "register_fixed_asset")
+                    if "register_fixed_asset" not in (execution_plan.potential_tools or []):
+                        execution_plan.potential_tools = ["register_fixed_asset", *list(execution_plan.potential_tools or [])]
+                    excluded_tools.discard("register_fixed_asset")
                 declined = bool(execution_plan.extracted_entities.get("depreciation_declined"))
                 if not declined:
                     for _fa_f in ("useful_life_years", "depreciation_method", "salvage_value"):
@@ -9965,22 +10004,26 @@ async def execute(
                             or execution_plan.extracted_entities.get("transaction_nature")
                         ),
                     )
+                    _q_src = str(getattr(_questionnaire, "source", "") or "")
+                    _has_llm_authored_q = _q_src in ("llm_authored", "llm_assisted") and bool(question and question.strip())
                     if is_consultative_query(user_message):
                         _advice = get_consultative_advice(user_message, entities=execution_plan.extracted_entities)
                         _conv_q = compose_consultative_response_with_draft(
                             user_query=user_message,
                             living_draft=_living_draft_dict or {},
-                            next_question=_prog_q,
+                            next_question=question if _has_llm_authored_q else _prog_q,
                             advice=_advice,
                         )
+                    elif _has_llm_authored_q:
+                        _conv_q = question
                     elif (
-                        questionnaire_client is not None
-                        or any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value", "transaction_nature"))
+                        any(f in _asked_fields for f in ("useful_life_years", "depreciation_method", "salvage_value", "transaction_nature"))
                         or bool(execution_plan.extracted_entities.get("line_items"))
+                        or _q_src == "floor"
                     ):
                         _conv_q = _prog_q
 
-                    if _prog_chips:
+                    if _prog_chips and (not _conv_options or not _has_llm_authored_q):
                         _conv_options = [[{"value": c, "label": c} for c in _prog_chips]]
                 except Exception as _cp_exc:
                     log.warning("agent.conversational_pacing_failed", error=str(_cp_exc)[:200])
@@ -11576,11 +11619,14 @@ async def execute(
                     entities=execution_plan.extracted_entities,
                     nature=execution_plan.transaction_nature or execution_plan.extracted_entities.get("transaction_nature"),
                 )
-                if _prog_q:
+                # Preserve grounded Phase-4 LLM question when it already wrote one; only fall back when missing.
+                if not (_q_text and _usable_question(_raw_q)) and _prog_q:
                     _q_text = _prog_q
-                if _prog_chips:
+                if _prog_chips and not _q_opts:
                     _chips = _prog_chips
                     _q_opts = [[{"value": c, "label": c} for c in _prog_chips]]
+                elif _prog_chips:
+                    _chips = _prog_chips
 
                 _ld_obj = build_living_draft(
                     intent=execution_plan.intent,
@@ -15319,7 +15365,30 @@ async def execute(
 
 
 
-        # ---- PHASE 9: COMPLETED ------------------------------------------
+        # ---- PHASE 9: GOAL DECISION FINALISATION & COMPLETED -------------
+
+        affected = build_affected_entities(tool_results)
+
+        accounting_impact = await build_accounting_impact(
+
+            tool_results,
+
+            resolve_account_name=_make_account_label_resolver(organization_id),
+
+        )
+
+        from app.reasoning import evaluate_goal_finalisation as _eval_goal_finalisation
+
+        _goal_verdict = _eval_goal_finalisation(
+            intent=execution_plan.intent,
+            entities=execution_plan.extracted_entities or {},
+            successful_tools=[tr.tool_name for tr in successful_results],
+            failed_tools=[tr.tool_name for tr in failed_results],
+            affected_entities=affected,
+            accounting_impact=accounting_impact,
+        )
+
+        await _log_step(session_id, "GOAL_FINALIZATION", _goal_verdict)
 
         status = ExecutionStatus.COMPLETED if verified else ExecutionStatus.FAILED
 
@@ -15348,29 +15417,9 @@ async def execute(
 
             "tools": [tr.tool_name for tr in tool_results],
 
+            "goal_achieved": _goal_verdict.get("goal_achieved"),
+
         })
-
-
-
-        # Build canonical affected entities + accounting impact.
-
-        # Contracts are defined in app/entity_contract.py and mirrored in
-
-        # frontend/src/lib/types/api.ts — the builders guarantee the shape
-
-        # (e.g. affected_entities[].type is always a non-empty string).
-
-        affected = build_affected_entities(tool_results)
-
-        accounting_impact = await build_accounting_impact(
-
-            tool_results,
-
-            resolve_account_name=_make_account_label_resolver(organization_id),
-
-        )
-
-
 
         # surface the recorded transaction date so the result
 
@@ -15406,23 +15455,15 @@ async def execute(
 
         )
 
-        response_data = (
+        response_data = {
 
-            {
+            **({"transaction_date": recorded_date, "date_defaulted": date_defaulted} if recorded_date else {}),
 
-                "transaction_date": recorded_date,
+            **nature_data,
 
-                "date_defaulted": date_defaulted,
+            "goal_finalisation": _goal_verdict,
 
-                **nature_data,
-
-            }
-
-            if recorded_date or nature_data
-
-            else None
-
-        )
+        }
 
 
 
@@ -16333,7 +16374,10 @@ async def resume_with_clarification(
                         pass
                 merged_entities[f_key] = f_ans
 
-        # Multi-field answer extraction for Turn 2 user response
+        # Multi-field answer extraction & flexible goal diversion for Turn 2+ user response
+        _divert_to_reasoning = False
+        _divert_reason = None
+        _synth_keys: set = set()
         if answer:
             try:
                 from app.conversational_manager import synthesize_cumulative_dialogue_intent
@@ -16351,10 +16395,57 @@ async def resume_with_clarification(
                     missing_fields=missing_fields,
                     client=questionnaire_client,
                 )
-                if _synth_res and _synth_res.get("entities"):
-                    merged_entities.update(_synth_res["entities"])
+                if _synth_res:
+                    _next_act = str(_synth_res.get("next_action") or "PROCEED").upper()
+                    if _next_act == "CANCEL":
+                        await asyncio.gather(
+                            _update_status(session_id, ExecutionStatus.CANCELLED),
+                            _log_step(session_id, "CANCELLED", {
+                                "source": "clarification_cancel",
+                                "reason": _synth_res.get("reasoning") or "User cancelled",
+                            }),
+                        )
+                        return AgentResponse(
+                            status=ExecutionStatus.CANCELLED,
+                            execution_id=session_id,
+                            summary="Cancelled as requested — nothing was recorded on the ledger.",
+                            requires_user_input=False,
+                        )
+                    _res_intent = str(_synth_res.get("resolved_intent") or "").strip()
+                    _compatible_compound = (
+                        intent in ("create_compound_journal", "split_transaction", "compound_journal")
+                        and _res_intent in ("create_compound_journal", "split_transaction", "compound_journal", "")
+                    )
+                    if _next_act == "DIVERT" or (
+                        _res_intent
+                        and _res_intent != intent
+                        and not _compatible_compound
+                    ):
+                        _divert_to_reasoning = True
+                        _divert_reason = _synth_res.get("diversion_reason") or _synth_res.get("reasoning") or f"Intent diverted from {intent} to {_res_intent or 'full reasoning'}"
+                    if _synth_res.get("entities"):
+                        _synth_keys = set(_synth_res.get("llm_keys") or [])
+                        merged_entities.update(_synth_res["entities"])
             except Exception as _synth_err:
                 log.warning("agent.cumulative_synthesis_fallback", error=str(_synth_err)[:200])
+
+            if _divert_to_reasoning:
+                await _log_step(session_id, "CLARIFICATION_DIVERTED", {
+                    "from_intent": intent,
+                    "reason": str(_divert_reason or "")[:300],
+                    "answer": answer[:300],
+                })
+                _orig_req = (session.get("user_request", "") or "").strip()
+                _diverted_prompt = f"{_orig_req}\n[User direction update]: {answer}" if _orig_req else answer
+                return await execute(
+                    user_message=_diverted_prompt,
+                    user_id=user_id,
+                    organization_id=organization_id,
+                    auth=auth,
+                    conversation_id=session.get("conversation_id"),
+                    clarification_history=history,
+                    questionnaire_client=questionnaire_client,
+                )
 
             parts = [p.strip() for p in re.split(r"[,;\n]+", answer) if p.strip()]
             for part in parts:
@@ -16365,7 +16456,7 @@ async def resume_with_clarification(
                     merged_entities["useful_life"] = val
 
                 m_party = re.search(r"\b(?:to|vendor|supplier|payee)\s+([A-Za-z0-9\s&.-]+)", part, re.IGNORECASE)
-                if m_party:
+                if m_party and "supplier_name" not in _synth_keys:
                     raw_p = m_party.group(1).strip()
                     raw_p = re.split(r"\b(?:via|using|through|with|for|bank)\b", raw_p, flags=re.IGNORECASE)[0].strip()
                     if raw_p:
@@ -16373,10 +16464,10 @@ async def resume_with_clarification(
                         merged_entities["vendor_name"] = raw_p
 
                 date_res = parse_transaction_date(part)
-                if date_res.ok:
+                if date_res.ok and "transaction_date" not in _synth_keys:
                     merged_entities["transaction_date"] = date_res.iso_date
                     merged_entities["expense_date"] = date_res.iso_date
-                elif any(k in part.upper() for k in ("CASH", "BANK", "TRANSFER", "CREDIT", "CARD", "CHEQUE")):
+                elif any(k in part.upper() for k in ("CASH", "BANK", "TRANSFER", "CREDIT", "CARD", "CHEQUE")) and "payment_method" not in _synth_keys:
                     ans_up = part.upper()
                     pm = "CASH" if "CASH" in ans_up else ("BANK" if ("BANK" in ans_up or "TRANSFER" in ans_up) else ("CREDIT" if any(k in ans_up for k in ("CREDIT", "LATER", "PAYABLE")) else "CASH"))
                     merged_entities["payment_method"] = pm
@@ -16385,7 +16476,7 @@ async def resume_with_clarification(
                         if b_keyword in ans_up:
                             merged_entities["bank_name"] = b_keyword.title()
                             break
-                elif any(k in part.upper() for k in ("FIXED_ASSET", "FIXED ASSET", "INVENTORY", "OPERATING_EXPENSE", "CONSUMABLE")):
+                elif any(k in part.upper() for k in ("FIXED_ASSET", "FIXED ASSET", "INVENTORY", "OPERATING_EXPENSE", "CONSUMABLE")) and intent != "create_compound_journal" and "transaction_nature" not in _synth_keys:
                     ans_up = part.upper()
                     if "FIXED" in ans_up:
                         merged_entities["transaction_nature"] = "FIXED_ASSET"
@@ -16393,7 +16484,7 @@ async def resume_with_clarification(
                         merged_entities["transaction_nature"] = "INVENTORY"
                     elif "CONSUMABLE" in ans_up or "OPERATING" in ans_up:
                         merged_entities["transaction_nature"] = "OPERATING_EXPENSE"
-                elif any(k in part.upper() for k in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY")):
+                elif any(k in part.upper() for k in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY")) and intent != "create_compound_journal":
                     ans_up = part.upper()
                     for c_type in ("EXPENSE", "ASSET", "LIABILITY", "REVENUE", "EQUITY"):
                         if c_type in ans_up:
@@ -16487,7 +16578,11 @@ async def resume_with_clarification(
                 merged_entities.setdefault("item_description", desc_known)
                 merged_entities.setdefault("description", desc_known)
 
-        # Re-check missing fields
+        # Sync payment_method <-> payment_type alias and check remaining missing fields
+        if merged_entities.get("payment_method") and not merged_entities.get("payment_type"):
+            merged_entities["payment_type"] = merged_entities["payment_method"]
+        elif merged_entities.get("payment_type") and not merged_entities.get("payment_method"):
+            merged_entities["payment_method"] = merged_entities["payment_type"]
         still_missing = [f for f in missing_fields if merged_entities.get(f) in (None, "", [])]
 
         if still_missing:
@@ -17164,10 +17259,23 @@ async def resume_with_clarification(
                                     description=_jl.get("description"),
                                 ))
 
+                    from app.reasoning import evaluate_goal_finalisation as _eval_goal_sh
+                    _cap_count = len(capitalized_assets) if "capitalized_assets" in locals() else 0
+                    _sh_goal_verdict = _eval_goal_sh(
+                        intent=intent,
+                        entities=merged_entities,
+                        successful_tools=[single_hop_call.tool_name],
+                        affected_entities=_aff_entities,
+                        accounting_impact=_acc_impact,
+                        capitalized_assets_count=_cap_count,
+                    )
+                    await _log_step(session_id, "GOAL_FINALIZATION", _sh_goal_verdict)
+
                     _data_payload = {
                         "tool_name": single_hop_call.tool_name,
                         "tool_result": tool_result.data,
                         "transaction_date": merged_entities.get("transaction_date"),
+                        "goal_finalisation": _sh_goal_verdict,
                         **({"living_draft": _completed_ld} if _completed_ld else {}),
                         **({"intent_progression": _prog_done} if _prog_done else {}),
                     }

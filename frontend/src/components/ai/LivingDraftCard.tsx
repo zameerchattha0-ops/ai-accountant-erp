@@ -57,21 +57,21 @@ export default function LivingDraftCard({
 
   const stageHeaderInfo = {
     fact_gathering: {
-      stepBadge: "Step 1 of 3",
-      title: "Fact Gathering & Verification",
-      subtitle: "The LLM is verifying facts from your instructions — no assumptions made.",
+      stepBadge: "Gathering Context",
+      title: "Fact Verification & Scoping",
+      subtitle: "Verifying facts from your instructions and live records — no assumptions made.",
       color: "bg-amber-500/10 text-amber-600 border-amber-500/20",
     },
     reasoning: {
-      stepBadge: "Step 2 of 3",
+      stepBadge: "Reasoning",
       title: "Accounting Reasoning & Standards",
-      subtitle: "Evaluating statutory compliance (IAS 16, Section 73, Section 153).",
+      subtitle: "Evaluating economic reality and statutory compliance (IAS 16, Section 73, Section 153).",
       color: "bg-blue-500/10 text-blue-600 border-blue-500/20",
     },
     ready_for_execution: {
-      stepBadge: "Step 3 of 3",
+      stepBadge: "Ready to Post",
       title: "Balanced Voucher Ready to Post",
-      subtitle: "All accounting requirements confirmed. Ready for General Ledger execution.",
+      subtitle: "All accounting requirements authenticated. Ready for General Ledger execution.",
       color: "bg-emerald-500/10 text-emerald-600 border-emerald-500/20",
     },
     posted: {
@@ -151,11 +151,11 @@ export default function LivingDraftCard({
 
       {isExpanded && (
         <div className="p-4 space-y-4 text-xs text-text-secondary">
-          {/* STEP 1: ESTABLISHED & FINALIZED FACTS (Green checks — strictly facts confirmed from user) */}
+          {/* ESTABLISHED & FINALIZED FACTS (Green checks — strictly facts confirmed from user) */}
           <div className="space-y-2">
             <div className="flex items-center gap-1.5 font-semibold text-text-primary text-[11px]">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-              <span>1. Established Facts (Verified from your input)</span>
+              <span>Established Facts (Verified from your input)</span>
             </div>
 
             {draft.finalized_facts && draft.finalized_facts.length > 0 ? (
@@ -178,11 +178,11 @@ export default function LivingDraftCard({
             )}
           </div>
 
-          {/* STEP 2: WHAT THE LLM IS REASONING FOR (Standards, Rules & Governance) */}
+          {/* ACTIVE ACCOUNTING REASONING (Standards, Rules & Governance) */}
           <div className="space-y-2">
             <div className="flex items-center gap-1.5 font-semibold text-text-primary text-[11px]">
               <Sparkles className="w-3.5 h-3.5 text-ai-600" />
-              <span>2. Active Accounting Reasoning & Standards</span>
+              <span>Active Accounting Reasoning & Standards</span>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -220,12 +220,12 @@ export default function LivingDraftCard({
             </div>
           </div>
 
-          {/* STEP 3: PENDING REQUIREMENTS (What the LLM is looking for) */}
+          {/* PENDING REQUIREMENTS (Remaining open accounting decisions) */}
           {draft.pending_requirements && draft.pending_requirements.length > 0 && !isReady && (
             <div className="space-y-1.5 p-3 rounded-xl bg-amber-50/60 border border-amber-200/80 dark:bg-amber-950/20 dark:border-amber-800/40">
               <div className="flex items-center gap-1.5 font-semibold text-amber-900 dark:text-amber-300 text-[11px]">
                 <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                <span>3. Missing Requirements (What the LLM is looking for)</span>
+                <span>Open Accounting Decisions</span>
               </div>
               <p className="text-[10px] text-amber-800 dark:text-amber-300/80">
                 The transaction cannot be posted with assumptions. Please provide answers to:

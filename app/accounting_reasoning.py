@@ -617,7 +617,7 @@ AUDITOR MINDSET FOR EVERY AREA:
   - Taxes: is a tax liability or recovery involved, and is a rate known?
   - Periods: is the intended date inside an OPEN period? If not, say so.
   - Corrections: prefer reversal + correct entry over silent edits.
-""".strip()
+  - Goal flexibility & authenticity: divert workflow, ask prerequisites, or verify all split/asset subgoals whenever live records demand.""".strip()
 
 
 @dataclass

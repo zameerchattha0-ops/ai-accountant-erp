@@ -2521,3 +2521,105 @@ async def resolve_preflight_entity_dependencies(
                             log.warning("reasoning.preflight_product_check_failed", error=str(exc))
 
     return prereq_calls + calls, injected
+
+
+def evaluate_goal_finalisation(
+    *,
+    intent: str,
+    entities: Optional[Dict[str, Any]] = None,
+    successful_tools: Sequence[str] = (),
+    failed_tools: Sequence[str] = (),
+    affected_entities: Optional[Sequence[Any]] = None,
+    accounting_impact: Optional[Sequence[Any]] = None,
+    capitalized_assets_count: int = 0,
+) -> Dict[str, Any]:
+    """Authenticate and verify final goal completion across all required sub-goals.
+
+    Enforces deterministic accounting completeness:
+      - Financial posting intents cannot claim completion when zero writes succeeded.
+      - Balanced double-entry invariant across reported accounting_impact rows.
+      - Multi-entity splits with IAS 16 capital items require both a posted
+        journal entry AND corresponding fixed-asset capitalization.
+    """
+    ents = dict(entities or {})
+    succ = list(successful_tools or ())
+    fail = list(failed_tools or ())
+    aff = list(affected_entities or ())
+    imp = list(accounting_impact or ())
+
+    verified_subgoals: List[str] = []
+    missing_subgoals: List[str] = []
+
+    if succ:
+        verified_subgoals.append(f"executed:{','.join(dict.fromkeys(succ))}")
+
+    # Double-entry balance verification across impact lines (when posted impact is present)
+    if imp:
+        tot_dr = 0.0
+        tot_cr = 0.0
+        for row in imp:
+            d = row.get("debit") if isinstance(row, dict) else getattr(row, "debit", 0.0)
+            c = row.get("credit") if isinstance(row, dict) else getattr(row, "credit", 0.0)
+            tot_dr += float(d or 0.0)
+            tot_cr += float(c or 0.0)
+        if abs(tot_dr - tot_cr) < 0.01 and tot_dr > 0:
+            verified_subgoals.append(f"balanced_double_entry:{tot_dr:.2f}")
+        elif tot_dr > 0 or tot_cr > 0:
+            missing_subgoals.append(f"unbalanced_impact:dr={tot_dr:.2f},cr={tot_cr:.2f}")
+
+    # Check multi-entity compound split + IAS 16 fixed asset sub-goal completeness
+    is_compound = (
+        intent in ("create_compound_journal", "split_transaction", "compound_journal")
+        or (isinstance(ents.get("line_items"), list) and len(ents["line_items"]) > 1)
+    )
+    if is_compound:
+        has_journal = any(
+            (e.get("type") if isinstance(e, dict) else getattr(e, "type", "")) == "journal_entry"
+            for e in aff
+        ) or "create_compound_journal" in succ
+        if has_journal:
+            verified_subgoals.append("compound_journal_posted")
+        else:
+            missing_subgoals.append("compound_journal_posted")
+
+        line_items = ents.get("line_items") or []
+        expects_asset = any(
+            isinstance(li, dict)
+            and (
+                str(li.get("nature") or "").upper() in ("FIXED_ASSET", "CAPEX")
+                or bool(li.get("is_fixed_asset"))
+                or "IAS 16" in str(li.get("ifrs_standard") or "").upper()
+            )
+            for li in (line_items if isinstance(line_items, list) else [])
+        )
+        if expects_asset:
+            has_asset_entity = capitalized_assets_count > 0 or any(
+                (e.get("type") if isinstance(e, dict) else getattr(e, "type", "")) == "fixed_asset"
+                for e in aff
+            ) or "register_fixed_asset" in succ
+            if has_asset_entity:
+                verified_subgoals.append("split_fixed_asset_registered")
+            else:
+                missing_subgoals.append("split_fixed_asset_registered")
+
+    # Guard against failed primary tools leaving an unfulfilled financial goal
+    if not succ and fail:
+        missing_subgoals.append("no_operation_succeeded")
+
+    goal_achieved = len(missing_subgoals) == 0 and bool(succ)
+    recommended_action = (
+        "COMPLETE" if goal_achieved else ("REMEDIATE" if succ or fail else "CLARIFY")
+    )
+    summary_note = (
+        "All accounting sub-goals authenticated and verified."
+        if goal_achieved
+        else f"Pending or unverified goal dimensions: {', '.join(missing_subgoals)}."
+    )
+
+    return {
+        "goal_achieved": goal_achieved,
+        "recommended_action": recommended_action,
+        "verified_subgoals": verified_subgoals,
+        "missing_subgoals": missing_subgoals,
+        "summary_note": summary_note,
+    }
