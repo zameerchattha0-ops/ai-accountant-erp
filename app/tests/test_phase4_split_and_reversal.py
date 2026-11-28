@@ -985,6 +985,78 @@ async def test_split_fixed_asset_dual_registration_uses_furniture_5yr_and_satisf
     assert "split_fixed_asset_registered" in verdict["verified_subgoals"]
 
 
+@pytest.mark.asyncio
+async def test_treatment_review_preserves_compound_journal_lines_without_false_contradiction(monkeypatch):
+    """_extract_facts_and_plan keeps GL lines + line_items for create_compound_journal (no false [nature_vs_plan])."""
+    import json
+    import uuid
+    from types import SimpleNamespace
+    import app.agent as agent_mod
+    from app.config import get_settings
+    from app.treatment_review import _extract_facts_and_plan, review_plan_treatment
+
+    lines = [
+        {"account_code": "6140", "account_name": "Utilities", "debit": 25000.0, "credit": 0.0, "description": "internet bill"},
+        {"account_code": "1502", "account_name": "Furniture & Fixtures", "debit": 70000.0, "credit": 0.0, "description": "2 office desks"},
+        {"account_code": "1010", "account_name": "Meezan Bank (Current)", "debit": 0.0, "credit": 95000.0, "description": "Bank settlement"},
+    ]
+    entities = {
+        "amount": 95000.0,
+        "payment_method": "BANK",
+        "item_description": "2 office desks",
+        "transaction_date": "2026-11-28",
+        "line_items": [
+            {"description": "internet bill", "amount": 25000.0, "nature": "OPERATING_EXPENSE"},
+            {"description": "2 office desks", "amount": 70000.0, "nature": "FIXED_ASSET", "is_fixed_asset": True},
+        ],
+    }
+    calls = [
+        agent_mod.ToolCall(
+            tool_name="create_compound_journal",
+            arguments={
+                "transaction_date": "2026-11-28",
+                "description": "Disaggregated payment: internet bill & 2 office desks",
+                "lines": lines,
+                "currency_code": "PKR",
+            },
+        )
+    ]
+
+    facts, plan = _extract_facts_and_plan(
+        intent="create_compound_journal",
+        classification=SimpleNamespace(transaction_nature="OPERATING_EXPENSE", source="llm"),
+        entities=entities,
+        calls=calls,
+    )
+    assert facts["transaction_nature"] == "COMPOUND"
+    assert "internet bill" in str(facts["item_description"])
+    assert "2 office desks" in str(facts["item_description"])
+    assert isinstance(facts.get("line_items"), list) and len(facts["line_items"]) == 2
+    assert len(plan) == 1
+    assert plan[0]["tool"] == "create_compound_journal"
+    assert plan[0]["arguments"].get("lines") == lines
+
+    class VerifyLinesClient:
+        async def generate_text_light(self, prompt: str) -> str:
+            assert '"account_code": "6140"' in prompt
+            assert '"account_code": "1502"' in prompt
+            assert '"transaction_nature": "COMPOUND"' in prompt
+            return json.dumps({"contradictions": [], "missing_material_facts": []})
+
+    monkeypatch.setattr(get_settings(), "treatment_review_enabled", True)
+    rev = await review_plan_treatment(
+        organization_id=uuid.uuid4(),
+        intent="create_compound_journal",
+        classification=SimpleNamespace(transaction_nature="OPERATING_EXPENSE", source="llm"),
+        entities=entities,
+        calls=calls,
+        client=VerifyLinesClient(),
+    )
+    assert rev.blocked is False
+    assert rev.ok is True
+
+
+
 
 
 

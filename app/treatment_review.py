@@ -48,7 +48,11 @@ _INSTRUCTION = (
     "the plan is consistent with the facts, output empty lists. Note: "
     "Return document tools (create_credit_note, create_purchase_return) are "
     "document-level contra reversal vouchers; their lines represent returned goods/services, "
-    "and they do not take a transaction_nature argument."
+    "and they do not take a transaction_nature argument. "
+    "Compound split journal tools (create_compound_journal) split multi-item or "
+    "mixed Opex/Capex transactions across balanced GL debit/credit 'lines' and "
+    "do not carry 'transaction_nature', 'items', or top-level 'amount'; treat "
+    "balanced GL 'lines' matching the confirmed 'line_items' and total as consistent."
 )
 
 
@@ -163,23 +167,49 @@ def _extract_facts_and_plan(
     entities: Dict[str, Any],
     calls: Any,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    line_items = entities.get("line_items") or entities.get("disaggregated_items")
+    has_compound_call = any(
+        getattr(c, "tool_name", "") == "create_compound_journal" for c in (calls or [])
+    )
+    has_split_lines = (
+        has_compound_call
+        or intent in ("create_compound_journal", "split_transaction", "compound_journal")
+        or (isinstance(line_items, list) and len(line_items) > 1)
+    )
     nature = str(getattr(classification, "transaction_nature", "") or "")
-    if intent in ("record_sale", "record_cash_sale", "create_invoice", "create_sale_invoice", "record_receipt") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
+    if has_split_lines:
+        nature = "COMPOUND"
+    elif intent in ("record_sale", "record_cash_sale", "create_invoice", "create_sale_invoice", "record_receipt") and nature in ("OPERATING_EXPENSE", "CONSUMABLE", "FIXED_ASSET"):
         nature = "INVENTORY" if (entities.get("item_description") or entities.get("quantity")) else "REVENUE"
     source = str(getattr(classification, "source", "") or "")
+    item_desc = entities.get("item_description")
+    if has_split_lines and isinstance(line_items, list) and line_items:
+        split_descs = [str(li.get("description") or "").strip() for li in line_items if isinstance(li, dict) and li.get("description")]
+        if split_descs:
+            item_desc = ", ".join(split_descs)
+    elif has_compound_call:
+        comp_descs: List[str] = []
+        for c in (calls or []):
+            if getattr(c, "tool_name", "") == "create_compound_journal":
+                for row in ((getattr(c, "arguments", None) or {}).get("lines") or []):
+                    if isinstance(row, dict) and float(row.get("debit") or 0.0) > 0 and row.get("description"):
+                        comp_descs.append(str(row["description"]).strip())
+        if comp_descs:
+            item_desc = ", ".join(comp_descs)
     facts = {
         "intent": intent,
         "transaction_nature": nature or None,
         "nature_source": source or None,
         "payment_method": entities.get("payment_method"),
         "party": entities.get("supplier_name") or entities.get("customer_name"),
-        "item_description": entities.get("item_description"),
+        "item_description": item_desc,
         "quantity": entities.get("quantity") or entities.get("item_quantity"),
         "amount": entities.get("amount"),
         "subtotal": entities.get("subtotal"),
         "tax_amount": entities.get("tax_amount") or entities.get("printed_tax"),
         "tax_code": entities.get("tax_code"),
         "transaction_date": entities.get("transaction_date"),
+        **({"line_items": line_items[:12]} if has_split_lines and isinstance(line_items, list) else {}),
     }
     extracted_plan: List[Dict[str, Any]] = []
     for call in (calls or []):
@@ -189,11 +219,13 @@ def _extract_facts_and_plan(
             k: v
             for k, v in raw_args.items()
             if k in (
-                "transaction_nature", "payment_method", "items", "total",
+                "transaction_nature", "payment_method", "items", "lines", "total",
                 "subtotal", "amount", "tax_total", "tax_code", "notes", "bill_date",
+                "transaction_date", "currency_code", "entry_type",
                 "quantity", "description", "item_description", "reason",
                 "credit_note_date", "return_date", "customer_id", "supplier_id",
                 "customer_name", "supplier_name", "invoice_id", "bill_id",
+                "useful_life_years", "depreciation_method",
             )
         }
         # For return tools (credit notes & purchase returns), if items array is not
