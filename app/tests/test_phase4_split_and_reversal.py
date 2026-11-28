@@ -1223,6 +1223,27 @@ def test_extracted_agent_submodules_keep_agent_exports_intact():
     assert agent_mod._execution_failure_summary is post_mod.execution_failure_summary
 
 
+def test_diverted_purchase_order_living_draft_skips_fixed_asset_depreciation():
+    """Diverting to create_purchase_order renders Purchase Order draft with no fake GL lines or depreciation reqs."""
+    from app.living_draft import build_living_draft
+
+    ld = build_living_draft(
+        intent="create_purchase_order",
+        entities={
+            "supplier_name": "Tech Depot",
+            "item_description": "Laser printer",
+            "amount": 45000.0,
+            "transaction_nature": "FIXED_ASSET",
+        },
+        missing_fields=[],
+    )
+    assert "Purchase Order" in ld.document_type
+    assert ld.depreciation_schedule is None
+    assert ld.voucher_preview == []
+    assert not any("useful life" in p.lower() for p in ld.pending_requirements)
+
+
+
 
 
 

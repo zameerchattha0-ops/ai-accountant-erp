@@ -609,6 +609,9 @@ export default function FixedAssetsPage() {
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-muted" />
           <input
+            id="fixed-assets-search"
+            name="fixed-assets-search"
+            aria-label="Search fixed assets"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search by asset name or code..."
@@ -616,6 +619,9 @@ export default function FixedAssetsPage() {
           />
         </div>
         <select
+          id="fixed-assets-status"
+          name="fixed-assets-status"
+          aria-label="Filter fixed assets by status"
           value={status}
           onChange={(e) => setStatus(e.target.value)}
           className={`${inputCls} sm:w-60`}

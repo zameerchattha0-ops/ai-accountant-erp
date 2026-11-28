@@ -284,6 +284,12 @@ def _determine_document_type(intent: str, nature: Optional[str], channel: Option
             return "Bank Payment Voucher (Compound Split Journal)"
         return "Compound Split Payment Voucher"
 
+    if "purchase_order" in intent_low:
+        return "Purchase Order (Non-Posting Draft)"
+
+    if "quotation" in intent_low or "sales_order" in intent_low:
+        return "Sales Quotation / Order (Non-Posting Draft)"
+
     if nature_up == "FIXED_ASSET" or any(w in intent_low for w in ("fixed_asset", "capital_asset", "depreciation")):
         if channel == "cash":
             return "Cash Payment Voucher (Fixed Asset Capitalization)"
@@ -342,7 +348,7 @@ def _generate_voucher_preview(
     entities: Dict[str, Any],
 ) -> List[VoucherLinePreview]:
     """Synthesize debit/credit double-entry lines for the voucher card preview."""
-    if not total_amount or total_amount <= 0:
+    if not total_amount or total_amount <= 0 or "Non-Posting" in document_type:
         return []
 
     lines: List[VoucherLinePreview] = []
@@ -697,14 +703,23 @@ def build_living_draft(
         entities=ents,
     )
 
-    depreciation_schedule = _build_depreciation_schedule(
-        nature=resolved_nature,
-        total_amount=total_amount,
-        entities=ents,
+    _is_non_posting_order = any(
+        k in (intent or "").lower()
+        for k in ("purchase_order", "sales_order", "quotation", "update_purchase_order_status")
+    )
+
+    depreciation_schedule = (
+        None
+        if _is_non_posting_order
+        else _build_depreciation_schedule(
+            nature=resolved_nature,
+            total_amount=total_amount,
+            entities=ents,
+        )
     )
 
     compliance_notes = _generate_compliance_notes(
-        nature=resolved_nature,
+        nature="" if _is_non_posting_order else resolved_nature,
         total_amount=total_amount,
         channel=channel,
         bank_name=bank_name,
@@ -766,7 +781,13 @@ def build_living_draft(
 
     # 2. Accounting reasoning steps
     reasoning_steps: List[ReasoningStep] = []
-    if resolved_nature == "FIXED_ASSET" or "Asset" in document_type:
+    if _is_non_posting_order:
+        reasoning_steps.append(ReasoningStep(
+            title="Procurement / Order Workflow (Non-Posting)",
+            description="Preparing draft commercial order/quotation — no General Ledger journal or Fixed Asset depreciation is recorded at this stage.",
+            status="completed" if not cleaned_missing else "analyzing",
+        ))
+    elif resolved_nature == "FIXED_ASSET" or "Asset" in document_type:
         reasoning_steps.append(ReasoningStep(
             title="IAS 16 Property, Plant & Equipment",
             description="Evaluating capitalization criteria and useful life depreciation allocation.",
@@ -785,14 +806,14 @@ def build_living_draft(
             status="completed" if not cleaned_missing else "analyzing",
         ))
 
-    if total_amount and total_amount > 50000:
+    if not _is_non_posting_order and total_amount and total_amount > 50000:
         reasoning_steps.append(ReasoningStep(
             title="Section 73 Statutory Cash Limit",
             description="Statutory rule: transactions > PKR 50,000 must settle via banking channel to claim tax deduction.",
             status="compliant" if channel in ("bank_transfer", "bank", "cheque") else ("analyzing" if not channel else "monitoring"),
         ))
 
-    if resolved_nature in ("FIXED_ASSET", "OPERATING_EXPENSE") and total_amount and total_amount > 0:
+    if not _is_non_posting_order and resolved_nature in ("FIXED_ASSET", "OPERATING_EXPENSE") and total_amount and total_amount > 0:
         reasoning_steps.append(ReasoningStep(
             title="Section 153 Withholding Tax",
             description="Evaluating statutory tax deduction applicability on vendor disbursement.",
@@ -801,14 +822,14 @@ def build_living_draft(
 
     # 3. Pending requirements
     pending_requirements: List[str] = []
-    if not channel:
+    if not channel and not _is_non_posting_order:
         pending_requirements.append("Payment settlement method (Cash, Bank Transfer, or On Credit / Accounts Payable)")
     if not counterparty or not counterparty.name:
         if "sale" in (intent or "").lower() or "invoice" in (intent or "").lower():
             pending_requirements.append("Customer / Client identity")
         elif ("expense" not in (intent or "").lower() and "compound" not in (intent or "").lower() and "split" not in (intent or "").lower() and not bool(ents.get("line_items"))) or channel == "credit":
             pending_requirements.append("Vendor / Supplier identity")
-    if resolved_nature == "FIXED_ASSET" and not ents.get("useful_life_years") and not ents.get("useful_life"):
+    if not _is_non_posting_order and resolved_nature == "FIXED_ASSET" and not ents.get("useful_life_years") and not ents.get("useful_life"):
         pending_requirements.append("Intended useful life (years) for straight-line depreciation (standard IT is 3 years)")
 
     for field_name in cleaned_missing:

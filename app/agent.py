@@ -9048,7 +9048,12 @@ async def execute(
                             or _match_asset_category(ln.description) in ("IT_EQUIPMENT", "FURNITURE", "VEHICLE", "MACHINERY")
                             for ln in _disagg_res.line_items
                         )
-                        if has_fa:
+                        if has_fa and execution_plan.intent not in (
+                            "create_purchase_order",
+                            "create_sales_order",
+                            "create_quotation",
+                            "update_purchase_order_status",
+                        ):
                             execution_plan.transaction_nature = "COMPOUND"
                             execution_plan.extracted_entities["transaction_nature"] = "COMPOUND"
                             if execution_plan.prohibited_actions:
@@ -9674,6 +9679,25 @@ async def execute(
         _dropped_missing = _drop_resolved(
             execution_plan.missing_fields, classification
         )
+        _non_posting_order = execution_plan.intent in (
+            "create_purchase_order",
+            "create_sales_order",
+            "create_quotation",
+            "update_purchase_order_status",
+        )
+        if _non_posting_order:
+            _dropped_missing = [
+                f
+                for f in _dropped_missing
+                if f not in (
+                    "useful_life_years",
+                    "depreciation_method",
+                    "salvage_value",
+                    "capitalization_decision",
+                    "payment_method",
+                    "payment_type",
+                )
+            ]
         _nature_val = (
             getattr(classification, "transaction_nature", None)
             or execution_plan.extracted_entities.get("transaction_nature")
@@ -9681,7 +9705,7 @@ async def execute(
         if _nature_val and not getattr(classification, "requires_clarification", False):
             _nature_str = str(_nature_val).upper()
             execution_plan.extracted_entities["transaction_nature"] = _nature_str
-            if _nature_str == "FIXED_ASSET":
+            if _nature_str == "FIXED_ASSET" and not _non_posting_order:
                 if (
                     not _model_intent
                     and execution_plan.intent != "create_compound_journal"
