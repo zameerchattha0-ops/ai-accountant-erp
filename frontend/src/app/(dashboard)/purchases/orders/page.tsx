@@ -269,7 +269,10 @@ export default function PurchaseOrdersPage() {
         <div className="relative w-full sm:w-64">
           <Search className="w-4 h-4 text-text-muted absolute left-3 top-2.5" />
           <input
+            id="po-search"
+            name="po-search"
             type="text"
+            aria-label="Search purchase orders"
             placeholder="Search PO # or supplier..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
